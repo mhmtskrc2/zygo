@@ -239,6 +239,8 @@ impl Pool {
             state: Mutex::new(SandboxState::Warm),
             tenant_cgroup,
             per_request_cgroup: self.config.per_request_cgroup,
+            timeout: f.limits.timeout.into(),
+            agent_host_pid: sandbox.pid(),
             _sandbox: sandbox,
         })
     }
@@ -284,6 +286,18 @@ pub struct WarmFn {
     /// accounted, and where per-request cgroups are created when they are.
     tenant_cgroup: Option<PathBuf>,
     per_request_cgroup: bool,
+    /// The function's own wall-clock budget, from its resolved spec.
+    ///
+    /// This is the limit; a caller's timeout only decides how long *it* waits.
+    /// Requirement N4 makes the spec's limits mandatory, so a client asking for
+    /// longer cannot get it.
+    timeout: std::time::Duration,
+    /// The agent's pid as the *host* sees it.
+    ///
+    /// The agent lives in its own pid namespace, so the pid it reports in
+    /// `FORKED` is meaningless here; this is the anchor used to translate it.
+    /// See [`WarmFn::host_pid_of`].
+    agent_host_pid: u32,
     /// Kept alive: dropping it kills the sandbox.
     _sandbox: Box<dyn crate::backend::Sandbox>,
 }
@@ -322,10 +336,17 @@ impl WarmFn {
         self.call_with_timeout(event, self.default_timeout())
     }
 
-    fn default_timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(30)
+    /// The function's own budget, which is also the ceiling for any caller's.
+    pub fn timeout(&self) -> std::time::Duration {
+        self.timeout
     }
 
+    fn default_timeout(&self) -> std::time::Duration {
+        self.timeout
+    }
+
+    /// Serve one request, giving up after `timeout` or the function's own
+    /// budget, whichever is shorter.
     pub fn call_with_timeout(
         &self,
         event: serde_json::Value,
@@ -394,7 +415,10 @@ impl WarmFn {
         // Passing `timeout_ms` to the agent is a courtesy, not a control: the
         // agent's own children are the thing being limited, so trusting it to
         // stop them is trusting the blast radius to contain itself.
-        let deadline = timeout.saturating_sub(admitted - started);
+        // The function's own limit wins: a caller asking for longer than the
+        // spec allows is asking to be allowed past a mandatory limit (N4).
+        let budget = timeout.min(self.timeout);
+        let deadline = budget.saturating_sub(admitted - started);
         if !wait_readable(&wire, deadline)? {
             self.enforce_deadline(request_cgroup.as_deref(), pid);
             // The child is dead, so the agent sees EOF on the result pipe and
@@ -489,15 +513,21 @@ impl WarmFn {
     /// kernel below 5.14 — all we have is the pid the agent reported, which
     /// misses grandchildren. That is a reason to keep per-request cgroups on,
     /// not a reason to skip the kill.
-    fn enforce_deadline(&self, request_cgroup: Option<&std::path::Path>, pid: u32) {
+    fn enforce_deadline(&self, request_cgroup: Option<&std::path::Path>, ns_pid: u32) {
         if let Some(dir) = request_cgroup {
             if let Ok(true) = crate::cgroup::kill(dir) {
                 return;
             }
         }
-        // SAFETY: `pid` came from the agent's `FORKED` for a child that has not
-        // been reaped, so the number still refers to that process.
-        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        // Without `cgroup.kill` (below kernel 5.14) all we have is the pid —
+        // and it has to be translated first, or the signal goes to whatever
+        // host process happens to hold the agent's namespace-local number.
+        let Some(host) = self.host_pid_of(ns_pid) else {
+            return;
+        };
+        // SAFETY: `host` was just read from the agent's children, so it names a
+        // child of this process that has not been reaped.
+        unsafe { libc::kill(host as libc::pid_t, libc::SIGKILL) };
     }
 
     /// Put the forked child in its own cgroup. Returns the directory to remove
@@ -514,8 +544,32 @@ impl WarmFn {
         // Failing to move the pid is not worth failing the request over: the
         // child is still inside the *tenant* cgroup, so the tenant's limits
         // still apply. What is lost is only the per-request accounting.
-        let _ = crate::cgroup::attach(&dir, pid);
+        if let Some(host) = self.host_pid_of(pid) {
+            let _ = crate::cgroup::attach(&dir, host);
+        }
         Some(dir)
+    }
+
+    /// Translate a pid the agent reported into the pid this process must use.
+    ///
+    /// The agent is pid 1 in its own namespace, so the number in `FORKED` means
+    /// nothing here: measured on 5.10, a child the agent called pid 2 was pid 28
+    /// on the host. Writing the agent's number into `cgroup.procs` silently
+    /// moved nothing, and passing it to `kill` would have signalled whatever
+    /// unrelated process happens to hold that number.
+    ///
+    /// The translation is `NSpid` from `/proc/<host>/status`, whose last field
+    /// is the pid in the innermost namespace. Candidates come from the agent's
+    /// own children rather than from all of `/proc`, so this stays a couple of
+    /// small reads on the request path.
+    fn host_pid_of(&self, ns_pid: u32) -> Option<u32> {
+        let agent = self.agent_host_pid;
+        let children =
+            std::fs::read_to_string(format!("/proc/{agent}/task/{agent}/children")).ok()?;
+        children
+            .split_whitespace()
+            .filter_map(|p| p.parse::<u32>().ok())
+            .find(|&candidate| innermost_ns_pid(candidate) == Some(ns_pid))
     }
 
     fn record(&self, ok: bool) {
@@ -735,6 +789,23 @@ fn wait_readable(wire: &Wire, timeout: std::time::Duration) -> Result<bool> {
             }
         }
     }
+}
+
+/// The pid of `host_pid` as seen in its own innermost pid namespace.
+///
+/// `NSpid` lists a process's pid in each namespace it belongs to, outermost
+/// first, so the last entry is the number the process sees for itself. A kernel
+/// without `NSpid` (below 4.1) reports nothing, which is treated as "cannot
+/// translate" rather than guessed at.
+fn innermost_ns_pid(host_pid: u32) -> Option<u32> {
+    let status = std::fs::read_to_string(format!("/proc/{host_pid}/status")).ok()?;
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("NSpid:"))?
+        .split_whitespace()
+        .next_back()?
+        .parse()
+        .ok()
 }
 
 /// Monotonic request ids. Short, because they become cgroup directory names.
