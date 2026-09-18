@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+.DS_Store
+__pycache__/
+*.pyc
+/dist
+zygo.lock
+
+# PoC artefacts: cross-compiled binaries, not source
+/poc/poc3-linux

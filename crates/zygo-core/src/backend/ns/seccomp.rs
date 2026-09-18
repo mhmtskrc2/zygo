@@ -1,0 +1,1232 @@
+//! seccomp-bpf filters (design doc appendix B).
+//!
+//! The filter is an **allowlist**: anything not named returns `EPERM`. That
+//! direction matters — a denylist silently gains a hole every time the kernel
+//! grows a syscall, and it grows several per release.
+//!
+//! The program is built in the parent, as a plain `Vec<SockFilter>`, and only
+//! *installed* in the child. Everything after `clone3` has to be
+//! allocation-free, and generating BPF is not.
+//!
+//! The three profiles come from appendix B. `default` is the one PoC 5
+//! validated against numpy, pandas, Pillow, pydantic and requests — the same
+//! syscall set, expressed here rather than as a Docker profile.
+
+use super::syscalls;
+use crate::spec::SeccompProfile;
+
+/// One classic-BPF instruction, the shape `SECCOMP_SET_MODE_FILTER` expects.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SockFilter {
+    pub code: u16,
+    pub jt: u8,
+    pub jf: u8,
+    pub k: u32,
+}
+
+/// `struct sock_fprog`.
+#[repr(C)]
+#[derive(Debug)]
+pub struct SockFprog {
+    pub len: u16,
+    pub filter: *const SockFilter,
+}
+
+// Classic BPF opcodes.
+const BPF_LD: u16 = 0x00;
+const BPF_W: u16 = 0x00;
+const BPF_ABS: u16 = 0x20;
+const BPF_JMP: u16 = 0x05;
+const BPF_JEQ: u16 = 0x10;
+const BPF_K: u16 = 0x00;
+const BPF_RET: u16 = 0x06;
+const BPF_ALU: u16 = 0x04;
+const BPF_AND: u16 = 0x50;
+const BPF_JA: u16 = 0x00;
+
+// `struct seccomp_data` field offsets.
+const OFF_NR: u32 = 0;
+const OFF_ARCH: u32 = 4;
+/// Low 32 bits of `args[0]`. Little-endian only, which both supported
+/// architectures are.
+const OFF_ARG0_LO: u32 = 16;
+/// Low 32 bits of `args[1]` — `ioctl`'s request number.
+const OFF_ARG1_LO: u32 = 24;
+
+// Filter return values.
+const RET_ALLOW: u32 = 0x7fff_0000;
+const RET_ERRNO: u32 = 0x0005_0000;
+/// Killing the whole process rather than the thread: a thread killed mid-syscall
+/// leaves the rest of the sandbox running in an unknown state.
+const RET_KILL_PROCESS: u32 = 0x8000_0000;
+
+/// `CLONE_NEW*` bits. A sandbox that can create namespaces can undo its own
+/// confinement, so `clone` is allowed only with all of these clear.
+const CLONE_NEW_MASK: u32 = 0x0002_0000   // NEWNS
+    | 0x0400_0000   // NEWUTS
+    | 0x0800_0000   // NEWIPC
+    | 0x1000_0000   // NEWUSER
+    | 0x2000_0000   // NEWPID
+    | 0x4000_0000   // NEWNET
+    | 0x0200_0000; // NEWCGROUP
+
+fn stmt(code: u16, k: u32) -> SockFilter {
+    SockFilter {
+        code,
+        jt: 0,
+        jf: 0,
+        k,
+    }
+}
+
+/// Where a branch goes.
+///
+/// Classic BPF encodes jumps as 8-bit *distances*, counted from the instruction
+/// after the branch. Computing those by hand is how the first version of this
+/// generator sent every `clone` to the deny instead of to its argument check —
+/// a one-instruction error that every structural test passed. Branch targets
+/// are therefore named here and resolved in a second pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Label {
+    /// Fall through to the next instruction.
+    Next,
+    Allow,
+    Deny,
+    Kill,
+    CloneCheck,
+    IoctlCheck,
+}
+
+/// An instruction before its branch distances are known.
+#[derive(Debug, Clone, Copy)]
+enum Pending {
+    Load(u32),
+    And(u32),
+    JumpEq {
+        k: u32,
+        jt: Label,
+        jf: Label,
+    },
+    Goto(Label),
+    Ret(u32),
+    /// Not an instruction: names the position that follows.
+    Mark(Label),
+}
+
+#[derive(Default)]
+struct Assembler {
+    pending: Vec<Pending>,
+}
+
+impl Assembler {
+    fn push(&mut self, insn: Pending) -> &mut Self {
+        self.pending.push(insn);
+        self
+    }
+
+    fn load(&mut self, offset: u32) -> &mut Self {
+        self.push(Pending::Load(offset))
+    }
+    fn and(&mut self, mask: u32) -> &mut Self {
+        self.push(Pending::And(mask))
+    }
+    fn jeq(&mut self, k: u32, jt: Label, jf: Label) -> &mut Self {
+        self.push(Pending::JumpEq { k, jt, jf })
+    }
+    fn goto(&mut self, target: Label) -> &mut Self {
+        self.push(Pending::Goto(target))
+    }
+    fn ret(&mut self, k: u32) -> &mut Self {
+        self.push(Pending::Ret(k))
+    }
+    fn mark(&mut self, label: Label) -> &mut Self {
+        self.push(Pending::Mark(label))
+    }
+
+    /// Resolve labels into distances and emit the program.
+    fn assemble(&self) -> Result<Vec<SockFilter>, SeccompError> {
+        // First pass: where each label lands, counting only real instructions.
+        let mut positions: Vec<(Label, usize)> = Vec::new();
+        let mut index = 0usize;
+        for insn in &self.pending {
+            match insn {
+                Pending::Mark(label) => positions.push((*label, index)),
+                _ => index += 1,
+            }
+        }
+        let position_of = |label: Label| -> Option<usize> {
+            positions.iter().find(|(l, _)| *l == label).map(|(_, p)| *p)
+        };
+
+        // Second pass: emit, converting each target into a distance.
+        let mut out = Vec::with_capacity(index);
+        for insn in &self.pending {
+            let here = out.len();
+            let distance = |label: Label| -> Result<u8, SeccompError> {
+                if label == Label::Next {
+                    return Ok(0);
+                }
+                let target = position_of(label).ok_or(SeccompError::UnresolvedLabel)?;
+                // `here + 1` because a branch counts from the instruction after
+                // it; a backward jump cannot be encoded at all.
+                let delta = target
+                    .checked_sub(here + 1)
+                    .ok_or(SeccompError::BackwardJump)?;
+                u8::try_from(delta).map_err(|_| SeccompError::JumpTooFar { delta })
+            };
+
+            out.push(match *insn {
+                Pending::Mark(_) => continue,
+                Pending::Load(offset) => stmt(BPF_LD | BPF_W | BPF_ABS, offset),
+                Pending::And(mask) => stmt(BPF_ALU | BPF_AND | BPF_K, mask),
+                Pending::Ret(value) => stmt(BPF_RET | BPF_K, value),
+                Pending::JumpEq { k, jt, jf } => SockFilter {
+                    code: BPF_JMP | BPF_JEQ | BPF_K,
+                    jt: distance(jt)?,
+                    jf: distance(jf)?,
+                    k,
+                },
+                Pending::Goto(target) => SockFilter {
+                    code: BPF_JMP | BPF_JA,
+                    jt: 0,
+                    jf: 0,
+                    k: distance(target)? as u32,
+                },
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// Syscalls every profile allows.
+///
+/// This is PoC 5's validated set: the five reference packages exercise their
+/// real code paths — numpy's BLAS threads, Pillow's codecs, pandas' file I/O,
+/// pydantic's Rust core, requests' TLS setup — under exactly these.
+pub const BASE_ALLOWLIST: &[&str] = &[
+    "accept4",
+    "access",
+    "arch_prctl",
+    "bind",
+    "brk",
+    "capget",
+    "capset",
+    "chdir",
+    "clock_getres",
+    "clock_gettime",
+    "clock_nanosleep",
+    "close",
+    "close_range",
+    "connect",
+    "copy_file_range",
+    "dup",
+    "dup2",
+    "dup3",
+    "epoll_create",
+    "epoll_create1",
+    "epoll_ctl",
+    "epoll_pwait",
+    "epoll_wait",
+    "eventfd",
+    "eventfd2",
+    "execve",
+    "execveat",
+    "exit",
+    "exit_group",
+    "faccessat",
+    "faccessat2",
+    "fadvise64",
+    "fallocate",
+    "fchdir",
+    "fchmod",
+    "fchmodat",
+    "fchown",
+    "fchownat",
+    "fcntl",
+    "fdatasync",
+    "flock",
+    "fstat",
+    "fstatfs",
+    "fsync",
+    "ftruncate",
+    "futex",
+    "get_robust_list",
+    "getcwd",
+    "getdents64",
+    "getegid",
+    "geteuid",
+    "getgid",
+    "getgroups",
+    "getpeername",
+    "getpgrp",
+    "getpid",
+    "getppid",
+    "getpriority",
+    "getrandom",
+    "getresgid",
+    "getresuid",
+    "getrlimit",
+    "getrusage",
+    "getsid",
+    "getsockname",
+    "getsockopt",
+    "gettid",
+    "gettimeofday",
+    "getuid",
+    "getxattr",
+    "ioctl",
+    "kill",
+    "lgetxattr",
+    "link",
+    "linkat",
+    "listen",
+    "lseek",
+    "lstat",
+    "madvise",
+    "membarrier",
+    "memfd_create",
+    "mkdir",
+    "mkdirat",
+    "mlock",
+    "mmap",
+    "mprotect",
+    "mremap",
+    "msync",
+    "munlock",
+    "munmap",
+    "nanosleep",
+    "newfstatat",
+    "open",
+    "openat",
+    "pipe",
+    "pipe2",
+    "poll",
+    "ppoll",
+    "prctl",
+    "pread64",
+    "preadv",
+    "preadv2",
+    "prlimit64",
+    "pselect6",
+    "pwrite64",
+    "pwritev",
+    "pwritev2",
+    "read",
+    "readlink",
+    "readlinkat",
+    "readv",
+    "recvfrom",
+    "recvmsg",
+    "rename",
+    "renameat",
+    "renameat2",
+    "rmdir",
+    "rseq",
+    "rt_sigaction",
+    "rt_sigpending",
+    "rt_sigprocmask",
+    "rt_sigqueueinfo",
+    "rt_sigreturn",
+    "rt_sigsuspend",
+    "rt_sigtimedwait",
+    "sched_get_priority_max",
+    "sched_get_priority_min",
+    "sched_getaffinity",
+    "sched_getattr",
+    "sched_getparam",
+    "sched_getscheduler",
+    "sched_rr_get_interval",
+    "sched_setaffinity",
+    "sched_setattr",
+    "sched_setparam",
+    "sched_setscheduler",
+    "sched_yield",
+    "select",
+    "sendmmsg",
+    "sendmsg",
+    "sendto",
+    "set_robust_list",
+    "set_tid_address",
+    "setfsgid",
+    "setfsuid",
+    "setgid",
+    "setgroups",
+    "setitimer",
+    "setpgid",
+    "setpriority",
+    "setregid",
+    "setresgid",
+    "setresuid",
+    "setreuid",
+    "setrlimit",
+    "setsid",
+    "setsockopt",
+    "setuid",
+    "shutdown",
+    "sigaltstack",
+    "signalfd4",
+    "socket",
+    "socketpair",
+    "stat",
+    "statfs",
+    "statx",
+    "symlink",
+    "symlinkat",
+    "sysinfo",
+    "tgkill",
+    "time",
+    "timer_create",
+    "timer_delete",
+    "timer_getoverrun",
+    "timer_gettime",
+    "timer_settime",
+    "timerfd_create",
+    "timerfd_gettime",
+    "timerfd_settime",
+    "times",
+    "truncate",
+    "umask",
+    "uname",
+    "unlink",
+    "unlinkat",
+    "utimensat",
+    "wait4",
+    "waitid",
+    "write",
+    "writev",
+];
+
+/// Syscalls `permissive` adds back. Roughly Docker's default profile: enough to
+/// debug a package that the tighter profiles break, and nothing that Docker
+/// itself would refuse.
+pub const PERMISSIVE_EXTRA: &[&str] = &[
+    "clone3",
+    "personality",
+    "ptrace",
+    "process_vm_readv",
+    "process_vm_writev",
+    "setns",
+    "unshare",
+    "mount",
+    "umount2",
+    "pivot_root",
+    "io_uring_setup",
+    "io_uring_enter",
+    "io_uring_register",
+    "userfaultfd",
+    "sync",
+    "syncfs",
+    "mknod",
+    "mknodat",
+    "chown",
+    "chmod",
+    "chroot",
+    "sethostname",
+    "setdomainname",
+];
+
+/// Syscalls `strict` removes from the base set.
+///
+/// The socket family goes because a `network = "none"` sandbox has nothing to
+/// talk to anyway, and `ptrace`/`mount` because nothing legitimate in a handler
+/// reaches for them.
+pub const STRICT_REMOVED: &[&str] = &[
+    "socket",
+    "socketpair",
+    "connect",
+    "bind",
+    "listen",
+    "accept4",
+    "sendto",
+    "sendmsg",
+    "sendmmsg",
+    "recvfrom",
+    "recvmsg",
+    "setsockopt",
+    "getsockopt",
+    "getsockname",
+    "getpeername",
+    "shutdown",
+    "ptrace",
+    "mount",
+    "umount2",
+];
+
+/// What a runtime agent's *forked child* may additionally drop.
+///
+/// `execve` is the interesting one, and it cannot be in [`STRICT_REMOVED`]: the
+/// launcher installs its filter immediately before `execve`-ing the sandboxed
+/// program, so a profile without it produces a sandbox that cannot start at all
+/// — which is exactly what happened the first time this was run.
+///
+/// Design doc §3.4.1 puts this tightening where it belongs: the agent's child,
+/// which is already running the interpreter and never needs to exec again. Used
+/// from phase 2.4; defined here so the two halves of the policy sit together.
+pub const STRICT_CHILD_REMOVED: &[&str] = &["execve", "execveat", "fork", "vfork"];
+
+/// Syscalls the filter handles with an argument check rather than a plain
+/// comparison, so they appear in no allowlist.
+///
+/// They still need numbers, which is why they are named here: the table is
+/// generated from these constants, and `clone`'s absence from it produced a
+/// filter that denied every `fork`.
+pub const SPECIAL_CASED: &[&str] = &["clone"];
+
+/// Syscalls that must never be reachable, whatever the profile
+/// (design doc appendix B).
+///
+/// Nothing grants these — they are simply absent from every allowlist. The
+/// constant exists so a test can assert that, rather than the absence being
+/// something a reader has to verify by reading 190 names.
+pub const NEVER_ALLOWED: &[&str] = &[
+    "bpf",
+    "io_uring_setup",
+    "io_uring_enter",
+    "io_uring_register",
+    "userfaultfd",
+    "keyctl",
+    "add_key",
+    "request_key",
+    "perf_event_open",
+    "ptrace",
+    "process_vm_readv",
+    "process_vm_writev",
+    "kcmp",
+    "mount",
+    "umount2",
+    "pivot_root",
+    "setns",
+    "unshare",
+    "open_by_handle_at",
+    "name_to_handle_at",
+    "quotactl",
+    "reboot",
+    "swapon",
+    "swapoff",
+    "kexec_load",
+    "kexec_file_load",
+    "init_module",
+    "finit_module",
+    "delete_module",
+    "acct",
+    "settimeofday",
+    "clock_settime",
+    "vhangup",
+    "ioperm",
+    "iopl",
+];
+
+/// The syscall names a profile permits, sorted and deduplicated.
+pub fn allowed_names(profile: SeccompProfile) -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = match profile {
+        SeccompProfile::Permissive => BASE_ALLOWLIST
+            .iter()
+            .chain(PERMISSIVE_EXTRA.iter())
+            .copied()
+            .collect(),
+        SeccompProfile::Default => BASE_ALLOWLIST.to_vec(),
+        SeccompProfile::Strict => BASE_ALLOWLIST
+            .iter()
+            .copied()
+            .filter(|n| !STRICT_REMOVED.contains(n))
+            .collect(),
+    };
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+/// `ioctl` requests denied on every profile.
+///
+/// `ioctl` itself has to be allowed — terminals, sockets and half of libc need
+/// it — so these are filtered on the request number instead.
+///
+/// `TIOCSTI` pushes a character into a terminal's *input* queue. A sandbox that
+/// inherits the caller's terminal can use it to type into the user's shell,
+/// which reads the characters as though they had been typed, after Zygo has
+/// exited. Measured working from inside a sandbox on Linux 5.10; kernel 6.2
+/// added `dev.tty.legacy_tiocsti` to disable it, but the host kernel cannot be
+/// relied on. `TIOCLINUX` reaches the same input queue by another route.
+pub const DENIED_IOCTLS: &[(&str, u32)] = &[("TIOCSTI", 0x5412), ("TIOCLINUX", 0x541C)];
+
+#[derive(Debug, thiserror::Error)]
+pub enum SeccompError {
+    #[error("internal: a seccomp branch target was never defined")]
+    UnresolvedLabel,
+
+    #[error("internal: a seccomp branch would jump backwards, which BPF cannot encode")]
+    BackwardJump,
+
+    #[error("internal: a seccomp branch of {delta} instructions exceeds BPF's 8-bit limit")]
+    JumpTooFar { delta: usize },
+
+    #[error(
+        "seccomp filtering is not implemented for {arch}\n  \
+         → use --seccomp permissive to run without a filter, understanding that \
+         the syscall surface is then unrestricted"
+    )]
+    UnsupportedArch { arch: &'static str },
+
+    #[error("the seccomp filter needs {len} instructions, more than the kernel's 4096 limit")]
+    TooLong { len: usize },
+
+    #[error("installing the seccomp filter failed: {0}")]
+    Install(#[source] std::io::Error),
+}
+
+/// Build the BPF program for a profile.
+///
+/// ```text
+///   load  arch
+///   jne   AUDIT_ARCH        -> kill        ; a foreign ABI means other numbers
+///   load  nr
+///   jeq   clone             -> clone_check ; allowed, but not with CLONE_NEW*
+///   jeq   ioctl             -> ioctl_check ; allowed, but not TIOCSTI
+///   jeq   <allowed>         -> allow       ; one comparison per syscall
+///   ...
+///   goto  deny
+/// clone_check:  load args[0]; and CLONE_NEW*; jeq 0 -> allow, else deny
+/// ioctl_check:  load args[1]; jeq <denied request> -> deny; ...; goto allow
+/// deny:  ret ERRNO(EPERM)
+/// kill:  ret KILL_PROCESS
+/// allow: ret ALLOW
+/// ```
+pub fn program(profile: SeccompProfile) -> Result<Vec<SockFilter>, SeccompError> {
+    if !syscalls::is_supported() {
+        return Err(SeccompError::UnsupportedArch {
+            arch: std::env::consts::ARCH,
+        });
+    }
+
+    let names = allowed_names(profile);
+    let clone_nr = syscalls::number("clone");
+    let ioctl_nr = syscalls::number("ioctl").filter(|_| names.contains(&"ioctl"));
+
+    // These two are compared against their arguments, not merely their number.
+    let simple: Vec<u32> = names
+        .iter()
+        .filter(|n| **n != "clone" && **n != "ioctl")
+        .filter_map(|n| syscalls::number(n))
+        .collect();
+
+    let mut asm = Assembler::default();
+
+    // The architecture check comes first: the numbers below mean one thing per
+    // ABI, and a process that re-executes under another would otherwise be
+    // filtered against the wrong table.
+    asm.load(OFF_ARCH)
+        .jeq(syscalls::AUDIT_ARCH, Label::Next, Label::Kill)
+        .load(OFF_NR);
+
+    if let Some(nr) = clone_nr {
+        asm.jeq(nr, Label::CloneCheck, Label::Next);
+    }
+    if let Some(nr) = ioctl_nr {
+        asm.jeq(nr, Label::IoctlCheck, Label::Next);
+    }
+    for nr in &simple {
+        asm.jeq(*nr, Label::Allow, Label::Next);
+    }
+    asm.goto(Label::Deny);
+
+    if clone_nr.is_some() {
+        asm.mark(Label::CloneCheck)
+            .load(OFF_ARG0_LO)
+            .and(CLONE_NEW_MASK)
+            .jeq(0, Label::Allow, Label::Deny);
+    }
+
+    if ioctl_nr.is_some() {
+        asm.mark(Label::IoctlCheck).load(OFF_ARG1_LO);
+        for (_name, request) in DENIED_IOCTLS {
+            asm.jeq(*request, Label::Deny, Label::Next);
+        }
+        asm.goto(Label::Allow);
+    }
+
+    asm.mark(Label::Deny)
+        .ret(RET_ERRNO | libc::EPERM as u32)
+        .mark(Label::Kill)
+        .ret(RET_KILL_PROCESS)
+        .mark(Label::Allow)
+        .ret(RET_ALLOW);
+
+    let prog = asm.assemble()?;
+    if prog.len() > 4096 {
+        return Err(SeccompError::TooLong { len: prog.len() });
+    }
+    Ok(prog)
+}
+
+const SYS_SECCOMP: libc::c_long = if cfg!(target_arch = "aarch64") {
+    277
+} else {
+    317
+};
+const SECCOMP_SET_MODE_FILTER: libc::c_uint = 1;
+/// Apply to every thread, not just the calling one.
+const SECCOMP_FILTER_FLAG_TSYNC: libc::c_uint = 1;
+
+/// Install a filter on the calling process.
+///
+/// # Safety
+///
+/// Async-signal-safe: two syscalls and no allocation, so it is callable between
+/// `clone3` and `execve`. `prog` must outlive the call.
+///
+/// `PR_SET_NO_NEW_PRIVS` must already be set, or the kernel refuses the filter
+/// for an unprivileged caller.
+pub unsafe fn install(prog: &[SockFilter]) -> Result<(), std::io::Error> {
+    let fprog = SockFprog {
+        len: prog.len() as u16,
+        filter: prog.as_ptr(),
+    };
+    let rc = unsafe {
+        libc::syscall(
+            SYS_SECCOMP,
+            SECCOMP_SET_MODE_FILTER,
+            SECCOMP_FILTER_FLAG_TSYNC,
+            &fprog as *const SockFprog,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn instruction_layout_matches_the_kernel() {
+        assert_eq!(core::mem::size_of::<SockFilter>(), 8);
+    }
+
+    #[test]
+    fn profiles_are_ordered_by_how_much_they_permit() {
+        let permissive = allowed_names(SeccompProfile::Permissive).len();
+        let default = allowed_names(SeccompProfile::Default).len();
+        let strict = allowed_names(SeccompProfile::Strict).len();
+        assert!(strict < default, "{strict} !< {default}");
+        assert!(default < permissive, "{default} !< {permissive}");
+    }
+
+    /// Appendix B's exclusions are the point of the whole profile. If one of
+    /// them ever appears in an allowlist, the sandbox has a hole that reading
+    /// 190 names would not reveal.
+    #[test]
+    fn the_forbidden_syscalls_are_absent_from_default_and_strict() {
+        for profile in [SeccompProfile::Default, SeccompProfile::Strict] {
+            let allowed = allowed_names(profile);
+            for name in NEVER_ALLOWED {
+                assert!(
+                    !allowed.contains(name),
+                    "{name} is allowed by the {profile} profile"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn strict_removes_the_socket_family() {
+        let strict = allowed_names(SeccompProfile::Strict);
+        for name in ["socket", "connect", "sendto", "ptrace"] {
+            assert!(
+                !strict.contains(&name),
+                "{name} survived the strict profile"
+            );
+        }
+        // But the sandbox still has to be able to run and exit.
+        for name in ["read", "write", "mmap", "exit_group"] {
+            assert!(strict.contains(&name), "{name} is required even in strict");
+        }
+    }
+
+    /// The launcher installs its filter immediately before `execve`. A profile
+    /// that denies it produces a sandbox that cannot start — the tightening
+    /// belongs in the agent's already-running child (design doc §3.4.1).
+    #[test]
+    fn no_profile_denies_the_exec_that_starts_the_sandbox() {
+        for profile in [
+            SeccompProfile::Permissive,
+            SeccompProfile::Default,
+            SeccompProfile::Strict,
+        ] {
+            assert!(
+                allowed_names(profile).contains(&"execve"),
+                "{profile} cannot start a sandbox at all"
+            );
+        }
+        assert!(
+            STRICT_CHILD_REMOVED.contains(&"execve"),
+            "the child-side tightening is where execve belongs"
+        );
+    }
+
+    #[test]
+    fn permissive_is_for_debugging_and_says_so_by_allowing_ptrace() {
+        let permissive = allowed_names(SeccompProfile::Permissive);
+        assert!(permissive.contains(&"ptrace"));
+        assert!(permissive.contains(&"unshare"));
+    }
+
+    #[test]
+    fn allowlists_have_no_duplicates() {
+        for profile in [
+            SeccompProfile::Permissive,
+            SeccompProfile::Default,
+            SeccompProfile::Strict,
+        ] {
+            let names = allowed_names(profile);
+            let mut unique = names.clone();
+            unique.dedup();
+            assert_eq!(names.len(), unique.len(), "{profile} has duplicates");
+        }
+    }
+
+    /// A profile can only grant or deny what it can name. A syscall missing
+    /// from the table is silently dropped from the filter, which made
+    /// `permissive` unable to allow `unshare` while every structural test
+    /// still passed.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn every_syscall_a_profile_mentions_is_in_the_table() {
+        // These genuinely do not exist on arm64 — it has only the `*at` and
+        // `*6` forms, and the x86 port I/O calls are x86-only. Computed from
+        // the difference between the two generated tables, not guessed.
+        let absent_on_aarch64 = [
+            "access",
+            "arch_prctl",
+            "chmod",
+            "chown",
+            "dup2",
+            "epoll_create",
+            "epoll_wait",
+            "eventfd",
+            "fork",
+            "getpgrp",
+            "ioperm",
+            "iopl",
+            "link",
+            "lstat",
+            "mkdir",
+            "mknod",
+            "open",
+            "pipe",
+            "poll",
+            "readlink",
+            "rename",
+            "rmdir",
+            "select",
+            "stat",
+            "symlink",
+            "time",
+            "unlink",
+            "vfork",
+        ];
+        let allowed_missing: &[&str] = if cfg!(target_arch = "aarch64") {
+            &absent_on_aarch64
+        } else {
+            &[]
+        };
+
+        let mentioned: Vec<&str> = BASE_ALLOWLIST
+            .iter()
+            .chain(PERMISSIVE_EXTRA)
+            .chain(NEVER_ALLOWED)
+            .chain(SPECIAL_CASED)
+            .copied()
+            .collect();
+        let missing: Vec<&str> = mentioned
+            .iter()
+            .copied()
+            .filter(|n| syscalls::number(n).is_none())
+            .collect();
+
+        for name in &missing {
+            assert!(
+                allowed_missing.contains(name),
+                "{name} is mentioned by a profile but has no number here"
+            );
+        }
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    mod program {
+        use super::*;
+
+        /// What the kernel would do with a given syscall.
+        #[derive(Debug, PartialEq, Eq)]
+        enum Verdict {
+            Allow,
+            Deny(u32),
+            Kill,
+        }
+
+        /// A miniature BPF interpreter over the opcodes this module emits.
+        ///
+        /// Structural assertions — "there is an AND instruction somewhere" —
+        /// cannot catch a wrong jump offset, and a wrong offset is how a filter
+        /// silently denies `fork` or silently permits `unshare`. Running the
+        /// program is the only assertion that actually tests the policy.
+        fn evaluate(prog: &[SockFilter], arch: u32, nr: u32, arg0: u64) -> Verdict {
+            evaluate_args(prog, arch, nr, arg0, 0)
+        }
+
+        fn evaluate_args(prog: &[SockFilter], arch: u32, nr: u32, arg0: u64, arg1: u64) -> Verdict {
+            let mut acc: u32 = 0;
+            let mut pc = 0usize;
+            let mut steps = 0;
+
+            loop {
+                steps += 1;
+                assert!(steps < 10_000, "the program does not terminate");
+                let insn = *prog
+                    .get(pc)
+                    .expect("execution ran past the end of the program");
+
+                match insn.code {
+                    c if c == BPF_LD | BPF_W | BPF_ABS => {
+                        acc = match insn.k {
+                            OFF_NR => nr,
+                            OFF_ARCH => arch,
+                            OFF_ARG0_LO => arg0 as u32,
+                            OFF_ARG1_LO => arg1 as u32,
+                            other => panic!("unexpected load offset {other}"),
+                        };
+                        pc += 1;
+                    }
+                    c if c == BPF_ALU | BPF_AND | BPF_K => {
+                        acc &= insn.k;
+                        pc += 1;
+                    }
+                    c if c == BPF_JMP | BPF_JEQ | BPF_K => {
+                        let taken = acc == insn.k;
+                        pc += 1 + usize::from(if taken { insn.jt } else { insn.jf });
+                    }
+                    c if c == BPF_JMP | BPF_JA => {
+                        pc += 1 + insn.k as usize;
+                    }
+                    c if c == BPF_RET | BPF_K => {
+                        return match insn.k {
+                            RET_ALLOW => Verdict::Allow,
+                            RET_KILL_PROCESS => Verdict::Kill,
+                            v => Verdict::Deny(v & 0xffff),
+                        };
+                    }
+                    other => panic!("unexpected opcode {other:#x}"),
+                }
+            }
+        }
+
+        fn verdict(profile: SeccompProfile, name: &str, arg0: u64) -> Verdict {
+            let prog = program(profile).unwrap();
+            let nr = syscalls::number(name)
+                .unwrap_or_else(|| panic!("{name} has no number on this architecture"));
+            evaluate(&prog, syscalls::AUDIT_ARCH, nr, arg0)
+        }
+
+        #[test]
+        fn ordinary_syscalls_are_allowed() {
+            for name in ["read", "write", "openat", "mmap", "exit_group", "execve"] {
+                assert_eq!(
+                    verdict(SeccompProfile::Default, name, 0),
+                    Verdict::Allow,
+                    "{name} should be allowed"
+                );
+            }
+        }
+
+        /// The first run of the real launcher failed with `can't fork:
+        /// Operation not permitted`: the `clone` comparison jumped to the deny
+        /// instead of to its argument check. Structural tests all passed.
+        #[test]
+        fn a_plain_fork_is_allowed_but_a_namespace_clone_is_not() {
+            const SIGCHLD: u64 = 17;
+            const CLONE_NEWUSER: u64 = 0x1000_0000;
+            const CLONE_NEWNET: u64 = 0x4000_0000;
+            const CLONE_VM_THREAD: u64 = 0x0000_0100 | 0x0000_0200 | 0x0000_0400;
+
+            assert_eq!(
+                verdict(SeccompProfile::Default, "clone", SIGCHLD),
+                Verdict::Allow,
+                "a plain fork must work — this is the warm path itself"
+            );
+            assert_eq!(
+                verdict(SeccompProfile::Default, "clone", CLONE_VM_THREAD),
+                Verdict::Allow,
+                "thread creation must work"
+            );
+            assert_eq!(
+                verdict(SeccompProfile::Default, "clone", SIGCHLD | CLONE_NEWUSER),
+                Verdict::Deny(libc::EPERM as u32),
+                "a sandbox that can nest a user namespace can escape its own"
+            );
+            assert_eq!(
+                verdict(SeccompProfile::Default, "clone", SIGCHLD | CLONE_NEWNET),
+                Verdict::Deny(libc::EPERM as u32)
+            );
+        }
+
+        #[test]
+        fn the_forbidden_syscalls_are_denied_when_actually_run() {
+            for name in NEVER_ALLOWED {
+                let Some(nr) = syscalls::number(name) else {
+                    continue; // not present on this architecture
+                };
+                let prog = program(SeccompProfile::Default).unwrap();
+                assert_eq!(
+                    evaluate(&prog, syscalls::AUDIT_ARCH, nr, 0),
+                    Verdict::Deny(libc::EPERM as u32),
+                    "{name} was permitted by the default profile"
+                );
+            }
+        }
+
+        #[test]
+        fn an_unknown_syscall_number_is_denied() {
+            let prog = program(SeccompProfile::Default).unwrap();
+            assert_eq!(
+                evaluate(&prog, syscalls::AUDIT_ARCH, 9999, 0),
+                Verdict::Deny(libc::EPERM as u32),
+                "the allowlist must deny by default, including future syscalls"
+            );
+        }
+
+        /// A filter that skips the architecture check is bypassed by
+        /// re-executing under the other ABI, where the numbers mean other things.
+        #[test]
+        fn a_foreign_architecture_is_killed_outright() {
+            let prog = program(SeccompProfile::Default).unwrap();
+            let read = syscalls::number("read").unwrap();
+            assert_eq!(
+                evaluate(&prog, 0xdead_beef, read, 0),
+                Verdict::Kill,
+                "a syscall from another ABI must not merely be denied"
+            );
+        }
+
+        /// Measured working from inside a real sandbox before this filter
+        /// existed: `ioctl(1, TIOCSTI, "x")` pushes a character into the
+        /// terminal's *input* queue, so a sandbox holding the caller's terminal
+        /// can type into the user's shell — and the shell reads it after Zygo
+        /// has exited.
+        #[test]
+        fn terminal_injection_ioctls_are_denied_on_every_profile() {
+            for profile in [
+                SeccompProfile::Permissive,
+                SeccompProfile::Default,
+                SeccompProfile::Strict,
+            ] {
+                let prog = program(profile).unwrap();
+                let Some(ioctl) = syscalls::number("ioctl") else {
+                    continue;
+                };
+                for (name, request) in DENIED_IOCTLS {
+                    assert_eq!(
+                        evaluate_args(&prog, syscalls::AUDIT_ARCH, ioctl, 1, *request as u64),
+                        Verdict::Deny(libc::EPERM as u32),
+                        "{profile} permits ioctl({name})"
+                    );
+                }
+            }
+        }
+
+        /// `ioctl` itself has to keep working: terminals, sockets and half of
+        /// libc depend on it, so the filter is on the request, not the syscall.
+        #[test]
+        fn ordinary_ioctls_still_work() {
+            let prog = program(SeccompProfile::Default).unwrap();
+            let ioctl = syscalls::number("ioctl").unwrap();
+            for request in [
+                0x5401u64, // TCGETS — every isatty() call
+                0x5413,    // TIOCGWINSZ — terminal size
+                0x8910,    // SIOCGIFNAME
+                0,
+            ] {
+                assert_eq!(
+                    evaluate_args(&prog, syscalls::AUDIT_ARCH, ioctl, 1, request),
+                    Verdict::Allow,
+                    "ioctl request {request:#x} should be allowed"
+                );
+            }
+        }
+
+        #[test]
+        fn strict_denies_the_socket_family_but_still_starts() {
+            assert_eq!(
+                verdict(SeccompProfile::Strict, "socket", 0),
+                Verdict::Deny(libc::EPERM as u32)
+            );
+            assert_eq!(verdict(SeccompProfile::Strict, "execve", 0), Verdict::Allow);
+            assert_eq!(verdict(SeccompProfile::Strict, "read", 0), Verdict::Allow);
+        }
+
+        #[test]
+        fn permissive_allows_what_default_denies() {
+            assert_eq!(
+                verdict(SeccompProfile::Default, "unshare", 0),
+                Verdict::Deny(libc::EPERM as u32)
+            );
+            assert_eq!(
+                verdict(SeccompProfile::Permissive, "unshare", 0),
+                Verdict::Allow
+            );
+        }
+
+        #[test]
+        fn every_program_starts_by_checking_the_architecture() {
+            for profile in [
+                SeccompProfile::Permissive,
+                SeccompProfile::Default,
+                SeccompProfile::Strict,
+            ] {
+                let p = program(profile).unwrap();
+                assert_eq!(
+                    p[0],
+                    stmt(BPF_LD | BPF_W | BPF_ABS, OFF_ARCH),
+                    "{profile}: the architecture must be the first thing loaded"
+                );
+                assert_eq!(p[1].k, syscalls::AUDIT_ARCH, "{profile}");
+                // Where the kill *lands* is the assembler's business; that a
+                // foreign ABI reaches it is asserted behaviourally in
+                // `a_foreign_architecture_is_killed_outright`.
+                assert!(
+                    p.iter()
+                        .any(|i| i.code == BPF_RET | BPF_K && i.k == RET_KILL_PROCESS),
+                    "{profile}: no kill return in the program"
+                );
+            }
+        }
+
+        #[test]
+        fn the_default_action_is_to_deny() {
+            let p = program(SeccompProfile::Default).unwrap();
+            let denies = p
+                .iter()
+                .filter(|i| i.code == BPF_RET | BPF_K && i.k == RET_ERRNO | libc::EPERM as u32)
+                .count();
+            assert!(denies >= 1, "no EPERM return in the program");
+            assert_eq!(
+                p.last().unwrap().k,
+                RET_ALLOW,
+                "the allow target belongs at the very end"
+            );
+        }
+
+        #[test]
+        fn clone_is_gated_on_its_namespace_flags() {
+            let p = program(SeccompProfile::Default).unwrap();
+            assert!(
+                p.iter()
+                    .any(|i| i.code == BPF_ALU | BPF_AND | BPF_K && i.k == CLONE_NEW_MASK),
+                "clone's CLONE_NEW* mask is not checked"
+            );
+            assert!(
+                p.iter()
+                    .any(|i| i.code == BPF_LD | BPF_W | BPF_ABS && i.k == OFF_ARG0_LO),
+                "clone's first argument is never loaded"
+            );
+        }
+
+        /// Every `CLONE_NEW*` bit has to be in the mask; one omission lets a
+        /// sandbox build a namespace it controls.
+        #[test]
+        fn the_clone_mask_covers_every_namespace_flag() {
+            for (name, bit) in [
+                ("NEWNS", 0x0002_0000u32),
+                ("NEWCGROUP", 0x0200_0000),
+                ("NEWUTS", 0x0400_0000),
+                ("NEWIPC", 0x0800_0000),
+                ("NEWUSER", 0x1000_0000),
+                ("NEWPID", 0x2000_0000),
+                ("NEWNET", 0x4000_0000),
+            ] {
+                assert!(CLONE_NEW_MASK & bit != 0, "CLONE_{name} is not masked");
+            }
+        }
+
+        #[test]
+        fn programs_fit_inside_the_kernels_limits() {
+            for profile in [
+                SeccompProfile::Permissive,
+                SeccompProfile::Default,
+                SeccompProfile::Strict,
+            ] {
+                let p = program(profile).unwrap();
+                assert!(p.len() < 4096, "{profile}: {} instructions", p.len());
+                // BPF jump offsets are 8-bit; a program that needed more would
+                // silently jump to the wrong place.
+                assert!(
+                    p.len() < 250,
+                    "{profile}: {} instructions risks 8-bit jump overflow",
+                    p.len()
+                );
+            }
+        }
+
+        #[test]
+        fn no_jump_offset_saturates() {
+            for profile in [
+                SeccompProfile::Permissive,
+                SeccompProfile::Default,
+                SeccompProfile::Strict,
+            ] {
+                for (i, insn) in program(profile).unwrap().iter().enumerate() {
+                    assert!(
+                        insn.jt < u8::MAX && insn.jf < u8::MAX,
+                        "{profile}: instruction {i} has a saturated jump"
+                    );
+                }
+            }
+        }
+
+        /// Every jump must land inside the program: an out-of-range offset is
+        /// rejected by the kernel's verifier, and a merely *wrong* one silently
+        /// changes the policy.
+        #[test]
+        fn every_jump_lands_within_the_program() {
+            for profile in [
+                SeccompProfile::Permissive,
+                SeccompProfile::Default,
+                SeccompProfile::Strict,
+            ] {
+                let p = program(profile).unwrap();
+                for (i, insn) in p.iter().enumerate() {
+                    if insn.code & 0x07 != BPF_JMP {
+                        continue;
+                    }
+                    let targets = if insn.code == BPF_JMP | BPF_JA {
+                        vec![i + 1 + insn.k as usize]
+                    } else {
+                        vec![i + 1 + insn.jt as usize, i + 1 + insn.jf as usize]
+                    };
+                    for target in targets {
+                        assert!(
+                            target < p.len(),
+                            "{profile}: instruction {i} jumps to {target}, past the end ({})",
+                            p.len()
+                        );
+                    }
+                }
+            }
+        }
+
+        /// The last instruction of a BPF program must be a return: execution
+        /// falling off the end is rejected by the verifier.
+        #[test]
+        fn the_program_ends_in_a_return() {
+            for profile in [
+                SeccompProfile::Permissive,
+                SeccompProfile::Default,
+                SeccompProfile::Strict,
+            ] {
+                let p = program(profile).unwrap();
+                assert_eq!(p.last().unwrap().code, BPF_RET | BPF_K, "{profile}");
+            }
+        }
+    }
+}

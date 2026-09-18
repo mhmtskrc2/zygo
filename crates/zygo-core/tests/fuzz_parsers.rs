@@ -1,0 +1,337 @@
+//! Property and fuzz-style tests for everything that parses untrusted input
+//! (todo.md, phase 1.5).
+//!
+//! The spec file comes from a user and the wire protocol comes from inside a
+//! sandbox, so neither may panic, hang or allocate unboundedly on malformed
+//! input. These are deterministic pseudo-random sweeps rather than a
+//! `cargo-fuzz` target: they run in CI on every change without a nightly
+//! toolchain, and a failure is reproducible from the seed it prints.
+//!
+//! A coverage-guided `cargo-fuzz` target still belongs in the plan; this closes
+//! the "must never panic" hole today.
+
+use zygo_core::protocol::{Message, decode, encode};
+use zygo_core::spec::Spec;
+
+/// xorshift64*, so a failure is reproducible from its seed without pulling in
+/// a dependency just to generate noise.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn byte(&mut self) -> u8 {
+        (self.next() >> 24) as u8
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        if n == 0 {
+            0
+        } else {
+            (self.next() % n as u64) as usize
+        }
+    }
+}
+
+/// Fragments drawn from the real grammar, so the sweep spends its time on
+/// nearly-valid input rather than on bytes the lexer rejects immediately.
+const SPEC_FRAGMENTS: &[&str] = &[
+    "[defaults]",
+    "[fn.a]",
+    "[fn.a.env]",
+    "[api]",
+    "mem",
+    "cpu",
+    "pids",
+    "timeout",
+    "scratch",
+    "network",
+    "allow",
+    "mounts",
+    "entry",
+    "cmd",
+    "image",
+    "runtime",
+    "isolation",
+    "seccomp",
+    "secrets",
+    "concurrency",
+    "idle_timeout",
+    "=",
+    "\"",
+    "'",
+    "[",
+    "]",
+    "{",
+    "}",
+    ",",
+    ".",
+    "\n",
+    " ",
+    "\t",
+    "-",
+    "_",
+    "256M",
+    "0.5",
+    "30s",
+    "none",
+    "egress",
+    "host",
+    "ns",
+    "vm",
+    "strict",
+    "true",
+    "false",
+    "0",
+    "-1",
+    "99999999999999999999",
+    "1e400",
+    "nan",
+    "python",
+    "./h.py",
+    "a:b:rw",
+    "*.example.com:443",
+    "10.0.0.0/8",
+    "\u{feff}",
+    "🙂",
+    "\r\n",
+    "#comment",
+];
+
+fn generated_spec(seed: u64) -> String {
+    let mut rng = Rng(seed);
+    let mut text = String::new();
+    for _ in 0..(1 + rng.below(24)) {
+        text.push_str(SPEC_FRAGMENTS[rng.below(SPEC_FRAGMENTS.len())]);
+    }
+    text
+}
+
+#[test]
+fn the_spec_parser_never_panics_on_generated_input() {
+    for seed in 1..=4000u64 {
+        let text = generated_spec(seed);
+        // Any outcome is acceptable except a panic.
+        let result = std::panic::catch_unwind(|| Spec::parse(&text, None));
+        assert!(result.is_ok(), "seed {seed} panicked on:\n{text}");
+    }
+}
+
+#[test]
+fn the_spec_parser_never_panics_on_arbitrary_bytes() {
+    for seed in 1..=2000u64 {
+        let mut rng = Rng(seed);
+        let len = rng.below(256);
+        let bytes: Vec<u8> = (0..len).map(|_| rng.byte()).collect();
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+
+        let result = std::panic::catch_unwind(|| Spec::parse(&text, None));
+        assert!(result.is_ok(), "seed {seed} panicked on {bytes:?}");
+    }
+}
+
+/// Resolution is where the limits and network rules are checked, so it sees
+/// values the parser happily accepted. It must report them, not panic on them.
+#[test]
+fn resolution_never_panics_on_anything_that_parsed() {
+    use zygo_core::spec::{Layer, ResolveOptions};
+
+    for seed in 1..=4000u64 {
+        let text = generated_spec(seed);
+        let Ok(spec) = Spec::parse(&text, None) else {
+            continue;
+        };
+        let names: Vec<String> = spec.function_names().map(str::to_string).collect();
+
+        let result = std::panic::catch_unwind(|| {
+            for name in &names {
+                let _ = spec.resolve(Some(name), &Layer::default(), &ResolveOptions::default());
+            }
+            let _ = spec.resolve(None, &Layer::default(), &ResolveOptions::default());
+        });
+        assert!(result.is_ok(), "seed {seed} panicked resolving:\n{text}");
+    }
+}
+
+#[test]
+fn protocol_decoding_never_panics_on_arbitrary_bytes() {
+    for seed in 1..=4000u64 {
+        let mut rng = Rng(seed);
+        let len = rng.below(512);
+        let bytes: Vec<u8> = (0..len).map(|_| rng.byte()).collect();
+
+        let result = std::panic::catch_unwind(|| decode::<Message>(&bytes));
+        assert!(result.is_ok(), "seed {seed} panicked on {len} bytes");
+    }
+}
+
+/// JSON shaped like a protocol message, with fields missing, negative, or of
+/// the wrong type — what a buggy third-party agent actually sends.
+#[test]
+fn protocol_decoding_never_panics_on_malformed_messages() {
+    const SHAPES: &[&str] = &[
+        r#"{"type":"READY"}"#,
+        r#"{"type":"READY","proto":"one"}"#,
+        r#"{"type":"READY","proto":-1,"pid":-1}"#,
+        r#"{"type":"EXEC"}"#,
+        r#"{"type":"EXEC","id":null,"event":{},"timeout_ms":-5}"#,
+        r#"{"type":"RESULT","id":"a","exit_code":99999999999999999999}"#,
+        r#"{"type":"DONE","id":"a","exit_code":0,"wall_ms":"fast"}"#,
+        r#"{"type":"UNKNOWN"}"#,
+        r#"{"type":42}"#,
+        r#"{}"#,
+        r#"[]"#,
+        r#"null"#,
+        r#"{"type":"FORKED","id":"a","pid":18446744073709551615}"#,
+        r#"{"type":"ERROR","code":"not_a_code","message":"x"}"#,
+    ];
+
+    for shape in SHAPES {
+        let result = std::panic::catch_unwind(|| decode::<Message>(shape.as_bytes()));
+        assert!(result.is_ok(), "panicked on {shape}");
+    }
+}
+
+/// A message that changed as it passed through would let an agent and a
+/// supervisor disagree about what was said.
+#[test]
+fn decoded_messages_round_trip() {
+    let messages = [
+        r#"{"type":"READY","proto":1,"pid":7,"imports_ms":1.5,"rss_kb":2,"runtime":"x/1"}"#,
+        r#"{"type":"EXEC","id":"a","event":{"n":[1,2,{"deep":true}]},"timeout_ms":30000}"#,
+        r#"{"type":"FORKED","id":"a","pid":1234}"#,
+        r#"{"type":"GO","id":"a"}"#,
+        r#"{"type":"RESULT","id":"a","exit_code":0,"stdout":"ü\n","wall_ms":1.25}"#,
+        r#"{"type":"DONE","id":"a","exit_code":1,"error":"boom","peak_rss_kb":9}"#,
+        r#"{"type":"PING","seq":18446744073709551615}"#,
+        r#"{"type":"SHUTDOWN","grace_ms":0}"#,
+    ];
+
+    for text in messages {
+        let first: Message = decode(text.as_bytes()).unwrap_or_else(|e| panic!("{text}: {e}"));
+        let bytes = encode(&first).expect("encode");
+        // `encode` prepends a four-byte length header; skip it to decode the
+        // body again.
+        let second = decode(&bytes[4..]).expect("re-decode");
+        assert_eq!(first, second, "{text} did not survive a round trip");
+    }
+}
+
+/// The framing layer is fed by a sandbox running untrusted code, so a hostile
+/// length prefix must not become a hostile allocation.
+#[test]
+fn framing_never_allocates_what_a_header_claims() {
+    use std::io::Cursor;
+    use zygo_core::protocol::FrameReader;
+
+    for seed in 1..=500u64 {
+        let mut rng = Rng(seed);
+        let claimed = rng.next() as u32;
+        let body_len = rng.below(32);
+
+        let mut stream = claimed.to_be_bytes().to_vec();
+        stream.extend((0..body_len).map(|_| rng.byte()));
+
+        let result = std::panic::catch_unwind(|| {
+            let mut reader: FrameReader<_, Message> = FrameReader::new(Cursor::new(stream));
+            let _ = reader.read();
+        });
+        assert!(
+            result.is_ok(),
+            "seed {seed} panicked on a header claiming {claimed} bytes"
+        );
+    }
+}
+
+/// Image references come from the command line and from spec files.
+#[test]
+fn image_reference_parsing_never_panics() {
+    use zygo_core::image::Reference;
+
+    let long = "x".repeat(200);
+    let pieces: Vec<&str> = vec![
+        "a",
+        "A",
+        ".",
+        "-",
+        "_",
+        "/",
+        ":",
+        "@",
+        "sha256:",
+        "localhost",
+        "5000",
+        "docker.io",
+        "library",
+        "latest",
+        "ghcr.io",
+        "\u{feff}",
+        "🙂",
+        " ",
+        &long,
+    ];
+
+    for seed in 1..=4000u64 {
+        let mut rng = Rng(seed);
+        let mut text = String::new();
+        for _ in 0..(1 + rng.below(12)) {
+            text.push_str(pieces[rng.below(pieces.len())]);
+        }
+        let result = std::panic::catch_unwind(|| text.parse::<Reference>());
+        assert!(result.is_ok(), "seed {seed} panicked on `{text}`");
+    }
+}
+
+/// The scalar types back both CLI flags and spec fields, so they see whatever a
+/// user types.
+#[test]
+fn scalar_parsing_never_panics() {
+    use zygo_core::spec::{AllowRule, Bytes, Cpu, Duration, Mount};
+
+    let long_digits = "9".repeat(40);
+    let pieces: Vec<&str> = vec![
+        "0",
+        "-",
+        "+",
+        ".",
+        "e",
+        "9",
+        "M",
+        "G",
+        "s",
+        "ms",
+        "h",
+        ":",
+        "/",
+        "*",
+        "1e400",
+        "nan",
+        "inf",
+        "18446744073709551616",
+        "-0.0",
+        " ",
+        "\t",
+        &long_digits,
+    ];
+
+    for seed in 1..=4000u64 {
+        let mut rng = Rng(seed);
+        let mut text = String::new();
+        for _ in 0..(1 + rng.below(10)) {
+            text.push_str(pieces[rng.below(pieces.len())]);
+        }
+        let result = std::panic::catch_unwind(|| {
+            let _ = text.parse::<Bytes>();
+            let _ = text.parse::<Cpu>();
+            let _ = text.parse::<Duration>();
+            let _ = text.parse::<Mount>();
+            let _ = text.parse::<AllowRule>();
+        });
+        assert!(result.is_ok(), "seed {seed} panicked on `{text}`");
+    }
+}

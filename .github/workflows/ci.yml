@@ -1,0 +1,183 @@
+name: ci
+
+# The matrix exists because phase 0 could not test several things: the
+# measurement environment was kernel 5.10 without KVM, so Landlock, cgroup.kill,
+# memory.peak, unprivileged overlayfs and the `vm` backend were never exercised.
+# Each of those has a job here that will exercise it, and the kernel each runner
+# provides is printed so a green tick can be checked rather than trusted.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Everything platform independent: spec, protocol, image store, mount plan.
+  # Runs on macOS too, because that is where most development happens and the
+  # Linux-only code must keep compiling there.
+  unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04      # kernel 6.8 — Landlock v4+, cgroup.kill
+            label: linux/x86_64
+          - os: ubuntu-22.04      # kernel 5.15 — the oldest supported
+            label: linux/x86_64/old
+          - os: ubuntu-24.04-arm
+            label: linux/aarch64
+          - os: macos-14
+            label: macos/aarch64
+    runs-on: ${{ matrix.os }}
+    name: unit (${{ matrix.label }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Report what this runner actually is
+        run: |
+          uname -a
+          if [ -f /proc/sys/kernel/osrelease ]; then
+            echo "kernel: $(cat /proc/sys/kernel/osrelease)"
+            echo "userns: $(cat /proc/sys/user/max_user_namespaces 2>/dev/null || echo '?')"
+            echo "cgroup: $(cat /sys/fs/cgroup/cgroup.controllers 2>/dev/null || echo 'not v2')"
+            echo "lsm:    $(cat /sys/kernel/security/lsm 2>/dev/null || echo '?')"
+          fi
+
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+      - name: Python agent conformance
+        run: python3 -W error::ResourceWarning -m unittest discover -s agents/python
+
+  # The launcher can only be exercised on Linux, and the interesting question is
+  # whether it works *without* root — requirement N5.
+  launcher:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            privilege: rootless
+          - os: ubuntu-24.04
+            privilege: root
+          - os: ubuntu-22.04
+            privilege: rootless
+          - os: ubuntu-24.04-arm
+            privilege: rootless
+    runs-on: ${{ matrix.os }}
+    name: launcher (${{ matrix.os }}, ${{ matrix.privilege }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Environment
+        run: |
+          cargo run --release --bin zygo -- doctor || true
+          echo "subuid: $(grep "^$USER:" /etc/subuid 2>/dev/null || echo 'none')"
+
+      - run: cargo build --release
+
+      - name: Isolation and limits
+        run: |
+          install -m 0755 target/release/zygo poc/zygo-linux
+          if [ "${{ matrix.privilege }}" = root ]; then
+            sudo -E sh poc/verify_launcher.sh
+          else
+            sh poc/verify_launcher.sh
+          fi
+        env:
+          ZYGO_DATA_HOME: /tmp/zygo-ci
+
+      - name: Escape suite
+        run: |
+          install -m 0755 target/release/zygo poc/zygo-linux
+          sh poc/escape_suite.sh
+        env:
+          ZYGO_DATA_HOME: /tmp/zygo-ci
+
+      # The only suite where the client process exits between steps, which is
+      # what catches failures living in the supervisor's threading rather than
+      # in the sandbox — `PDEATHSIG` firing on thread exit was found this way
+      # and no in-process test can see it.
+      - name: Supervisor lifecycle
+        run: |
+          install -m 0755 target/release/zygo poc/zygo-linux
+          sh poc/verify_supervisor.sh
+
+  # Requirement N6: one static binary, no runtime dependencies, small enough to
+  # `curl | sh`.
+  static-binary:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    name: static (${{ matrix.target }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - run: cargo build --release --target ${{ matrix.target }}
+
+      - name: It must be static, and under 15 MB
+        run: |
+          BIN=target/${{ matrix.target }}/release/zygo
+          file "$BIN"
+          SIZE=$(stat -c %s "$BIN")
+          echo "size: $((SIZE / 1048576)) MB ($SIZE bytes)"
+
+          file "$BIN" | grep -q "statically linked" \
+            || { echo "::error::the binary is not statically linked"; exit 1; }
+          [ "$SIZE" -lt 15728640 ] \
+            || { echo "::error::binary is $((SIZE / 1048576)) MB, over the 15 MB budget"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zygo-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/zygo
+
+  # The seccomp syscall numbers are generated from each architecture's headers.
+  # A profile that gained a syscall without regenerating them would silently
+  # drop it from the filter, so the committed tables are checked against a
+  # fresh generation.
+  syscall-tables:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3    # for the non-native architecture
+      - run: python3 poc/gen_syscall_tables.py
+      - name: The committed tables must match
+        run: |
+          git diff --exit-code crates/zygo-core/src/backend/ns/syscalls.rs \
+            || { echo "::error::run 'make syscall-tables' and commit the result"; exit 1; }
+
+  # Known gaps from the phase 0 report that need hardware CI does not always
+  # have. Informational until a suitable runner exists — see docs/poc-report.md.
+  pending-hardware:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: What is still unverified
+        run: |
+          echo "KVM (the vm backend, PoC 8): $([ -e /dev/kvm ] && echo present || echo ABSENT)"
+          echo "Landlock:                    $(grep -o landlock /sys/kernel/security/lsm 2>/dev/null || echo ABSENT)"
+          echo
+          echo "Both are tracked in todo.md; see docs/poc-report.md for what each blocks."

@@ -1,0 +1,714 @@
+//! The two-level cgroup v2 hierarchy (design doc §3.6).
+//!
+//! ```text
+//! zygo.slice/                     memory.max = host RAM − reserve
+//! ├── system/                     supervisor, image GC   memory.min = 512M
+//! └── tenants/                    memory.max = tenant budget
+//!     ├── tenant-A/               memory.max, pids.max, cpu.max
+//!     │   ├── zygote
+//!     │   ├── req-01f3…
+//!     │   └── req-01f4…
+//!     └── tenant-B/
+//! ```
+//!
+//! The point of `system/` having a `memory.min` reservation is that a thousand
+//! tenants all pressed against their limits must not be able to OOM the
+//! supervisor — if the supervisor dies, nothing enforces the timeouts.
+//!
+//! Directory manipulation here is plain filesystem I/O, so the whole layout is
+//! exercised against a temporary directory in the tests rather than needing a
+//! Linux host.
+
+use std::path::{Path, PathBuf};
+
+use crate::error::{Error, IoContext, Result};
+use crate::sandbox::limits::{CgroupWrite, Limits};
+use crate::spec::Bytes;
+
+/// Memory kept out of the tenant budget for the supervisor and image store.
+pub const SYSTEM_RESERVE: Bytes = Bytes(512 * 1024 * 1024);
+
+/// Fraction of the `zygo.slice` budget tenants may collectively use.
+pub const TENANT_BUDGET_FRACTION: f64 = 0.8;
+
+/// Where Zygo's slice lives, and how to name things inside it.
+#[derive(Debug, Clone)]
+pub struct Hierarchy {
+    /// Absolute path of `zygo.slice`, e.g.
+    /// `/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/zygo.slice`.
+    root: PathBuf,
+}
+
+impl Hierarchy {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    /// Locate `zygo.slice` under the caller's own cgroup, which is where a
+    /// rootless supervisor is allowed to create children.
+    ///
+    /// Reads `/proc/self/cgroup` (cgroup v2 emits a single `0::<path>` line).
+    #[cfg(target_os = "linux")]
+    pub fn discover() -> Result<Self> {
+        const MOUNT: &str = "/sys/fs/cgroup";
+        let text = std::fs::read_to_string("/proc/self/cgroup").at("/proc/self/cgroup")?;
+        let rel = text
+            .lines()
+            .find_map(|l| l.strip_prefix("0::"))
+            .ok_or_else(|| Error::BackendUnavailable {
+                backend: "ns",
+                reason: "cgroup v2 is not the unified hierarchy on this host".into(),
+                remedy: "boot with systemd.unified_cgroup_hierarchy=1, or use --isolation vm"
+                    .into(),
+            })?
+            .trim();
+        let current = Path::new(MOUNT).join(rel.trim_start_matches('/'));
+
+        // If this process is already inside a `zygo.slice`, that is the slice —
+        // do not nest another one inside it.
+        //
+        // `ensure` has to enable `subtree_control` on the slice's parent, and a
+        // cgroup that delegates to its children may no longer hold processes of
+        // its own. So the cgroup a first `zygo` ran from cannot host a second
+        // one, and without this the next invocation would silently build a
+        // second hierarchy somewhere else. Recognising the existing slice makes
+        // repeated invocations idempotent, and is also what happens when the
+        // supervisor spawns a child of itself.
+        if let Some(existing) = current
+            .ancestors()
+            .find(|a| a.file_name().is_some_and(|n| n == "zygo.slice"))
+        {
+            return Ok(Self::new(existing));
+        }
+
+        Ok(Self::new(current.join("zygo.slice")))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn discover() -> Result<Self> {
+        Err(Error::BackendUnavailable {
+            backend: "ns",
+            reason: "cgroup v2 only exists on Linux".into(),
+            remedy: "run inside a Linux VM or container; macOS support is phase 5".into(),
+        })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// `zygo.slice/system` — the supervisor and the image store.
+    pub fn system(&self) -> PathBuf {
+        self.root.join("system")
+    }
+
+    /// `zygo.slice/tenants` — the parent of every tenant, and the place the
+    /// aggregate budget is enforced.
+    pub fn tenants(&self) -> PathBuf {
+        self.root.join("tenants")
+    }
+
+    pub fn tenant(&self, name: &str) -> PathBuf {
+        self.tenants().join(sanitise(name))
+    }
+
+    /// Where the tenant's long-lived process actually sits.
+    ///
+    /// Not the tenant cgroup itself: that one carries the limits *and* parents
+    /// the per-request cgroups, and cgroup v2 forbids a cgroup from holding
+    /// processes while delegating to children. The design's own diagram (§3.6)
+    /// shows this — `tenant-A/zygote` alongside `tenant-A/req-…` — and writing
+    /// a pid into `tenant-A` directly returns EBUSY.
+    pub fn zygote(&self, name: &str) -> PathBuf {
+        self.tenant(name).join("zygote")
+    }
+
+    /// Per-request cgroup. A directory per request costs a `mkdir` and three
+    /// small writes (~50 µs), and buys `cgroup.kill`: one write tears down the
+    /// whole tree on timeout (open question A2 in the design doc).
+    pub fn request(&self, tenant: &str, request_id: &str) -> PathBuf {
+        self.tenant(tenant)
+            .join(format!("req-{}", sanitise(request_id)))
+    }
+
+    /// Create the top-level layout and its budgets. Idempotent.
+    ///
+    /// The first thing this does is move the calling process into
+    /// `zygo.slice/system`, which is where the design says the supervisor
+    /// belongs (§3.6) — and which is also what makes the rest possible.
+    /// cgroup v2 forbids a cgroup from holding processes *and* delegating
+    /// controllers to its children, so as long as Zygo's own process sits in
+    /// `zygo.slice`'s parent, that parent can never enable the controllers the
+    /// tenants below need (PoC 2 found this one level down; it applies at every
+    /// level).
+    pub fn ensure(&self, host_ram: Bytes) -> Result<()> {
+        let total = Bytes(host_ram.get().saturating_sub(SYSTEM_RESERVE.get()));
+        let tenant_budget = total.scaled(TENANT_BUDGET_FRACTION);
+
+        create(&self.root)?;
+        create(&self.system())?;
+
+        // Step out of the way, then vacate anything else still in the slice.
+        join_system(&self.system())?;
+        vacate(&self.root, &self.system())?;
+
+        // Delegation has to be enabled from the parent downwards: a controller
+        // that the parent does not pass down cannot be enabled below it.
+        if let Some(parent) = self.root.parent() {
+            enable_controllers(parent, CONTROLLERS)?;
+        }
+        enable_controllers(&self.root, CONTROLLERS)?;
+
+        // The reservation and the aggregate budget are protections, not
+        // correctness requirements: without them a tenant is still bounded by
+        // its own limits, which is what requirement N4 actually demands. They
+        // are also the first things to be unavailable on a host that has not
+        // delegated the memory controller, and failing here would turn a
+        // degraded setup into a refusal to start. `create_tenant` is where the
+        // hard check lives.
+        let _ = write_file(
+            &self.system().join("memory.min"),
+            &SYSTEM_RESERVE.get().to_string(),
+        );
+
+        create(&self.tenants())?;
+        enable_controllers(&self.tenants(), CONTROLLERS)?;
+        let _ = write_file(
+            &self.tenants().join("memory.max"),
+            &tenant_budget.get().to_string(),
+        );
+        Ok(())
+    }
+
+    /// Total RAM on this host, for sizing the tenant budget.
+    pub fn host_ram() -> Bytes {
+        std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|text| {
+                text.lines()
+                    .find_map(|l| l.strip_prefix("MemTotal:"))
+                    .and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok())
+            })
+            .map(|kb| Bytes(kb * 1024))
+            // A conservative guess is better than refusing to start; the
+            // per-tenant limits are what actually protect the host.
+            .unwrap_or(Bytes(2 * 1024 * 1024 * 1024))
+    }
+
+    /// Create a tenant cgroup and apply its limits.
+    ///
+    /// Fails rather than silently running without limits. A cgroup whose
+    /// controllers were never delegated looks perfectly normal — the directory
+    /// exists, `mkdir` succeeded — but `memory.max` is simply absent and every
+    /// write to it is ignored. That is risk R2, and requirement N4 says a
+    /// sandbox must never start in that state.
+    pub fn create_tenant(&self, name: &str, limits: &Limits) -> Result<PathBuf> {
+        let dir = self.tenant(name);
+
+        // Controllers have to be enabled at *every* level between the root and
+        // the leaf; enabling them only at the top leaves the grandchild without
+        // a single limit file (PoC 2).
+        create(&self.tenants())?;
+        enable_controllers(&self.root, CONTROLLERS)?;
+        enable_controllers(&self.tenants(), CONTROLLERS)?;
+
+        create(&dir)?;
+        enable_controllers(&dir, CONTROLLERS)?;
+
+        let missing = missing_limit_files(&dir);
+        if !missing.is_empty() {
+            return Err(Error::BackendUnavailable {
+                backend: "ns",
+                reason: format!(
+                    "the cgroup {} has no {} — its controllers were not delegated",
+                    dir.display(),
+                    missing.join(", ")
+                ),
+                remedy: "delegate cgroup v2 controllers to your user session; \
+                         `zygo doctor` prints the one-line fix"
+                    .into(),
+            });
+        }
+
+        apply(&dir, &limits.cgroup_writes())?;
+
+        // The leaf the process will live in. Limits stay on the parent so they
+        // cover the zygote and every per-request child together.
+        create(&dir.join("zygote"))?;
+        Ok(dir)
+    }
+
+    /// Create a per-request cgroup. Limits are inherited from the tenant; only
+    /// the wall-clock kill switch is per request.
+    pub fn create_request(&self, tenant: &str, request_id: &str) -> Result<PathBuf> {
+        let dir = self.request(tenant, request_id);
+        create(&dir)?;
+        Ok(dir)
+    }
+
+    /// Remove a cgroup directory and its children. Safe to call twice.
+    ///
+    /// cgroups are removed with `rmdir`, which refuses a directory that still
+    /// has child cgroups — so the leaves have to go first. Ordinary recursive
+    /// deletion would not work either: the control files inside cannot be
+    /// unlinked.
+    pub fn remove(dir: &Path) -> Result<()> {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    Self::remove(&entry.path())?;
+                }
+            }
+        }
+        match std::fs::remove_dir(dir) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            // A cgroup still holding processes cannot be removed; the caller
+            // has already killed them, but the kernel reaps asynchronously.
+            Err(e) if e.raw_os_error() == Some(libc::EBUSY) => Ok(()),
+            Err(e) => Err(Error::io(dir, e)),
+        }
+    }
+}
+
+/// Move a process into a cgroup by writing its pid to `cgroup.procs`.
+pub fn attach(dir: &Path, pid: u32) -> Result<()> {
+    write_file(&dir.join("cgroup.procs"), &pid.to_string())
+}
+
+/// Kill every process in the subtree with a single write (kernel ≥ 5.14).
+///
+/// The fallback for older kernels is signalling the pid namespace's init, which
+/// the launcher owns; this function reports whether the fast path exists.
+pub fn kill(dir: &Path) -> Result<bool> {
+    let path = dir.join("cgroup.kill");
+    if !path.exists() {
+        return Ok(false);
+    }
+    write_file(&path, "1")?;
+    Ok(true)
+}
+
+/// Freeze or thaw a subtree — how `idle_timeout` parks a warm zygote without
+/// giving up its resident memory.
+pub fn freeze(dir: &Path, frozen: bool) -> Result<()> {
+    write_file(&dir.join("cgroup.freeze"), if frozen { "1" } else { "0" })
+}
+
+/// Peak memory usage, for per-request metrics (kernel ≥ 5.19).
+pub fn peak_memory(dir: &Path) -> Option<Bytes> {
+    std::fs::read_to_string(dir.join("memory.peak"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+        .map(Bytes)
+}
+
+/// Apply a batch of limit writes.
+pub fn apply(dir: &Path, writes: &[CgroupWrite]) -> Result<()> {
+    for w in writes {
+        write_file(&dir.join(w.file), &w.value)?;
+    }
+    Ok(())
+}
+
+/// Controllers delegated to this cgroup, from `cgroup.controllers`.
+///
+/// A rootless setup needs `Delegate=cpu cpuset io memory pids` on
+/// `user@.service`; without it the limits silently do nothing, which is
+/// requirement N4's failure mode and why `zygo doctor` checks it (risk R2).
+pub fn available_controllers(dir: &Path) -> Vec<String> {
+    std::fs::read_to_string(dir.join("cgroup.controllers"))
+        .map(|s| s.split_whitespace().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// Controllers Zygo cannot enforce limits without.
+pub const REQUIRED_CONTROLLERS: &[&str] = &["memory", "pids", "cpu"];
+
+/// Which of [`REQUIRED_CONTROLLERS`] are missing at `dir`.
+pub fn missing_controllers(dir: &Path) -> Vec<&'static str> {
+    let have = available_controllers(dir);
+    REQUIRED_CONTROLLERS
+        .iter()
+        .copied()
+        .filter(|c| !have.iter().any(|h| h == c))
+        .collect()
+}
+
+/// Controllers Zygo enables for its subtree.
+const CONTROLLERS: &[&str] = &["cpu", "io", "memory", "pids"];
+
+/// Limit files that must exist before a sandbox may start.
+const REQUIRED_LIMIT_FILES: &[&str] = &["memory.max", "pids.max", "cpu.max"];
+
+/// Which mandatory limit files are absent from `dir`.
+fn missing_limit_files(dir: &Path) -> Vec<&'static str> {
+    REQUIRED_LIMIT_FILES
+        .iter()
+        .copied()
+        .filter(|f| !dir.join(f).exists())
+        .collect()
+}
+
+/// Move the calling process into `system`.
+///
+/// Idempotent: writing a pid that is already there is a no-op.
+fn join_system(system: &Path) -> Result<()> {
+    // SAFETY: getpid cannot fail and has no preconditions.
+    let pid = unsafe { libc::getpid() };
+    match std::fs::write(system.join("cgroup.procs"), pid.to_string()) {
+        Ok(()) => Ok(()),
+        // Not being able to move is only fatal if the limits then fail to
+        // apply, which `create_tenant` checks explicitly.
+        Err(_) => Ok(()),
+    }
+}
+
+/// Move every process out of `from` and into `into`.
+///
+/// cgroup v2 forbids a cgroup from holding processes *and* enabling controllers
+/// for its children at the same time ("no internal processes"). Anything
+/// already sitting in Zygo's slice therefore has to move aside before
+/// `subtree_control` can be written — and `system/` is exactly where the
+/// design says the supervisor belongs anyway (PoC 2).
+fn vacate(from: &Path, into: &Path) -> Result<()> {
+    let procs = match std::fs::read_to_string(from.join("cgroup.procs")) {
+        Ok(text) => text,
+        Err(_) => return Ok(()),
+    };
+    if procs.trim().is_empty() {
+        return Ok(());
+    }
+    create(into)?;
+    for pid in procs.split_whitespace() {
+        // A process that exits between the read and the write is not an error.
+        let _ = std::fs::write(into.join("cgroup.procs"), pid);
+    }
+    Ok(())
+}
+
+/// Enable controllers for children via `cgroup.subtree_control`.
+///
+/// Best-effort: a controller that is already enabled, or that the parent never
+/// delegated, produces an error the caller cannot act on here. Enforcement of
+/// "no limits, no sandbox" happens in [`Hierarchy::create_tenant`], which
+/// checks that the limit files actually appeared.
+fn enable_controllers(dir: &Path, controllers: &[&str]) -> Result<()> {
+    let have = available_controllers(dir);
+    for c in controllers {
+        if have.iter().any(|h| h == *c) {
+            // One controller per write: a single rejected entry would
+            // otherwise discard the whole line.
+            let _ = std::fs::write(dir.join("cgroup.subtree_control"), format!("+{c}"));
+        }
+    }
+    Ok(())
+}
+
+fn create(dir: &Path) -> Result<()> {
+    match std::fs::create_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            Err(Error::BackendUnavailable {
+                backend: "ns",
+                reason: format!("cannot create the cgroup {}", dir.display()),
+                remedy: "delegate cgroup v2 controllers to your user session; run `zygo doctor`"
+                    .into(),
+            })
+        }
+        Err(e) => Err(Error::io(dir, e)),
+    }
+}
+
+fn write_file(path: &Path, value: &str) -> Result<()> {
+    std::fs::write(path, value).at(path)
+}
+
+/// Make a name safe as a single path component. Tenant names come from callers
+/// that may be passing through end-user input, so `../` must not be a way out
+/// of the tenant subtree.
+fn sanitise(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    // `.` and `..` survive the filter above but are still traversal.
+    if cleaned.chars().all(|c| c == '.') {
+        return "_".repeat(cleaned.len().max(1));
+    }
+    if cleaned.is_empty() {
+        return "_".to_string();
+    }
+    cleaned
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::{Cpu, Duration};
+
+    fn limits() -> Limits {
+        Limits {
+            mem: Bytes::from_mib(256),
+            mem_high: Bytes::from_mib(230),
+            swap: Bytes(0),
+            oom_group: true,
+            cpu: Cpu(0.5),
+            pids: 64,
+            timeout: Duration::from_secs(30),
+            scratch: Bytes::from_mib(64),
+            scratch_inodes: 10_000,
+            io_read: None,
+            io_write: None,
+            nofile: 1024,
+            fsize: Bytes::from_mib(64),
+        }
+    }
+
+    /// The path logic of `discover`, exercised without `/proc`.
+    fn slice_for(current: &str) -> PathBuf {
+        let current = Path::new(current);
+        match current
+            .ancestors()
+            .find(|a| a.file_name().is_some_and(|n| n == "zygo.slice"))
+        {
+            Some(existing) => existing.to_path_buf(),
+            None => current.join("zygo.slice"),
+        }
+    }
+
+    #[test]
+    fn discovery_creates_a_slice_under_the_current_cgroup() {
+        assert_eq!(
+            slice_for("/sys/fs/cgroup/user.slice/user-1000.slice"),
+            Path::new("/sys/fs/cgroup/user.slice/user-1000.slice/zygo.slice")
+        );
+    }
+
+    /// A second invocation must reuse the first one's slice instead of nesting.
+    #[test]
+    fn discovery_reuses_an_enclosing_slice_rather_than_nesting() {
+        let expected = Path::new("/sys/fs/cgroup/launch/zygo.slice");
+        assert_eq!(
+            slice_for("/sys/fs/cgroup/launch/zygo.slice/system"),
+            expected
+        );
+        assert_eq!(
+            slice_for("/sys/fs/cgroup/launch/zygo.slice/tenants/acme/zygote"),
+            expected
+        );
+        assert_eq!(slice_for("/sys/fs/cgroup/launch/zygo.slice"), expected);
+    }
+
+    #[test]
+    fn layout_matches_the_design_document() {
+        let h = Hierarchy::new("/sys/fs/cgroup/zygo.slice");
+        assert_eq!(h.system(), Path::new("/sys/fs/cgroup/zygo.slice/system"));
+        assert_eq!(h.tenants(), Path::new("/sys/fs/cgroup/zygo.slice/tenants"));
+        assert_eq!(
+            h.tenant("tenant-A"),
+            Path::new("/sys/fs/cgroup/zygo.slice/tenants/tenant-A")
+        );
+        assert_eq!(
+            h.request("tenant-A", "01f3"),
+            Path::new("/sys/fs/cgroup/zygo.slice/tenants/tenant-A/req-01f3")
+        );
+    }
+
+    #[test]
+    fn tenant_names_cannot_escape_the_subtree() {
+        let h = Hierarchy::new("/cg/zygo.slice");
+        for evil in ["../../etc", "..", "a/b", "a\0b", "."] {
+            let p = h.tenant(evil);
+            assert_eq!(
+                p.parent().unwrap(),
+                h.tenants(),
+                "`{evil}` escaped to {}",
+                p.display()
+            );
+        }
+        // And the same for request ids, which come from the same direction.
+        let p = h.request("t", "../../x");
+        assert_eq!(p.parent().unwrap(), h.tenant("t"));
+    }
+
+    #[test]
+    fn ensure_builds_the_hierarchy_with_a_system_reservation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let h = Hierarchy::new(tmp.path().join("zygo.slice"));
+        h.ensure(Bytes(64 * (1 << 30))).unwrap();
+
+        assert!(h.system().is_dir());
+        assert!(h.tenants().is_dir());
+
+        let sys_min = std::fs::read_to_string(h.system().join("memory.min")).unwrap();
+        assert_eq!(sys_min, SYSTEM_RESERVE.get().to_string());
+
+        let budget = std::fs::read_to_string(h.tenants().join("memory.max")).unwrap();
+        let expected = Bytes(64 * (1 << 30) - SYSTEM_RESERVE.get()).scaled(TENANT_BUDGET_FRACTION);
+        assert_eq!(budget, expected.get().to_string());
+    }
+
+    /// Stand in for a delegated hierarchy: on a real cgroupfs the kernel
+    /// creates the limit files when a controller is enabled.
+    fn fake_delegation(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("cgroup.controllers"), "cpu io memory pids\n").unwrap();
+        for f in ["memory.max", "pids.max", "cpu.max"] {
+            std::fs::write(dir.join(f), "").unwrap();
+        }
+    }
+
+    #[test]
+    fn creating_a_tenant_writes_every_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let h = Hierarchy::new(tmp.path().join("zygo.slice"));
+        h.ensure(Bytes(8 * (1 << 30))).unwrap();
+        fake_delegation(&h.tenant("acme"));
+
+        let dir = h.create_tenant("acme", &limits()).unwrap();
+
+        let read = |f: &str| std::fs::read_to_string(dir.join(f)).unwrap();
+        assert_eq!(read("memory.max"), (256 * (1 << 20)).to_string());
+        assert_eq!(read("memory.swap.max"), "0");
+        assert_eq!(read("memory.oom.group"), "1");
+        assert_eq!(read("pids.max"), "64");
+        assert_eq!(read("cpu.max"), "50000 100000");
+    }
+
+    /// Requirement N4: a sandbox must never start with limits that are not
+    /// actually enforced. Without delegation the directory exists and `mkdir`
+    /// succeeds, but no limit file does — which is risk R2's exact shape.
+    #[test]
+    fn a_tenant_without_delegated_controllers_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let h = Hierarchy::new(tmp.path().join("zygo.slice"));
+        h.ensure(Bytes(8 * (1 << 30))).unwrap();
+
+        let err = h.create_tenant("acme", &limits()).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("not delegated"), "{text}");
+        assert!(text.contains("memory.max"), "{text}");
+        assert_eq!(err.exit_code(), 125);
+    }
+
+    #[test]
+    fn missing_limit_files_are_listed_individually() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(missing_limit_files(tmp.path()), REQUIRED_LIMIT_FILES);
+
+        std::fs::write(tmp.path().join("memory.max"), "").unwrap();
+        assert_eq!(missing_limit_files(tmp.path()), ["pids.max", "cpu.max"]);
+    }
+
+    /// cgroup v2's "no internal processes" rule: controllers cannot be enabled
+    /// for children while the cgroup still holds processes of its own.
+    #[test]
+    fn ensure_moves_existing_processes_into_the_system_cgroup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let h = Hierarchy::new(tmp.path().join("zygo.slice"));
+        std::fs::create_dir_all(h.root()).unwrap();
+        std::fs::write(h.root().join("cgroup.procs"), "111\n222\n").unwrap();
+
+        h.ensure(Bytes(8 * (1 << 30))).unwrap();
+
+        let moved = std::fs::read_to_string(h.system().join("cgroup.procs")).unwrap();
+        // Each pid is written separately, so the fake file holds the last one;
+        // what matters is that the move happened at all.
+        assert!(!moved.trim().is_empty(), "processes were not moved aside");
+    }
+
+    #[test]
+    fn vacating_an_empty_cgroup_is_a_no_op() {
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("from");
+        let into = tmp.path().join("into");
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::write(from.join("cgroup.procs"), "\n").unwrap();
+
+        vacate(&from, &into).unwrap();
+        assert!(!into.exists(), "nothing to move, nothing to create");
+    }
+
+    #[test]
+    fn attach_writes_the_pid_to_cgroup_procs() {
+        let tmp = tempfile::tempdir().unwrap();
+        attach(tmp.path(), 4242).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("cgroup.procs")).unwrap(),
+            "4242"
+        );
+    }
+
+    #[test]
+    fn kill_reports_whether_the_fast_path_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Kernels before 5.14 have no `cgroup.kill`; the caller must fall back.
+        assert!(!kill(tmp.path()).unwrap());
+
+        std::fs::write(tmp.path().join("cgroup.kill"), "").unwrap();
+        assert!(kill(tmp.path()).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("cgroup.kill")).unwrap(),
+            "1"
+        );
+    }
+
+    #[test]
+    fn freeze_and_thaw_write_the_expected_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        freeze(tmp.path(), true).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("cgroup.freeze")).unwrap(),
+            "1"
+        );
+        freeze(tmp.path(), false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("cgroup.freeze")).unwrap(),
+            "0"
+        );
+    }
+
+    #[test]
+    fn missing_controllers_are_detected() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No file at all: everything is missing (risk R2).
+        assert_eq!(missing_controllers(tmp.path()), REQUIRED_CONTROLLERS);
+
+        std::fs::write(
+            tmp.path().join("cgroup.controllers"),
+            "cpu io memory pids\n",
+        )
+        .unwrap();
+        assert!(missing_controllers(tmp.path()).is_empty());
+
+        std::fs::write(tmp.path().join("cgroup.controllers"), "cpu io\n").unwrap();
+        assert_eq!(missing_controllers(tmp.path()), ["memory", "pids"]);
+    }
+
+    #[test]
+    fn remove_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("gone");
+        std::fs::create_dir(&dir).unwrap();
+        Hierarchy::remove(&dir).unwrap();
+        Hierarchy::remove(&dir).unwrap();
+    }
+
+    #[test]
+    fn peak_memory_is_optional() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(peak_memory(tmp.path()), None);
+        std::fs::write(tmp.path().join("memory.peak"), "123456\n").unwrap();
+        assert_eq!(peak_memory(tmp.path()), Some(Bytes(123456)));
+    }
+}
