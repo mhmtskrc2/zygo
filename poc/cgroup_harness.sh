@@ -33,6 +33,32 @@
 # Requires `$ZYGO`. Defines `zygo()` and `zygo_supervisor()`, the latter
 # setting `$SUPERVISOR_PID`.
 
+# Clear a suite's data directory, and refuse to continue if it cannot be.
+#
+# `rm -rf` on a store a sandbox is still writing to fails with `Directory not
+# empty` and leaves half of it — including an `images/` with no `index.json`.
+# Every function in the spec then fails to start with "image is not in the
+# local store", and a Raspberry Pi run reported **38 failures** whose whole
+# cause was this one line's exit status going unread. A second attempt a
+# second later succeeds, because whatever was writing has finished dying.
+#
+# Loud rather than best-effort: a suite that starts with a half-deleted store
+# is not measuring the product.
+clear_data_home() {
+    dir=$1
+    i=0
+    while [ "$i" -lt 5 ]; do
+        rm -rf "$dir" 2>/dev/null
+        [ -e "$dir" ] || return 0
+        i=$((i + 1))
+        sleep 1
+    done
+    echo "  the data directory $dir could not be cleared after 5 tries." >&2
+    echo "  Something is still writing to it — most likely a sandbox left" >&2
+    echo "  over from an earlier run. \`sh poc/cleanup.sh\` clears those." >&2
+    return 1
+}
+
 ZYGO_HARNESS_ROOT=$(
     rel=$(sed -n 's/^0:://p' /proc/self/cgroup 2>/dev/null | head -1)
     printf '%s' "/sys/fs/cgroup${rel%/}"

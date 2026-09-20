@@ -33,10 +33,12 @@ export ZYGO_DATA_HOME
 # venvs for one requirements file and call it a bug in the cache. Assertions
 # about what a cache contains only mean something when the cache started
 # empty.
-rm -rf "$ZYGO_DATA_HOME"
-
-# Two environments need opposite cgroup preparation; the shared prelude picks.
+# Sourced below, but needed here: see `clear_data_home`.
 . "$(dirname "$0")/cgroup_harness.sh"
+clear_data_home "$ZYGO_DATA_HOME" || exit 1
+
+# The prelude is already sourced, above, because clearing the data
+# directory needs one of its helpers before anything else happens.
 
 # Bring a supervisor up and wait for its socket. The prelude decides which
 # cgroup it starts in; this only cares that it answers.

@@ -47,6 +47,27 @@ while [ "$passes" -lt 5 ]; do
     sleep 1
 done
 
+# The sandboxes, which are not `zygo` processes at all. A tenant runs
+# `python3 /zygo/agent.py`, and killing the supervisor does not always take it
+# with it — `PR_SET_PDEATHSIG` fires on the death of the *thread* that created
+# it, which is not always the last one to go. A surviving agent keeps writing
+# to the store, and the next run's `rm -rf` of its data directory fails with
+# `Directory not empty`, leaving a half-deleted store that answers "image is
+# not in the local store" for every function in the spec. That is thirty-eight
+# failures from one leaked process.
+#
+# Identified by cgroup rather than by name: anything under a `zygo.slice` is
+# Zygo's by construction, whatever it is running.
+for pid in $(ls /proc 2>/dev/null | grep '^[0-9]*$'); do
+    case "$ancestors" in
+        *" $pid "*) continue ;;
+    esac
+    if grep -qs 'zygo\.slice' "/proc/$pid/cgroup" 2>/dev/null; then
+        kill -9 "$pid" 2>/dev/null && killed=$((killed + 1))
+    fi
+done
+sleep 1
+
 # Both places a socket can live: the self-contained layout a suite asks for
 # with `ZYGO_DATA_HOME`, and the XDG runtime directory an ordinary session
 # uses. A stale socket file makes the next `serve` report that a supervisor is
