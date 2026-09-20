@@ -149,7 +149,11 @@ jobs:
             sh poc/verify_launcher.sh
           fi
         env:
-          ZYGO_DATA_HOME: /tmp/zygo-ci
+          # Its own tree, because the root entry runs this one step under
+          # `sudo` and every step after it unprivileged. Sharing one directory
+          # left those steps unable to write it — and an escape suite that
+          # cannot start a sandbox reported *16 escapes*.
+          ZYGO_DATA_HOME: /tmp/zygo-launcher-${{ matrix.privilege }}
           SRC: ${{ github.workspace }}
 
       - name: Escape suite

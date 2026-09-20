@@ -58,11 +58,28 @@ PYEOF
 )
 
 # Run Python inside a sandbox and echo its stdout.
-py() { zygo run "$IMAGE" python3 -c "$1" 2>/dev/null; }
+py() { zygo run "$IMAGE" python3 -c "$1" 2>/tmp/escape.err; }
 
 say "escape suite — every case is an attempt, not an inspection"
 say "  kernel $(uname -r)"
 zygo pull "$IMAGE" >/dev/null 2>&1
+
+# Nothing below is a result unless a sandbox runs. Every case here reads the
+# attempt's *output*, and an empty answer looks exactly like a refusal that
+# printed nothing — so a suite that cannot start a sandbox at all reported
+# **1 blocked, 16 escaped**, which is the most alarming way to say "the data
+# directory was not writable". It was a CI step running unprivileged against
+# a tree an earlier `sudo` step had created.
+#
+# Rule 4 from the README, at the top of the file it is about: a negative check
+# must first prove the thing ran.
+if [ "$(py 'print("alive")')" != alive ]; then
+    say ""
+    say "  the suite cannot start a sandbox, so none of its cases would mean"
+    say "  anything. Nothing below has been attempted."
+    say "  $(grep -v '^$' /tmp/escape.err 2>/dev/null | tr '\n' ' ' | cut -c1-300)"
+    exit 1
+fi
 say ""
 
 # --- 1. the runtime binary (CVE-2019-5736 shape) ----------------------------
