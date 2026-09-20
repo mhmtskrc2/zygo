@@ -1528,6 +1528,46 @@ on the Pi, as an ordinary user, before:  error: … Permission denied
                                  after:  {"k": "sk_live_9"}
 ```
 
+**The same window, a second time: rootless networking never worked.** With
+the secrets path fixed, `zygo up` on a function with `network = "egress"`
+still refused, and the message was `pasta could not configure the sandbox's
+network: Couldn't open user namespace /proc/<pid>/ns/user: Permission
+denied`. That is the sentence above in different clothes. `pasta` is handed
+the sandbox's user and network namespaces by path, it runs *after* the id map
+is written, and `/proc/<pid>/ns` is closed by then to anything that does not
+hold a capability in that namespace. The supervisor holds one, because it
+created the namespace; `pasta` is a separate process and holds nothing. As
+root in a container the check is skipped entirely, which is the only reason
+this shipped — **every rootless networked sandbox this project ever started
+was refused**, and the suite that would have caught it had only ever run as
+root.
+
+It reproduces with no Zygo in the picture at all:
+
+```
+$ unshare -Ur --net --pid --fork sleep 60 &
+$ pasta --config-net --userns /proc/$!/ns/user --netns /proc/$!/ns/net
+Couldn't open user namespace /proc/65548/ns/user: Permission denied
+```
+
+The fix is the one the file next door already uses. The launcher opens the
+two namespaces in the window where it still can — the same window it already
+uses for a held sandbox's descriptors, before the map — and `pasta` is given
+`/proc/self/fd/3` and `/proc/self/fd/4`, descriptors dup'd into place by
+`pre_exec`. A descriptor names the namespace itself; there is no `/proc`
+lookup left to refuse. `nft` and `tc` never had the problem, because
+`run_in_namespace` had been passing them descriptors since it was written.
+
+What is *not* proven yet is the rest of the path. The Raspberry Pi gets past
+the refusal and then fails inside `pasta`'s own self-sandboxing with `mount
+/: Permission denied` — that machine runs the passt Ubuntu 23.10 shipped in
+June 2023, and `pasta --config-net -- /bin/true`, with no Zygo involved,
+fails there too. So the suite now tells the two apart: a failure whose text
+begins `pasta could not configure` is reported as a prerequisite that is
+present but does not work, and the section is skipped rather than counted.
+CI's ubuntu-24.04 runner, rootless and current, is where the fixed path gets
+its first honest run.
+
 **The verification suites only knew how to run in a container.** Each one
 hard-coded `/sys/fs/cgroup` as the place to build its harness, which is the
 root of the hierarchy in a container and a directory nobody may write to on a

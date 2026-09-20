@@ -66,6 +66,16 @@ pub const DNS_ADDR: &str = "169.254.1.1";
 /// resolver has to be on port 53 of an address only this sandbox can reach.
 pub const PROXY_ADDR: &str = "127.0.0.53";
 
+/// Where `pasta` finds the sandbox's user namespace, as a descriptor number
+/// in its own process. Anything above the standard three works; these two are
+/// the first free ones.
+#[cfg(target_os = "linux")]
+const USERNS_FD: std::os::fd::RawFd = 3;
+
+/// Where `pasta` finds the sandbox's network namespace. See [`USERNS_FD`].
+#[cfg(target_os = "linux")]
+const NETNS_FD: std::os::fd::RawFd = 4;
+
 /// The tap interface `pasta` creates inside the namespace. Named explicitly so
 /// `tc` has something to name; the default follows the host's interface,
 /// which is anyone's guess.
@@ -508,7 +518,15 @@ pub(crate) mod linux {
     }
 
     impl NetNs {
-        fn open(pid: u32) -> Result<NetNs> {
+        /// Open a started sandbox's user and network namespaces.
+        ///
+        /// **When** this is called is the whole of it. `/proc/<pid>/ns/*` is
+        /// reachable only while the process is dumpable, and writing the id
+        /// map clears that — so the launcher takes these descriptors in the
+        /// window before it writes the map, and hands them here. Opening them
+        /// afterwards works from the supervisor, which holds every capability
+        /// in the namespace it created, and fails from anything else.
+        pub(crate) fn open(pid: u32) -> Result<NetNs> {
             let open = |kind: &str| -> Result<OwnedFd> {
                 let path = PathBuf::from(format!("/proc/{pid}/ns/{kind}"));
                 Ok(OwnedFd::from(std::fs::File::open(&path).at(&path)?))
@@ -531,18 +549,17 @@ pub(crate) mod linux {
     /// it for the sandbox's lifetime.
     #[allow(clippy::too_many_arguments)]
     pub fn configure(
-        pid: u32,
         network: Network,
         rules: &[AllowRule],
         allowed: &Allowed,
         allow_private: bool,
         limits: &crate::sandbox::Limits,
         pasta_pid_file: &Path,
+        ns: NetNs,
     ) -> Result<Option<DnsProxy>> {
         let programs = availability(limits.bandwidth.is_some())?;
-        let ns = NetNs::open(pid)?;
 
-        start_pasta(&programs.pasta, pid, pasta_pid_file)?;
+        start_pasta(&programs.pasta, &ns, pasta_pid_file)?;
 
         let text = ruleset(network, rules, allowed, allow_private, limits.connections);
         let output = run_in_namespace(&ns, &programs.nft, &["-f", "-"], Some(&text))?;
@@ -589,7 +606,20 @@ pub(crate) mod linux {
     /// itself once the namespace is configured, so this returns when the
     /// sandbox can reach the network — the pid file is what lets the sandbox
     /// take it down again.
-    fn start_pasta(pasta: &Path, pid: u32, pid_file: &Path) -> Result<()> {
+    ///
+    /// Those two options name *descriptors*, not `/proc/<pid>/ns/...`. The
+    /// path version worked for years of testing as root and refused every
+    /// rootless sandbox with `Permission denied`: `/proc/<pid>/ns` is
+    /// reachable only while the process is dumpable, writing the id map
+    /// clears that, and the supervisor gets away with it afterwards only
+    /// because it holds every capability in the namespace it created. `pasta`
+    /// holds nothing of the sort. So the launcher opens the namespaces before
+    /// it writes the map, and they arrive here as descriptors that name the
+    /// namespaces themselves and need no `/proc` lookup at all — the same
+    /// move the secrets directory made, for the same reason.
+    fn start_pasta(pasta: &Path, ns: &NetNs, pid_file: &Path) -> Result<()> {
+        use std::os::unix::process::CommandExt;
+
         if let Some(parent) = pid_file.parent() {
             std::fs::create_dir_all(parent).at(parent)?;
         }
@@ -599,7 +629,8 @@ pub(crate) mod linux {
         // SAFETY: neither call takes an argument or can fail.
         let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
 
-        let output = std::process::Command::new(pasta)
+        let mut command = std::process::Command::new(pasta);
+        command
             .arg("--config-net")
             .arg("--quiet")
             // Keep our identity. Started as root, `pasta` drops to `nobody`
@@ -619,10 +650,38 @@ pub(crate) mod linux {
             .args(["--ns-ifname", SANDBOX_IFNAME])
             .arg("--pid")
             .arg(pid_file)
+            // Descriptors 3 and 4, put there by `pre_exec` below.
             .arg("--userns")
-            .arg(format!("/proc/{pid}/ns/user"))
+            .arg(format!("/proc/self/fd/{USERNS_FD}"))
             .arg("--netns")
-            .arg(format!("/proc/{pid}/ns/net"))
+            .arg(format!("/proc/self/fd/{NETNS_FD}"));
+
+        let (user, net) = (ns.user.as_raw_fd(), ns.net.as_raw_fd());
+        // SAFETY: between `fork` and `execve`. Every call is
+        // async-signal-safe and nothing allocates.
+        unsafe {
+            command.pre_exec(move || {
+                // Out of the way first: either descriptor could already *be*
+                // 3 or 4, and `dup2` onto itself is a no-op that would leave
+                // `CLOEXEC` set — the one case where this silently hands
+                // `pasta` a closed descriptor.
+                let high = |fd| libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 10);
+                let (u, n) = (high(user), high(net));
+                if u < 0 || n < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // `dup2` clears `CLOEXEC` on the new descriptor, which is
+                // what lets these two survive the exec.
+                if libc::dup2(u, USERNS_FD) < 0 || libc::dup2(n, NETNS_FD) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                libc::close(u);
+                libc::close(n);
+                Ok(())
+            });
+        }
+
+        let output = command
             .output()
             .map_err(|e| Error::primitive("start pasta", "could not run `pasta`", e))?;
 

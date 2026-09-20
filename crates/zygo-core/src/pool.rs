@@ -526,7 +526,7 @@ impl Pool {
                         .map_err(|e| Error::primitive("spawn", "agent reader thread", e))?
                 };
 
-                Ok(Function::Agent(WarmFn {
+                Ok(Function::Agent(Box::new(WarmFn {
                     name: f.name.clone(),
                     conn,
                     replies: Mutex::new(Some(replies)),
@@ -543,7 +543,7 @@ impl Pool {
                     agent_host_pid: sandbox.pid(),
                     secrets: Mutex::new(Secrets::default()),
                     _sandbox: sandbox,
-                }))
+                })))
             }
         }
     }
@@ -587,7 +587,7 @@ impl Pool {
             .secrets_dir()
             .and_then(|fd| fd.try_clone_to_owned().ok());
 
-        Ok(Function::Exec(WarmExec {
+        Ok(Function::Exec(Box::new(WarmExec {
             name: f.name.clone(),
             init_pid: sandbox.pid(),
             secrets_dir,
@@ -600,7 +600,7 @@ impl Pool {
             per_request_cgroup: self.config.per_request_cgroup,
             timeout: f.limits.timeout.get(),
             secrets: Mutex::new(Secrets::default()),
-        }))
+        })))
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -1920,11 +1920,17 @@ fn resident_kb(pid: u32) -> Option<u64> {
 /// agent forks for it or a fresh process is entered into its sandbox.
 pub enum Function {
     /// An agent in the box, forking per request.
-    Agent(WarmFn),
+    Agent(Box<WarmFn>),
     /// A held sandbox, entered per request.
     #[cfg(target_os = "linux")]
-    Exec(WarmExec),
+    Exec(Box<WarmExec>),
 }
+
+// Both arms are boxed. An enum is as large as its largest arm, and these two
+// differ by a factor of two, so unboxed every agent would carry a held
+// sandbox's worth of padding. The cost is one allocation per *served
+// function* — not per request, and nothing on the request path follows the
+// pointer more than once.
 
 macro_rules! each {
     ($self:expr, $f:ident => $body:expr) => {

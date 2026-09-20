@@ -457,7 +457,9 @@ unsafe fn apply(op: &PreparedOp, err_fd: c_int) {
                     c"devpts".as_ptr(),
                     target.as_ptr(),
                     c"devpts".as_ptr(),
-                    (super::prepare::MS_REC & 0) as libc::c_ulong,
+                    // No flags: a fresh `devpts` instance, not a bind and
+                    // not recursive.
+                    0,
                     options.as_ptr() as *const c_void,
                 )
             };

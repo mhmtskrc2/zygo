@@ -27,7 +27,6 @@ pub mod prepare;
 pub mod seccomp;
 pub mod syscalls;
 
-use std::io::Read;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -476,6 +475,25 @@ pub fn launch(config: &SandboxConfig, hierarchy: Option<&cgroup::Hierarchy>) -> 
                 }
             }
 
+            // And for the same reason, a networked sandbox's user and network
+            // namespaces. `pasta` runs as a separate process with none of the
+            // supervisor's standing in this namespace, so it cannot look them
+            // up under `/proc/<pid>/ns` once the map below makes that process
+            // undumpable — which is why every rootless networked sandbox was
+            // refused with `Permission denied` while root-in-a-container
+            // sailed through. Taken here, handed over as descriptors.
+            let net_ns = if crate::net::needs_configuration(config.network) {
+                match crate::net::linux::NetNs::open(pid) {
+                    Ok(ns) => Some(ns),
+                    Err(e) => {
+                        let _ = sandbox.kill();
+                        return Err(e);
+                    }
+                }
+            } else {
+                None
+            };
+
             // The child is blocked waiting for its identity. Give it one, then
             // put it in its cgroup — both must happen before it runs any code.
             let identity = write_id_maps(pid, &uid_map, &gid_map);
@@ -493,8 +511,8 @@ pub fn launch(config: &SandboxConfig, hierarchy: Option<&cgroup::Hierarchy>) -> 
             // briefly reachable with no allowlist at all. Any failure here
             // takes the sandbox down rather than starting it unconfined.
             if identity.is_ok()
-                && crate::net::needs_configuration(config.network)
-                && let Err(e) = configure_network(config, pid, &mut sandbox)
+                && let Some(net_ns) = net_ns
+                && let Err(e) = configure_network(config, net_ns, &mut sandbox)
             {
                 let _ = sandbox.kill();
                 return Err(e);
@@ -565,7 +583,11 @@ pub fn launch(config: &SandboxConfig, hierarchy: Option<&cgroup::Hierarchy>) -> 
 /// The pid file is recorded on the sandbox before `pasta` is started, so a
 /// `pasta` that came up and then failed the ruleset step is still stopped when
 /// the sandbox is torn down.
-fn configure_network(config: &SandboxConfig, pid: u32, sandbox: &mut NsSandbox) -> Result<()> {
+fn configure_network(
+    config: &SandboxConfig,
+    ns: crate::net::linux::NetNs,
+    sandbox: &mut NsSandbox,
+) -> Result<()> {
     let pid_file = config
         .pasta_pid_file
         .clone()
@@ -579,13 +601,13 @@ fn configure_network(config: &SandboxConfig, pid: u32, sandbox: &mut NsSandbox) 
         })?;
     sandbox.pasta_pid_file = Some(pid_file.clone());
     sandbox.dns = crate::net::configure(
-        pid,
         config.network,
         &config.allow,
         &config.allow_resolved,
         config.allow_private_net,
         &config.limits,
         &pid_file,
+        ns,
     )?;
     Ok(())
 }

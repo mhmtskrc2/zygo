@@ -502,6 +502,10 @@ fn exec_candidates(program: &str, env: &[(String, String)]) -> Result<Vec<CStrin
         .collect()
 }
 
+// `RLIMIT_*` is `c_int` under musl and `c_uint` under glibc, so exactly one
+// of the two libcs makes each cast below redundant — and clippy, run against
+// that one, calls it an error. The cast stays.
+#[allow(clippy::unnecessary_cast)]
 fn rlimit_resource(kind: crate::sandbox::RlimitKind) -> i32 {
     use crate::sandbox::RlimitKind::*;
     match kind {
@@ -705,6 +709,8 @@ mod tests {
         assert!(entries.iter().all(|e| e.contains('=')));
     }
 
+    // Same libc difference as `rlimit_resource` itself: see the note there.
+    #[allow(clippy::unnecessary_cast)]
     #[test]
     fn rlimits_map_onto_kernel_resource_numbers() {
         let p = prepare(&config(overlay())).unwrap();

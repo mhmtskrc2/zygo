@@ -987,13 +987,25 @@ if "$ZYGO" up >/tmp/up-net.log 2>&1; then
     ok "\`up\` brings up sealed, egress, limited and full functions together"
     egress_up=yes
 else
-    # One failure, then skip what depends on it. Every check below reads a
-    # field out of a networked function's answer, so without those functions
-    # they all fail for the same single reason — twelve red lines saying one
-    # thing, with the one thing buried. `pasta` failing to open
-    # `/dev/net/tun` produced exactly that on a Raspberry Pi.
+    # One line, then skip what depends on it. Every check below reads a field
+    # out of a networked function's answer, so without those functions they
+    # all fail for the same single reason — twelve red lines saying one
+    # thing, with the one thing buried.
     egress_up=no
-    bad "up with egress failed: $(grep -v '^$' /tmp/up-net.log | tail -3 | tr '\n' ' ' | cut -c1-220)"
+    why=$(grep -v '^$' /tmp/up-net.log | tail -3 | tr '\n' ' ' | cut -c1-220)
+    case $why in
+        # `pasta` refusing before Zygo has said anything is a prerequisite
+        # that is present but does not work — the Raspberry Pi here carries
+        # the passt Ubuntu shipped in June 2023, which cannot sandbox itself
+        # as an ordinary user and says so in its own words. That is not a
+        # result about Zygo and should not be counted as one. Anything else
+        # is ours.
+        *"pasta could not configure"*)
+            say "  SKIP  \`pasta\` on this host cannot configure a sandbox's network:"
+            say "        $why"
+            say "        → this is passt, not Zygo; a newer one is the fix" ;;
+        *) bad "up with egress failed: $why" ;;
+    esac
     say "  SKIP  the rest of this section needs those functions; skipping it"
 fi
 
