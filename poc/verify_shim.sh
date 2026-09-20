@@ -47,6 +47,14 @@ fi
 ZYGO=$(cd "$(dirname "$ZYGO")" && pwd)/$(basename "$ZYGO")
 
 say "  $(sw_vers -productName) $(sw_vers -productVersion), $(limactl --version 2>&1 | head -1)"
+
+# Start from a running VM, because the section below asks `doctor` what the VM
+# says about itself and a stopped one says nothing. The suite's *last* act is
+# `stop --all`, which now stops the VM too — so running this twice in a row
+# failed the second time, on a check about `doctor` rather than about
+# anything the run had done. One ordinary command is what a user's first
+# command does anyway.
+"$ZYGO" ps >/dev/null 2>&1
 say ""
 
 # ---------------------------------------------------------------------------
