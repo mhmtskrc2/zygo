@@ -1231,13 +1231,27 @@ mod tests {
             }
         }
 
+        /// Denied — and the denial says *why*, because that changes what a
+        /// caller does next.
+        ///
+        /// This used to assert `EPERM`. It is `ENOSYS` now, deliberately: a
+        /// libc that probes for a syscall added after this table was
+        /// generated falls back to the old way on `ENOSYS` and gives up on
+        /// `EPERM`, which is how `fchmodat2` broke `python3 -m venv` on a
+        /// 6.17 kernel. Both are refusals; only one is one the caller can
+        /// work around, and neither lets the syscall run.
         #[test]
-        fn an_unknown_syscall_number_is_denied() {
+        fn an_unknown_syscall_number_is_denied_as_not_existing() {
             let prog = program(SeccompProfile::Default).unwrap();
+            let verdict = evaluate(&prog, syscalls::AUDIT_ARCH, 9999, 0);
             assert_eq!(
-                evaluate(&prog, syscalls::AUDIT_ARCH, 9999, 0),
-                Verdict::Deny(libc::EPERM as u32),
+                verdict,
+                Verdict::Deny(libc::ENOSYS as u32),
                 "the allowlist must deny by default, including future syscalls"
+            );
+            assert!(
+                !matches!(verdict, Verdict::Allow),
+                "and it must never be allowed"
             );
         }
 
