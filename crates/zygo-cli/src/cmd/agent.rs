@@ -47,6 +47,16 @@ use crate::output::{self, Style};
 /// conformance failure against an agent that conforms.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The words every "it never answered" failure carries.
+///
+/// Once an agent misses a deadline the conversation is out of step: its late
+/// reply arrives during the *next* exchange, and every check after that is
+/// answering the wrong question. A run on a loaded Raspberry Pi reported the
+/// `sh` agent as non-conforming twice for that reason, when the real finding
+/// was one slow reply. So the runner stops at the first one, and this phrase
+/// is how it knows.
+const STALLED: &str = "stopped answering";
+
 /// How long to wait, after `FORKED`, for a `DONE` that must *not* arrive.
 ///
 /// The child is required to do nothing until `GO`. Long enough that a child
@@ -60,6 +70,9 @@ struct Report {
     passed: u32,
     failed: u32,
     json: bool,
+    /// Set once the agent has missed a deadline. Everything after that is
+    /// answering the previous question, so the run stops.
+    stalled: bool,
     results: Vec<(String, bool, String)>,
 }
 
@@ -70,6 +83,7 @@ impl Report {
             passed: 0,
             failed: 0,
             json,
+            stalled: false,
             results: Vec::new(),
         }
     }
@@ -93,11 +107,28 @@ impl Report {
 
     fn bad(&mut self, what: impl Into<String>, detail: impl Into<String>) {
         let (what, detail) = (what.into(), detail.into());
+        self.stalled |= detail.contains(STALLED);
         self.failed += 1;
         if !self.json {
             println!("  {} {what} — {detail}", self.style.red("FAIL"));
         }
         self.results.push((what, false, detail));
+    }
+
+    /// A check that was not run, and why.
+    ///
+    /// Counted as neither passed nor failed: it is not a result. A suite that
+    /// scored these as failures would report an agent as non-conforming on
+    /// the strength of one slow reply.
+    fn skipped(&mut self, what: &str) {
+        if !self.json {
+            println!(
+                "  {} {what} — {}",
+                self.style.yellow("SKIP"),
+                self.style
+                    .dim("not asked: the agent is no longer in step with this suite")
+            );
+        }
     }
 
     /// Record one check from a `Result`, so a failed step reads the same as a
@@ -213,7 +244,7 @@ impl Agent {
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
-                anyhow::bail!("the agent sent nothing for {REPLY_TIMEOUT:?}")
+                anyhow::bail!("the agent {STALLED}: nothing at all for {REPLY_TIMEOUT:?}")
             }
             Err(e) => Err(e.into()),
         }
@@ -237,7 +268,7 @@ impl Agent {
             }
             anyhow::ensure!(
                 Instant::now() < deadline,
-                "no {what} arrived within {REPLY_TIMEOUT:?}"
+                "the agent {STALLED}: no {what} within {REPLY_TIMEOUT:?}"
             );
         }
     }
@@ -321,41 +352,55 @@ pub fn test(cli: &Cli, binary: &Path, args: &[String]) -> anyhow::Result<u8> {
         return finish(cli, report);
     }
 
+    // Stop at the first missed deadline. `?` would be wrong here — the checks
+    // already run are a result and should be printed — so each step asks
+    // whether the conversation is still in step before adding to a tally that
+    // would otherwise count the same slow reply several times.
+    macro_rules! step {
+        ($what:expr, $check:expr) => {
+            if report.stalled {
+                report.skipped($what);
+            } else {
+                report.check($what, $check);
+            }
+        };
+    }
+
     // 2. Liveness.
-    report.check(
+    step!(
         "PING is answered by PONG with the same seq",
-        ping_check(&mut agent),
+        ping_check(&mut agent)
     );
 
     // 3–6. The request handshake, which is most of the protocol.
-    report.check(
+    step!(
         "EXEC is answered by FORKED naming a process that is not the agent",
-        forked_check(&mut agent),
+        forked_check(&mut agent)
     );
-    report.check("the child does nothing until GO", go_check(&mut agent));
-    report.check(
+    step!("the child does nothing until GO", go_check(&mut agent));
+    step!(
         "the event reaches the handler and its result comes back",
-        result_check(&mut agent),
+        result_check(&mut agent)
     );
-    report.check(
+    step!(
         "stdout and stderr come back in separate fields",
-        streams_check(&mut agent),
+        streams_check(&mut agent)
     );
 
     // 7. No silent loss, with more than one request outstanding.
-    report.check(
+    step!(
         "two requests in flight are both answered, with their own ids",
-        concurrency_check(&mut agent),
+        concurrency_check(&mut agent)
     );
 
     // 8. A protocol error is reported rather than fatal.
-    report.check(
+    step!(
         "a frame that is not a message is an ERROR, not a crash",
-        bad_message_check(&mut agent),
+        bad_message_check(&mut agent)
     );
 
     // 9. Shutdown. Last, because it ends the agent.
-    report.check("SHUTDOWN makes the agent exit", shutdown_check(&mut agent));
+    step!("SHUTDOWN makes the agent exit", shutdown_check(&mut agent));
 
     finish(cli, report)
 }
@@ -539,7 +584,7 @@ fn concurrency_check(agent: &mut Agent) -> anyhow::Result<String> {
     while answered.len() < 2 {
         anyhow::ensure!(
             Instant::now() < deadline,
-            "only {} of 2 requests were answered within {REPLY_TIMEOUT:?}",
+            "the agent {STALLED}: {} of 2 requests answered within {REPLY_TIMEOUT:?}",
             answered.len()
         );
         match agent.recv()? {
@@ -638,5 +683,25 @@ fn one_request(agent: &mut Agent, id: &str, event: serde_json::Value) -> anyhow:
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Every "it never answered" failure has to carry the phrase, or the suite
+    // carries on asking questions the agent is no longer in step to answer.
+    #[test]
+    fn a_missed_deadline_stops_the_run_and_a_wrong_answer_does_not() {
+        let mut report = Report::new(true);
+        report.bad("a check", "the agent said Pong when Forked was due");
+        assert!(!report.stalled, "a wrong answer is still an answer");
+
+        report.bad(
+            "another",
+            format!("the agent {STALLED}: nothing at all for 30s"),
+        );
+        assert!(report.stalled);
     }
 }
