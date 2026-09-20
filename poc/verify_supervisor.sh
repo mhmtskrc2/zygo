@@ -232,6 +232,46 @@ fi
 "$ZYGO" stop jam >/dev/null 2>&1
 
 say ""
+say "the live table"
+
+# `zygo top` exists beside `ps` for one reason: a rate needs two samples and
+# `ps` takes one. So the thing worth checking is that a single frame refuses
+# to invent one.
+out=$("$ZYGO" top --once 2>&1)
+case $out in
+    *"REQ/S"*) ok "\`top --once\` prints a frame with the columns \`ps\` cannot have" ;;
+    *) bad "top --once: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-160)" ;;
+esac
+case $out in
+    *"a rate needs two samples"*) ok "and the first frame says why its rate is blank" ;;
+    *) bad "the first frame does not explain the missing rate: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-160)" ;;
+esac
+
+# A rate from two real samples. Forty requests inside a two-second interval
+# is twenty a second, and the check allows a wide band because the client
+# start-up is inside the window.
+"$ZYGO" top --interval 2 >/tmp/top-frames.txt 2>&1 &
+topper=$!
+sleep 1
+n=0
+while [ "$n" -lt 40 ]; do
+    "$ZYGO" exec double '{"n": 1}' >/dev/null 2>&1
+    n=$((n + 1))
+done
+sleep 3
+kill "$topper" 2>/dev/null
+# The field after `MB`, not a column number: the RSS value contains a space,
+# so counting fields read `MB` as the rate and reported it as a failure.
+rate=$(grep -E '^double ' /tmp/top-frames.txt | sed -n '2p' |
+    awk '{ for (i = 1; i <= NF; i++) if ($i == "MB") { print $(i + 1); exit } }')
+rate_int=$(printf '%s' "${rate:-0}" | awk '{printf "%d", $1}')
+if [ "${rate_int:-0}" -ge 5 ]; then
+    ok "a second frame reports a real rate (${rate} req/s for 40 requests in 2 s)"
+else
+    bad "the rate column read ${rate:-nothing}; two samples should have produced one"
+fi
+
+say ""
 say "the zygote stays clean"
 
 # Copy-on-write is the whole economy of the warm path: a request is a fork,

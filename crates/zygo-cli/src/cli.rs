@@ -87,8 +87,16 @@ pub enum Command {
     #[command(subcommand, hide = true)]
     Supervisor(SupervisorCommand),
 
-    /// Live resource table.
-    Top,
+    /// Live resource table: `ps` on a timer, plus the rate columns a single
+    /// sample cannot have.
+    Top {
+        /// Seconds between frames.
+        #[arg(short, long, default_value_t = 2.0)]
+        interval: f64,
+        /// Print one frame and exit, for scripts.
+        #[arg(long)]
+        once: bool,
+    },
 
     /// Metric summary.
     Stats { name: Option<String> },

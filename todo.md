@@ -39,12 +39,12 @@ live here.
 | `seccomp = "strict"` | **Works** — all five reference packages, after `clone3` → `ENOSYS` and the socket data calls were kept (3.0g) |
 | `zygo login` | **Works** — verified against the registry before it is stored, `auth.json` at 0600, Docker's file read and never written |
 | `zygo stats` | **Works** — counters since the warm-up beside latencies over the log window, with the two labelled apart; no `p99` under a hundred samples |
-| `zygo top` | Declared; it exits saying which phase brings it |
+| `zygo top` | **Works** — `ps` on a timer plus the rate columns one sample cannot have; the first frame says `—` rather than inventing a zero |
 
-Test status: **566 Rust tests on Linux** (473 on macOS) + 34 Python +
-**293 Linux integration / escape / supervisor / backend / example / registry
+Test status: **570 Rust tests on Linux** (477 on macOS) + 34 Python +
+**296 Linux integration / escape / supervisor / backend / example / registry
 checks** + **14 macOS shim checks**
-(36 launcher, 16 escape vectors, 13 syscall-sweep, 19 gvisor, 154 supervisor,
+(36 launcher, 16 escape vectors, 13 syscall-sweep, 19 gvisor, 157 supervisor,
 12 examples, 15 registry credentials, 10 seccomp-matrix cells, 9 Python and
 9 Node conformance),
 `clippy -D warnings`.
@@ -1072,7 +1072,9 @@ exactly this reason.
       list`, `images`, `ps`, `stop`, `serve`, `exec`, `up`, `down`, `spec
       validate`/`explain`, `pull`, `bench`, `agent test`, `logs`. Not on `api`
       (a server), `shell` (a terminal) or `completion` (a script), where it
-      would mean nothing. `top` does not exist; `stats` does — see below
+      would mean nothing. Not on `top` either, whose `--json` prints one
+      frame and exits — a stream of frames is a different thing and `--once`
+      is the scriptable form
 
 - [x] **`zygo stats [name]`.** Counters and latencies are different windows
       and the table says which is which: `requests`/`failures` are counted
@@ -1091,6 +1093,20 @@ exactly this reason.
       logged `0` too: nothing was timing them at all. Both now record what
       the supervisor's own clock saw, and two checks in
       `poc/verify_supervisor.sh` hold them there.
+
+- [x] **`zygo top`.** What justifies it beside `ps` is the pair of columns a
+      single sample cannot have: a rate needs two. So the first frame prints
+      `—` and says why, rather than a zero that would be a measurement. The
+      rate is over the interval that actually elapsed, not the one asked for,
+      because on a loaded machine those differ and dividing by the request
+      would overstate every figure. A counter that goes backwards — a
+      restarted supervisor — saturates to zero instead of becoming an enormous
+      rate. Measured in the suite: 40 requests inside a 2 s interval read as
+      **19.9 req/s**.
+
+      Every command the CLI declares is now built. The `pending()` helper that
+      answered "not implemented yet (todo.md, phase N)" has no callers left
+      and is gone.
 
 #### 3.0a Two bugs `zygo up` found — the first time functions shared an image
 

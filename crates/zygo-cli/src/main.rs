@@ -104,7 +104,7 @@ fn run(cli: &Cli) -> anyhow::Result<u8> {
         } => cmd::logs::run(cli, name, *follow, *tail, *failed),
         Command::Stop { name, all } => cmd::supervisor::stop(cli, name.as_deref(), *all),
         Command::Supervisor(command) => cmd::supervisor::supervisor(cli, command),
-        Command::Top => pending("zygo top", "3"),
+        Command::Top { interval, once } => cmd::top::run(cli, *interval, *once),
         Command::Stats { name } => cmd::stats::run(cli, name.as_deref()),
         Command::Api(args) => cmd::api::run(cli, args),
         Command::Up { file, relock } => cmd::supervisor::up(cli, file.path(), *relock),
@@ -119,15 +119,6 @@ fn run(cli: &Cli) -> anyhow::Result<u8> {
         }
         Command::Shell { name, command } => cmd::shell::run(cli, name, command),
     }
-}
-
-/// A command that is designed but not built yet. Points at the plan rather than
-/// pretending the feature does not exist.
-fn pending(what: &str, phase: &str) -> anyhow::Result<u8> {
-    anyhow::bail!(
-        "{what} is not implemented yet (todo.md, phase {phase})\n  \
-         → available today: zygo doctor, pull, images, run --dry-run, spec"
-    )
 }
 
 fn init_tracing(verbose: u8, json: bool) {
