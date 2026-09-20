@@ -250,6 +250,17 @@ pub const BASE_ALLOWLIST: &[&str] = &[
     "fcntl",
     "fdatasync",
     "flock",
+    // x86 only, and that is the whole reason they were missing. musl's
+    // `fork()` uses `SYS_fork` where the architecture has one and falls back
+    // to `clone(SIGCHLD)` where it does not — so on aarch64, where there is
+    // no `fork` syscall at all, the allowlist never needed an entry and
+    // nobody noticed there was none. On x86_64 every musl image in a Zygo
+    // sandbox got `can't fork: Operation not permitted` from its shell.
+    //
+    // Safe by construction: neither can create a namespace, which is the only
+    // thing the `clone` flags check exists to refuse. `vfork` for the same
+    // reason — it is what `posix_spawn` reaches for.
+    "fork",
     "fstat",
     "fstatfs",
     "fsync",
@@ -395,6 +406,7 @@ pub const BASE_ALLOWLIST: &[&str] = &[
     "unlink",
     "unlinkat",
     "utimensat",
+    "vfork",
     "wait4",
     "waitid",
     "write",
@@ -792,6 +804,35 @@ pub unsafe fn install(prog: &[SockFilter]) -> Result<(), std::io::Error> {
 
 #[cfg(test)]
 mod tests {
+    /// Sorted, and every name known to *some* architecture.
+    ///
+    /// Sortedness is not cosmetic here: it is how a reader finds out whether
+    /// a syscall is allowed, and `fork` went missing for exactly as long as
+    /// nobody could look it up.
+    #[test]
+    fn the_allowlist_is_sorted() {
+        let mut sorted = BASE_ALLOWLIST.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(BASE_ALLOWLIST, sorted.as_slice());
+    }
+
+    /// The bug this pair fixes: musl's `fork()` uses `SYS_fork` where the
+    /// architecture has one, and `clone(SIGCHLD)` where it does not. aarch64
+    /// has no `fork` syscall, so its absence from the allowlist cost nothing
+    /// and was invisible; on x86_64 every musl image in a sandbox got
+    /// `can't fork: Operation not permitted` from its shell.
+    #[test]
+    fn a_process_can_fork_however_its_libc_spells_it() {
+        for name in ["fork", "vfork", "clone"] {
+            let known_here = crate::backend::ns::syscalls::number(name).is_some();
+            let allowed = BASE_ALLOWLIST.contains(&name) || SPECIAL_CASED.contains(&name);
+            assert!(
+                allowed || !known_here,
+                "`{name}` exists on this architecture and nothing allows it"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

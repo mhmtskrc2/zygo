@@ -65,29 +65,6 @@ out=$(echo "piped in" | zygo run "$IMAGE" /bin/cat 2>/dev/null)
 
 say ""
 
-# Temporary diagnostic. CI reports `can't fork: Operation not permitted` from
-# every sandbox on an x86_64 runner, and the same probe run outside this
-# harness forks fine — so it has to be asked from in here, where the cgroup
-# and the limits are the ones the suite applies. `python` needs no fork to
-# start, so it can call `fork` itself and name the errno.
-cat > /tmp/forkprobe.py <<'PYEOF'
-import errno
-import os
-import resource
-
-print("uid", os.getuid(), "nproc-rlimit", resource.getrlimit(resource.RLIMIT_NPROC), end=" ")
-try:
-    pid = os.fork()
-    if pid == 0:
-        os._exit(0)
-    os.waitpid(pid, 0)
-    print("fork ok")
-except OSError as e:
-    print("fork failed:", errno.errorcode.get(e.errno, e.errno), e.strerror)
-PYEOF
-zygo pull python:3.12-slim >/dev/null 2>&1
-say "  note  $(zygo run --mount /tmp/forkprobe.py:/t.py:ro python:3.12-slim python3 /t.py 2>&1 | tr '\n' ' ' | cut -c1-200)"
-
 # --- the boundary -----------------------------------------------------------
 
 out=$(sb 'ls /proc | grep -c "^[0-9]*$"')

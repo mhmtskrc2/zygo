@@ -137,42 +137,6 @@ jobs:
 
       - run: cargo build --release
 
-      # Temporary. The sandbox is confined exactly as intended — seccomp
-      # mode 2, one filter, no capabilities, `no_new_privs` — and the fork
-      # still fails. `python` as the sandbox's own program needs no fork to
-      # start, so it can ask the kernel and report the errno by number, which
-      # is the one fact that separates seccomp from a resource limit.
-      - name: Which errno the fork gets (diagnostic)
-        if: ${{ !cancelled() }}
-        run: |
-          . poc/ci_cgroup.sh
-          Z=target/release/zygo
-          $Z pull python:3.12-slim >/dev/null 2>&1 || true
-          cat > /tmp/forktest.py <<'PYEOF'
-          import ctypes, errno, os
-          print("uid", os.getuid(), "euid", os.geteuid())
-          try:
-              pid = os.fork()
-              if pid == 0:
-                  os._exit(0)
-              os.waitpid(pid, 0)
-              print("fork: ok")
-          except OSError as e:
-              print("fork:", e.errno, errno.errorcode.get(e.errno), e.strerror)
-          libc = ctypes.CDLL("libc.so.6", use_errno=True)
-          for name, flags in (("clone SIGCHLD", 17), ("clone 0", 0)):
-              ctypes.set_errno(0)
-              rc = libc.syscall(56, flags, 0, 0, 0, 0)
-              if rc == 0:
-                  os._exit(0)
-              print(name, "->", rc, errno.errorcode.get(ctypes.get_errno(), "?"))
-          PYEOF
-          echo "this shell is in: $(sed -n 's/^0:://p' /proc/self/cgroup | head -1)"
-          $Z run --mount /tmp/forktest.py:/t.py:ro python:3.12-slim python3 /t.py 2>&1 | head -12
-        env:
-          ZYGO_DATA_HOME: /tmp/zygo-diag
-          SRC: ${{ github.workspace }}
-
       # The scripts default to `/src`, which is where `make` mounts the
       # checkout inside its containers; here the checkout is the workspace.
       - name: Isolation and limits
