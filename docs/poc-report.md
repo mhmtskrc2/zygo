@@ -2149,6 +2149,39 @@ product defect hides it exactly as well as no test at all.
 `ensure` now moves Zygo's *own* processes out of the parent first, matched by
 `/proc/<pid>/exe` so nobody else's are touched.
 
+### A third: a supervisor that answers `ping` and serves nothing, ever
+
+Found on the Raspberry Pi with a stopwatch, because the symptom is silence.
+`zygo serve` sat for fourteen minutes on a reply that was never coming, while
+the supervisor it was talking to answered `supervisor status` and looked
+perfectly healthy.
+
+The launcher thread was in `waitpid`, with no deadline, on a child it had
+already killed. Except it had not: `kill_tree` wrote to `cgroup.kill` and, if
+that write succeeded, sent no signal at all — and the write succeeds on an
+*empty* cgroup, which is what a sandbox that failed before it was attached to
+one leaves behind. So the signal went nowhere, the child stayed, and the one
+thread that starts sandboxes stopped starting them. Every later `serve`
+queued behind it.
+
+```
+zygo-launcher   do_wait                      ← the whole supervisor, here
+zygo-linux-mus  futex_wait_queue             ← the serve, queued behind it
+74309           supervisor run, 14:18 alive  ← the child it thinks is dead
+```
+
+Both halves are fixed: the cgroup write and the signal are now *both* sent,
+which is free and always safe because an unreaped child's pid is still ours;
+and the wait has ten seconds, one more `SIGKILL` halfway through, and then
+gives up with an error naming the pid. Giving up leaks a process. Parking the
+launcher leaks the supervisor, and says nothing while it does it.
+
+Worth noting where the bound already existed and where it did not. The pipe
+read that waits for the child's own failure report had been bounded earlier,
+after a different wedge on the same machine. The `waitpid` three lines later
+had not — the search had stopped at the first unbounded wait rather than at
+the last.
+
 ### AppArmor, and a check that read a setting
 
 Ubuntu 24.04 ships `kernel.apparmor_restrict_unprivileged_userns=1`. An
