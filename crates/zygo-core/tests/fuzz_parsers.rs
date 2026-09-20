@@ -10,6 +10,9 @@
 //! A coverage-guided `cargo-fuzz` target still belongs in the plan; this closes
 //! the "must never panic" hole today.
 
+use zygo_core::image::auth::CredentialStore;
+use zygo_core::image::media::{Index, Manifest};
+use zygo_core::lock::LockFile;
 use zygo_core::protocol::{Message, decode, encode};
 use zygo_core::spec::Spec;
 
@@ -333,5 +336,101 @@ fn scalar_parsing_never_panics() {
             let _ = text.parse::<AllowRule>();
         });
         assert!(result.is_ok(), "seed {seed} panicked on `{text}`");
+    }
+}
+
+/// An OCI index or manifest comes from a **registry**, which is the most
+/// remote input this program has: a hostile or merely broken one can answer
+/// anything at all to a pull. `serde` refusing it is the expected outcome; a
+/// panic on the way to refusing it would be a denial of service reachable by
+/// anyone who can make Zygo pull from a host they control.
+#[test]
+fn registry_documents_never_panic_on_arbitrary_bytes() {
+    let mut rng = Rng(0x0C13_D1A5_EED0);
+    for _ in 0..8_000 {
+        let len = rng.below(256);
+        let bytes: Vec<u8> = (0..len).map(|_| rng.byte()).collect();
+        let text = String::from_utf8_lossy(&bytes);
+        let _ = serde_json::from_str::<Index>(&text);
+        let _ = serde_json::from_str::<Manifest>(&text);
+    }
+}
+
+/// The same documents, but shaped like the real thing and then damaged: pure
+/// noise is refused by the first byte and never reaches the fields, so it
+/// exercises the outside of the parser and none of the inside.
+#[test]
+fn registry_documents_never_panic_when_a_plausible_one_is_damaged() {
+    const SEED: &str = r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":7143,"platform":{"architecture":"arm64","os":"linux"}}]}"#;
+    let mut rng = Rng(0xD0C7_0FED);
+    for _ in 0..8_000 {
+        let mut bytes = SEED.as_bytes().to_vec();
+        for _ in 0..1 + rng.below(4) {
+            let at = rng.below(bytes.len());
+            bytes[at] = rng.byte();
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        let _ = serde_json::from_str::<Index>(&text);
+        let _ = serde_json::from_str::<Manifest>(&text);
+    }
+}
+
+/// `~/.docker/config.json` is a file a person edits, and Zygo reads it
+/// whether or not it makes sense. `parse` is written to return an empty store
+/// rather than fail, so the property is that it always returns *something* —
+/// including for input that is not JSON at all.
+#[test]
+fn docker_credentials_never_panic_and_always_return_a_store() {
+    let mut rng = Rng(0x00C0_FFEE_A417);
+    for _ in 0..8_000 {
+        let len = rng.below(200);
+        let bytes: Vec<u8> = (0..len).map(|_| rng.byte()).collect();
+        let store = CredentialStore::parse(&String::from_utf8_lossy(&bytes));
+        // Looking one up must work on whatever came back.
+        let _ = store.get("ghcr.io");
+    }
+
+    // And a plausible file with a damaged `auth` value, which is the field
+    // that gets base64-decoded and split on a colon.
+    const SEED: &str = r#"{"auths":{"ghcr.io":{"auth":"dXNlcjpwYXNz"},"docker.io":{"username":"u","password":"p"}}}"#;
+    for _ in 0..8_000 {
+        let mut bytes = SEED.as_bytes().to_vec();
+        for _ in 0..1 + rng.below(3) {
+            let at = rng.below(bytes.len());
+            bytes[at] = rng.byte();
+        }
+        let store = CredentialStore::parse(&String::from_utf8_lossy(&bytes));
+        let _ = store.get("ghcr.io");
+    }
+}
+
+/// `zygo.lock` sits in a repository, which means it is edited by hand, merged
+/// badly, and committed half-resolved. It is refused when it does not parse —
+/// the point here is only that refusing it is a `Result` and never a panic.
+#[test]
+fn the_lock_file_parser_never_panics() {
+    let mut rng = Rng(0x10CF_1125_EED0);
+    for _ in 0..8_000 {
+        let len = rng.below(200);
+        let bytes: Vec<u8> = (0..len).map(|_| rng.byte()).collect();
+        let _ = toml::from_str::<LockFile>(&String::from_utf8_lossy(&bytes));
+    }
+
+    // And a plausible file with a few bytes changed, which is what a bad
+    // merge produces.
+    const SEED: &str = r#"
+version = 1
+
+[fn.resize]
+image = "python:3.12-slim"
+digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+"#;
+    for _ in 0..8_000 {
+        let mut bytes = SEED.as_bytes().to_vec();
+        for _ in 0..1 + rng.below(4) {
+            let at = rng.below(bytes.len());
+            bytes[at] = rng.byte();
+        }
+        let _ = toml::from_str::<LockFile>(&String::from_utf8_lossy(&bytes));
     }
 }

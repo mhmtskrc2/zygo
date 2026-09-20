@@ -41,7 +41,7 @@ live here.
 | `zygo stats` | **Works** — counters since the warm-up beside latencies over the log window, with the two labelled apart; no `p99` under a hundred samples |
 | `zygo top` | **Works** — `ps` on a timer plus the rate columns one sample cannot have; the first frame says `—` rather than inventing a zero |
 
-Test status: **570 Rust tests on Linux** (477 on macOS) + 34 Python +
+Test status: **574 Rust tests on Linux** (481 on macOS) + 34 Python +
 **296 Linux integration / escape / supervisor / backend / example / registry
 checks** + **14 macOS shim checks**
 (36 launcher, 16 escape vectors, 13 syscall-sweep, 19 gvisor, 157 supervisor,
@@ -310,8 +310,18 @@ equivalent of `docker run`".
       argument for, would buy back a fifth of a cost that is already off the
       warm path. Not worth handing live namespaces between tenants for.
 - [x] Fuzzing: spec parser, resolution, protocol decoding, framing, image
-      references and scalar types — 9 tests, ~25k generated inputs, reproducible
-      from a seed (`crates/zygo-core/tests/fuzz_parsers.rs`). No panics found
+      references, scalar types, **registry manifests and indexes, Docker's
+      `config.json` and `zygo.lock`** — 13 tests, ~65k generated inputs,
+      reproducible from a seed (`crates/zygo-core/tests/fuzz_parsers.rs`). No
+      panics found.
+
+      The three added last are the surfaces that arrived after the first pass
+      and are the most exposed of the lot: an OCI index or manifest is the
+      most *remote* input this program has, answered by whatever registry it
+      was pointed at; `config.json` and `zygo.lock` are files people edit and
+      merge by hand. Each is swept twice — with noise, and with a plausible
+      document damaged in a few bytes, because pure noise is refused at the
+      first byte and never reaches the fields
 - [ ] A coverage-guided `cargo-fuzz` target (needs nightly)
 - [x] Static musl binary: **4.5 MB**, zero dynamic dependencies (N6).
       `make dist-linux` checks both the staticness and the budget; it is in CI too
