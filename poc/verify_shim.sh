@@ -188,10 +188,25 @@ say ""
 say "cleaning up"
 
 "$ZYGO" stop --all >/dev/null 2>&1
+
+# "Stop everything" includes the machine it was all running in. Read from
+# `limactl` rather than from Zygo, because Zygo saying it stopped the VM is
+# the claim under test.
+state=$(limactl list --format '{{.Status}}' zygo 2>/dev/null | head -1)
+if [ "$state" = Running ]; then
+    bad "the VM is still running after \`stop --all\`; an idle Mac is holding one"
+else
+    ok "\`stop --all\` stops the VM too — it is $state"
+fi
+
+# And now the strong version of "nothing survived": the next command brings
+# the VM back from a full stop, and the function must not be in it.
+started=$(now_ms)
 out=$("$ZYGO" ps 2>&1)
+back=$((($(now_ms) - started) / 1000))
 case $out in
-    *shimcheck*) bad "the function outlived \`stop --all\`" ;;
-    *) ok "\`stop --all\` reaches into the VM and stops everything" ;;
+    *shimcheck*) bad "the function came back with the VM" ;;
+    *) ok "the next command restarts the VM (${back}s) and the function is not in it" ;;
 esac
 
 cd / || exit 1

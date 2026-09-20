@@ -306,7 +306,7 @@ make verify-supervisor-linux  # 151 end-to-end supervisor lifecycle checks
 make escape-linux   # 16 escape attempts against a real kernel
 make fuzz-linux     # every syscall number, against all three seccomp profiles
 make gvisor-linux   # the gvisor backend against a real runsc, compared with ns
-make verify-shim    # 13 macOS checks, against the Linux VM the shim manages
+make verify-shim    # 14 macOS checks, against the Linux VM the shim manages
 make dist-linux     # the static musl binary, checked against N6
 make lint
 ```
@@ -341,7 +341,7 @@ appendix C. `zygo doctor` reports each one and prints the fix.
 On macOS the code builds, the platform-independent layers are fully tested, and
 sandboxes run in a Linux VM the shim manages — `zygo doctor` prints what that
 VM says about itself and exits with its answer. A warm `exec` from the Mac
-round-trips in 96 ms; `make verify-shim` is 13 checks against a real VM.
+round-trips in 96 ms; `make verify-shim` is 14 checks against a real VM.
 
 One thing to know before running Zygo on Ubuntu 24.04 or later:
 `kernel.apparmor_restrict_unprivileged_userns=1` lets an unprivileged process

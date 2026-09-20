@@ -41,7 +41,7 @@ live here.
 
 Test status: **552 Rust tests on Linux** (462 on macOS) + 34 Python +
 **275 Linux integration / escape / supervisor / backend / example checks** +
-**13 macOS shim checks**
+**14 macOS shim checks**
 (36 launcher, 16 escape vectors, 13 syscall-sweep, 19 gvisor, 151 supervisor,
 12 examples, 10 seccomp-matrix cells, 9 Python and 9 Node conformance),
 `clippy -D warnings`.
@@ -1671,7 +1671,12 @@ every backend, so the fallback now happens in the bundle.
 - [x] **Command forwarding**, over Lima's ssh rather than vsock. `ps`, `serve`,
       `exec`, `run`, `stop` all work from the Mac; stdin crosses, and an exit
       status of 7 arrives as 7.
-- [ ] Keeping the VM in the background and shutting it down when idle
+- [x] **The VM goes when the user says they are finished.** `zygo stop
+      --all` means everything, and that includes the machine Zygo started to
+      do it in — verified by asking `limactl`, not by believing Zygo. Not an
+      idle *timer*: noticing idleness needs something running to notice it,
+      and on macOS that is a launchd agent Zygo does not install. The next
+      command brings the VM back in 15 s with nothing in it.
 - [ ] An optional Apple container runtime backend on Apple Silicon (research)
 - [ ] CI: an end-to-end test on a macOS runner — **blocked**: GitHub's hosted
       macOS runners are themselves VMs and offer no nested virtualization, so
@@ -1683,7 +1688,7 @@ every backend, so the fallback now happens in the bundle.
 with the VM up, against a target of 100 ms — the ssh hop is 46 ms of it, and
 vsock is where that goes if it matters. `serve` warms in **104 ms** and a warm
 `exec` round-trips in **96 ms**, which is the Linux number plus the hop.
-`make verify-shim` is 13 checks, all passing.
+`make verify-shim` is 14 checks, all passing.
 
 Two product bugs came out of running Zygo somewhere that was neither a
 container nor a test harness, and both would have stopped a first-time user on

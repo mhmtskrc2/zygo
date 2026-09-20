@@ -301,10 +301,52 @@ pub fn forward(cli: &Cli) -> anyhow::Result<Option<u8>> {
         .status()
         .with_context(|| format!("could not run {}", limactl.display()))?;
 
+    // "Stop everything" includes the machine Zygo started to do it in. A VM
+    // holding no warm functions is four gigabytes of a laptop doing nothing,
+    // and the user did not ask for a VM in the first place — they asked for a
+    // sandbox, and they have just said they are finished with it.
+    //
+    // Only on success, and only for `--all`: `stop <name>` leaves the others
+    // running and so leaves the VM, and stopping it after a failed teardown
+    // would hide whatever did not stop.
+    if status.success() && stops_everything(&cli.command) {
+        stop_vm(&limactl);
+    }
+
     // A signal is not an exit code. `limactl` relays the inner status where
     // it can; where the child died on a signal there is none to relay, and
     // 128 + n is what every shell reports.
     Ok(Some(exit_status(&status)))
+}
+
+/// Whether this command means the user is finished with the VM.
+///
+/// Not an idle timer: that needs something running to notice the idleness, and
+/// the only way to have one on macOS is a launchd agent, which Zygo does not
+/// install. `stop --all` is the moment the user says so out loud, and acting
+/// on it costs them nothing they did not ask for — the next command starts the
+/// VM again, as the first one did.
+pub fn stops_everything(command: &Command) -> bool {
+    matches!(command, Command::Stop { all: true, .. })
+}
+
+/// `limactl stop zygo`, best effort.
+///
+/// Best effort on purpose: the command the user typed has already succeeded
+/// and its exit status is theirs. A VM that will not stop is worth a line in
+/// the log, not a failure on a teardown that worked.
+#[cfg(target_os = "macos")]
+fn stop_vm(limactl: &Path) {
+    match std::process::Command::new(limactl)
+        .args(["stop", INSTANCE])
+        .status()
+    {
+        Ok(status) if status.success() => {
+            tracing::debug!("the Linux VM is stopped; the next command starts it again");
+        }
+        Ok(status) => tracing::warn!("the Linux VM did not stop ({status})"),
+        Err(e) => tracing::warn!("could not stop the Linux VM: {e}"),
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -611,6 +653,15 @@ mod tests {
         let target = install.iter().position(|a| a == GUEST_BIN).unwrap();
         assert!(stage < target, "{install:?}");
         assert!(install.contains(&"0755".to_string()));
+    }
+
+    #[test]
+    fn only_stopping_everything_stops_the_machine_too() {
+        assert!(stops_everything(&command_of(&["zygo", "stop", "--all"])));
+        // One function stopping leaves the others running, and them the VM.
+        assert!(!stops_everything(&command_of(&["zygo", "stop", "f"])));
+        assert!(!stops_everything(&command_of(&["zygo", "ps"])));
+        assert!(!stops_everything(&command_of(&["zygo", "down"])));
     }
 
     #[test]

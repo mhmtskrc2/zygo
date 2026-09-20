@@ -2104,7 +2104,7 @@ the user.
 | warm `zygo exec`, round trip from the Mac | 96 ms |
 
 The 17 ms over target is the ssh hop; vsock is where that goes if it matters.
-`make verify-shim` is 13 checks against a real VM — a Linux kernel answers,
+`make verify-shim` is 14 checks against a real VM — a Linux kernel answers,
 stdin crosses, an exit status of 7 arrives as 7, a handler in the current
 directory is found, and `ps` lists a function running inside.
 
