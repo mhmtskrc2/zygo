@@ -210,7 +210,12 @@ jobs:
         run: |
           . poc/ci_cgroup.sh
           install -m 0755 target/release/zygo poc/zygo-linux
-          sudo apt-get install -y --no-install-recommends passt nftables iproute2 jq >/dev/null
+          # Not fatal: `passt` is not packaged before Ubuntu 23.04, and the
+          # suite has a prerequisite check that skips the egress section and
+          # says so. A failed `apt-get` here ended the whole step instead,
+          # with exit 100 and no result at all.
+          sudo apt-get install -y --no-install-recommends passt nftables iproute2 jq >/dev/null || \
+            echo "::warning::some egress packages are unavailable here; the suite will skip that section"
           sh poc/verify_supervisor.sh
         env:
           SRC: ${{ github.workspace }}

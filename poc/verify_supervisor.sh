@@ -867,10 +867,19 @@ field() { printf '%s' "$1" | sed -n "s/.*\"$2\":\"\([^\"]*\)\".*/\1/p"; }
 # One JSON number field.
 num() { printf '%s' "$1" | sed -n "s/.*\"$2\":\([0-9.]*\).*/\1/p"; }
 # How many `pasta` processes are running right now.
+# How many `pasta` processes are running right now.
+#
+# Matched by prefix, not equality: `passt` ships CPU-tuned builds and
+# `/usr/bin/pasta` is a symlink to one of them, so `comm` reads `pasta.avx2`
+# on an x86_64 runner with AVX2 and `pasta` on aarch64. Asking for equality
+# found none of them and reported "expected a pasta per networked sandbox,
+# found 0" on a host where four were serving.
 pastas() {
     n=0
     for c in /proc/[0-9]*/comm; do
-        [ "$(cat "$c" 2>/dev/null)" = pasta ] && n=$((n+1))
+        case "$(cat "$c" 2>/dev/null)" in
+            pasta | pasta.*) n=$((n + 1)) ;;
+        esac
     done
     printf '%s' "$n"
 }
