@@ -1,0 +1,24 @@
+# A webhook receiver: one warm function behind the HTTP API.
+#
+#   export WEBHOOK_SECRET=…           # read by `up` from *this* shell
+#   zygo up
+#   ZYGO_API_TOKEN=… zygo api         # 127.0.0.1:7700 by default
+#   curl -H "Authorization: Bearer $ZYGO_API_TOKEN" \
+#        -d '{"payload": {"kind": "order", "items": [1, 2]}}' \
+#        http://127.0.0.1:7700/fn/webhook
+
+[defaults]
+image = "python:3.12-slim"
+
+[fn.webhook]
+entry       = "handler.py"
+secrets     = ["WEBHOOK_SECRET"]     # /run/secrets/WEBHOOK_SECRET, per request
+mem         = "128M"
+timeout     = "5s"
+concurrency = 8
+# No network: a webhook *receives*. A handler that has to call out gets
+# `network = "egress"` and an `allow` list, nothing wider.
+
+[api]
+listen = "127.0.0.1:7700"
+auth   = "bearer"

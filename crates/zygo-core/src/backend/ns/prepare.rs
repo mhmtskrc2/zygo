@@ -49,6 +49,15 @@ pub enum Step {
     InstallSeccomp = 23,
     ParentDied = 24,
     Execve = 25,
+    /// Warm-exec: the helper could not enter the sandbox's namespaces.
+    Setns = 27,
+    /// Warm-exec: the request process could not enter the mount namespace.
+    EnterMountNamespace = 28,
+    /// Warm-exec: wiring the request's pipes onto stdin/stdout/stderr.
+    WireStdio = 29,
+    /// The sandbox could not create `/run/secrets` or hand its descriptor
+    /// back. See `child::hand_out_secrets_dir`.
+    HandOutSecretsDir = 30,
 }
 
 impl Step {
@@ -81,6 +90,10 @@ impl Step {
             23 => InstallSeccomp,
             24 => ParentDied,
             25 => Execve,
+            27 => Setns,
+            28 => EnterMountNamespace,
+            29 => WireStdio,
+            30 => HandOutSecretsDir,
             _ => return None,
         })
     }
@@ -115,6 +128,10 @@ impl Step {
             InstallSeccomp => "installing the seccomp filter",
             ParentDied => "the launcher exited while the sandbox was starting",
             Execve => "executing the sandboxed program",
+            Setns => "entering the sandbox's namespaces for a warm-exec request",
+            EnterMountNamespace => "entering the sandbox's mount namespace",
+            WireStdio => "wiring the request's pipes to stdin, stdout and stderr",
+            HandOutSecretsDir => "creating /run/secrets and handing its descriptor back",
         }
     }
 
@@ -159,10 +176,12 @@ pub enum PreparedOp {
         target: CString,
         options: CString,
     },
-    /// Read-only recursive bind of a flattened rootfs.
+    /// Recursive bind of a flattened rootfs, remounted read-only unless the
+    /// config asked for a writable root (the derived-layer builder only).
     BindRoot {
         source: CString,
         target: CString,
+        readonly: bool,
     },
     Tmpfs {
         target: CString,
@@ -224,6 +243,17 @@ pub struct PreparedLaunch {
     /// The runtime agent's connected socket, to be placed at `AGENT_FD`.
     pub agent_fd: Option<std::os::fd::RawFd>,
 
+    /// A socket to send `/run/secrets`'s descriptor back on, for a held
+    /// sandbox.
+    ///
+    /// The supervisor cannot reach that directory by path: `/proc/<pid>/root`
+    /// is traversable only while the process is dumpable, and writing the id
+    /// map cleared that for everything in this sandbox before the mounts even
+    /// began. So the child opens it and hands it out while it still can.
+    pub secrets_fd: Option<std::os::fd::RawFd>,
+    /// Hold the sandbox open instead of running the program (warm-exec).
+    pub hold: bool,
+
     /// Absolute paths to try, in order. More than one when the command had no
     /// `/` and has to be looked up along `PATH`.
     pub program_candidates: Vec<CString>,
@@ -233,6 +263,15 @@ pub struct PreparedLaunch {
     argv_ptrs: Vec<*const c_char>,
     envp_ptrs: Vec<*const c_char>,
 }
+
+// SAFETY: the raw pointers in `argv_ptrs` and `envp_ptrs` point into the heap
+// buffers of `_argv` and `_envp`, which the struct owns and never mutates
+// after construction. Moving the struct moves the `Vec` headers, not the
+// buffers, so the pointers stay valid; sharing it between threads shares only
+// reads. The supervisor keeps one per warm-exec function and uses it from
+// whichever thread a request arrives on.
+unsafe impl Send for PreparedLaunch {}
+unsafe impl Sync for PreparedLaunch {}
 
 impl PreparedLaunch {
     pub fn argv(&self) -> *const *const c_char {
@@ -311,6 +350,7 @@ pub fn prepare(config: &SandboxConfig) -> Result<PreparedLaunch, PrepareError> {
             MountOp::BindRoot { source, target } => PreparedOp::BindRoot {
                 source: cstr(source)?,
                 target: cstr(target)?,
+                readonly: !config.writable_root,
             },
 
             MountOp::Tmpfs {
@@ -406,10 +446,12 @@ pub fn prepare(config: &SandboxConfig) -> Result<PreparedLaunch, PrepareError> {
         seccomp: super::seccomp::program(config.seccomp)?,
         stdio: config.stdio,
         agent_fd: config.agent_fd,
+        secrets_fd: None,
+        hold: config.hold,
         landlock: super::landlock::build(
             super::landlock::abi_version(),
             &config.mounts,
-            config.network,
+            super::landlock::NetPolicy::of(config.network, &config.allow),
         ),
         program_candidates,
         _argv: argv,
@@ -437,7 +479,7 @@ fn mount_flags(abstract_flags: u64) -> u64 {
 }
 
 /// Docker's default `PATH`, used when the image config sets none.
-const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+use crate::sandbox::DEFAULT_PATH;
 
 /// Absolute paths to try for `program`, in order.
 ///

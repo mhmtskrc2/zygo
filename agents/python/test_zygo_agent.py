@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 
@@ -58,7 +59,9 @@ class Wire:
 class AgentHarness:
     """Start an agent against a handler and speak the protocol to it."""
 
-    def __init__(self, handler_source: str, mode: str = "function") -> None:
+    def __init__(
+        self, handler_source: str, mode: str = "function", env: dict | None = None
+    ) -> None:
         self._dir = tempfile.TemporaryDirectory()
         root = Path(self._dir.name)
 
@@ -74,6 +77,7 @@ class AgentHarness:
         self.proc = subprocess.Popen(
             [sys.executable, str(AGENT), str(self._sock_path), str(self.handler_path), mode],
             stderr=subprocess.PIPE,
+            env={**os.environ, **(env or {})},
         )
         conn, _ = self._listener.accept()
         self.wire = Wire(conn)
@@ -429,6 +433,242 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(first["type"], "ERROR")
         self.assertIn("defines no `handler`", first["message"])
 
+    def test_a_frame_that_is_not_json_is_reported_and_survived(self):
+        """Found by `zygo agent test`: this used to kill the agent.
+
+        The length prefix was honoured, so the stream is still sitting at a
+        frame boundary and the agent can say so and carry on. Dying here would
+        take every request in flight with it.
+        """
+        h = self.harness("def handler(event):\n    return event\n")
+        h.ready()
+
+        body = b"{ this is not json"
+        h.wire._conn.sendall(HEADER.pack(len(body)) + body)
+
+        reply = h.wire.recv()
+        self.assertEqual(reply["type"], "ERROR")
+        self.assertEqual(reply["code"], "bad_message")
+
+        # Still serving.
+        self.assertEqual(h.call({"n": 1})["result"], {"n": 1})
+
+    def test_a_frame_that_is_json_but_not_an_object_is_also_reported(self):
+        h = self.harness("def handler(event):\n    return event\n")
+        h.ready()
+
+        body = b"[1, 2, 3]"
+        h.wire._conn.sendall(HEADER.pack(len(body)) + body)
+
+        reply = h.wire.recv()
+        self.assertEqual(reply["type"], "ERROR")
+        self.assertEqual(reply["code"], "bad_message")
+        self.assertEqual(h.call({"n": 2})["result"], {"n": 2})
+
+
+class FixtureTests(unittest.TestCase):
+    """The wire fixtures in spec/fixtures, shared with the Rust suite.
+
+    Two implementations tested against each other drift together; tested
+    against one file of bytes, they cannot.
+    """
+
+    FIXTURES = Path(__file__).resolve().parents[2] / "spec" / "fixtures" / "protocol-v1.json"
+
+    def fixtures(self):
+        with open(self.FIXTURES) as f:
+            return json.load(f)
+
+    def test_frames_are_the_exact_bytes_in_both_directions(self):
+        from zygo_agent import Framing
+
+        for case in self.fixtures()["frames"]:
+            want = bytes.fromhex(case["hex"])
+            ours, theirs = socket.socketpair()
+            try:
+                Framing(ours).send(case["message"])
+                theirs.settimeout(5)
+                got = theirs.recv(len(want) + 64)
+                self.assertEqual(got, want, case["name"] + ": send")
+
+                theirs.sendall(want)
+                self.assertEqual(Framing(ours).recv(), case["message"], case["name"] + ": recv")
+            finally:
+                ours.close()
+                theirs.close()
+
+    def test_the_agent_answers_the_supervisor_fixtures_as_specified(self):
+        """Every supervisor→agent fixture is sent to a live agent and the reply
+        is what the spec says it should be."""
+        h = AgentHarness("def handler(event):\n    return event\n")
+        self.addCleanup(h.close)
+        h.ready()
+        for case in self.fixtures()["messages"]:
+            if not case["direction"].startswith("supervisor"):
+                continue
+            message = case["message"]
+            kind = message["type"]
+            if kind == "SHUTDOWN":
+                continue  # last, and covered by the shutdown tests
+            h.wire.send(message)
+            if kind == "PING":
+                self.assertEqual(h.wire.recv(), {"type": "PONG", "seq": message["seq"]}, case["name"])
+            elif kind == "EXEC":
+                forked = h.wire.recv()
+                self.assertEqual(forked["type"], "FORKED", case["name"])
+                self.assertEqual(forked["id"], message["id"])
+                h.wire.send({"type": "GO", "id": message["id"]})
+                done = h.wire.recv()
+                self.assertEqual(done["type"], "DONE", case["name"])
+                self.assertEqual(done["id"], message["id"])
+                self.assertEqual(done["result"], message["event"], "the echo handler")
+            elif kind == "GO":
+                # A GO for a request that is not in flight: nothing to do, and
+                # not an error. The next PING must still be answered.
+                h.wire.send({"type": "PING", "seq": 99})
+                self.assertEqual(h.wire.recv()["seq"], 99, case["name"])
+
+
+class ConcurrencyTests(unittest.TestCase):
+    """Several requests in flight at once (design doc §3.3).
+
+    The agent used to handle one `EXEC` to completion before reading the next,
+    and that was measured to be the ceiling on throughput: with the CPU quota
+    lifted, four concurrent callers got the same ~600 requests/s as one caller
+    while using 1.5 of 4 cores, and one of them waited 3.7 s for its turn.
+    """
+
+    SLEEPER = """
+        import time
+
+        def handler(event):
+            time.sleep(event["sleep"])
+            return {"slept": event["sleep"]}
+    """
+
+    def test_a_slow_request_does_not_block_a_fast_one(self):
+        # The property in one test: start a slow request, then a fast one, and
+        # the fast one must answer first. On a sequential agent the second
+        # `EXEC` is not even read until the first has finished.
+        agent = AgentHarness(self.SLEEPER)
+        self.addCleanup(agent.close)
+        agent.ready()
+
+        for request_id, seconds in (("slow", 1.0), ("fast", 0.0)):
+            agent.wire.send(
+                {
+                    "type": "EXEC",
+                    "id": request_id,
+                    "event": {"sleep": seconds},
+                    "timeout_ms": 30_000,
+                }
+            )
+            forked = agent.wire.recv()
+            self.assertEqual(forked["type"], "FORKED")
+            self.assertEqual(forked["id"], request_id)
+            agent.wire.send({"type": "GO", "id": request_id})
+
+        first = agent.wire.recv()
+        second = agent.wire.recv()
+        self.assertEqual(first["type"], "DONE")
+        self.assertEqual(second["type"], "DONE")
+        self.assertEqual(
+            first["id"],
+            "fast",
+            "the fast request waited for the slow one; the agent is serialising",
+        )
+        self.assertEqual(second["id"], "slow")
+
+    def test_a_child_does_not_hold_another_requests_result_pipe(self):
+        # The failure this guards is a deadlock, not a slowdown: a child forked
+        # while another request is in flight inherits that request's pipe, so
+        # its reader never reaches end of file. The first request would then
+        # wait for a handler it has nothing to do with.
+        #
+        # Ordering the sleeps the other way round from the test above is what
+        # exposes it: the *first* request finishes first, and can only do so if
+        # the second child is not holding its pipe open.
+        agent = AgentHarness(self.SLEEPER)
+        self.addCleanup(agent.close)
+        agent.ready()
+
+        agent.wire.send(
+            {"type": "EXEC", "id": "quick", "event": {"sleep": 0.0}, "timeout_ms": 30_000}
+        )
+        quick_forked = agent.wire.recv()
+        self.assertEqual(quick_forked["id"], "quick")
+
+        # Fork the long one *before* releasing the quick one, so it is
+        # guaranteed to inherit whatever was open at that moment.
+        agent.wire.send(
+            {"type": "EXEC", "id": "long", "event": {"sleep": 1.5}, "timeout_ms": 30_000}
+        )
+        long_forked = agent.wire.recv()
+        self.assertEqual(long_forked["id"], "long")
+
+        agent.wire.send({"type": "GO", "id": "quick"})
+        agent.wire.send({"type": "GO", "id": "long"})
+
+        started = time.monotonic()
+        first = agent.wire.recv()
+        elapsed = time.monotonic() - started
+        self.assertEqual(first["id"], "quick")
+        self.assertLess(
+            elapsed,
+            1.0,
+            "the quick request waited for the long one's child to exit, so its "
+            "result pipe was being held open by a process that inherited it",
+        )
+        self.assertEqual(agent.wire.recv()["id"], "long")
+
+    def test_results_are_not_mixed_up_between_requests(self):
+        # Replies come back out of order, so each one has to carry enough to be
+        # matched to its caller.
+        agent = AgentHarness(
+            """
+            def handler(event):
+                return {"echo": event["n"]}
+            """
+        )
+        self.addCleanup(agent.close)
+        agent.ready()
+
+        for n in range(8):
+            agent.wire.send(
+                {"type": "EXEC", "id": f"r{n}", "event": {"n": n}, "timeout_ms": 30_000}
+            )
+
+        # No assumption about order: once requests overlap, the next frame may
+        # be anyone's `FORKED` or anyone's `DONE`. A supervisor has to route by
+        # id, and so does this.
+        seen = {}
+        while len(seen) < 8:
+            message = agent.wire.recv()
+            if message["type"] == "FORKED":
+                agent.wire.send({"type": "GO", "id": message["id"]})
+            elif message["type"] == "DONE":
+                seen[message["id"]] = message["result"]["echo"]
+            else:
+                self.fail(f"unexpected {message}")
+        self.assertEqual(seen, {f"r{n}": n for n in range(8)})
+
+    def test_a_shutdown_still_answers_what_is_already_in_flight(self):
+        # Otherwise a `zygo stop` during a request loses its answer.
+        agent = AgentHarness(self.SLEEPER)
+        self.addCleanup(agent.close)
+        agent.ready()
+
+        agent.wire.send(
+            {"type": "EXEC", "id": "inflight", "event": {"sleep": 0.3}, "timeout_ms": 30_000}
+        )
+        self.assertEqual(agent.wire.recv()["id"], "inflight")
+        agent.wire.send({"type": "GO", "id": "inflight"})
+        agent.wire.send({"type": "SHUTDOWN", "grace_ms": 5_000})
+
+        done = agent.wire.recv()
+        self.assertEqual(done["type"], "DONE")
+        self.assertEqual(done["id"], "inflight")
+
 
 class InheritedSocketTests(unittest.TestCase):
     """The launcher hands the agent a connected socket rather than a path."""
@@ -485,6 +725,146 @@ class ForkFallbackTests(unittest.TestCase):
             # Still isolated: a second request gets its own process too.
             other = h.call({"n": 5}, request_id="b")
             self.assertNotEqual(other["result"]["pid"], done["result"]["pid"])
+        finally:
+            stderr = h.close()
+        self.assertIn("falling back to spawn", stderr)
+
+
+def _execve_denying_filter() -> bytes | None:
+    """A seven-instruction seccomp program that refuses `execve` with EPERM.
+
+    Hand-assembled here so the test depends on nothing but the kernel's ABI:
+    check the architecture (kill on a mismatch), load the syscall number, deny
+    `execve`, allow the rest. The numbers are per architecture; `None` on one
+    this test does not know.
+    """
+    import platform
+
+    numbers = {"x86_64": (0xC000003E, 59), "aarch64": (0xC00000B7, 221)}
+    known = numbers.get(platform.machine())
+    if known is None:
+        return None
+    audit_arch, execve = known
+    ld_abs, jeq, ret = 0x20, 0x15, 0x06
+    allow, kill, eperm = 0x7FFF0000, 0x80000000, 0x00050001
+    insn = struct.Struct("HBBI")  # struct sock_filter, native order
+    return b"".join(
+        insn.pack(*i)
+        for i in [
+            (ld_abs, 0, 0, 4),  # A = arch
+            (jeq, 1, 0, audit_arch),  # ours? skip the kill
+            (ret, 0, 0, kill),
+            (ld_abs, 0, 0, 0),  # A = syscall number
+            (jeq, 0, 1, execve),  # execve? fall into the deny
+            (ret, 0, 0, eperm),
+            (ret, 0, 0, allow),
+        ]
+    )
+
+
+@unittest.skipUnless(sys.platform == "linux", "seccomp is a Linux facility")
+class ChildFilterTests(unittest.TestCase):
+    """`ZYGO_CHILD_SECCOMP`: the supervisor's tightening of the forked child.
+
+    The filter is installed by the agent, after `fork()` and before the
+    handler, so the only honest test drives the real agent: first without the
+    variable, to prove the handler *can* start a program, then with it.
+    """
+
+    SPAWNER = """
+        import subprocess
+
+        def handler(event):
+            out = subprocess.run(["/bin/echo", "spawned"], capture_output=True, text=True)
+            return {"spawned": out.stdout.strip()}
+        """
+
+    def setUp(self):
+        self.raw = _execve_denying_filter()
+        if self.raw is None:
+            self.skipTest("no syscall numbers for this architecture in the test")
+        import base64
+
+        self.env = {"ZYGO_CHILD_SECCOMP": base64.b64encode(self.raw).decode()}
+
+    def test_without_the_variable_the_handler_can_start_a_program(self):
+        h = AgentHarness(self.SPAWNER)
+        try:
+            self.assertEqual(h.ready()["type"], "READY")
+            done = h.call({})
+            self.assertEqual(done["exit_code"], 0, done.get("error"))
+            self.assertEqual(done["result"], {"spawned": "spawned"})
+        finally:
+            h.close()
+
+    def test_with_the_variable_the_child_cannot_execve_and_the_agent_survives(self):
+        h = AgentHarness(self.SPAWNER, env=self.env)
+        try:
+            self.assertEqual(h.ready()["type"], "READY")
+            done = h.call({})
+            self.assertEqual(done["exit_code"], 1, done)
+            self.assertIn("PermissionError", done["error"], done["error"])
+            # The filter lived and died with that child: the zygote is
+            # untouched and the next request is answered the same way.
+            again = h.call({}, request_id="b")
+            self.assertEqual(again["exit_code"], 1, again)
+            self.assertIn("PermissionError", again["error"])
+        finally:
+            h.close()
+
+    def test_the_filter_does_not_stop_threads_or_ordinary_work(self):
+        h = AgentHarness(
+            """
+            import threading
+
+            def handler(event):
+                seen = []
+                t = threading.Thread(target=lambda: seen.append(1))
+                t.start()
+                t.join()
+                with open("/dev/null") as f:
+                    f.read()
+                return {"threads": len(seen)}
+            """,
+            env=self.env,
+        )
+        try:
+            self.assertEqual(h.ready()["type"], "READY")
+            done = h.call({})
+            self.assertEqual(done["exit_code"], 0, done.get("error"))
+            self.assertEqual(done["result"], {"threads": 1})
+        finally:
+            h.close()
+
+    def test_a_malformed_filter_is_a_start_up_failure_not_a_silent_skip(self):
+        h = AgentHarness(self.SPAWNER, env={"ZYGO_CHILD_SECCOMP": "not base64!!"})
+        try:
+            first = h.ready()
+            self.assertEqual(first["type"], "ERROR", first)
+            self.assertIn("ZYGO_CHILD_SECCOMP", first["message"])
+        finally:
+            h.close()
+
+    def test_the_spawn_fallback_installs_it_too(self):
+        # A handler with an import-time thread cannot be forked; each request
+        # is a fresh interpreter, and that interpreter is the child now.
+        h = AgentHarness(
+            """
+            import subprocess, threading, time
+
+            threading.Thread(target=lambda: time.sleep(3600), daemon=True).start()
+
+            def handler(event):
+                subprocess.run(["/bin/true"])
+                return {"spawned": True}
+            """,
+            env=self.env,
+        )
+        try:
+            self.assertEqual(h.ready()["type"], "READY")
+            done = h.call({})
+            self.assertEqual(done["exit_code"], 1, done)
+            self.assertIn("PermissionError", done["error"], done["error"])
         finally:
             stderr = h.close()
         self.assertIn("falling back to spawn", stderr)

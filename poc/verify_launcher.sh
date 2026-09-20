@@ -9,42 +9,19 @@
 #           -e ZYGO_DATA_HOME=/tmp/zdata alpine:3 sh /src/poc/verify_launcher.sh
 set -u
 
-ZYGO=/src/poc/zygo-linux
+# Where the checkout is: `/src` inside the containers `make` starts, the
+# workspace in CI. Everything below is relative to it.
+SRC=${SRC:-/src}
+
+ZYGO=${ZYGO:-$SRC/poc/zygo-linux}
 IMAGE=alpine:3
 # Checks that need an allocator or an interpreter use this one.
 PYIMAGE=python:3.12-slim
 PASS=0
 FAIL=0
 
-# cgroup preparation.
-#
-# cgroup v2 forbids a cgroup from holding processes *and* delegating controllers
-# to its children. Inside a container every process sits directly in the
-# container's cgroup, so this harness has to step aside and then hand each
-# `zygo` invocation a cgroup of its own — which is what a systemd user session
-# with `Delegate=` provides for free.
-CG=/sys/fs/cgroup
-mkdir -p "$CG/harness" "$CG/launch" 2>/dev/null
-for p in $(cat "$CG/cgroup.procs" 2>/dev/null); do
-    echo "$p" > "$CG/harness/cgroup.procs" 2>/dev/null
-done
-for c in memory pids cpu; do echo "+$c" > "$CG/cgroup.subtree_control" 2>/dev/null; done
-
-# Run zygo in `$CG/launch`, which holds nothing else, so it can build its slice
-# underneath. `exec` matters: the shell must not survive inside that cgroup.
-# Once the first run has built `/launch/zygo.slice`, later runs go straight into
-# its `system` cgroup: zygo recognises the enclosing slice and reuses it. Before
-# that, `/launch` itself is the starting point.
-zygo() {
-    sh -c '
-        CG=/sys/fs/cgroup
-        if [ -d "$CG/launch/zygo.slice/system" ]; then
-            echo $$ > "$CG/launch/zygo.slice/system/cgroup.procs" 2>/dev/null
-        else
-            echo $$ > "$CG/launch/cgroup.procs" 2>/dev/null
-        fi
-        exec "$@"' _ "$ZYGO" "$@"
-}
+# Two environments need opposite cgroup preparation; the shared prelude picks.
+. "$(dirname "$0")/cgroup_harness.sh"
 
 say() { printf '%s\n' "$*"; }
 ok()  { PASS=$((PASS+1)); say "  PASS  $*"; }

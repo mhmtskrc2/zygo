@@ -24,12 +24,14 @@ and its own import cost is paid by every tenant.
 from __future__ import annotations
 
 import base64
+import binascii
 import gc
 import importlib.util
 import json
 import os
 import random
 import resource
+import select
 import signal
 import socket
 import struct
@@ -61,11 +63,45 @@ RING_BUFFER_BYTES = 256 * 1024
 # --------------------------------------------------------------------------
 
 
+class InFlight:
+    """One forked request the agent is still carrying.
+
+    `go_fd` becomes `None` once `GO` has released the child, which is also how
+    the loop knows whether a request that is finishing was ever released.
+    """
+
+    __slots__ = ("request_id", "pid", "result_fd", "go_fd", "chunks")
+
+    def __init__(self, request_id: str, pid: int, result_fd: int, go_fd: int) -> None:
+        self.request_id = request_id
+        self.pid = pid
+        self.result_fd = result_fd
+        self.go_fd: int | None = go_fd
+        self.chunks: list[bytes] = []
+
+
+class BadFrame(Exception):
+    """A frame arrived whole, but its body is not a message.
+
+    Recoverable on purpose. The announced length was honoured, so the stream is
+    still sitting at a frame boundary and the agent can report the problem and
+    carry on serving — which is what `spec/protocol.md` asks for: a protocol
+    failure is an `ERROR`, not silence and not a dead agent that loses every
+    request in flight with it.
+
+    An announced length past the cap is deliberately *not* this: nothing was
+    consumed, the stream cannot be resynchronised, and the connection has to go.
+    """
+
+
 class Framing:
     """Length-prefixed JSON over a byte stream."""
 
     def __init__(self, sock: socket.socket) -> None:
         self._sock = sock
+
+    def fileno(self) -> int:
+        return self._sock.fileno()
 
     def send(self, message: dict) -> None:
         body = json.dumps(message, separators=(",", ":")).encode()
@@ -83,7 +119,13 @@ class Framing:
         body = self._read_exactly(size)
         if body is None:
             raise ConnectionError("connection closed mid-frame")
-        return json.loads(body)
+        try:
+            message = json.loads(body)
+        except ValueError as e:
+            raise BadFrame(f"body is not valid JSON: {e}") from None
+        if not isinstance(message, dict):
+            raise BadFrame(f"body is {type(message).__name__}, not a JSON object")
+        return message
 
     def _read_exactly(self, count: int) -> bytes | None:
         chunks: list[bytes] = []
@@ -165,7 +207,13 @@ def has_extra_threads() -> bool:
 # --------------------------------------------------------------------------
 
 
-def run_request(handler, request: dict, result_fd: int, go_fd: int) -> None:
+def run_request(
+    handler,
+    request: dict,
+    result_fd: int,
+    go_fd: int,
+    child_filter: "ChildFilter | None" = None,
+) -> None:
     """Run one request in the freshly forked child. Never returns."""
     exit_code = 0
     error = None
@@ -180,6 +228,12 @@ def run_request(handler, request: dict, result_fd: int, go_fd: int) -> None:
         # allocation here would be billed to the wrong place.
         os.read(go_fd, 1)
         os.close(go_fd)
+
+        # The supervisor's tightening for this child, before any handler code:
+        # no new program, no new process. A filter that cannot be installed
+        # is a failed request, never a request that ran without it.
+        if child_filter is not None:
+            child_filter.install()
 
         # Each request gets its own entropy. Without this, forks share the
         # parent's seeded state and every child produces identical "random"
@@ -234,6 +288,79 @@ def run_request(handler, request: dict, result_fd: int, go_fd: int) -> None:
     # Straight out: no atexit handlers, no interpreter teardown, no flushing of
     # buffers the parent also owns.
     os._exit(0)
+
+
+CHILD_SECCOMP_ENV = "ZYGO_CHILD_SECCOMP"
+
+
+class ChildFilter:
+    """The seccomp program the supervisor asks every forked child to install.
+
+    It arrives in ``ZYGO_CHILD_SECCOMP`` as base64 of the raw ``struct
+    sock_filter`` array — the supervisor knows the host's syscall numbers and
+    this agent does not need to. Decoded and laid out once, in the zygote, so
+    the child's share of the work is one ``prctl``. Filters stack: the
+    sandbox's own filter stays in force underneath this one.
+    """
+
+    PR_SET_SECCOMP = 22
+    PR_SET_NO_NEW_PRIVS = 38
+    SECCOMP_MODE_FILTER = 2
+
+    def __init__(self, raw: bytes) -> None:
+        import ctypes
+
+        if not raw or len(raw) % 8:
+            raise ValueError(
+                f"{CHILD_SECCOMP_ENV} is {len(raw)} bytes, not a whole number of "
+                "8-byte BPF instructions"
+            )
+
+        class SockFprog(ctypes.Structure):
+            _fields_ = [("len", ctypes.c_ushort), ("filter", ctypes.c_void_p)]
+
+        # Kept on the instance: the kernel reads the instructions through the
+        # pointer at install time, so the buffer must outlive the struct.
+        self._buffer = ctypes.create_string_buffer(raw, len(raw))
+        self._prog = SockFprog(len(raw) // 8, ctypes.cast(self._buffer, ctypes.c_void_p))
+        self._libc = ctypes.CDLL(None, use_errno=True)
+        self._libc.prctl.restype = ctypes.c_int
+        self._libc.prctl.argtypes = [ctypes.c_int] + [ctypes.c_ulong] * 4
+        self._ctypes = ctypes
+        self.instructions = len(raw) // 8
+
+    @classmethod
+    def from_environment(cls) -> "ChildFilter | None":
+        encoded = os.environ.get(CHILD_SECCOMP_ENV)
+        if not encoded:
+            return None
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise ValueError(f"{CHILD_SECCOMP_ENV} is not base64: {exc}") from exc
+        return cls(raw)
+
+    def install(self) -> None:
+        """Install in the calling process. Irreversible, by design."""
+        # Already set by the launcher; harmless to repeat, and it is what lets
+        # an unprivileged process install a filter at all.
+        if self._libc.prctl(self.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+            errno_ = self._ctypes.get_errno()
+            raise OSError(errno_, f"PR_SET_NO_NEW_PRIVS: {os.strerror(errno_)}")
+        rc = self._libc.prctl(
+            self.PR_SET_SECCOMP,
+            self.SECCOMP_MODE_FILTER,
+            self._ctypes.addressof(self._prog),
+            0,
+            0,
+        )
+        if rc != 0:
+            errno_ = self._ctypes.get_errno()
+            raise OSError(
+                errno_,
+                f"cannot install the child seccomp filter "
+                f"({self.instructions} instructions): {os.strerror(errno_)}",
+            )
 
 
 def _reseed_random() -> None:
@@ -349,47 +476,186 @@ class Agent:
         can_fork: bool,
         handler_path: str,
         mode: str,
+        child_filter: "ChildFilter | None" = None,
     ) -> None:
         self._wire = Framing(sock)
         self._handler = handler
         self._can_fork = can_fork
         self._handler_path = handler_path
         self._mode = mode
+        self._child_filter = child_filter
         # Children whose result has already been forwarded, still to be reaped.
         # Reaping is process teardown, and teardown of a forked interpreter is
         # not fast: measured at p99 32 ms on the request path, against a 2 ms
         # budget. Once the RESULT is in hand the answer owes nothing to the
         # corpse, so it is collected between requests instead.
         self._unreaped: list[int] = []
+        # Requests that have been forked and not yet answered, keyed by id and
+        # by the descriptor their result will arrive on.
+        self._inflight: dict[str, InFlight] = {}
+        self._by_result_fd: dict[int, InFlight] = {}
 
     def serve(self) -> None:
-        while True:
+        """Handle requests until the supervisor goes away.
+
+        Several at once. The loop waits on the control socket *and* on every
+        in-flight request's result pipe together, so a request that is still
+        running does not stop the next `EXEC` being accepted.
+
+        Doing one request to completion before reading the next was the
+        original shape, and it was measured to be the ceiling on throughput:
+        with the CPU quota lifted, four concurrent callers got the same ~600
+        requests/s as one, using 1.5 of 4 cores, and one of them waited 3.7 s
+        for its turn. `concurrency` in the spec bounds what the supervisor
+        admits; this is what lets the agent actually overlap them.
+        """
+        wire_fd = self._wire.fileno()
+        accepting = True
+
+        while accepting or self._inflight:
+            watch = list(self._by_result_fd)
+            if accepting:
+                watch.append(wire_fd)
+            if not watch:
+                break
+
             try:
-                message = self._wire.recv()
-            except (ConnectionError, OSError):
-                return
-            if message is None:
+                ready, _, _ = select.select(watch, [], [])
+            except InterruptedError:
+                continue
+            except OSError:
                 return
 
-            kind = message.get("type")
-            if kind == "EXEC":
-                self._exec(message)
-            elif kind == "PING":
-                self._wire.send({"type": "PONG", "seq": message.get("seq", 0)})
-            elif kind == "SHUTDOWN":
-                self._reap_all()
-                return
-            else:
-                self._wire.send(
-                    {
-                        "type": "ERROR",
-                        "id": message.get("id"),
-                        "code": "bad_message",
-                        "message": f"unexpected message `{kind}`",
-                    }
-                )
+            for fd in ready:
+                if fd == wire_fd:
+                    if not self._handle_message():
+                        # End of stream, or a `SHUTDOWN`: stop taking new work
+                        # but finish what is already forked, so a request in
+                        # flight still gets its answer.
+                        accepting = False
+                else:
+                    self._collect(self._by_result_fd[fd])
+
+        self._reap_all()
+
+    def _handle_message(self) -> bool:
+        """Read and act on one control message. `False` means stop accepting."""
+        try:
+            message = self._wire.recv()
+        except BadFrame as e:
+            # The stream is still aligned, so this is reportable rather than
+            # fatal. Found by `zygo agent test`: before this, one malformed
+            # frame killed the agent and every request in flight with it.
+            self._wire.send(
+                {"type": "ERROR", "id": None, "code": "bad_message", "message": str(e)}
+            )
+            return True
+        except (ConnectionError, OSError):
+            return False
+        if message is None:
+            return False
+
+        kind = message.get("type")
+        if kind == "EXEC":
+            self._exec(message)
+        elif kind == "GO":
+            self._release(message.get("id", ""))
+        elif kind == "PING":
+            self._wire.send({"type": "PONG", "seq": message.get("seq", 0)})
+        elif kind == "SHUTDOWN":
+            return False
+        else:
+            self._wire.send(
+                {
+                    "type": "ERROR",
+                    "id": message.get("id"),
+                    "code": "bad_message",
+                    "message": f"unexpected message `{kind}`",
+                }
+            )
+        return True
+
+    def _release(self, request_id: str) -> None:
+        """`GO`: the supervisor has the child in its cgroup; let it run."""
+        request = self._inflight.get(request_id)
+        if request is None or request.go_fd is None:
+            return
+        try:
+            os.write(request.go_fd, b"\0")
+        except OSError:
+            pass
+        os.close(request.go_fd)
+        request.go_fd = None
+
+    def _collect(self, request: InFlight) -> None:
+        """A result pipe is readable: take what is there, answer at end of file."""
+        try:
+            chunk = os.read(request.result_fd, 64 * 1024)
+        except OSError:
+            chunk = b""
+        if chunk:
+            request.chunks.append(chunk)
+            return
+
+        self._finish(request)
+
+    def _finish(self, request: InFlight) -> None:
+        os.close(request.result_fd)
+        del self._by_result_fd[request.result_fd]
+        del self._inflight[request.request_id]
+        if request.go_fd is not None:
+            # The supervisor never said `GO`, so the child is still blocked.
+            os.close(request.go_fd)
+
+        result = _decode_result_frame(b"".join(request.chunks), request.request_id)
+        if result is None:
+            # No result means the child died on the way — an OOM kill, a
+            # deadline kill, or a segfault in a C extension. Here the exit
+            # status *is* the answer, so it is worth waiting for.
+            _, status = os.waitpid(request.pid, 0)
+            result = {
+                "id": request.request_id,
+                "exit_code": _exit_code(status),
+                "result": None,
+                "stdout": "",
+                "stderr": "",
+                "error": _death_reason(status),
+                "peak_rss_kb": 0,
+                "wall_ms": 0.0,
+                "cpu_ms": 0.0,
+            }
+        else:
+            # The child has already reported and called `_exit`; what remains
+            # is the kernel tearing its address space down. Answering now and
+            # reaping later keeps that off the request's clock.
+            self._unreaped.append(request.pid)
+
+        result["type"] = "DONE"
+        self._wire.send(result)
+        self._reap_finished()
+
+    def _open_fds(self) -> list[int]:
+        """Descriptors a newly forked child must not inherit.
+
+        Every in-flight request's pipes. Without this the new child holds the
+        write end of *another* request's result pipe, so that request's reader
+        never sees end of file and its answer waits for an unrelated handler to
+        finish — the failure that turns overlapping requests into a deadlock.
+        """
+        fds = []
+        for other in self._inflight.values():
+            fds.append(other.result_fd)
+            if other.go_fd is not None:
+                fds.append(other.go_fd)
+        return fds
 
     def _exec(self, request: dict) -> None:
+        """Fork a child for `request` and return; the loop takes it from here.
+
+        Nothing is waited for: `FORKED` goes out and the request joins the
+        in-flight table. `GO` arrives as an ordinary message and the result
+        arrives on the pipe, both handled by `serve`.
+        """
         if not self._can_fork:
             self._exec_spawned(request)
             return
@@ -397,6 +663,9 @@ class Agent:
         request_id = request.get("id", "")
         result_r, result_w = os.pipe()
         go_r, go_w = os.pipe()
+        # Collected before the fork: afterwards the child cannot ask the parent
+        # what else was open, and it must close every one of them.
+        inherited = self._open_fds()
 
         try:
             pid = os.fork()
@@ -416,53 +685,27 @@ class Agent:
         if pid == 0:
             os.close(result_r)
             os.close(go_w)
-            run_request(self._handler, request, result_w, go_r)
+            # Another request's pipes, inherited by accident. Holding the write
+            # end of someone else's result pipe would stop them ever reaching
+            # end of file.
+            for fd in inherited:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            run_request(self._handler, request, result_w, go_r, self._child_filter)
             return  # unreachable: run_request calls os._exit
 
         os.close(result_w)
         os.close(go_r)
 
-        # Tell the supervisor the pid, wait for it to say the cgroup is ready,
-        # then release the child.
+        request_state = InFlight(request_id, pid, result_r, go_w)
+        self._inflight[request_id] = request_state
+        self._by_result_fd[result_r] = request_state
+
+        # The supervisor needs the pid to build the request cgroup; the child
+        # is blocked on its `go` pipe until `GO` comes back.
         self._wire.send({"type": "FORKED", "id": request_id, "pid": pid})
-        reply = self._wire.recv()
-        if reply is None or reply.get("type") != "GO":
-            os.kill(pid, signal.SIGKILL)
-            os.waitpid(pid, 0)
-            os.close(go_w)
-            os.close(result_r)
-            return
-        os.write(go_w, b"\0")
-        os.close(go_w)
-
-        result = self._read_result(result_r, request_id)
-        os.close(result_r)
-
-        if result is None:
-            # No result means the child died on the way — an OOM kill, a
-            # deadline kill, or a segfault in a C extension. Here the exit
-            # status *is* the answer, so it is worth waiting for.
-            _, status = os.waitpid(pid, 0)
-            result = {
-                "id": request_id,
-                "exit_code": _exit_code(status),
-                "result": None,
-                "stdout": "",
-                "stderr": "",
-                "error": _death_reason(status),
-                "peak_rss_kb": 0,
-                "wall_ms": 0.0,
-                "cpu_ms": 0.0,
-            }
-        else:
-            # The child has already reported and called `_exit`; what remains
-            # is the kernel tearing its address space down. Answering now and
-            # reaping later keeps that off the request's clock.
-            self._unreaped.append(pid)
-
-        result["type"] = "DONE"
-        self._wire.send(result)
-        self._reap_finished()
 
     def _exec_spawned(self, request: dict) -> None:
         """Fallback for handlers that cannot be forked (risk R1).
@@ -609,13 +852,15 @@ def oneshot(handler_path: str, mode: str) -> int:
     request = json.loads(raw[HEADER.size : HEADER.size + size])
 
     handler = load_handler(handler_path, mode)
+    # The spawned interpreter is the "child" here, and inherits the variable.
+    child_filter = ChildFilter.from_environment()
 
     # `run_request` waits for a byte on `go_fd`; with the spawn path the
     # barrier has already been crossed, so hand it one that is ready.
     go_r, go_w = os.pipe()
     os.write(go_w, b"\0")
     os.close(go_w)
-    run_request(handler, request, sys.stdout.fileno(), go_r)
+    run_request(handler, request, sys.stdout.fileno(), go_r, child_filter)
     return 0  # unreachable: run_request calls os._exit
 
 
@@ -657,6 +902,10 @@ def main(argv: list[str]) -> int:
     started = time.monotonic()
     try:
         handler = load_handler(handler_path, mode)
+        # Decoded here, once, so a bad value is a start-up failure the
+        # supervisor sees, not a per-request one — and so no child pays for
+        # the `ctypes` import.
+        child_filter = ChildFilter.from_environment()
     except BaseException:  # noqa: BLE001
         wire.send(
             {
@@ -703,6 +952,7 @@ def main(argv: list[str]) -> int:
         can_fork=can_fork,
         handler_path=handler_path,
         mode=mode,
+        child_filter=child_filter,
     ).serve()
     return 0
 

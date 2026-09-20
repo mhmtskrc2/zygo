@@ -2,7 +2,9 @@
 //!
 //! The filter is an **allowlist**: anything not named returns `EPERM`. That
 //! direction matters — a denylist silently gains a hole every time the kernel
-//! grows a syscall, and it grows several per release.
+//! grows a syscall, and it grows several per release. One exception, for a
+//! reason: `clone3` returns `ENOSYS` where it is not allowed, because that is
+//! the only answer glibc's `pthread_create` falls back from.
 //!
 //! The program is built in the parent, as a plain `Vec<SockFilter>`, and only
 //! *installed* in the child. Everything after `clone3` has to be
@@ -93,6 +95,8 @@ enum Label {
     Next,
     Allow,
     Deny,
+    /// `ENOSYS` rather than `EPERM`: the answer for `clone3`, see [`program`].
+    NoSys,
     Kill,
     CloneCheck,
     IoctlCheck,
@@ -420,6 +424,9 @@ pub const PERMISSIVE_EXTRA: &[&str] = &[
     "mknod",
     "mknodat",
     "chown",
+    // `dpkg` changes the ownership of symlinks it unpacks; on x86_64 glibc
+    // does that with the legacy syscall (arm64 has only `fchownat`).
+    "lchown",
     "chmod",
     "chroot",
     "sethostname",
@@ -428,9 +435,19 @@ pub const PERMISSIVE_EXTRA: &[&str] = &[
 
 /// Syscalls `strict` removes from the base set.
 ///
-/// The socket family goes because a `network = "none"` sandbox has nothing to
-/// talk to anyway, and `ptrace`/`mount` because nothing legitimate in a handler
-/// reaches for them.
+/// Socket *creation* and the calls that make a socket reach somewhere —
+/// `connect`, `bind`, `listen`, `accept4` — because a `network = "none"`
+/// sandbox has nothing to talk to and a stricter tenant should not be able to
+/// try; `ptrace` and `mount`, because nothing legitimate in a handler reaches
+/// for them.
+///
+/// Deliberately **not** the data calls — `sendto`, `recvfrom`, `sendmsg`,
+/// `setsockopt` and the rest. They were removed at first, and the seccomp
+/// compatibility matrix found every `strict` function dead before its handler
+/// ran: the agent speaks to the supervisor over a socket it *inherited*, and
+/// a socket it cannot `recvfrom` is a supervisor it cannot hear. Transferring
+/// bytes on a descriptor a process was handed is not a capability; opening
+/// one is, and that is what stays removed.
 pub const STRICT_REMOVED: &[&str] = &[
     "socket",
     "socketpair",
@@ -438,22 +455,12 @@ pub const STRICT_REMOVED: &[&str] = &[
     "bind",
     "listen",
     "accept4",
-    "sendto",
-    "sendmsg",
-    "sendmmsg",
-    "recvfrom",
-    "recvmsg",
-    "setsockopt",
-    "getsockopt",
-    "getsockname",
-    "getpeername",
-    "shutdown",
     "ptrace",
     "mount",
     "umount2",
 ];
 
-/// What a runtime agent's *forked child* may additionally drop.
+/// What a runtime agent's *forked child* additionally loses under `strict`.
 ///
 /// `execve` is the interesting one, and it cannot be in [`STRICT_REMOVED`]: the
 /// launcher installs its filter immediately before `execve`-ing the sandboxed
@@ -461,9 +468,82 @@ pub const STRICT_REMOVED: &[&str] = &[
 /// — which is exactly what happened the first time this was run.
 ///
 /// Design doc §3.4.1 puts this tightening where it belongs: the agent's child,
-/// which is already running the interpreter and never needs to exec again. Used
-/// from phase 2.4; defined here so the two halves of the policy sit together.
+/// which is already running the interpreter and never needs to exec again.
+/// [`child_program`] turns it into a filter; the supervisor hands that to the
+/// agent in `ZYGO_CHILD_SECCOMP`, and the agent installs it after `fork()` and
+/// before the handler runs. `fork` and `vfork` are listed for completeness —
+/// glibc creates processes through `clone`, which the program checks by flag.
 pub const STRICT_CHILD_REMOVED: &[&str] = &["execve", "execveat", "fork", "vfork"];
+
+/// The `clone` flag that makes a thread rather than a process.
+const CLONE_THREAD: u32 = 0x0001_0000;
+
+/// The filter a runtime agent installs in its forked child under `strict`.
+///
+/// The child is already running the interpreter, so it never needs another
+/// program: `execve` and `execveat` are refused. It never needs another
+/// *process* either: `fork`, `vfork` and any `clone` without `CLONE_THREAD`
+/// are refused, so a handler cannot fork-bomb its way to `pids.max` — while a
+/// thread, which is a `clone` *with* the flag, still works. Everything else
+/// falls through to `ret ALLOW`, which is not a grant: the sandbox's own
+/// filter stays installed underneath, filters stack, and the kernel takes the
+/// strictest answer.
+///
+/// `None` for the profiles that do not tighten the child — the difference
+/// between `default` and `strict` is meant to be visible.
+pub fn child_program(profile: SeccompProfile) -> Result<Option<Vec<SockFilter>>, SeccompError> {
+    if profile != SeccompProfile::Strict {
+        return Ok(None);
+    }
+    if !syscalls::is_supported() {
+        return Err(SeccompError::UnsupportedArch {
+            arch: std::env::consts::ARCH,
+        });
+    }
+
+    let mut asm = Assembler::default();
+    asm.load(OFF_ARCH)
+        .jeq(syscalls::AUDIT_ARCH, Label::Next, Label::Kill)
+        .load(OFF_NR);
+    for nr in STRICT_CHILD_REMOVED
+        .iter()
+        .filter_map(|name| syscalls::number(name))
+    {
+        asm.jeq(nr, Label::Deny, Label::Next);
+    }
+    let clone_nr = syscalls::number("clone");
+    if let Some(nr) = clone_nr {
+        asm.jeq(nr, Label::CloneCheck, Label::Next);
+    }
+    asm.goto(Label::Allow);
+    if clone_nr.is_some() {
+        asm.mark(Label::CloneCheck)
+            .load(OFF_ARG0_LO)
+            .and(CLONE_THREAD)
+            .jeq(0, Label::Deny, Label::Allow);
+    }
+    asm.mark(Label::Deny)
+        .ret(RET_ERRNO | libc::EPERM as u32)
+        .mark(Label::Kill)
+        .ret(RET_KILL_PROCESS)
+        .mark(Label::Allow)
+        .ret(RET_ALLOW);
+    Ok(Some(asm.assemble()?))
+}
+
+/// The raw `struct sock_filter` array, byte for byte as `prctl(PR_SET_SECCOMP)`
+/// reads it, so an agent in any language can install a program without
+/// knowing what is in it. Native byte order: the bytes never leave the host.
+pub fn encode(prog: &[SockFilter]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(prog.len() * 8);
+    for insn in prog {
+        out.extend_from_slice(&insn.code.to_ne_bytes());
+        out.push(insn.jt);
+        out.push(insn.jf);
+        out.extend_from_slice(&insn.k.to_ne_bytes());
+    }
+    out
+}
 
 /// Syscalls the filter handles with an argument check rather than a plain
 /// comparison, so they appear in no allowlist.
@@ -602,6 +682,15 @@ pub fn program(profile: SeccompProfile) -> Result<Vec<SockFilter>, SeccompError>
     let names = allowed_names(profile);
     let clone_nr = syscalls::number("clone");
     let ioctl_nr = syscalls::number("ioctl").filter(|_| names.contains(&"ioctl"));
+    // `clone3` takes its flags in a struct the filter cannot read, so a
+    // profile that inspects `clone`'s flags cannot allow it. But it must not
+    // answer `EPERM` either: glibc's `pthread_create` tries `clone3` first and
+    // falls back to `clone` **only on `ENOSYS`** — on `EPERM` it gives up, and
+    // every threaded program dies with "can't start new thread". Found by the
+    // seccomp compatibility matrix: `pip` starts a thread for its progress
+    // bar on a large download, and `numpy` starts several on import. Docker's
+    // profile answers `ENOSYS` for the same reason.
+    let clone3_nosys = syscalls::number("clone3").filter(|_| !names.contains(&"clone3"));
 
     // These two are compared against their arguments, not merely their number.
     let simple: Vec<u32> = names
@@ -621,6 +710,9 @@ pub fn program(profile: SeccompProfile) -> Result<Vec<SockFilter>, SeccompError>
 
     if let Some(nr) = clone_nr {
         asm.jeq(nr, Label::CloneCheck, Label::Next);
+    }
+    if let Some(nr) = clone3_nosys {
+        asm.jeq(nr, Label::NoSys, Label::Next);
     }
     if let Some(nr) = ioctl_nr {
         asm.jeq(nr, Label::IoctlCheck, Label::Next);
@@ -647,6 +739,8 @@ pub fn program(profile: SeccompProfile) -> Result<Vec<SockFilter>, SeccompError>
 
     asm.mark(Label::Deny)
         .ret(RET_ERRNO | libc::EPERM as u32)
+        .mark(Label::NoSys)
+        .ret(RET_ERRNO | libc::ENOSYS as u32)
         .mark(Label::Kill)
         .ret(RET_KILL_PROCESS)
         .mark(Label::Allow)
@@ -733,14 +827,33 @@ mod tests {
     #[test]
     fn strict_removes_the_socket_family() {
         let strict = allowed_names(SeccompProfile::Strict);
-        for name in ["socket", "connect", "sendto", "ptrace"] {
+        for name in [
+            "socket",
+            "socketpair",
+            "connect",
+            "bind",
+            "listen",
+            "ptrace",
+        ] {
             assert!(
                 !strict.contains(&name),
                 "{name} survived the strict profile"
             );
         }
-        // But the sandbox still has to be able to run and exit.
-        for name in ["read", "write", "mmap", "exit_group"] {
+        // But the sandbox still has to be able to run and exit — and an agent
+        // has to be able to use the control socket it was handed. `strict`
+        // once removed `recvfrom`, and every strict function died before its
+        // handler ran.
+        for name in [
+            "read",
+            "write",
+            "mmap",
+            "exit_group",
+            "sendto",
+            "recvfrom",
+            "sendmsg",
+            "recvmsg",
+        ] {
             assert!(strict.contains(&name), "{name} is required even in strict");
         }
     }
@@ -810,6 +923,7 @@ mod tests {
             "getpgrp",
             "ioperm",
             "iopl",
+            "lchown",
             "link",
             "lstat",
             "mkdir",
@@ -960,6 +1074,21 @@ mod tests {
                 Verdict::Allow,
                 "thread creation must work"
             );
+            // glibc reaches `clone` only if `clone3` says ENOSYS. EPERM here
+            // is "can't start new thread" in every program with a thread —
+            // which the compatibility matrix found in `pip` and `numpy`.
+            for profile in [SeccompProfile::Default, SeccompProfile::Strict] {
+                assert_eq!(
+                    verdict(profile, "clone3", 0),
+                    Verdict::Deny(libc::ENOSYS as u32),
+                    "{profile}: clone3 must be ENOSYS so glibc falls back to clone"
+                );
+            }
+            assert_eq!(
+                verdict(SeccompProfile::Permissive, "clone3", 0),
+                Verdict::Allow,
+                "permissive lists clone3 outright"
+            );
             assert_eq!(
                 verdict(SeccompProfile::Default, "clone", SIGCHLD | CLONE_NEWUSER),
                 Verdict::Deny(libc::EPERM as u32),
@@ -1053,6 +1182,72 @@ mod tests {
                     "ioctl request {request:#x} should be allowed"
                 );
             }
+        }
+
+        /// The tightening the design puts in the agent's child, run rather
+        /// than inspected: a program is refused, a process is refused, a
+        /// thread is not — and the profiles that do not tighten hand back
+        /// nothing at all rather than an empty filter.
+        #[test]
+        fn the_child_filter_refuses_programs_and_processes_but_not_threads() {
+            const SIGCHLD: u64 = 17;
+            const CLONE_VM_FS_FILES_THREAD: u64 = 0x100 | 0x200 | 0x400 | 0x1_0000;
+            const CLONE_VM_VFORK: u64 = 0x100 | 0x4000;
+
+            let prog = child_program(SeccompProfile::Strict)
+                .unwrap()
+                .expect("strict tightens the child");
+            let nr = |name: &str| syscalls::number(name).unwrap();
+            let run = |nr: u32, arg0: u64| evaluate(&prog, syscalls::AUDIT_ARCH, nr, arg0);
+            let eperm = Verdict::Deny(libc::EPERM as u32);
+
+            assert_eq!(run(nr("execve"), 0), eperm, "no new program");
+            assert_eq!(run(nr("execveat"), 0), eperm);
+            assert_eq!(run(nr("clone"), SIGCHLD), eperm, "a fork is a clone");
+            assert_eq!(
+                run(nr("clone"), CLONE_VM_VFORK),
+                eperm,
+                "posix_spawn's vfork-style clone is a process too"
+            );
+            assert_eq!(
+                run(nr("clone"), CLONE_VM_FS_FILES_THREAD),
+                Verdict::Allow,
+                "a thread must still work"
+            );
+            for name in ["read", "write", "mmap", "openat", "exit_group", "prctl"] {
+                assert_eq!(run(nr(name), 0), Verdict::Allow, "{name} falls through");
+            }
+            assert_eq!(
+                evaluate(&prog, syscalls::AUDIT_ARCH ^ 1, nr("read"), 0),
+                Verdict::Kill,
+                "a foreign ABI is killed, as in every other program here"
+            );
+
+            for profile in [SeccompProfile::Default, SeccompProfile::Permissive] {
+                assert_eq!(
+                    child_program(profile).unwrap(),
+                    None,
+                    "{profile} does not tighten the child"
+                );
+            }
+        }
+
+        /// What the agent receives is bytes; the layout has to be the kernel's.
+        #[test]
+        fn the_child_filter_encodes_to_the_kernel_layout() {
+            let prog = child_program(SeccompProfile::Strict).unwrap().unwrap();
+            let bytes = encode(&prog);
+            assert_eq!(bytes.len(), prog.len() * 8);
+            let first = &bytes[..8];
+            assert_eq!(u16::from_ne_bytes([first[0], first[1]]), prog[0].code);
+            assert_eq!(first[2], prog[0].jt);
+            assert_eq!(first[3], prog[0].jf);
+            assert_eq!(
+                u32::from_ne_bytes([first[4], first[5], first[6], first[7]]),
+                prog[0].k
+            );
+            // The whole thing has to fit in the environment comfortably.
+            assert!(bytes.len() < 512, "{} bytes", bytes.len());
         }
 
         #[test]

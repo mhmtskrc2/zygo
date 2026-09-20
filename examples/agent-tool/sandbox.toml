@@ -1,0 +1,19 @@
+# A tool for an LLM agent. The model writes the input; the model is untrusted.
+#
+#   zygo up
+#   zygo exec calc '{"expression": "2 ** 10 / 4"}'      # {"result": 256.0}
+#
+# For code you did not write and cannot read, `isolation = "vm"` — a hardware
+# boundary rather than the kernel's — is the setting the design intends. It
+# is not built yet (todo.md, 2.5), so this runs on `ns` with the tightest
+# profile it has.
+
+[fn.calc]
+image       = "python:3.12-slim"
+entry       = "tool.py"
+seccomp     = "strict"       # no sockets, no ptrace, no mount
+mem         = "64M"
+scratch     = "8M"
+pids        = 4
+timeout     = "2s"           # a model that asks for 10**10**10 gets 137
+concurrency = 16

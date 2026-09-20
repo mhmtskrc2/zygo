@@ -33,11 +33,11 @@ use std::time::{Duration, Instant};
 
 use crate::error::{Error, IoContext, Result};
 use crate::paths::Paths;
-use crate::pool::{Pool, PoolConfig, Status, WarmFn};
+use crate::pool::{Function, Pool, PoolConfig, Status};
 use crate::spec::{Layer, ResolveOptions, ResolvedFn, Spec};
 
 pub use gate::{Gate, Rejected};
-pub use protocol::{CONTROL_VERSION, ControlError, Request, Response};
+pub use protocol::{CONTROL_VERSION, Change, ControlError, Request, Response};
 
 /// How long a request waits for a concurrency slot before it is told to retry.
 ///
@@ -171,17 +171,105 @@ impl Backoff {
     }
 }
 
+/// How often the idle policy is applied.
+///
+/// `idle_timeout` and `cold_after` default to ten minutes and an hour, so a
+/// second of granularity is far finer than anything that depends on it. The
+/// cost is one pass over the registry, and it is what lets the thread be a
+/// plain sleeper rather than a timer wheel.
+pub const TIER_INTERVAL: Duration = Duration::from_secs(1);
+
+/// What a function was built from, as bytes on disk.
+///
+/// The resolved spec *names* the handler and the requirements file; this is
+/// what was in them when the sandbox started. `zygo up` compares it against the
+/// disk to decide whether a function is the one already running, because the
+/// spec alone cannot tell: editing `handler.py` changes nothing the spec sees,
+/// and an edited handler is the most common reason to deploy at all.
+///
+/// Mounts are deliberately absent. A bind mount is live by design — the sandbox
+/// sees a file the moment it changes — so their contents are not something the
+/// warm-up captured and a restart would not refresh.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct Sources(Vec<(PathBuf, Option<[u8; 32]>)>);
+
+impl Sources {
+    /// Hash the files `resolved` will load. A file that cannot be read hashes
+    /// to `None`: the warm-up will report that properly, and until then the
+    /// comparison only has to say "not what is registered", which it does.
+    fn of(resolved: &ResolvedFn) -> Sources {
+        use sha2::{Digest, Sha256};
+        Sources(
+            resolved
+                .entry
+                .iter()
+                .chain(resolved.requirements.iter())
+                .map(|path| {
+                    let digest = std::fs::read(path)
+                        .ok()
+                        .map(|bytes| Sha256::digest(&bytes).into());
+                    (path.clone(), digest)
+                })
+                .collect(),
+        )
+    }
+}
+
 /// One registered function.
 struct Entry {
     resolved: ResolvedFn,
-    function: WarmFn,
+    /// Secret values, kept apart from `resolved` on purpose: the resolved spec
+    /// is what `zygo spec explain` prints, and these must never be in it.
+    secrets: BTreeMap<String, String>,
+    /// What was on disk when the sandbox started. See [`Sources`].
+    sources: Sources,
+    function: Function,
     gate: Gate,
     registered: Instant,
+    /// When a request last finished. Drives the idle policy.
+    last_used: Mutex<Instant>,
 }
 
 impl Entry {
     fn status(&self) -> Status {
         self.function.status()
+    }
+
+    fn touch(&self) {
+        *self.last_used.lock().expect("last_used") = Instant::now();
+    }
+
+    fn idle_for(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(*self.last_used.lock().expect("last_used"))
+    }
+}
+
+/// A function that has been tiered all the way down.
+///
+/// Only the spec is kept. That is the whole point: a cold function costs
+/// nothing but a map entry, and the next request rebuilds it from exactly the
+/// configuration it had. The last status is kept alongside so `zygo ps` does not
+/// reset someone's request count just because their function went quiet.
+struct Cold {
+    resolved: ResolvedFn,
+    secrets: BTreeMap<String, String>,
+    sources: Sources,
+    last_status: Status,
+    since: Instant,
+}
+
+/// What one pass of the idle policy did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Tiered {
+    /// Frozen: still resident, no longer schedulable.
+    pub paused: Vec<String>,
+    /// Stopped: the sandbox is gone, the spec is kept.
+    pub cooled: Vec<String>,
+}
+
+impl Tiered {
+    pub fn is_empty(&self) -> bool {
+        self.paused.is_empty() && self.cooled.is_empty()
     }
 }
 
@@ -196,8 +284,14 @@ pub struct Supervisor {
     launcher: Launcher,
     paths: Paths,
     functions: Mutex<BTreeMap<String, Arc<Entry>>>,
+    /// Functions tiered down to cold: registered, but with no sandbox.
+    cold: Mutex<BTreeMap<String, Cold>>,
     /// Rewarm history per name. See [`Backoff`] for why it is not in `Entry`.
     rewarms: Mutex<BTreeMap<String, Backoff>>,
+    /// Recent log per name. Kept here rather than in `Entry` so it survives
+    /// a replacement and a cold spell: a `zygo logs -f` across a deploy
+    /// should show the new zygote coming up, not go quiet.
+    logs: Mutex<BTreeMap<String, crate::pool::Logs>>,
     started: Instant,
     /// Set by `SHUTDOWN`; the accept loop notices and stops.
     stopping: AtomicBool,
@@ -206,12 +300,29 @@ pub struct Supervisor {
 impl Supervisor {
     pub fn new(paths: Paths) -> Result<Supervisor> {
         let pool = Arc::new(Pool::new(PoolConfig::new(paths.clone()))?);
+
+        // Sandboxes die with their supervisor, but cgroups outlive their
+        // processes. Without this a restarted supervisor inherits one dead
+        // `tenants/<name>` tree per previous lifetime, and would reuse their
+        // stale limits for any name it serves again.
+        if let Ok(hierarchy) = crate::cgroup::Hierarchy::discover() {
+            let cleaned = hierarchy.clean_stale_tenants();
+            if !cleaned.is_empty() {
+                tracing::info!(
+                    tenants = ?cleaned,
+                    "removed cgroups left by a previous supervisor"
+                );
+            }
+        }
+
         Ok(Supervisor {
             pool,
             launcher: Launcher::new()?,
             paths,
             functions: Mutex::new(BTreeMap::new()),
+            cold: Mutex::new(BTreeMap::new()),
             rewarms: Mutex::new(BTreeMap::new()),
+            logs: Mutex::new(BTreeMap::new()),
             started: Instant::now(),
             stopping: AtomicBool::new(false),
         })
@@ -233,13 +344,23 @@ impl Supervisor {
     ///
     /// Replaces any function already under that name: `zygo serve` on a handler
     /// you just edited should give you the new one, and a name that silently
-    /// kept serving stale code would be a debugging trap.
+    /// kept serving stale code would be a debugging trap. The replacement is
+    /// blue/green — the new sandbox is warm before the old one stops taking
+    /// requests, requests the old one accepted finish on it, and requests that
+    /// were queued behind it are admitted to the new one.
+    ///
+    /// With `if_changed`, a registered function that is identical — same
+    /// resolved spec, same secret values, same bytes in the handler and
+    /// requirements files — is kept instead, so a deploy that changed three of
+    /// ten functions restarts three.
     pub fn serve(
         &self,
         name: &str,
         spec: Option<&Spec>,
         layer: &Layer,
         options: &ResolveOptions,
+        secrets: BTreeMap<String, String>,
+        if_changed: bool,
     ) -> std::result::Result<Response, Response> {
         // Before anything else, including validation: the user has just said
         // what this function should be, so the automatic-recovery history of
@@ -259,17 +380,87 @@ impl Supervisor {
             .resolve_for_serve(name, layer, options)
             .map_err(|e| Response::error(ControlError::BadSpec, e))?;
 
-        let warming = Instant::now();
-        let (_, status, warnings) = self.warm_and_register(name, resolved)?;
+        // Every secret the spec names has to have a value, and the client is
+        // the only party that could have supplied one — so a missing value is
+        // reported here as the spec problem it is, before a sandbox exists.
+        let missing: Vec<&str> = resolved
+            .secrets
+            .iter()
+            .filter(|s| !secrets.contains_key(*s))
+            .map(String::as_str)
+            .collect();
+        if !missing.is_empty() {
+            return Err(Response::error(
+                ControlError::BadSpec,
+                format!(
+                    "fn.{name}.secrets: no value for {}; \
+                     set {} in the environment of the shell running `zygo serve`",
+                    missing.join(", "),
+                    if missing.len() == 1 { "it" } else { "them" }
+                ),
+            ));
+        }
+        // Only what the spec asked for. A client that sent more — its whole
+        // environment, say — must not have the surplus delivered.
+        let secrets: BTreeMap<String, String> = secrets
+            .into_iter()
+            .filter(|(k, _)| resolved.secrets.contains(k))
+            .collect();
 
+        let warming = Instant::now();
+        if if_changed && self.is_registered_as(name, &resolved, &secrets) {
+            // Kept, but brought to warm: `up` promises warm functions, and an
+            // unchanged one may have been tiered down since the last deploy.
+            let entry = self.ensure_warm(name)?;
+            let status = entry.status();
+            return Ok(Response::Served {
+                name: name.to_string(),
+                runtime: status.runtime,
+                rss_kb: status.rss_kb,
+                imports_ms: status.imports_ms,
+                warm_ms: warming.elapsed().as_secs_f64() * 1000.0,
+                warnings: resolved.warnings,
+                change: Change::Unchanged,
+            });
+        }
+
+        let warmed = self.warm_and_register(name, resolved, secrets)?;
         Ok(Response::Served {
             name: name.to_string(),
-            runtime: status.runtime,
-            rss_kb: status.rss_kb,
-            imports_ms: status.imports_ms,
+            runtime: warmed.status.runtime,
+            rss_kb: warmed.status.rss_kb,
+            imports_ms: warmed.status.imports_ms,
             warm_ms: warming.elapsed().as_secs_f64() * 1000.0,
-            warnings,
+            warnings: warmed.warnings,
+            change: if warmed.replaced {
+                Change::Replaced
+            } else {
+                Change::Started
+            },
         })
+    }
+
+    /// Whether `name` is registered — warm, paused or cold — as exactly this
+    /// function: the spec the caller resolved, the secret values it sent, and
+    /// what is in the handler and requirements files *now*.
+    fn is_registered_as(
+        &self,
+        name: &str,
+        resolved: &ResolvedFn,
+        secrets: &BTreeMap<String, String>,
+    ) -> bool {
+        let sources = Sources::of(resolved);
+        if let Some(entry) = self.functions.lock().expect("registry").get(name) {
+            return entry.resolved == *resolved
+                && entry.secrets == *secrets
+                && entry.sources == sources;
+        }
+        if let Some(cold) = self.cold.lock().expect("cold").get(name) {
+            return cold.resolved == *resolved
+                && cold.secrets == *secrets
+                && cold.sources == sources;
+        }
+        false
     }
 
     /// Warm a resolved function and put it in the registry under `name`.
@@ -281,15 +472,23 @@ impl Supervisor {
         &self,
         name: &str,
         resolved: ResolvedFn,
-    ) -> std::result::Result<(Arc<Entry>, Status, Vec<String>), Response> {
+        secrets: BTreeMap<String, String>,
+    ) -> std::result::Result<Warmed, Response> {
+        // Hashed before the warm-up rather than after, so an edit that lands
+        // while the sandbox is starting counts as a change next time — the
+        // sandbox may or may not have read it, and "replace" is the safe answer.
+        let sources = Sources::of(&resolved);
+
         // On the launcher thread, never here: see [`Launcher`].
         let pool = Arc::clone(&self.pool);
         let spec_for_warm = resolved.clone();
+        let logs = self.logs_for(name);
         let function = self
             .launcher
-            .run(move || pool.serve(&spec_for_warm))
+            .run(move || pool.serve_with_logs(&spec_for_warm, logs))
             .map_err(|e| Response::error(ControlError::WarmFailed, e))?
             .map_err(|e| Response::error(ControlError::WarmFailed, e))?;
+        function.set_secrets(secrets.clone());
 
         let status = function.status();
         let warnings = resolved.warnings.clone();
@@ -299,8 +498,11 @@ impl Supervisor {
                 Gate::default_queue_limit(resolved.concurrency),
             ),
             resolved,
+            secrets,
+            sources,
             function,
             registered: Instant::now(),
+            last_used: Mutex::new(Instant::now()),
         });
 
         // The previous entry is dropped after the lock is released: dropping a
@@ -310,10 +512,19 @@ impl Supervisor {
             let mut functions = self.functions.lock().expect("registry");
             functions.insert(name.to_string(), Arc::clone(&entry))
         };
+        // A cold registration under this name is superseded too, whether this
+        // is the wake-up that was waiting for it or a deploy over it.
+        let was_cold = self.cold.lock().expect("cold").remove(name).is_some();
+        let replaced = previous.is_some() || was_cold;
         if let Some(previous) = previous {
             self.retire(previous);
         }
-        Ok((entry, status, warnings))
+        Ok(Warmed {
+            entry,
+            status,
+            warnings,
+            replaced,
+        })
     }
 
     /// Bring a crashed function back, respecting its backoff.
@@ -343,14 +554,14 @@ impl Supervisor {
         }
 
         tracing::warn!(function = name, "agent is not healthy; rewarming");
-        let outcome = self.warm_and_register(name, broken.resolved.clone());
+        let outcome = self.warm_and_register(name, broken.resolved.clone(), broken.secrets.clone());
 
         let mut rewarms = self.rewarms.lock().expect("rewarms");
         let backoff = rewarms.entry(name.to_string()).or_default();
         match outcome {
-            Ok((entry, _, _)) => {
+            Ok(warmed) => {
                 backoff.failures = 0;
-                Ok(entry)
+                Ok(warmed.entry)
             }
             Err(response) => {
                 backoff.failures = backoff.failures.saturating_add(1);
@@ -359,38 +570,146 @@ impl Supervisor {
         }
     }
 
+    /// Apply the idle policy once (design doc F12, §3.9).
+    ///
+    /// Two tiers, both driven by how long it has been since a request finished:
+    /// past `idle_timeout` a function is frozen, which keeps the resident pages
+    /// that make the next request a `fork()` while costing no CPU; past
+    /// `cold_after` its sandbox is dropped entirely and only the spec is kept.
+    ///
+    /// Separated from the thread that calls it so the policy can be tested by
+    /// calling it, rather than by sleeping and hoping.
+    pub fn tier_idle(&self) -> Tiered {
+        let now = Instant::now();
+        let candidates: Vec<(String, Arc<Entry>)> = {
+            let functions = self.functions.lock().expect("registry");
+            functions
+                .iter()
+                .map(|(name, entry)| (name.clone(), Arc::clone(entry)))
+                .collect()
+        };
+
+        let mut tiered = Tiered::default();
+        for (name, entry) in candidates {
+            // A request in flight means the function is in use whatever the
+            // clock says; freezing it would stop the request it is serving.
+            let (in_flight, queued) = entry.gate.load();
+            if in_flight > 0 || queued > 0 {
+                continue;
+            }
+            let idle = entry.idle_for(now);
+
+            if idle >= entry.resolved.cold_after.get() {
+                if self.cool(&name, &entry) {
+                    tiered.cooled.push(name);
+                }
+            } else if idle >= entry.resolved.idle_timeout.get()
+                && entry.function.state() == crate::sandbox::SandboxState::Warm
+                && entry.function.pause().is_ok()
+            {
+                tiered.paused.push(name);
+            }
+        }
+        tiered
+    }
+
+    /// Drop a function's sandbox but keep its registration.
+    fn cool(&self, name: &str, entry: &Arc<Entry>) -> bool {
+        let mut status = entry.status();
+        status.state = crate::sandbox::SandboxState::Cold;
+
+        let removed = {
+            let mut functions = self.functions.lock().expect("registry");
+            // Only remove the entry we looked at: a `serve` may have replaced it
+            // while we were deciding, and that new sandbox is not idle.
+            match functions.get(name) {
+                Some(current) if Arc::ptr_eq(current, entry) => functions.remove(name),
+                _ => None,
+            }
+        };
+        let Some(removed) = removed else {
+            return false;
+        };
+
+        self.cold.lock().expect("cold").insert(
+            name.to_string(),
+            Cold {
+                resolved: removed.resolved.clone(),
+                secrets: removed.secrets.clone(),
+                sources: removed.sources.clone(),
+                last_status: status,
+                since: Instant::now(),
+            },
+        );
+        self.retire(removed);
+        true
+    }
+
     /// Route one request to its function.
     pub fn exec(
         &self,
         name: &str,
-        event: serde_json::Value,
+        mut event: serde_json::Value,
         timeout: Duration,
     ) -> std::result::Result<Response, Response> {
         let mut entry = self.lookup(name)?;
 
-        // A function whose agent died is replaced before the request is sent,
-        // not after it fails: the caller should not pay for a crash that
-        // happened between their request and somebody else's.
-        if !entry.function.is_healthy() {
-            entry = self.rewarm(name, &entry)?;
-        }
+        // At most one redirect. A gate closes for two reasons — the function was
+        // stopped, or it was replaced — and a request that was queued behind a
+        // function being replaced belongs on its replacement, not on the floor.
+        // Whoever replaced it warmed the new one first, so this is a retry that
+        // costs one registry lookup. A second closure in a row means someone is
+        // redeploying faster than requests are being admitted, and at that
+        // point telling the caller is better than looping.
+        for _ in 0..2 {
+            // A function whose agent died is replaced before the request is
+            // sent, not after it fails: the caller should not pay for a crash
+            // that happened between their request and somebody else's.
+            if !entry.function.is_healthy() {
+                entry = self.rewarm(name, &entry)?;
+            }
 
+            // Thawing is one write, so a paused function answers at warm speed
+            // plus that. This is the whole reason pausing is a tier of its own
+            // rather than going straight to cold.
+            if let Err(e) = entry.function.resume() {
+                return Err(Response::error(ControlError::CallFailed, e));
+            }
+
+            event = match self.attempt(&entry, name, event, timeout) {
+                Attempt::Done(response) => return response,
+                Attempt::Closed(event) => event,
+            };
+            match self.lookup(name) {
+                Ok(current) if !Arc::ptr_eq(&current, &entry) => entry = current,
+                _ => break,
+            }
+        }
+        Err(Response::error(
+            ControlError::NotFound,
+            format!("`{name}` is shutting down"),
+        ))
+    }
+
+    /// One pass through a function's gate and, if admitted, its sandbox.
+    fn attempt(
+        &self,
+        entry: &Entry,
+        name: &str,
+        event: serde_json::Value,
+        timeout: Duration,
+    ) -> Attempt {
         let permit = match entry.gate.enter(QUEUE_WAIT) {
             Ok(permit) => permit,
-            Err(Rejected::Closed) => {
-                return Err(Response::error(
-                    ControlError::NotFound,
-                    format!("`{name}` is shutting down"),
-                ));
-            }
+            Err(Rejected::Closed) => return Attempt::Closed(event),
             Err(rejected) => {
                 let (in_flight, queued, limit) = rejected.load().unwrap_or_default();
-                return Ok(Response::Busy {
+                return Attempt::Done(Ok(Response::Busy {
                     name: name.to_string(),
                     in_flight,
                     queued,
                     limit,
-                });
+                }));
             }
         };
 
@@ -399,16 +718,88 @@ impl Supervisor {
             .call_with_timeout(event, timeout)
             .map_err(|e| Response::error(ControlError::CallFailed, e));
         drop(permit);
+        // After the call, not before: the clock should measure how long the
+        // function has been idle, not how long ago a slow request started.
+        entry.touch();
 
-        Ok(Response::Executed {
-            outcome: Box::new(outcome?),
+        if let Ok(outcome) = &outcome {
+            self.logs_for(name).push(
+                crate::pool::LogKind::Request {
+                    id: next_log_request_id(),
+                    exit_code: outcome.exit_code,
+                    wall_ms: outcome.metrics.wall_ms,
+                    error: outcome.error.clone(),
+                    stderr: outcome.stderr.clone(),
+                },
+                outcome.stdout.clone(),
+            );
+        }
+
+        Attempt::Done(outcome.map(|outcome| Response::Executed {
+            outcome: Box::new(outcome),
+        }))
+    }
+
+    /// The log ring for `name`, created on first use.
+    fn logs_for(&self, name: &str) -> crate::pool::Logs {
+        Arc::clone(
+            self.logs
+                .lock()
+                .expect("logs")
+                .entry(name.to_string())
+                .or_default(),
+        )
+    }
+
+    /// A function's recent log.
+    ///
+    /// A name that was never served has no log and is `not_found`; one that
+    /// was served and went cold keeps its log, because the questions people
+    /// bring to a log — "why did that fail?" — are asked after the fact.
+    pub fn logs(
+        &self,
+        name: &str,
+        after: u64,
+        limit: u32,
+        failed: bool,
+    ) -> std::result::Result<Response, Response> {
+        let ring = self
+            .logs
+            .lock()
+            .expect("logs")
+            .get(name)
+            .cloned()
+            .ok_or_else(|| {
+                Response::error(
+                    ControlError::NotFound,
+                    format!("no function named `{name}`; `zygo serve` it first"),
+                )
+            })?;
+        let (entries, next) = ring.since(after, limit.max(1) as usize, failed);
+        Ok(Response::Logs {
+            name: name.to_string(),
+            entries,
+            next,
         })
     }
 
     /// Everything `zygo ps` shows, ordered by name so the output is stable.
     pub fn list(&self) -> Vec<Status> {
-        let functions = self.functions.lock().expect("registry");
-        functions.values().map(|e| e.status()).collect()
+        let mut all: BTreeMap<String, Status> = self
+            .functions
+            .lock()
+            .expect("registry")
+            .iter()
+            .map(|(name, entry)| (name.clone(), entry.status()))
+            .collect();
+        // Cold functions are still registered, so `ps` has to show them —
+        // otherwise a function that went quiet looks like one that was never
+        // served, and `zygo exec` on it would be a surprise either way.
+        for (name, cold) in self.cold.lock().expect("cold").iter() {
+            all.entry(name.clone())
+                .or_insert_with(|| cold.last_status.clone());
+        }
+        all.into_values().collect()
     }
 
     /// Per-function load, for the columns `zygo ps` adds beyond [`Status`].
@@ -429,28 +820,98 @@ impl Supervisor {
             .collect()
     }
 
+    /// Bring a registered function to `Warm` without calling it.
+    ///
+    /// The same path a request takes to find its function — waking it from
+    /// cold, rewarming it if its agent died, thawing it if it was paused —
+    /// stopped just short of sending anything.
+    pub fn warm(&self, name: &str) -> std::result::Result<Response, Response> {
+        let entry = self.ensure_warm(name)?;
+        Ok(Response::Warmed {
+            name: name.to_string(),
+            state: entry.function.state(),
+        })
+    }
+
+    /// Where a debug shell should enter, for `zygo shell`.
+    ///
+    /// Warms the function first, for the same reason `warm` does: a shell into
+    /// a function that went cold should give you the function, not an error
+    /// about the tiering policy.
+    pub fn shell(&self, name: &str) -> std::result::Result<Response, Response> {
+        let entry = self.ensure_warm(name)?;
+        Ok(Response::Sandbox {
+            name: name.to_string(),
+            pid: entry.function.init_pid(),
+            workdir: entry.resolved.workdir.clone(),
+        })
+    }
+
+    /// The registered function called `name`, warm: woken if it was cold,
+    /// rewarmed if its agent died, thawed if it was paused.
+    fn ensure_warm(&self, name: &str) -> std::result::Result<Arc<Entry>, Response> {
+        let mut entry = self.lookup(name)?;
+        if !entry.function.is_healthy() {
+            entry = self.rewarm(name, &entry)?;
+        }
+        if let Err(e) = entry.function.resume() {
+            return Err(Response::error(ControlError::CallFailed, e));
+        }
+        entry.touch();
+        Ok(entry)
+    }
+
     /// Stop one function, or every function when `name` is `None`.
     pub fn stop(&self, name: Option<&str>) -> std::result::Result<Response, Response> {
+        // A cold function has no sandbox left to stop, but it is still
+        // registered and would come back on the next request, so `stop` has to
+        // deregister it too.
+        let cold_names: Vec<String> = {
+            let mut cold = self.cold.lock().expect("cold");
+            match name {
+                Some(name) => cold
+                    .remove(name)
+                    .map(|_| name.to_string())
+                    .into_iter()
+                    .collect(),
+                None => std::mem::take(&mut *cold).into_keys().collect(),
+            }
+        };
+
         let removed = {
             let mut functions = self.functions.lock().expect("registry");
             match name {
                 Some(name) => match functions.remove(name) {
                     Some(entry) => vec![entry],
-                    None => {
+                    None if cold_names.is_empty() => {
                         return Err(Response::error(
                             ControlError::NotFound,
                             format!("no function named `{name}`"),
                         ));
                     }
+                    None => vec![],
                 },
                 None => std::mem::take(&mut *functions).into_values().collect(),
             }
         };
 
-        let names = removed
+        let mut names = removed
             .iter()
             .map(|e| e.resolved.name.clone())
             .collect::<Vec<_>>();
+        names.extend(cold_names);
+        names.sort();
+        names.dedup();
+
+        // Stopped is deregistered, and a deregistered name's log goes with
+        // it: `stop` is the one operation that means "forget this function".
+        {
+            let mut logs = self.logs.lock().expect("logs");
+            for n in &names {
+                logs.remove(n);
+            }
+        }
+
         for entry in removed {
             self.retire(entry);
         }
@@ -462,14 +923,35 @@ impl Supervisor {
         self.stopping.store(true, Ordering::SeqCst);
     }
 
+    /// Find a function, bringing it back from cold if that is where it is.
+    ///
+    /// A cold function is still registered, so a request for it is not a
+    /// mistake to report — it is a cold start to pay. The caller sees a slower
+    /// request, which is exactly the trade `cold_after` was configured to make.
     fn lookup(&self, name: &str) -> std::result::Result<Arc<Entry>, Response> {
-        let functions = self.functions.lock().expect("registry");
-        functions.get(name).cloned().ok_or_else(|| {
-            Response::error(
-                ControlError::NotFound,
-                format!("no function named `{name}`; `zygo serve` it first"),
-            )
-        })
+        if let Some(entry) = self.functions.lock().expect("registry").get(name) {
+            return Ok(Arc::clone(entry));
+        }
+
+        let cold = self
+            .cold
+            .lock()
+            .expect("cold")
+            .get(name)
+            .map(|c| (c.resolved.clone(), c.secrets.clone(), c.since.elapsed()));
+        if let Some((resolved, secrets, asleep)) = cold {
+            tracing::info!(
+                function = name,
+                asleep_s = asleep.as_secs(),
+                "waking a cold function"
+            );
+            return Ok(self.warm_and_register(name, resolved, secrets)?.entry);
+        }
+
+        Err(Response::error(
+            ControlError::NotFound,
+            format!("no function named `{name}`; `zygo serve` it first"),
+        ))
     }
 
     /// Close a function to new requests and let it go.
@@ -482,6 +964,32 @@ impl Supervisor {
         entry.gate.close();
         let _ = entry.function.shutdown();
     }
+}
+
+/// Request ids in the log: short, unique per supervisor, and the same shape
+/// the agent protocol uses so a line in the log can be matched to a trace.
+fn next_log_request_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    format!("{:08x}", NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+/// A function that was just warmed and registered.
+struct Warmed {
+    entry: Arc<Entry>,
+    status: Status,
+    warnings: Vec<String>,
+    /// Whether something — warm, paused or cold — held the name before.
+    replaced: bool,
+}
+
+/// One pass at a request, from [`Supervisor::attempt`].
+enum Attempt {
+    /// The request was admitted and ran, or was turned away with an answer.
+    Done(std::result::Result<Response, Response>),
+    /// The gate had been closed. The event comes back so it can be offered to
+    /// whatever holds the name now.
+    Closed(serde_json::Value),
 }
 
 /// What a function is doing right now.
@@ -526,7 +1034,10 @@ impl Listener {
                 Ok(_) => {
                     return Err(Error::BackendUnavailable {
                         backend: "supervisor",
-                        reason: format!("a supervisor is already listening on {}", socket.display()),
+                        reason: format!(
+                            "a supervisor is already listening on {}",
+                            socket.display()
+                        ),
                         remedy: "use it, or stop it with `zygo stop --all`".into(),
                     });
                 }
@@ -574,6 +1085,28 @@ impl Listener {
             .set_nonblocking(false)
             .map_err(|e| Error::primitive("set_nonblocking", "control socket", e))?;
 
+        // The idle policy runs on its own thread rather than on whichever
+        // connection happens to arrive, so a supervisor nobody is talking to
+        // still gives its memory back.
+        let tiering = {
+            let supervisor = Arc::clone(&supervisor);
+            std::thread::Builder::new()
+                .name("zygo-idle".into())
+                .spawn(move || {
+                    while !supervisor.is_stopping() {
+                        std::thread::sleep(TIER_INTERVAL);
+                        let tiered = supervisor.tier_idle();
+                        for name in &tiered.paused {
+                            tracing::info!(function = %name, "idle: paused");
+                        }
+                        for name in &tiered.cooled {
+                            tracing::info!(function = %name, "idle: gone cold");
+                        }
+                    }
+                })
+                .map_err(|e| Error::primitive("spawn", "idle thread", e))?
+        };
+
         let mut threads = Vec::new();
         for stream in self.listener.incoming() {
             if supervisor.is_stopping() {
@@ -597,6 +1130,7 @@ impl Listener {
         for t in threads {
             let _ = t.join();
         }
+        let _ = tiering.join();
         let _ = supervisor.stop(None);
         Ok(())
     }
@@ -687,6 +1221,8 @@ fn dispatch(supervisor: &Supervisor, request: Request, greeted: &mut bool) -> Re
             allow_host_net,
             allow_private_net,
             allow_unlimited,
+            secrets,
+            if_changed,
         } => {
             let options = ResolveOptions {
                 allow_host_net,
@@ -695,7 +1231,14 @@ fn dispatch(supervisor: &Supervisor, request: Request, greeted: &mut bool) -> Re
                 base_dir: Some(base_dir),
                 one_shot: false,
             };
-            merge(supervisor.serve(&name, spec.as_deref(), &layer, &options))
+            merge(supervisor.serve(
+                &name,
+                spec.as_deref(),
+                &layer,
+                &options,
+                secrets,
+                if_changed,
+            ))
         }
         Request::Exec {
             name,
@@ -703,6 +1246,14 @@ fn dispatch(supervisor: &Supervisor, request: Request, greeted: &mut bool) -> Re
             timeout_ms,
         } => merge(supervisor.exec(&name, event, Duration::from_millis(timeout_ms))),
         Request::Stop { name } => merge(supervisor.stop(name.as_deref())),
+        Request::Warm { name } => merge(supervisor.warm(&name)),
+        Request::Shell { name } => merge(supervisor.shell(&name)),
+        Request::Logs {
+            name,
+            after,
+            limit,
+            failed,
+        } => merge(supervisor.logs(&name, after, limit, failed)),
         Request::Shutdown => Response::Ok,
     }
 }
@@ -787,6 +1338,186 @@ mod tests {
         Paths::rooted(dir.path())
     }
 
+    // --- idle tiering ------------------------------------------------------
+    //
+    // These exercise the policy without a sandbox, which is what `tier_idle`
+    // being a callable pass rather than a thread is for: a test that had to
+    // sleep out a ten-minute `idle_timeout` would not be written.
+
+    #[test]
+    fn nothing_to_tier_is_not_an_event() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let supervisor = Supervisor::new(paths(&dir)).expect("supervisor");
+        assert!(supervisor.tier_idle().is_empty());
+    }
+
+    #[test]
+    fn a_cold_function_is_still_listed_and_still_registered() {
+        // The distinction that matters to someone reading `ps`: a function that
+        // went quiet is not a function that was never served, and `exec` on it
+        // is a cold start rather than an error.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let supervisor = Supervisor::new(paths(&dir)).expect("supervisor");
+
+        let status = Status {
+            name: "resize".into(),
+            state: crate::sandbox::SandboxState::Cold,
+            runtime: "python/3.12".into(),
+            rss_kb: 0,
+            imports_ms: 0.0,
+            requests: 17,
+            failures: 1,
+        };
+        supervisor.cold.lock().expect("cold").insert(
+            "resize".into(),
+            Cold {
+                resolved: resolved_fn("resize"),
+                secrets: BTreeMap::new(),
+                sources: Sources::default(),
+                last_status: status.clone(),
+                since: Instant::now(),
+            },
+        );
+
+        let listed = supervisor.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].state, crate::sandbox::SandboxState::Cold);
+        assert_eq!(
+            listed[0].requests, 17,
+            "going cold must not reset someone's counters"
+        );
+    }
+
+    #[test]
+    fn stopping_a_cold_function_deregisters_it() {
+        // Without this it would come back on the next request, having been
+        // explicitly stopped.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let supervisor = Supervisor::new(paths(&dir)).expect("supervisor");
+        supervisor.cold.lock().expect("cold").insert(
+            "resize".into(),
+            Cold {
+                resolved: resolved_fn("resize"),
+                secrets: BTreeMap::new(),
+                sources: Sources::default(),
+                last_status: cold_status("resize"),
+                since: Instant::now(),
+            },
+        );
+
+        assert_eq!(
+            supervisor.stop(Some("resize")),
+            Ok(Response::Stopped {
+                names: vec!["resize".into()]
+            })
+        );
+        assert!(supervisor.list().is_empty());
+        // And it is gone for good, not merely asleep.
+        assert!(matches!(
+            supervisor.stop(Some("resize")),
+            Err(Response::Error {
+                code: ControlError::NotFound,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn stop_all_takes_cold_functions_with_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let supervisor = Supervisor::new(paths(&dir)).expect("supervisor");
+        for name in ["a", "b"] {
+            supervisor.cold.lock().expect("cold").insert(
+                name.into(),
+                Cold {
+                    resolved: resolved_fn(name),
+                    secrets: BTreeMap::new(),
+                    sources: Sources::default(),
+                    last_status: cold_status(name),
+                    since: Instant::now(),
+                },
+            );
+        }
+        assert_eq!(
+            supervisor.stop(None),
+            Ok(Response::Stopped {
+                names: vec!["a".into(), "b".into()]
+            })
+        );
+        assert!(supervisor.list().is_empty());
+    }
+
+    #[test]
+    fn a_cold_function_that_cannot_be_rewarmed_reports_why() {
+        // There is no image in this scratch store, so waking it fails — the
+        // point is that the caller is told, rather than getting "not found" for
+        // a function that is registered.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let supervisor = Supervisor::new(paths(&dir)).expect("supervisor");
+        supervisor.cold.lock().expect("cold").insert(
+            "resize".into(),
+            Cold {
+                resolved: resolved_fn("resize"),
+                secrets: BTreeMap::new(),
+                sources: Sources::default(),
+                last_status: cold_status("resize"),
+                since: Instant::now(),
+            },
+        );
+        let response = supervisor
+            .exec("resize", serde_json::Value::Null, Duration::from_secs(1))
+            .expect_err("no image to wake it from");
+        assert!(
+            matches!(
+                response,
+                Response::Error {
+                    code: ControlError::WarmFailed,
+                    ..
+                }
+            ),
+            "{response:?}"
+        );
+    }
+
+    #[test]
+    fn the_tiering_thresholds_are_the_resolved_specs() {
+        // The policy has no thresholds of its own; a function with an
+        // `idle_timeout` of an hour must not be paused because the supervisor
+        // felt like it.
+        let f = resolved_fn("resize");
+        assert_eq!(f.idle_timeout.get(), Duration::from_secs(600));
+        assert_eq!(f.cold_after.get(), Duration::from_secs(3600));
+        assert!(
+            f.cold_after.get() >= f.idle_timeout.get(),
+            "resolution should already have rejected this"
+        );
+    }
+
+    fn resolved_fn(name: &str) -> ResolvedFn {
+        crate::spec::resolve_standalone(
+            name,
+            &Layer {
+                image: Some("python:3.12-slim".into()),
+                entry: Some(std::path::PathBuf::from("/tmp/handler.py")),
+                ..Default::default()
+            },
+            &ResolveOptions::default(),
+        )
+        .expect("resolve")
+    }
+
+    fn cold_status(name: &str) -> Status {
+        Status {
+            name: name.into(),
+            state: crate::sandbox::SandboxState::Cold,
+            runtime: "python/3.12".into(),
+            rss_kb: 0,
+            imports_ms: 0.0,
+            requests: 0,
+            failures: 0,
+        }
+    }
+
     // --- rewarm backoff ---------------------------------------------------
 
     #[test]
@@ -856,7 +1587,14 @@ mod tests {
             image: Some("python:3.12-slim".into()),
             ..Default::default()
         };
-        let _ = supervisor.serve("resize", None, &layer, &ResolveOptions::default());
+        let _ = supervisor.serve(
+            "resize",
+            None,
+            &layer,
+            &ResolveOptions::default(),
+            BTreeMap::new(),
+            false,
+        );
         assert!(
             !supervisor
                 .rewarms
@@ -924,13 +1662,16 @@ mod tests {
         let launcher = Launcher::new().expect("launcher");
         assert_eq!(launcher.run(|| 6 * 7).expect("job"), 42);
         assert_eq!(
-            launcher.run(|| "from the launcher".to_string()).expect("job"),
+            launcher
+                .run(|| "from the launcher".to_string())
+                .expect("job"),
             "from the launcher"
         );
         // Results carry errors through unchanged, which is how a failed warm-up
         // reaches the client.
-        let failed: std::result::Result<(), String> =
-            launcher.run(|| Err("no such image".to_string())).expect("job");
+        let failed: std::result::Result<(), String> = launcher
+            .run(|| Err("no such image".to_string()))
+            .expect("job");
         assert_eq!(failed, Err("no such image".into()));
     }
 
@@ -1018,7 +1759,10 @@ mod tests {
 
         let socket = paths.supervisor_sock();
         assert!(socket.exists());
-        let mode = std::fs::metadata(&socket).expect("stat").permissions().mode();
+        let mode = std::fs::metadata(&socket)
+            .expect("stat")
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o600, "the control socket is owner-only");
 
         let runtime = std::fs::metadata(paths.runtime()).expect("stat");
@@ -1196,6 +1940,173 @@ mod tests {
     }
 
     #[test]
+    fn a_secret_the_spec_names_but_nobody_supplied_is_a_spec_problem() {
+        // Reported before any sandbox exists, and naming the variable: the
+        // alternative is a handler that fails opening a file that is not there.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let supervisor = Supervisor::new(paths(&dir)).expect("supervisor");
+        let layer = Layer {
+            image: Some("python:3.12-slim".into()),
+            entry: Some(std::path::PathBuf::from("/tmp/handler.py")),
+            secrets: Some(vec!["STRIPE_KEY".into(), "DB_URL".into()]),
+            ..Default::default()
+        };
+        let response = supervisor
+            .serve(
+                "pay",
+                None,
+                &layer,
+                &ResolveOptions::default(),
+                BTreeMap::from([("STRIPE_KEY".to_string(), "sk".to_string())]),
+                false,
+            )
+            .expect_err("DB_URL has no value");
+        match response {
+            Response::Error {
+                code: ControlError::BadSpec,
+                message,
+            } => {
+                assert!(message.contains("DB_URL"), "{message}");
+                assert!(
+                    !message.contains("STRIPE_KEY"),
+                    "only the missing one: {message}"
+                );
+                assert!(
+                    !message.contains("sk"),
+                    "a value must never be echoed: {message}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // --- blue/green ------------------------------------------------------
+
+    fn handler_in(dir: &tempfile::TempDir, body: &str) -> (Layer, ResolvedFn) {
+        let path = dir.path().join("handler.py");
+        std::fs::write(&path, body).expect("write handler");
+        let layer = Layer {
+            image: Some("python:3.12-slim".into()),
+            entry: Some(path),
+            ..Default::default()
+        };
+        let resolved = crate::spec::resolve_standalone("f", &layer, &ResolveOptions::default())
+            .expect("resolve");
+        (layer, resolved)
+    }
+
+    #[test]
+    fn sources_follow_the_bytes_on_disk_not_the_path() {
+        // The spec cannot see an edit to the handler; this is what can.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_, before) = handler_in(&dir, "def handler(e): return 1\n");
+        let at_start = Sources::of(&before);
+        assert_eq!(at_start, Sources::of(&before), "hashing is deterministic");
+
+        std::fs::write(dir.path().join("handler.py"), "def handler(e): return 2\n").expect("edit");
+        assert_ne!(
+            at_start,
+            Sources::of(&before),
+            "an edited handler is a change"
+        );
+
+        std::fs::remove_file(dir.path().join("handler.py")).expect("remove");
+        let gone = Sources::of(&before);
+        assert_ne!(at_start, gone, "a deleted handler is a change");
+        assert_eq!(
+            gone.0[0].1, None,
+            "and is recorded as unreadable, not as empty"
+        );
+    }
+
+    #[test]
+    fn a_cold_function_is_unchanged_only_while_its_inputs_are() {
+        // Registration is compared, not just the name: `up` after editing the
+        // handler, changing a secret, or changing the spec must replace, and
+        // `up` after none of those must not.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let supervisor = Supervisor::new(paths(&dir)).expect("supervisor");
+        let (_, resolved) = handler_in(&dir, "def handler(e): return 1\n");
+        let secrets = BTreeMap::from([("KEY".to_string(), "v1".to_string())]);
+        supervisor.cold.lock().expect("cold").insert(
+            "f".into(),
+            Cold {
+                resolved: resolved.clone(),
+                secrets: secrets.clone(),
+                sources: Sources::of(&resolved),
+                last_status: cold_status("f"),
+                since: Instant::now(),
+            },
+        );
+
+        assert!(supervisor.is_registered_as("f", &resolved, &secrets));
+
+        let other_secret = BTreeMap::from([("KEY".to_string(), "v2".to_string())]);
+        assert!(!supervisor.is_registered_as("f", &resolved, &other_secret));
+
+        let mut other_spec = resolved.clone();
+        other_spec.concurrency += 1;
+        assert!(!supervisor.is_registered_as("f", &other_spec, &secrets));
+
+        assert!(
+            !supervisor.is_registered_as("g", &resolved, &secrets),
+            "a different name"
+        );
+
+        std::fs::write(dir.path().join("handler.py"), "def handler(e): return 2\n").expect("edit");
+        assert!(
+            !supervisor.is_registered_as("f", &resolved, &secrets),
+            "the handler changed on disk"
+        );
+    }
+
+    #[test]
+    fn a_serve_that_would_change_nothing_does_not_touch_the_registry() {
+        // No image in this store, so an actual warm-up would fail loudly; a
+        // request for the identical function does not get that far. It does,
+        // however, try to *wake* the function, which is a warm-up — so the
+        // failure it reports is the wake-up's, not a "bad spec".
+        let dir = tempfile::tempdir().expect("tempdir");
+        let supervisor = Supervisor::new(paths(&dir)).expect("supervisor");
+        let (layer, resolved) = handler_in(&dir, "def handler(e): return 1\n");
+        supervisor.cold.lock().expect("cold").insert(
+            "f".into(),
+            Cold {
+                resolved: resolved.clone(),
+                secrets: BTreeMap::new(),
+                sources: Sources::of(&resolved),
+                last_status: cold_status("f"),
+                since: Instant::now(),
+            },
+        );
+
+        let response = supervisor
+            .serve(
+                "f",
+                None,
+                &layer,
+                &ResolveOptions::default(),
+                BTreeMap::new(),
+                true,
+            )
+            .expect_err("waking needs an image this store does not have");
+        assert!(
+            matches!(
+                response,
+                Response::Error {
+                    code: ControlError::WarmFailed,
+                    ..
+                }
+            ),
+            "{response:?}"
+        );
+        assert!(
+            supervisor.cold.lock().expect("cold").contains_key("f"),
+            "a failed wake-up leaves the registration in place"
+        );
+    }
+
+    #[test]
     fn a_bad_spec_is_reported_as_a_spec_problem_not_a_warm_failure() {
         // The distinction matters to the person reading: one is their file,
         // the other is the machine.
@@ -1210,7 +2121,14 @@ mod tests {
             ..Default::default()
         };
         let response = supervisor
-            .serve("x", None, &layer, &ResolveOptions::default())
+            .serve(
+                "x",
+                None,
+                &layer,
+                &ResolveOptions::default(),
+                BTreeMap::new(),
+                false,
+            )
             .expect_err("resolution should fail");
         assert!(matches!(
             response,

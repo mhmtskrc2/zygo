@@ -4,7 +4,17 @@
 __pycache__/
 *.pyc
 /dist
-zygo.lock
+
+# `zygo.lock` is meant to be committed — the docs say so, and a project that
+# does not commit it gets no benefit from it. Ignored only under `examples/`,
+# where a pinned digest would refuse to come up for every reader whose image
+# is newer than the one the lock was written against.
+/examples/**/zygo.lock
 
 # PoC artefacts: cross-compiled binaries, not source
 /poc/poc3-linux
+/poc/zygo-linux
+/poc/zygo-linux-musl
+
+# Built by `make examples-go-linux`
+/examples/warm-exec/go/bin/

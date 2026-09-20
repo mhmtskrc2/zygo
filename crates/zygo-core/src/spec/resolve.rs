@@ -26,6 +26,7 @@ pub fn defaults() -> Layer {
         timeout: Some(Duration::from_secs(30)),
         scratch: Some(Bytes::from_mib(64)),
         nofile: Some(1024),
+        connections: Some(256),
         network: Some(Network::None),
         mode: Some(HandlerMode::Function),
         concurrency: Some(4),
@@ -84,6 +85,11 @@ pub struct ResolvedFn {
 
     pub network: Network,
     pub allow: Vec<AllowRule>,
+    /// Whether `--allow-private-net` was given. Part of the resolved function
+    /// rather than of the launcher's options because it decides what the
+    /// egress ruleset contains, and because a deploy that adds it is a change
+    /// the supervisor must notice.
+    pub allow_private_net: bool,
 
     pub mounts: Vec<Mount>,
     pub env: BTreeMap<String, String>,
@@ -322,6 +328,23 @@ fn resolve_layer(
         ));
     }
 
+    let connections = l.connections.expect("connections has a built-in default");
+    if connections == 0 {
+        return Err(SpecError::invalid_with(
+            field("connections"),
+            "must be at least 1",
+            "a networked sandbox that may open no connections is `network = \"none\"`",
+        ));
+    }
+    if let Some(bandwidth) = l.bandwidth
+        && bandwidth.get() == 0
+    {
+        return Err(SpecError::invalid(
+            field("bandwidth"),
+            "a zero bandwidth blocks the network; use `network = \"none\"` for that",
+        ));
+    }
+
     let limits = Limits {
         mem,
         mem_high: mem.scaled(0.9),
@@ -336,10 +359,21 @@ fn resolve_layer(
         nofile: l.nofile.expect("nofile has a built-in default"),
         fsize: scratch,
         oom_group: true,
+        connections,
+        bandwidth: l.bandwidth,
     };
 
     // --- network -----------------------------------------------------------
     let network = l.network.expect("network has a built-in default");
+    if l.bandwidth.is_none() && matches!(network, Network::Egress | Network::Full) && !opts.one_shot
+    {
+        // The same standing as the disk I/O warning: fairness between
+        // tenants, so a one-shot run has no use for it.
+        warnings.push(format!(
+            "{}: no bandwidth limit; one tenant can saturate the link for the others",
+            field("bandwidth")
+        ));
+    }
     if network == Network::Host && !opts.allow_host_net {
         return Err(SpecError::invalid_with(
             field("network"),
@@ -375,7 +409,6 @@ fn resolve_layer(
             }
         }
     }
-
     // --- mounts ------------------------------------------------------------
     let mut mounts = Vec::new();
     let mut seen_targets: BTreeMap<PathBuf, ()> = BTreeMap::new();
@@ -427,6 +460,16 @@ fn resolve_layer(
         }
     }
 
+    // --- derived layers -----------------------------------------------------
+    // Validated here, filesystem-free, so `zygo spec explain` rejects a bad
+    // package name before any image is copied for the install.
+    let system = l.system.unwrap_or_default();
+    for p in &system {
+        if let Err(message) = crate::derive::validate_package(p) {
+            return Err(SpecError::invalid(field("system"), message));
+        }
+    }
+
     Ok(ResolvedFn {
         name: name.to_string(),
         image,
@@ -437,13 +480,14 @@ fn resolve_layer(
         requirements: l.requirements.map(|r| absolutise(base_dir, &r)),
         workdir: l.workdir.expect("workdir has a built-in default"),
         user: l.user.expect("user has a built-in default"),
-        system: l.system.unwrap_or_default(),
+        system,
         nix: l.nix.unwrap_or_default(),
         isolation: l.isolation.expect("isolation has a built-in default"),
         seccomp: l.seccomp.expect("seccomp has a built-in default"),
         limits,
         network,
         allow,
+        allow_private_net: opts.allow_private_net,
         mounts,
         env,
         secrets,

@@ -1,0 +1,447 @@
+//! Entering a held sandbox to run one request (warm-exec, design doc §3.4).
+//!
+//! The sandbox was built once and its init is holding it. A request is a
+//! fresh process that has to end up *inside* — same namespaces, same
+//! hardening, same cgroup discipline — without an agent in the box to fork it.
+//! That is done in two hops, because two of the rules cannot be satisfied by
+//! one process:
+//!
+//! ```text
+//!   supervisor ──fork──► helper ──setns(user,pid,net,ipc,uts,cgroup)──fork──► request
+//!                          │                                            │
+//!                          │ reports the request's HOST pid             │ waits for GO
+//!                          │ (fork() returns it in the helper's ns)     │ setns(mnt)
+//!                          │ waits, reports the exit status             │ harden, execve
+//! ```
+//!
+//! - The helper enters the pid namespace but stays out of the mount
+//!   namespace. Entering `pid` affects *children*, so the request is born
+//!   inside it — and because the helper is still in the host's pid namespace,
+//!   the pid `fork()` returns is the host pid. No translation, unlike the
+//!   agent path (§2.2b).
+//! - The request enters the mount namespace itself, after `GO`. Entering it
+//!   in the helper would take the helper's view of the host away before it
+//!   has reported anything.
+//!
+//! Why this is allowed rootless: `setns` into a user namespace needs
+//! `CAP_SYS_ADMIN` in it, and a process in the parent namespace with the
+//! creator's uid has every capability there. The supervisor created it; the
+//! helper is its fork. PoC 9's third row measured exactly this case.
+//!
+//! Everything between `fork` and `execve` is async-signal-safe: the parent is
+//! multi-threaded, and a child that allocates can deadlock on a lock some
+//! other thread held at the moment of the fork.
+
+use std::os::fd::{AsRawFd, OwnedFd};
+
+use libc::{c_int, c_void};
+
+use super::child;
+use super::prepare::{PreparedLaunch, Step};
+use crate::backend::NamespaceFds;
+use crate::error::{Error, Result};
+
+/// The descriptors and pids of one request, on the supervisor's side.
+#[derive(Debug)]
+pub struct Entered {
+    /// Host pid of the helper. Reaped by [`Entered::reap_helper`].
+    pub helper: u32,
+    /// Host pid of the request process, for the cgroup and for the deadline.
+    pub pid: u32,
+    /// Write one byte here once the request is in its cgroup. `Option` so the
+    /// caller can take it and drop it — the drop is the close.
+    pub go: Option<OwnedFd>,
+    /// The request's stdin: take it, write the event, drop it. The drop is
+    /// the end of file the program is waiting for.
+    pub stdin: Option<OwnedFd>,
+    pub stdout: OwnedFd,
+    pub stderr: OwnedFd,
+    /// The request's exit status, four native-endian bytes, written by the
+    /// helper after it has waited for the request.
+    pub status: OwnedFd,
+    /// The request's hardening failure report, if any: eight bytes in the
+    /// same format as a launch failure, or end of file when `execve` worked.
+    pub err: OwnedFd,
+}
+
+impl Entered {
+    /// Collect the helper. It exits on its own once the request has.
+    pub fn reap_helper(&self) -> Result<()> {
+        let mut status: c_int = 0;
+        // SAFETY: `helper` is a child of this process that has not been reaped.
+        let rc = unsafe { libc::waitpid(self.helper as libc::pid_t, &mut status, 0) };
+        if rc < 0 {
+            return Err(Error::primitive(
+                "waitpid",
+                "the warm-exec helper could not be reaped",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Fork the helper, have it enter the sandbox and fork the request, and
+/// return once the request's host pid is known.
+///
+/// The request is created but *parked*: it runs nothing until [`Entered::go`]
+/// is written, which is the supervisor's moment to put it in a cgroup. Same
+/// handshake as `FORKED`/`GO` on the agent path, for the same reason.
+pub fn enter(plan: &PreparedLaunch, ns: &NamespaceFds) -> Result<Entered> {
+    // Every pipe close-on-exec: the request `dup2`s the three it keeps onto
+    // 0, 1 and 2 (which clears the flag on the copies) and the rest vanish at
+    // `execve` without anyone having to remember them.
+    let (go_r, go_w) = pipe_cloexec()?;
+    let (stdin_r, stdin_w) = pipe_cloexec()?;
+    let (stdout_r, stdout_w) = pipe_cloexec()?;
+    let (stderr_r, stderr_w) = pipe_cloexec()?;
+    let (status_r, status_w) = pipe_cloexec()?;
+    let (err_r, err_w) = pipe_cloexec()?;
+
+    // SAFETY: the child does nothing but syscalls on descriptors and plan data
+    // that were fully materialised before the fork, and never returns.
+    let helper = unsafe { libc::fork() };
+    if helper < 0 {
+        return Err(Error::primitive(
+            "fork",
+            "could not fork the warm-exec helper",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    if helper == 0 {
+        // SAFETY: see above. `helper_main` never returns.
+        unsafe {
+            helper_main(
+                plan,
+                ns,
+                Ends {
+                    go_r: go_r.as_raw_fd(),
+                    stdin_r: stdin_r.as_raw_fd(),
+                    stdout_w: stdout_w.as_raw_fd(),
+                    stderr_w: stderr_w.as_raw_fd(),
+                    status_w: status_w.as_raw_fd(),
+                    err_w: err_w.as_raw_fd(),
+                },
+            )
+        }
+    }
+
+    // Parent. Drop the ends the children own, so end-of-file can ever arrive
+    // on the ones we read.
+    drop((go_r, stdin_r, stdout_w, stderr_w, status_w, err_w));
+
+    // The helper's first act after entering the namespaces is to report the
+    // request's pid. Anything else — a short read, or a failure payload on the
+    // error pipe — means it could not.
+    let mut pid_bytes = [0u8; 4];
+    if read_exact(status_r.as_raw_fd(), &mut pid_bytes).is_err() {
+        let mut payload = [0u8; 8];
+        let n = read_some(err_r.as_raw_fd(), &mut payload);
+        reap(helper);
+        return Err(match child::decode_failure(&payload[..n]) {
+            Some((step, errno)) => Error::Primitive {
+                operation: step.describe(),
+                remedy: step
+                    .remedy(errno)
+                    .unwrap_or("run `zygo doctor`; entering a sandbox needs the same primitives as building one")
+                    .to_string(),
+                source: std::io::Error::from_raw_os_error(errno),
+            },
+            None => Error::primitive(
+                "warm-exec helper",
+                "the helper exited before reporting the request's pid",
+                std::io::Error::other("no pid received"),
+            ),
+        });
+    }
+
+    Ok(Entered {
+        helper: helper as u32,
+        pid: u32::from_ne_bytes(pid_bytes),
+        go: Some(go_w),
+        stdin: Some(stdin_w),
+        stdout: stdout_r,
+        stderr: stderr_r,
+        status: status_r,
+        err: err_r,
+    })
+}
+
+/// Raw descriptors the children work with.
+#[derive(Clone, Copy)]
+struct Ends {
+    go_r: c_int,
+    stdin_r: c_int,
+    stdout_w: c_int,
+    stderr_w: c_int,
+    status_w: c_int,
+    err_w: c_int,
+}
+
+/// `close_range(2)`, by number: the libc crate's constant is not on every
+/// target, and the number is the same on every architecture.
+const SYS_CLOSE_RANGE: libc::c_long = 436;
+
+/// Close every descriptor from `first` upwards.
+///
+/// `close_range` on kernels that have it (5.9+); a loop otherwise. The loop's
+/// ceiling is the soft `RLIMIT_NOFILE`, which is the most a process can have
+/// open and is usually 1024.
+///
+/// # Safety
+/// Child side of a fork: syscalls only.
+pub(super) unsafe fn close_from(first: c_int) {
+    // SAFETY: plain syscall; a failure only means the fallback runs.
+    if unsafe { libc::syscall(SYS_CLOSE_RANGE, first, c_int::MAX, 0) } == 0 {
+        return;
+    }
+    let mut limit = libc::rlimit {
+        rlim_cur: 1024,
+        rlim_max: 1024,
+    };
+    // SAFETY: `limit` is live for the call.
+    unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
+    let ceiling = limit.rlim_cur.min(65_536) as c_int;
+    for fd in first..ceiling {
+        // SAFETY: closing a descriptor we may or may not hold; EBADF is fine.
+        unsafe { libc::close(fd) };
+    }
+}
+
+/// The helper: enter, fork the request, report, wait, report, exit.
+///
+/// # Safety
+/// Child side of a fork from a multi-threaded parent: nothing here allocates,
+/// and it never returns.
+unsafe fn helper_main(plan: &PreparedLaunch, ns: &NamespaceFds, ends: Ends) -> ! {
+    // Die with the supervisor, so a request cannot outlive the thing that is
+    // enforcing its deadline.
+    unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) };
+
+    // Descriptor hygiene, and it is not optional. `fork` copied the
+    // supervisor's whole table: the control socket, every agent's connection,
+    // every other in-flight request's pipes — and the *parent's* ends of this
+    // request's own pipes. Holding the parent's write end of stdin here means
+    // the program never sees end of file; measured as `cat` echoing its input
+    // and then waiting the full 30 s deadline. Holding another request's
+    // stdin does the same to *that* request.
+    //
+    // Keep exactly the thirteen descriptors this and the request need, at
+    // known low numbers, and close everything else. Copies are made first so
+    // no `dup2` can overwrite a descriptor that has not been copied yet.
+    let needed = [
+        ns.user.as_raw_fd(),
+        ns.pid.as_raw_fd(),
+        ns.net.as_raw_fd(),
+        ns.ipc.as_raw_fd(),
+        ns.uts.as_raw_fd(),
+        ns.cgroup.as_raw_fd(),
+        ns.mnt.as_raw_fd(),
+        ends.go_r,
+        ends.stdin_r,
+        ends.stdout_w,
+        ends.stderr_w,
+        ends.status_w,
+        ends.err_w,
+    ];
+    const FIRST: c_int = 3;
+    const PARKED: c_int = 64;
+    let mut parked = [0 as c_int; 13];
+    for (i, fd) in needed.iter().enumerate() {
+        // SAFETY: `fcntl` with F_DUPFD on a descriptor we hold.
+        parked[i] = unsafe { libc::fcntl(*fd, libc::F_DUPFD, PARKED) };
+        if parked[i] < 0 {
+            child::fail(ends.err_w, Step::Setns);
+        }
+    }
+    for (i, fd) in parked.iter().enumerate() {
+        // SAFETY: both are descriptors we hold.
+        if unsafe { libc::dup2(*fd, FIRST + i as c_int) } < 0 {
+            child::fail(*fd, Step::Setns);
+        }
+    }
+    unsafe { close_from(FIRST + needed.len() as c_int) };
+
+    let user = FIRST;
+    let (pid_ns, net, ipc, uts, cgroup, mnt) = (
+        FIRST + 1,
+        FIRST + 2,
+        FIRST + 3,
+        FIRST + 4,
+        FIRST + 5,
+        FIRST + 6,
+    );
+    let ends = Ends {
+        go_r: FIRST + 7,
+        stdin_r: FIRST + 8,
+        stdout_w: FIRST + 9,
+        stderr_w: FIRST + 10,
+        status_w: FIRST + 11,
+        err_w: FIRST + 12,
+    };
+
+    // User first: it is what grants the capability to enter the others. Mount
+    // is deliberately absent — the request enters that one itself.
+    for (fd, kind) in [
+        (user, libc::CLONE_NEWUSER),
+        (pid_ns, libc::CLONE_NEWPID),
+        (net, libc::CLONE_NEWNET),
+        (ipc, libc::CLONE_NEWIPC),
+        (uts, libc::CLONE_NEWUTS),
+        (cgroup, libc::CLONE_NEWCGROUP),
+    ] {
+        if unsafe { libc::setns(fd, kind) } != 0 {
+            child::fail(ends.err_w, Step::Setns);
+        }
+    }
+
+    // SAFETY: single-threaded here; the request does only syscalls.
+    let request = unsafe { libc::fork() };
+    if request < 0 {
+        child::fail(ends.err_w, Step::Setns);
+    }
+    if request == 0 {
+        unsafe { request_main(plan, mnt, ends) }
+    }
+
+    // Only the status pipe stays open here. Closing `err_w` matters: the
+    // request's copy closes at `execve`, and the parent takes end of file on
+    // that pipe as "it worked" — which never arrives while this copy is open.
+    unsafe {
+        libc::close(ends.err_w);
+        libc::close(ends.go_r);
+        libc::close(ends.stdin_r);
+        libc::close(ends.stdout_w);
+        libc::close(ends.stderr_w);
+    }
+
+    // `fork()` returned the request's pid in *this* namespace — the host's.
+    let pid = (request as u32).to_ne_bytes();
+    write_all_raw(ends.status_w, &pid);
+
+    let mut status: c_int = 0;
+    // SAFETY: waiting for our own child.
+    while unsafe { libc::waitpid(request, &mut status, 0) } < 0 {
+        if child::errno() != libc::EINTR {
+            unsafe { libc::_exit(1) };
+        }
+    }
+    write_all_raw(ends.status_w, &status.to_ne_bytes());
+    unsafe { libc::_exit(0) }
+}
+
+/// The request process: wait for `GO`, enter the mount namespace, wire up
+/// stdio, harden exactly as the sandbox init did, and run the program.
+///
+/// `mnt` is the mount namespace descriptor, already renumbered by the helper.
+///
+/// # Safety
+/// As [`helper_main`].
+unsafe fn request_main(plan: &PreparedLaunch, mnt: c_int, ends: Ends) -> ! {
+    unsafe {
+        libc::close(ends.status_w);
+    }
+
+    // Parked until the supervisor has put this pid in its cgroup. Until then
+    // every allocation would be billed to the tenant's cgroup as a whole
+    // rather than to this request.
+    let mut byte = [0u8; 1];
+    if unsafe { libc::read(ends.go_r, byte.as_mut_ptr() as *mut c_void, 1) } != 1 {
+        // The supervisor gave up on us (a cgroup it could not create, say).
+        unsafe { libc::_exit(127) }
+    }
+    unsafe { libc::close(ends.go_r) };
+
+    // Now the filesystem: the pivoted root the init built. Needs
+    // `CAP_SYS_ADMIN` in the sandbox's user namespace, which the helper's
+    // `setns(user)` granted and this fork inherited.
+    if unsafe { libc::setns(mnt, libc::CLONE_NEWNS) } != 0 {
+        child::fail(ends.err_w, Step::EnterMountNamespace);
+    }
+    if unsafe { libc::chdir(plan.workdir.as_ptr()) } != 0
+        && unsafe { libc::chdir(c"/".as_ptr()) } != 0
+    {
+        child::fail(ends.err_w, Step::Chdir);
+    }
+
+    // The event arrives on stdin; the result leaves on stdout. `dup2` onto the
+    // standard descriptors clears close-on-exec on the copies, which is the
+    // only reason these three survive `execve` when every other pipe does not.
+    for (from, to) in [(ends.stdin_r, 0), (ends.stdout_w, 1), (ends.stderr_w, 2)] {
+        if unsafe { libc::dup2(from, to) } < 0 {
+            child::fail(ends.err_w, Step::WireStdio);
+        }
+    }
+
+    // Exactly what the init went through, so a request is never less
+    // constrained than the sandbox it is in.
+    unsafe { child::harden(plan, ends.err_w) };
+    unsafe { child::exec_or_fail(plan, ends.err_w) }
+}
+
+fn pipe_cloexec() -> Result<(OwnedFd, OwnedFd)> {
+    rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)
+        .map_err(|e| Error::primitive("pipe", "internal warm-exec error", e.into()))
+}
+
+/// `write` in a loop, without touching the heap. For the children.
+fn write_all_raw(fd: c_int, buf: &[u8]) {
+    let mut written = 0;
+    while written < buf.len() {
+        // SAFETY: `buf` is live for the call.
+        let n = unsafe {
+            libc::write(
+                fd,
+                buf[written..].as_ptr() as *const c_void,
+                buf.len() - written,
+            )
+        };
+        if n <= 0 {
+            return;
+        }
+        written += n as usize;
+    }
+}
+
+/// Fill `buf` or fail. Parent side.
+fn read_exact(fd: c_int, buf: &mut [u8]) -> std::io::Result<()> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        // SAFETY: `buf` is live for the call.
+        let n = unsafe {
+            libc::read(
+                fd,
+                buf[filled..].as_mut_ptr() as *mut c_void,
+                buf.len() - filled,
+            )
+        };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "short read",
+            ));
+        }
+        filled += n as usize;
+    }
+    Ok(())
+}
+
+/// Read what is there, up to `buf.len()`, returning how much. Parent side.
+fn read_some(fd: c_int, buf: &mut [u8]) -> usize {
+    // SAFETY: `buf` is live for the call.
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
+    if n < 0 { 0 } else { n as usize }
+}
+
+fn reap(pid: libc::pid_t) {
+    let mut status: c_int = 0;
+    // SAFETY: waiting for our own child.
+    unsafe { libc::waitpid(pid, &mut status, 0) };
+}

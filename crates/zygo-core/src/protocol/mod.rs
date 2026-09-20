@@ -31,6 +31,13 @@ pub use frame::{FrameError, FrameReader, FrameWriter, MAX_FRAME_BYTES, decode, e
 /// sees an unknown version refuses the agent rather than guessing.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// Environment variable through which the supervisor hands a runtime agent the
+/// seccomp program its forked child must install before the handler runs:
+/// base64 of the raw `struct sock_filter` array, in the host's byte order.
+/// Absent when the function's profile does not tighten the child. The agent
+/// contract is in `spec/protocol.md` §3.
+pub const CHILD_SECCOMP_ENV: &str = "ZYGO_CHILD_SECCOMP";
+
 /// A protocol message.
 ///
 /// Serialised as a JSON object with a `type` discriminator, e.g.
@@ -241,6 +248,64 @@ pub enum ProtocolError {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The fixtures both suites read, so the Rust and Python implementations
+    /// are held to one set of bytes rather than to each other.
+    fn fixtures() -> serde_json::Value {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../spec/fixtures/protocol-v1.json"
+        );
+        serde_json::from_str(&std::fs::read_to_string(path).expect("fixture file")).expect("json")
+    }
+
+    #[test]
+    fn every_fixture_message_decodes_and_canonical_ones_round_trip_exactly() {
+        let f = fixtures();
+        assert_eq!(f["proto"], PROTOCOL_VERSION);
+        let mut seen = std::collections::BTreeSet::new();
+        for case in f["messages"].as_array().expect("messages") {
+            let name = case["name"].as_str().unwrap();
+            let raw = &case["message"];
+            let message: Message = serde_json::from_value(raw.clone())
+                .unwrap_or_else(|e| panic!("fixture `{name}` does not decode: {e}"));
+            assert_eq!(message.kind(), raw["type"].as_str().unwrap(), "{name}");
+            seen.insert(message.kind());
+            if case["canonical"].as_bool().unwrap_or(false) {
+                let back = serde_json::to_value(&message).unwrap();
+                assert_eq!(
+                    back, *raw,
+                    "fixture `{name}` did not re-serialise to itself"
+                );
+            }
+        }
+        // Every message type has a fixture, so an addition to the enum is an
+        // addition here too — and therefore to the Python suite.
+        for kind in [
+            "READY", "EXEC", "FORKED", "GO", "RESULT", "DONE", "PING", "PONG", "SHUTDOWN", "ERROR",
+        ] {
+            assert!(seen.contains(kind), "no fixture for {kind}");
+        }
+    }
+
+    #[test]
+    fn frame_fixtures_are_the_exact_bytes_in_both_directions() {
+        let f = fixtures();
+        for case in f["frames"].as_array().expect("frames") {
+            let name = case["name"].as_str().unwrap();
+            let bytes: Vec<u8> = hex::decode(case["hex"].as_str().unwrap()).unwrap();
+            let message: Message = serde_json::from_value(case["message"].clone()).unwrap();
+            assert_eq!(frame::encode(&message).unwrap(), bytes, "{name}: encode");
+            let decoded: Message = frame::decode(&bytes[frame::HEADER_BYTES..]).unwrap();
+            assert_eq!(decoded, message, "{name}: decode");
+            let announced = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+            assert_eq!(
+                announced,
+                bytes.len() - frame::HEADER_BYTES,
+                "{name}: length prefix"
+            );
+        }
+    }
 
     #[test]
     fn ready_roundtrips() {

@@ -100,6 +100,14 @@ per tenant"): a per-request cgroup is 5% of the total budget, which is cheap in
 exchange for killing the whole tree in one write with `cgroup.kill`. **Keep it
 per request by default.**
 
+> **Correction (phase 2.2).** That 97 µs is not the cost of a per-request
+> cgroup. The pid the agent reports is namespace-local, so the write into
+> `cgroup.procs` moved nothing and the directory stayed empty — 97 µs is the
+> cost of creating and removing an empty directory. The bug is described under
+> [phase 2.2](#phase-22--the-pid-in-forked-was-namespace-local-so-nothing-was-ever-moved)
+> and is fixed; the real cost has not been re-measured, so **A2's conclusion is
+> not yet supported by a measurement.**
+
 ### The bug this PoC found
 
 The first measurement gave p50 **11.8 ms** — six times the target. The cause was
@@ -791,11 +799,1230 @@ caller's correct reaction is to retry, not to give up.
 
 ---
 
+## Phase 2.2 — the pid in `FORKED` was namespace-local, so nothing was ever moved
+
+Building the request deadline exposed a bug that had been invisible since the
+warm pool was written, and it invalidates one of PoC 3's numbers.
+
+The agent is pid 1 in its own pid namespace, so the pid it reports in `FORKED`
+is the child's number *in that namespace*. The supervisor was writing it
+straight into `cgroup.procs`, and would have passed it to `kill`.
+
+Measured on 5.10, with a handler that reports its own `os.getpid()` while a
+probe reads the cgroup from outside:
+
+| | |
+|---|---|
+| pid the agent reported | **2** |
+| the child's actual host pid | **28** |
+| contents of `req-.../cgroup.procs` | **empty** |
+
+So the per-request cgroup — the entire reason the protocol has the `FORKED`/`GO`
+handshake — had never contained a request. It was a directory being created and
+removed, and the **97 µs attributed to it in PoC 3 is the cost of that and
+nothing else**; the real cost of a populated request cgroup has not been
+measured yet. Open question A2 should be revisited once it has been.
+
+`admit()` ignores errors deliberately — a failed move should not fail a request,
+because the tenant cgroup still bounds the child — so nothing ever complained.
+
+**PoC 3 could not have caught it.** There the agent was a plain host subprocess
+with no pid namespace of its own, so the number it reported happened to be
+correct. The bug only exists once the agent is really sandboxed, which is
+exactly the configuration that shipped.
+
+### The fix, and two consequences
+
+The pid is translated before use, via `NSpid` in `/proc/<host>/status` — whose
+last field is the pid in the innermost namespace — with candidates taken from
+the agent's own `children` rather than all of `/proc`, so it stays two small
+reads on the request path. Re-measured: `req-.../cgroup.procs` holds the host
+pid and the zygote cgroup holds only the agent.
+
+1. **A SIGKILL to an untranslated pid would have hit an unrelated process.**
+   Nothing had a deadline before, so it never fired; the deadline work is what
+   made it reachable.
+2. **Killing one pid is not enough anyway.** Below kernel 5.14 there is no
+   `cgroup.kill`, and a handler that forks helpers leaves them running and
+   holding the result pipe open, so the agent never sees end of file and the
+   function wedges. Measured with a handler that forks four spinners: all four
+   survived. `cgroup::kill` now falls back to freeze → signal every member →
+   thaw. The freeze is the part that matters: without it a process can fork
+   between reading `cgroup.procs` and sending the signal, and the new child is
+   born unsignalled. Re-measured: 0 survivors, and the request is killed at its
+   deadline instead of wedging the function.
+
+### The deadline itself
+
+The timeout is the **function's** own, not the caller's. `zygo exec` waits 60 s
+by default; a function served with `--timeout 2s` is stopped at 2 s regardless,
+because N4 makes the spec's limits mandatory and a client must not be able to
+buy more time by asking for it. Measured: 2009 ms for a handler that never
+returns, 2075 ms for one that forked four helpers.
+
+The connection survives a kill, which is what stops every timeout costing a
+rewarm: the supervisor kills the request, the agent notices EOF on the result
+pipe and sends `DONE` by itself, and the next request goes down the same
+connection. Verified by a second request reaching the same sandbox with the
+function still `warm`.
+
+---
+
+## Phase 2.2 — idle tiering: what pausing is actually worth
+
+The design document's F12 asks for idle sandboxes to be put to sleep and woken
+on demand, in two tiers. The question worth measuring is whether the middle tier
+earns its place: if waking a paused function costs what a cold start costs,
+there is no reason to have it.
+
+Measured on 5.10, a function served with `--idle-timeout 1s`, left alone, then
+called:
+
+| | |
+|---|---|
+| state after the idle timeout | `paused` |
+| time to answer once woken | **7 ms** |
+| a cold start, for comparison | ~300 ms |
+
+So pausing keeps what matters. The asset a warm function represents is its
+resident pages — they are the whole reason a request costs a `fork()` — and
+`cgroup.freeze` gives up the CPU while keeping them. Going cold gives up both,
+which is why it is a separate, much later threshold.
+
+Two rules the policy follows, both of which would be bugs if it did not:
+
+- **A function with a request in flight is never tiered**, whatever the clock
+  says. The idle clock is read after a call finishes rather than before it
+  starts, so a slow request cannot make its own function look idle.
+- **A cold function is still registered.** It appears in `zygo ps` as `cold`
+  with its counters intact, and a request for it is a cold start rather than a
+  "not found" — which is exactly the trade `cold_after` was configured to make.
+  `zygo stop` deregisters it, or it would come back on the next request having
+  been explicitly stopped.
+
+### Cgroups outlive their processes
+
+A supervisor that dies takes its sandboxes with it (`PDEATHSIG`) but not their
+cgroups. Verified directly rather than assumed: after `kill -9` on the
+supervisor, `tenants/<name>` was still there. Without cleanup a restarted
+supervisor would accumulate one dead tenant tree per previous lifetime and reuse
+their stale limits for any name it served again.
+
+`Hierarchy::clean_stale_tenants` removes tenant cgroups whose subtree holds no
+process, checked by reading `cgroup.procs` at every level — a check that only
+looked at the top would delete a tenant whose request cgroup was busy. Anything
+still holding a process is left alone: `Listener::bind` has already established
+that no other supervisor is listening, so this should find nothing, and if it
+does, the honest reading is not to kill it.
+
+This half could not be unit tested. `rmdir` on a real cgroup succeeds with its
+control files in place and on an ordinary filesystem it does not, so a temporary
+directory cannot stand in for cgroupfs. The decision (`is_empty_subtree`) is
+unit tested; the removal is checked end to end in `poc/verify_supervisor.sh`
+against a real kernel.
+
+---
+
+## Phase 2.9 — the throughput criterion, measured
+
+`zygo bench cold` and `zygo bench load` exist to put numbers on two
+requirements that had never been measured.
+
+**N2, a cold `run` with the image cached: p50 18.4 ms** against a 50 ms budget
+(p90 21.2, p99 33.7, 30 runs, `python3 -c pass` in `python:3.12-slim`). Worth a
+caveat the tool prints itself: this host has no unprivileged overlayfs, so the
+rootfs is flattened — the same bind mount every run, which is the cheap case. A
+number measured with a real overlay would be higher.
+
+**The phase 2 criterion is "≥ 600 requests/s at a concurrency of 4".** Measured
+over 6 s runs with an empty handler:
+
+| | requests/s | CPU used | longest wait for the connection |
+|---|---|---|---|
+| concurrency 1, `cpu = 1.0` | 424 | 1.00 / 1.00 (saturated) | 0 |
+| concurrency 4, `cpu = 1.0` | 394 | 1.00 / 1.00 (saturated) | — |
+| concurrency 1, `cpu = 4.0` | 607 | 1.46 / 4.00 | 0 |
+| concurrency 2, `cpu = 4.0` | 592 | 1.49 / 4.00 | — |
+| concurrency 4, `cpu = 4.0` | 599–609 | 1.45 / 4.00 | **2.2–3.7 s** |
+
+Two findings, and they point in different directions.
+
+**At the default quota the criterion is unreachable, and not because of Zygo.**
+A warm request costs ~2.4 ms of CPU, so one core is about 420 requests/s. 600
+needs at least 1.5 cores. This is the same lesson as §2.1b in a different shape,
+and `bench load` reports the CPU accounting so the number is attributable rather
+than mysterious.
+
+**Concurrency contributes nothing.** With the quota lifted, throughput is flat
+at ~600 requests/s whether 1 or 4 clients call, while only 1.5 of 4 cores are
+used — so neither the quota nor the machine is the constraint. The agent handles
+one `EXEC` to completion before reading the next, so `concurrency` bounds what
+the *supervisor admits*, not what the agent can overlap.
+
+So the criterion is met numerically at concurrency 4, by a single serialised
+stream, with the "concurrency 4" part doing no work. The honest reading is that
+it is **not satisfied as intended**, and what it needs is agent work — a
+`select` over the wire and the in-flight result pipes — rather than anything in
+the supervisor.
+
+### A fairness problem found on the way
+
+At concurrency 4 the requests-per-client split is only moderately uneven (684
+against 1166), but one client waited **2.2–3.7 s** for the connection.
+`WarmFn`'s wire is guarded by a plain mutex, which is not fair, so waiting is
+unbounded and badly skewed.
+
+This nearly went unnoticed, and the reason is worth recording: the *percentiles*
+of connection-wait time were **zero at p99** while the maximum was 3.7 seconds.
+A distribution that skewed defeats a percentile — almost every request acquires
+the lock instantly and a handful wait for seconds. `bench load` therefore prints
+the maximum and the per-client request counts, not just percentiles. My first
+hypothesis from the percentiles alone was total starvation; the per-client
+counts disproved it, and the maximum located the real problem.
+
+---
+
+## Phase 2.9 — concurrency, and what it cost
+
+The measurement above said the agent's sequential loop was the ceiling. Fixing
+it meant changing both ends: the agent's `serve` now waits on the control socket
+**and** every in-flight request's result pipe together, and the supervisor runs
+one thread per function that routes replies to their callers by request id.
+Nothing holds the connection for longer than a single frame takes to write.
+
+Re-measured, `--cpu 4` so the quota is not the constraint:
+
+| | before | after |
+|---|---|---|
+| concurrency 1 | 607 req/s | 538 |
+| concurrency 2 | 592 | **912** |
+| concurrency 4 | 599–609 | **981** |
+| longest wait for the connection, c4 | **3.7 s** | **494 µs** |
+| requests per client, c4 | 684 vs 1166 | **1464 vs 1477** |
+| CPU used, c4 | 1.45 / 4 cores | 2.35 / 4 |
+
+The criterion is now met *because of* concurrency rather than in spite of it,
+and the fairness problem is gone — the split is even to within 1% and the worst
+wait is under half a millisecond.
+
+### What it cost, isolated
+
+Single-stream p50 went from 1316 µs to 1695 µs; headroom at p50 from 34% to 15%.
+Two separate causes, separated by measuring with the per-request cgroup turned
+off:
+
+| | p50 | admit phase |
+|---|---|---|
+| before, with the request cgroup silently empty | 1316 µs | 62 µs |
+| now | 1702 | 213 |
+| now, `--no-cgroup` | 1574 | 0 |
+
+- **~150 µs** is the pid translation making the per-request cgroup actually
+  contain the request. That is a correctness fix being paid for, not a
+  regression: the old 62 µs bought an empty directory.
+- **~300 µs** is multiplexing — `FORKED` and `DONE` each cross a channel to
+  reach the calling thread, instead of being read on it.
+
+A fast path that reads the socket on the calling thread when it is the only
+caller in flight would recover most of the 300 µs. Not done: it needs a careful
+answer to who owns the socket, and 15% headroom is passing. Recorded here so the
+trade is visible rather than discovered later.
+
+### Two bugs the design made possible
+
+Both are the kind that only exist once requests overlap, and both are now
+covered by tests:
+
+- **A child inherits the other requests' pipes.** Forked while another request
+  is in flight, it holds the write end of that request's result pipe, so the
+  reader never reaches end of file and the two requests deadlock. The child now
+  closes every other in-flight descriptor — collected *before* the fork, because
+  afterwards it cannot ask the parent what was open.
+- **`SHUTDOWN` must not abandon forked work.** It stops new work being accepted
+  and lets what is already running finish, or a `zygo stop` during a request
+  loses its answer.
+
+The conformance suite gained a test that fails on a sequential agent by
+construction: a slow request and a fast one issued in that order, where the fast
+one has to answer first. Writing it the other way round — the quick request
+first, the long one forked before the quick one is released — is what catches
+the inherited-pipe deadlock.
+
+---
+
+## Phase 3 — `zygo up`, and the first time two functions shared an image
+
+Bringing a whole spec file up is the first thing that runs several functions
+from one image, and it found two bugs immediately.
+
+**The flattened rootfs was shared, mount points and all.** `rootfs_view` keyed
+the flattened directory on the image layers alone and then created the mount
+points *inside* it — so every function using that image shared one directory and
+the first to run decided the shape of each mount point.
+
+Measured on a three-function spec. Names are ordered, so `broken` ran first, and
+its handler did not exist; a mount source that is not there is treated as a
+directory (what `docker run -v` does), so `/zygo/handler.py` was created as a
+**directory**. The other two functions then failed with **ENOTDIR** binding a
+file onto it.
+
+The flat rootfs is now keyed on the layers *and* the mount points — exactly as
+the overlay skeleton already was — and the mount points are created before the
+done marker, so nothing ever observes a rootfs whose mount points are half
+there. Identical shapes still share one copy, which is the common case and the
+reason sharing was tempting in the first place.
+
+Reachable before `up` existed: two `zygo serve` calls on one image with
+different mounts would have done it. It had simply never happened, because every
+test until now used one function per image.
+
+**A missing handler failed with ENOTDIR instead of naming the file.** Now
+checked in `Pool::serve`, which reports
+`fn.broken.entry: /proj/does-not-exist.py does not exist`.
+
+Where that check went is worth recording. The obvious home is resolution — but
+resolution is filesystem-free on purpose: it normalises paths without touching
+them, which is what lets the entire spec layer be tested on a host with no
+sandboxes at all. There is a test named for exactly that property, and it failed
+when the check was put there. That is the test doing its job, and the check
+belongs at the first point that genuinely needs the file.
+
+---
+
+## Phase 3 — blue/green: `up` as a deploy rather than a restart
+
+`up` restarted every function on every run. That is the wrong default for a
+deploy command: a project with ten functions where one handler was edited
+would lose nine warm sandboxes — their resident pages, their request counters —
+for nothing. The fix has two halves, and the second turned out to be the
+interesting one.
+
+**Deciding "unchanged".** The supervisor now compares what a `SERVE` asks for
+against what it holds under that name: the resolved spec, the secret values,
+and a SHA-256 of the handler and requirements files as they are on disk now.
+The file hash is what makes it work — the spec cannot see an edit to
+`handler.py`, and that edit is why anyone runs `up`. The hash is taken before
+the warm-up, so an edit that lands during it is counted as a change next time
+rather than guessed about. Cold functions are compared too, and an unchanged
+cold function is woken rather than rebuilt.
+
+Eleven end-to-end checks on a three-function project. A second `up` with
+nothing edited: `replaced: []`, `unchanged: [other, s, v]`, request counters
+intact. Edit one handler: `replaced: [v]`, the other two untouched, and the
+next request sees the new code. Append `timeout = "9s"` to one function's
+section: that one replaced. Rotate a secret value: the function that names it
+replaced, and the new value is what it reads from `/run/secrets`.
+
+**The queued request.** Replacement was already blue/green — the new sandbox
+is warm before the old gate closes, and the old sandbox lives until the last
+in-flight request drops its `Arc` — and the checks confirm it: with a
+2-second request in flight, `up` over an edited handler returned, a new request
+was answered by the replacement with the new code, and the in-flight one
+finished on the old sandbox with the old code, exit 0.
+
+But a request *queued* behind the old gate (`concurrency = 1`) got
+"`v` is shutting down". The gate closes for two reasons — stopped or replaced —
+and a caller cannot tell which. Now, on `Closed`, the request looks the name up
+once more and, if a different entry holds it, tries that one; the queued
+request in the check ran on the replacement and returned the new version.
+One redirect, not a loop: a second closure in a row means someone is
+redeploying faster than requests are admitted, and the honest answer beats a
+retry storm.
+
+---
+
+## Phase 3 — the seccomp profile that had never been run
+
+The default profile was "validated" in phase 0 against numpy, pandas, Pillow,
+pydantic and requests. That validation used a JSON profile applied by a
+different tool. The BPF filter that ships — generated in Rust from the same
+syscall names — had never been run against any of them until the strict
+compatibility matrix was written, and its venv build failed before a single
+function existed.
+
+**Every threaded program was dead.** `RuntimeError: can't start new thread`,
+from `pip`'s progress bar on a 13.6 MB wheel. The filter is an allowlist that
+answers `EPERM` to anything unlisted, and `clone3` was listed only in
+`permissive`. glibc's `pthread_create` tries `clone3` first and falls back to
+`clone` on exactly one error, `ENOSYS`; on `EPERM` it gives up. So the
+profile that was supposed to let numpy's BLAS threads run refused the call
+that creates them, and every program with a thread died the same way — the
+launcher's own tests never started one.
+
+The fix is not to allow `clone3`. Its flags live in a struct the filter cannot
+read, and the reason `clone` is special-cased is to read the flags and refuse
+`CLONE_NEWUSER`. It answers `ENOSYS` instead, which is what Docker's profile
+does for the same reason, and glibc takes the `clone` path — where the flags
+are checked.
+
+**`strict` killed every function before its handler ran.** With threads
+fixed, all five packages worked under `default`, and all five `strict`
+functions reported "expected READY from the agent, got end of stream".
+`strict` removed the whole socket family, data calls included. The agent
+speaks to the supervisor over a socket it inherited at descriptor 3; a socket
+it cannot `recvfrom` is a supervisor it cannot hear. The profile had confused
+two things: transferring bytes on a descriptor a process already holds, which
+is not a capability, and opening one, which is. `strict` now removes
+`socket`, `socketpair`, `connect`, `bind`, `listen` and `accept4` and keeps
+the transfer calls, and its unit test asserts both halves.
+
+The matrix, after both fixes: ten cells, ten "works" — each a real operation
+returning `{"ok": true}`, not an import. Under `strict`, `requests` gets
+`EPERM` from `socket()` and reports its own `ConnectionError` at once, which
+is the behaviour the profile is for.
+
+The lesson is the one the escape suite was built on, applied to a different
+artefact: a security control that has been read carefully and never run is a
+list of intentions.
+
+**The child filter, added afterwards.** The design's remaining tightening was
+for the agent's *forked child*: it is already running the interpreter and
+never needs another program, so `execve` and process creation can go. The
+sandbox's own filter cannot take them, because the launcher `execve`s into the
+agent. The split that makes it work is that the supervisor builds the BPF
+program — the syscall numbers are the host's — and hands it over as bytes in
+`ZYGO_CHILD_SECCOMP`, so an agent in any language installs it with one
+`prctl` without knowing what is in it.
+
+`clone` was the entry that mattered. Removing `fork` and `vfork` does nothing
+on glibc, which makes both processes and threads through `clone`; the program
+checks `CLONE_THREAD` and refuses only the calls without it. A handler can
+still start a thread and can no longer fork at all. Re-running the matrix with
+it installed was the point of having a matrix: all five `strict` cells still
+work, and a handler's `subprocess.run` now fails with `PermissionError` where
+it succeeded under `default` — the difference between the two profiles, run
+rather than asserted.
+
+---
+
+## Phase 3 — `zygo shell`, and who should do the entering
+
+A debug shell into a warm sandbox looks like it belongs to the supervisor: the
+supervisor owns the sandbox, so surely it should run the shell. Following that
+through gives you a terminal proxied over the control socket — a raw byte
+stream through a frame protocol that carries nothing else like it, plus window
+resizing, plus signal forwarding, plus a pty pair on the supervisor side. Three
+hundred lines to move a terminal that was already in the right place.
+
+The client can do all of it, because of the same property warm-exec's `enter`
+rests on: a process in the parent user namespace gains a full capability set
+when it enters a child one. `zygo shell` runs as the same user that started the
+supervisor, so `setns` into the sandbox's user namespace gives it exactly what
+the supervisor would have had. The supervisor's whole contribution is one
+message answering "which pid", and the terminal never moves.
+
+Order matters in the `setns` sequence, for the same reason it does in `enter`:
+the user namespace first, because it is what grants the capability to enter the
+rest, and the mount namespace last, so `/proc/<pid>/ns/*` is still resolved
+against the host's filesystem while it still is the host's.
+
+**What the shell keeps and what it drops** is the part worth stating, because a
+debug tool that quietly has more power than the thing it is debugging is a
+security hole with a friendly name. It keeps the namespaces — filesystem, pids,
+network, hostname — so an egress allowlist is as real for the shell as for a
+request, those being nftables rules *inside* the network namespace it just
+entered. It drops every capability and sets `no_new_privs`. It deliberately
+does not install the seccomp filter or the Landlock ruleset, and does not join
+the tenant's cgroup: a debug shell killed by the tenant's memory limit, or one
+that cannot run the tool you came to run, is not a debug shell. It prints that
+on the way in rather than leaving it to the documentation.
+
+Six checks, and the one that matters is the last: the function's request count
+and state are read before and after, and must be unchanged. The command is only
+worth having if looking at a function does not disturb it.
+
+---
+
+## Phase 3 — the derived system layer, built where `upperdir` cannot be
+
+`system = ["jq"]` in a function's spec gives it `jq`, without a Dockerfile and
+without touching the image anyone else uses. The mechanism the design names —
+an overlay whose upper directory becomes the layer — is not available to a
+rootless build on the kernel this project measures on (5.10 has no
+unprivileged overlay), and where it is, the upper's whiteouts are character
+devices and `trusted.*` xattrs that an unprivileged process cannot read back.
+
+So the layer is made by **copy and diff**. The flattened base is copied with
+modes and mtimes preserved; `apt-get install` runs inside a one-shot sandbox
+whose root is that copy, left writable — the only sandbox Zygo ever starts
+without the read-only remount; then both trees are walked. A file whose kind,
+size, mode and nanosecond mtime match is unchanged, which is sound because the
+copy preserved them and `dpkg` writes files with their package's timestamps.
+Everything else is an addition; anything missing is a `.wh.` entry; a path
+that changed kind is written as both. The tar is sorted and root-owned, so the
+same inputs produce the same digest, and it goes into the store like a pulled
+layer: verified by digest, unpacked, whiteouts recorded in the sidecar. A
+derived image `python:3.12-slim+system.<key>` is indexed beside its base.
+
+Measured on `python:3.12-slim`, `jq`: **5.3 s** to build (of which `apt-get
+update` is most), **125 ms** for a second function naming the same package.
+A function on the same image without `system` does not see `jq`, and the
+layer holds no apt lists — the build cleans them, as a Dockerfile would.
+
+**What the first run found.** `apt-get update` died with `seteuid 42 failed -
+Invalid argument`. `apt` sandboxes its own download methods by switching to
+the `_apt` user, and under a single-id user namespace uid 42 is not mapped.
+The option that disables it, `APT::Sandbox::User=root`, was on the `install`
+line — and the download happens in `update`. It is now on both, and the unit
+test counts two occurrences, because this is the kind of fix that is one
+refactor away from being undone.
+
+**Ownership is root's throughout.** On the build host everything belongs to
+the user who ran it; in the layer it belongs to root, because a layer that
+recorded a host uid would be wrong on every other machine. A package that
+`chown`s to a service user gets EINVAL under a single-id map — the same result
+as a rootless `docker build`, and the same remedy: `newuidmap` with a
+subordinate range, which the launcher uses when it is there.
+
+---
+
+## Phase 2.1 — the conformance suite, and what it found in the reference agent
+
+"The protocol is language independent" had been an assertion since the design
+document was written. `zygo agent test` makes it checkable: nine checks, taken
+from `spec/protocol.md` §3 rather than from the Python agent's behaviour, run
+against a real process with the control socket at descriptor 3.
+
+On the first run the reference agent failed one of them and died. A frame whose
+body was not valid JSON raised `json.JSONDecodeError` out of the read loop,
+taking the agent and every request in flight with it — the exact failure the
+spec's "no silent loss" rule exists to prevent, in the one place nobody had
+looked.
+
+The fix turns on whether the stream can be resynchronised. A body that arrived
+whole and is not a message leaves the connection at a frame boundary, because
+the length prefix was honoured: reportable, and the agent carries on. An
+announced length past the 32 MiB cap is the opposite — nothing was consumed,
+the next frame cannot be found, and closing is the only correct answer. The
+spec gained this as requirement 6; it was implied by requirement 5 and worth
+saying out loud.
+
+**The second agent is what keeps the suite honest.** A conformance tool written
+against one implementation encodes that implementation's habits. So
+`examples/agents/sh` is a complete agent in POSIX sh and `jq` — about 130 lines
+including its comments, sharing no code with Zygo, in a language with no JSON
+support, no threads and no `fork` primitive beyond `&`. It passes the same nine
+checks. Writing it forced one clarification: it serves one request at a time
+and answers a second `EXEC` with `overloaded`, which is conforming —
+concurrency is optional, losing a request is not — so the suite accepts a
+refusal as an answer and reports it as one.
+
+And a check on the checker, in the supervisor suite: an agent that sends
+`READY` and then sleeps is run through the tool, and the run fails if it
+*passes*.
+
+---
+
+## Phase 4 — the first run on a real host, and what a container was hiding
+
+Every measurement in this report until now was taken in Docker on macOS:
+aarch64, kernel 5.10.104-linuxkit, one cgroup, root inside the container. A
+Raspberry Pi running Ubuntu 23.10 on kernel 6.5 is a different machine in the
+ways that matter — a systemd user session, an unprivileged user, real
+`subuid` ranges, and two kernel features this project has always had code for
+and never executed:
+
+| | Docker on macOS | the Pi |
+|---|---|---|
+| kernel | 5.10 | 6.5 |
+| overlayfs in a user namespace (5.11+) | absent, layers always flattened | **supported** |
+| `cgroup.kill` (5.14+) | absent, freeze-signal-thaw every time | **present** |
+| Landlock | ABI 0 | not compiled into this kernel at all |
+| privilege | root in a container | an ordinary user |
+
+Three things were wrong, and all three had been wrong for the whole project.
+
+**`zygo doctor` said the host was fine where `zygo run` failed.** The cgroup
+check read `cgroup.controllers` and found `cpu memory pids`, so it printed
+`cgroup v2 … ok`. The next command refused to start: an ssh login sits in a
+`session-N.scope`, which lists everything its parent delegated and still
+refuses `mkdir`, because the scope itself is not delegated. Risk R2 is that a
+host without delegation silently applies no limits; requirement N4 says that
+must never be silent. It was not silent — but the tool whose job is to
+predict it was confidently wrong, which is worse than saying nothing. The
+check now *attempts* what a sandbox will do: create a child cgroup, remove it.
+That is the project's own first rule, applied to the file that had been
+exempt from it.
+
+The remedy was incomplete too. It named the user manager's `Delegate=`, which
+is necessary and not sufficient: after applying it, the same ssh session fails
+identically, because the session scope is still a leaf. Both halves are
+printed now, the second being `systemd-run --user --scope -p Delegate=yes`.
+
+**`zygo doctor` offered a backend that does not exist.** It printed
+`backends available: ns, vm` on a machine with `/dev/kvm`, while
+`zygo backend list` said — correctly — that `vm` is not built. Two causes: a
+`/dev/kvm` the user cannot open was `degraded` rather than absent, and the
+report answered "does the host have what this needs" while printing an answer
+to "can I use this". The first is now absent; the second is joined in the CLI,
+which is the layer allowed to know both.
+
+Fixing that introduced a fourth bug, worth recording because of how it
+presented: `Report::supports` calling `backend::for_isolation` recursed,
+because the `ns` backend's own availability check calls `doctor::run()`. The
+symptom was `zygo doctor` exiting 139 — a `SIGSEGV` from a blown stack — and
+only inside a *working* delegated scope, because anywhere else the `&&`
+short-circuited before reaching the cycle. A data type reaching back into the
+layer above it deserved that.
+
+**A client talking to a wedged supervisor waited for ever.** This is the one
+that cost the most, because it disguised all the others.
+
+The control socket had no timeout anywhere: not in `send`, not in the
+greeting. So when a supervisor thread stopped — a deadlocked `place_secrets`,
+later a launcher thread parked on a futex — every client that spoke to it
+blocked in `unix_stream_data_wait` and never came back. From the outside that
+is indistinguishable from the host having locked up, and three separate
+investigations here began by ruling that out. `zygo exec --timeout` did not
+help: it bounded the *supervisor's* budget for the work, not the client's wait
+for the answer, though the comment beside it claimed otherwise.
+
+One timeout would not do, because the honest budgets differ by three orders of
+magnitude:
+
+| request | budget | why |
+|---|---|---|
+| `serve` | 20 min | warming may run `pip` or `apt` inside a sandbox |
+| `exec` | the request's own deadline, plus 10 s | the supervisor enforces the deadline and then still has to reply |
+| everything else | 30 s | `ps`, `stop`, `logs` read state the supervisor already holds |
+
+The budget is a *liveness* check rather than a deadline for the work, and the
+test says so by construction: a fake supervisor greets, then answers nothing,
+and the client must come back with an error naming the request inside its
+budget rather than blocking.
+
+**The sh agent's framing was wrong on any host with `gawk`.** The example
+agent in POSIX sh exists to keep the "language independent protocol" claim
+honest. It turns out to have been keeping it honest against one distribution.
+
+It writes the protocol's four-byte length prefix with
+`awk 'BEGIN { printf "%c%c%c%c", … }'`. In a UTF-8 locale, `gawk`'s `%c`
+encodes a value above 127 as a **two-byte UTF-8 sequence**; `mawk` has no
+multibyte notion and writes one byte. Debian's minimal images ship `mawk`,
+Ubuntu ships `gawk` — so the conformance suite passed in the container and
+failed on the Pi, on exactly the checks whose frames exceeded 127 bytes:
+
+```
+PASS  READY          (~90 bytes)
+PASS  PING/PONG      (short)
+PASS  FORKED         (short)
+FAIL  DONE           (~130 bytes)  ← the first frame over 127
+FAIL  DONE with stdout/stderr
+PASS  ERROR overloaded (short)
+PASS  SHUTDOWN       (short)
+```
+
+Which checks failed was the diagnosis: the boundary was a byte value, not a
+message type. `export LC_ALL=C` at the top of the script fixes it, and says
+why — every byte-level tool in that file has to agree that the length is a
+count of bytes.
+
+The lesson is the protocol claim's own: an implementation tested on one
+machine is a claim about that machine. The Node agent is unaffected — it
+writes `Buffer`s — and the Python one uses `struct`.
+
+**And the supervisor had two more waits with no end.** With the client
+timeout in place the next wedge was legible instead of mysterious: a
+supervisor whose `zygo-launcher` thread sat in `pipe_read` while a `serve`
+queued behind it for ever.
+
+The launcher is deliberately one thread — warming is serial, so two `serve`s
+cannot race for the same name — and the cost of that choice is that **any**
+unbounded wait inside a warm-up stops the supervisor warming anything, ever
+again. There were two:
+
+* the launcher reading the sandbox's status pipe, which sees end of file when
+  the child `execve`s and bytes when it fails, and nothing at all when the
+  child does neither;
+* the thread waiting for the agent's `READY` frame, for an agent that starts
+  and then says nothing.
+
+Both are bounded now — 60 s to reach `execve`, 120 s for an agent to announce
+itself — and both report what did not happen rather than an I/O error. A pipe
+has no read timeout, so the first needed `poll` with a deadline; the second is
+a socket and took `set_read_timeout`.
+
+The budgets are deliberately far above anything real: a sandbox reaches
+`execve` in milliseconds, and an agent's imports run after the venv and the
+derived layer are already built. They exist to turn "never" into "failed",
+which is the whole of the lesson these three fixes share.
+
+**Secrets do not work for a warm-exec function without privilege — and the
+failure was a permanent hang.** This is the one that mattered.
+
+The supervisor suite stalled on the Pi and never finished. The client sat in
+`unix_stream_data_wait`; a supervisor thread sat in `futex_wait_queue`, which
+is a mutex nobody was going to release. Bisecting the spec showed that
+*declaring* a secret was enough — a warm-exec function that never read one hung
+just the same — which put it in `place_secrets` rather than in the handler.
+
+The deadlock is four lines of Rust and entirely self-inflicted:
+
+```rust
+let mut guard = secrets.lock()?;        // the lock
+let lease = SecretsLease { secrets, .. }; // dropping this re-locks it
+std::fs::create_dir_all(&dir)?;          // <- early return on failure
+```
+
+`SecretsLease::drop` calls `withdraw_secrets`, which locks the same mutex, and
+`Mutex` is not reentrant. So a *failed write* dropped the lease on a thread
+that still held the lock, and that thread stopped for ever — one leaked thread
+per request, and a client that waits for ever. It only fires when the write
+fails, which is why root in a container never saw it. The lease is created
+after the guard is dropped now, and the regression test asserts the call
+*finishes* rather than asserting its value; against the old code it fails with
+"place_secrets deadlocked on the error path".
+
+Then the real error appeared:
+`i/o error on /proc/9447/root/run/secrets: Permission denied`.
+
+A held sandbox's init sets `PR_SET_DUMPABLE` off, on purpose and with a
+comment saying why: it is a fork of the supervisor, it still maps the
+supervisor's memory — which holds every function's secrets — and it sits in
+the same namespaces as tenant code under the same uid. Non-dumpable is what
+refuses `ptrace` and `/proc/1/mem` to that code. The cost, unnoticed until
+now, is that `/proc/<init>/root` becomes root-owned, so an unprivileged
+supervisor cannot write a secret through it either.
+
+| | secrets, rootless |
+|---|---|
+| runtime agent (`runtime = "python"`) | **works** — `execve` resets dumpable, so the agent's `/proc/<pid>/root` is writable |
+| warm-exec (`cmd`) | **refused**, with that explanation |
+
+Rootless is principle P2, so this is a real gap in the headline mode, and every
+test this project had ran as root in a container where the check is bypassed.
+The request now fails immediately and says which combination is unsupported
+and what to use instead.
+
+The obvious cheaper fix does not work, and why is the useful part. Reaching
+through the *request's* own parked process instead of the held init was
+tried: same `EACCES`. `/proc/<pid>/root` is traversable only while the
+process is **dumpable**, and writing the id map clears that, because it
+changes credentials. The launcher already lives on the other side of the same
+window — it opens `/proc/<pid>/ns/*` "while the child is guaranteed still
+dumpable", which is before the map is written and therefore before anything is
+mounted. There is no moment in a sandbox's life at which an unprivileged
+supervisor can reach its `/run` by path.
+
+So it was a choice, not a patch: either the child hands a directory descriptor
+out over `SCM_RIGHTS` before it hardens — keeping the property that nothing
+inside ever holds a value, at the cost of a handshake in the clone child — or
+the request's own helper writes the files just before `execve`, which is far
+simpler and means a process inside the sandbox briefly holds them.
+
+**The first was built.** The sandbox's init creates `/run/secrets` and sends
+its descriptor out, in the only moment such a thing can be taken: after the
+root is committed, so the directory can exist, and before `harden`, which
+drops the capabilities creating it needs and may install a Landlock ruleset
+that forbids it. The supervisor writes with `openat` and never touches
+`/proc` again. The `SCM_RIGHTS` helpers were already in the tree for the DNS
+socket, so this is a second use of code that was already carrying its own
+weight rather than a new mechanism.
+
+It also removes a difference that should never have existed: root and
+unprivileged now take the same path, and the reason this bug survived so long
+was precisely that they did not.
+
+```
+on the Pi, as an ordinary user, before:  error: … Permission denied
+                                 after:  {"k": "sk_live_9"}
+```
+
+**The verification suites only knew how to run in a container.** Each one
+hard-coded `/sys/fs/cgroup` as the place to build its harness, which is the
+root of the hierarchy in a container and a directory nobody may write to on a
+host. `verify_launcher.sh` reported **24 failures on a host where the launcher
+worked perfectly** — every one of them an empty string where output should
+have been, because the wrapper was breaking the invocation. The seven suites
+now share `poc/cgroup_harness.sh`, which reads the starting cgroup from
+`/proc/self/cgroup` and builds relative to it. The same file runs in both
+places; on a host the suite is started with
+
+```bash
+systemd-run --user --scope -p Delegate=yes -- sh poc/verify_launcher.sh
+```
+
+and the reason is not cosmetic: cgroup v2 forbids a cgroup from holding
+processes *and* delegating to its children, so the shell running the suite has
+to step out of the way or `zygo` cannot enable the controllers its tenants
+need. That rule is why the container harness existed; reading the root from
+`/proc` is all it took to make it general.
+
+---
+
+## Phase 4 — the `gvisor` backend, and three ways a runtime says no
+
+The mount plan has been pure data since phase 1, with a comment saying the
+reason: `ns` executes it, and `gvisor` would translate it into an OCI
+`config.json` instead. That translation is a few hundred lines and it is
+unit-tested on macOS, which is the payoff being collected. Then it was run,
+and the running is where the report starts — three failures in a row, none of
+which a unit test could have produced.
+
+**The documented download does not exist.** gVisor's install instructions
+describe `…/releases/release/latest/${ARCH}/runsc` beside a `runsc.sha512`.
+The bucket has neither; it serves `gvisor.tar.zstd`. Zstd rather than the
+bz2 alternative is free here, because the image store already carries a zstd
+decoder for layers and carries no bzip2 at all.
+
+**`runsc` alone is not a runtime.** The first working download installed the
+100 MB binary and nothing else. It answers `runsc --version` perfectly and
+then refuses to start anything: `sidecar "gvisor_sentry" not usable …
+--sidecar-usage-policy is set to STRICT`. The release's `gvisor-bin/`
+directory is required. The 41 MB containerd shim beside it is not, and is
+left behind.
+
+**`--rootless` and a user namespace are the same request made twice.** With
+the sidecars in place, every run died in the gofer with `fork/exec
+/proc/self/exe: invalid argument` — a message that names nothing. `runsc do`,
+its own minimal path, worked. So the fault was in the generated bundle, and
+finding it meant starting from a baseline `runsc spec` and adding this
+bundle's differences one at a time:
+
+| added to a working baseline | result |
+|---|---|
+| cgroup namespace | ok |
+| unknown `_zygo*` keys | ok |
+| an OCI seccomp section | ok |
+| **user namespace + id mappings** | **the gofer's EINVAL** |
+
+`runsc --rootless` creates a user namespace and writes its own id map; a spec
+that also declares one makes the gofer clone with `CLONE_NEWUSER` a second
+time. The bundle omits it now, and the uid still applies — gVisor's Sentry
+implements `process.user` itself, which a test confirms by asking `id -u`
+inside.
+
+**And one difference that was not a failure.** `ns` `chdir`s to the spec's
+working directory and falls back to `/` when the image lacks it, on the
+grounds that refusing to start is worse. An OCI runtime instead *creates* the
+directory — and fails on a read-only root. So `zygo run --isolation gvisor
+alpine:3 echo hi` died where `ns` had run it. Requirement N8 is that the same
+spec means the same thing on every backend, so the fallback moved into the
+bundle rather than staying a property of one launcher.
+
+What it does now, checked by 19 end-to-end checks in `make gvisor-linux`:
+
+```
+uname -r  on ns      5.10.104-linuxkit
+uname -r  on gvisor  4.19.0-gvisor
+```
+
+Three probes give byte-identical answers and exit codes on both backends, and
+the kernel differs — which is the pair of facts the acceptance criterion
+actually asks for. A comparison where everything matched would only prove both
+backends ran the same binary.
+
+What it does not do is refused rather than weakened: warm functions (entering
+one is `runsc exec`, not `setns`), the agent (its socket is an inherited
+descriptor, and an OCI runtime closes everything but stdio), and networking
+(gVisor's netstack is its own). Rootless `runsc` also cannot write cgroups, so
+limits there are advisory — said in a warning on every start, because a limit
+written down and not enforced is worse than one never promised.
+
+---
+
+## Phase 4 — the syscall sweep, and two bugs in the sweep itself
+
+The escape suite attempts the vectors somebody thought of. The seccomp filter
+has a failure mode that nobody thinks of: its branch offsets are *computed*,
+and one wrong offset silently allows a syscall no test names. The unit tests
+run a BPF interpreter over the program, which catches that — against the
+program, not against the kernel.
+
+`make fuzz-linux` calls every syscall number the architecture has, 469 of
+them, under each profile, each one in a forked child with zero arguments so a
+call that blocks, exits or changes process state takes nothing with it. What
+it asserts needs no copy of the allowlist, deliberately: a check that compared
+against the list would only be testing the list against itself. Instead it
+asserts relationships — `permissive` ⊋ `default` ⊋ `strict` on a real kernel,
+no syscall kills the process, `clone3` answers `ENOSYS` and not `EPERM` — and
+the differences come out as exactly the 16 and 6 syscalls the constants claim.
+
+| profile | refused with EPERM, of 469 |
+|---|---|
+| `permissive` | 284 |
+| `default` | 300 |
+| `strict` | 306 |
+
+The first run of it found two bugs, both in the sweep rather than in the
+filter, and both of the kind this project keeps finding in its own tests. The
+SIGALRM handler returned instead of raising, so PEP 475 restarted the
+interrupted read and the sweep hung for ever on the first syscall that waits —
+it ran for eleven minutes without producing a line. And the set comparison
+sorted numerically before handing the lists to `comm`, which compares as
+strings: it had been answering from unsorted input, warning about it only on
+stderr, where nothing was looking. The comparison now fails loudly if `comm`
+complains at all.
+
+Those are the fifteenth and sixteenth entries in the inventory below, and the
+same lesson as all the others: the test is also code.
+
+---
+
+## Phase 4 — dating a kernel without a feed
+
+The design asks `zygo doctor` to warn about a kernel old enough to have open
+CVEs. The obvious implementation — fetch a vulnerability feed — is the wrong
+one for this tool: a check that needs the network fails closed on exactly the
+air-gapped hosts most likely to be running something ancient.
+
+What needs no network is the release date of each upstream series, which is a
+fact that never changes. `doctor` now dates the running series against a table
+of them and warns past two years, saying whether it is a long-term series,
+because a long-term series two years old and a development series two years
+old are different propositions.
+
+Two things keep it honest. A series *newer* than the table is never called
+old: the table is a floor on what this build knows, and guessing would turn
+the warning into a lie the moment the binary is a year old. And the wording
+never says "unpatched" — a distro backports fixes into an old series without
+changing its version, which is what the long-term series are for. What age
+actually measures is how much kernel hardening the host is behind, which
+matters because every `ns` control is a kernel feature.
+
+On the host this was written on it reads:
+
+```
+kernel age   5.10 is 5 years old, a long-term series   degraded
+             → a long-term series still gets stable updates, so this is
+               about features and hardening rather than open CVEs
+```
+
+Running it rather than trusting the unit tests paid for itself immediately,
+though not in the way intended: `zygo doctor | head` printed the report and
+then `Aborted`. Rust's runtime sets `SIGPIPE` to `SIG_IGN`, so writing to a
+pipe whose reader has gone returns `EPIPE`, `println!` panics on it, and this
+binary is built with `panic = "abort"`. Every command in the CLI did it —
+`zygo ps | grep -q` included, which is how several verification scripts read
+its output. The fix is one line restoring the default disposition, and the
+lesson is the project's own: a feature that has only ever been unit-tested has
+only ever been unit-tested.
+
+---
+
+## Phase 3 — `zygo.lock`, and the digest that was being thrown away
+
+A tag is a pointer. `image = "python:3.12-slim"` today and next month are two
+different images, and until now nothing in a deploy noticed. `zygo up` writes
+what each function resolved to beside the spec, with `Cargo.lock`'s
+semantics: absent means write it, an edited spec means rewrite that entry
+silently, and an image that moved under a spec nobody edited is **refused**
+with both digests and a `--relock` that accepts it. The file changes nothing
+by itself; refusing to let something change silently is the whole feature.
+
+Writing it found something already wrong. The registry client resolves a
+multi-platform index to this host's manifest and had been discarding the
+index digest — it only ever needed the one it was about to pull. But the
+index digest is the one that means the same image on every architecture, and
+a lock file naming this host's manifest fails on a colleague's laptop for no
+reason other than its CPU. That is a lock file that teaches people to delete
+lock files. The client keeps both now, the store records both, and where an
+image genuinely exists for one platform only the refusal message says why the
+line cannot travel.
+
+`apt` versions are the deliberate exception: a move is recorded with a
+warning rather than refused, because Debian's archive does not keep old
+versions and refusing would strand every host that was not built the same
+week.
+
+---
+
+## Phase 3 — OTLP, without the dependency that usually comes with it
+
+The design asks for an OpenTelemetry export beside the Prometheus endpoint.
+The obvious route — `opentelemetry-otlp` — brings `tonic`, `prost` and code
+generation for a binary with a 15 MB budget, which is why this sat unbuilt
+for a phase. The way through is that OTLP defines *two* stable encodings, and
+the JSON one over HTTP is accepted by every collector on the same port as
+protobuf. So the exporter is `serde_json` building one document, and the HTTP
+client the registry pull already links: no new dependency at all.
+
+What is exported comes from the same snapshot `/metrics` renders, so the two
+views cannot disagree — the refactor that made `/metrics` read a snapshot was
+most of the change. The JSON mapping has traps that a hand-built document
+gets wrong quietly: 64-bit integers are strings, sums must declare cumulative
+temporality and carry a start time, gauges must not. The test receives the
+real POST on a real socket and asserts on the bytes that arrived, because a
+payload that is never sent exports nothing.
+
+Metrics only. The request spans §3.12 also names need a trace context carried
+on the request path, which is a protocol change, and are not built.
+
+---
+
+## Phase 3 — egress, and the capability that `execve` takes back
+
+`network = "egress"` was the last large piece of the design that had never been
+attempted. The design says: rootless `pasta` for transport, an allowlist by
+host/CIDR/port, DNS forced to a resolver Zygo controls. Everything here was
+probed against a real kernel before a line of it was written, because two of
+those three could plausibly have been impossible rootless.
+
+**Both halves work, unprivileged.** `pasta`, given `--netns` and `--userns`
+paths, configures a namespace that already exists — copying the host's
+addresses and routes into it — and forwards TCP and UDP in userspace. `nft`,
+run inside that namespace, actually filters: with a default-drop output chain
+allowing only `1.1.1.1:443`, a connection there returned `HTTP/2 301` and
+connections to `8.8.8.8:443` and to the host's own bridge address both failed
+to connect. DNS to the address `pasta` intercepts returned a 33-byte answer.
+None of it needed a capability on the host.
+
+**`pasta` is given namespace paths rather than a pid on purpose.** Given a pid
+it joins the target's *mount* namespace too, so it can rewrite
+`/etc/resolv.conf`. At the moment it runs, the sandbox has not pivoted yet and
+its mount namespace is still a copy of the host's — and `make-rprivate` changes
+propagation, not which inode a write lands on. So that write would have hit the
+host's own `/etc/resolv.conf`. With explicit paths it never enters a mount
+namespace at all; Zygo supplies `resolv.conf` as a read-only bind mount, which
+also means the host's search domains never reach a tenant.
+
+**The failure worth recording.** `nft` reported
+`cache initialization failed: Operation not permitted`, which reads like a
+kernel without nftables in user namespaces — and the identical ruleset loaded
+fine under `nsenter -U -n`. The difference is `execve`. Entering a user
+namespace Zygo created grants a full capability set inside it, but `execve`
+recomputes capabilities and keeps them only for uid 0. Inside the sandbox's
+namespace the supervisor is the *mapped* uid — 1000 by default — and uid 0
+there is not mapped to anything when the host has no subordinate range, so
+`setuid(0)` is not a way out either. The fix is the ambient set, the one set
+that survives `execve` for an unprivileged uid: raise `CAP_NET_ADMIN` there
+after `setns` and before the exec. `nsenter` hides the whole problem by setting
+uid 0 for you.
+
+The second failure was smaller and the same shape: `pasta` started as root
+drops to `nobody` *before* opening `/proc/<pid>/ns/user`, and `nobody` cannot
+read it. Zygo passes `--runas <uid>:<gid>` explicitly now — a no-op for the
+rootless case the project targets, and the fix for the containers and CI
+runners where it is not.
+
+**A test bug the same run exposed.** The negative checks were written as
+`case "$out" in *'"other":"ok"'*) bad ;; *) ok ;; esac`, so "the destination was
+refused" was the fallthrough — and when `up` failed, three of them passed
+against an error message. They read a named field out of the handler's answer
+now and fail when it is absent. The check that no `pasta` leaks was worse: it
+passed because none had ever started. It asserts one per networked sandbox
+while they are up, before asserting none afterwards.
+
+**What holds the allowlist together.** The rules are generated in Rust and
+handed to `nft` on stdin — no shell, no tenant string in the ruleset — and the
+order *is* the policy: loopback, established, DNS to the forced address only,
+the private and link-local rejects, then what the spec allowed, then reject.
+Putting the private rejects above the allow rules is what makes a *hostname*
+that resolves into a private range refused; resolution alone could only ever
+catch a CIDR written in the file.
+
+**Wildcards, and the resolver that had to move inside.** A wildcard rule
+cannot be turned into addresses ahead of time, and the filter works on
+addresses — so enforcing `*.example.com` means Zygo answering the sandbox's
+DNS itself and admitting each answer to the filter before it is sent. The
+constraint that decides where that resolver lives is that `resolv.conf` cannot
+name a port: it has to be on port 53 of an address the sandbox can reach,
+which is *inside the sandbox's own network namespace*. A forked helper enters
+the namespaces, binds `127.0.0.53:53`, and hands the socket back over
+`SCM_RIGHTS`; a socket belongs to the namespace it was created in whoever
+holds it, so the supervisor serves it from an ordinary thread. Measured: a
+`*.cloudflare.com:443` rule resolves and serves; `example.com` gets `NXDOMAIN`;
+`pasta`'s forwarder, which would be a second resolver and therefore a way
+around the first, does not answer.
+
+**The download limit that broke `pasta`.** `bandwidth` on what the sandbox
+sends is a token bucket on the tap and does what the arithmetic says — 500 KB
+at 100 KB/s took 4.89 s against 1.09 s unlimited. What it receives is another
+matter. The rootless tool for ingress is a policer that drops packets over the
+rate, and every attempt, at every burst, ended in `Connection reset by peer`:
+`pasta` is a userspace TCP stack and treats that loss as a dead peer. The
+alternative is to queue rather than drop, which needs an `ifb` device to
+redirect ingress through — a kernel module this host lacks and one that cannot
+be autoloaded from a user namespace. The limit therefore shapes what is sent,
+shapes what is received where `ifb` exists, and says so where it does not.
+
+---
+
+## Phase 3 — the examples, run rather than read
+
+An example is a promise: its README says what happens, and nothing checks
+that it does. `make examples-go-linux` now runs them. The Go program comes up
+as a warm-exec function on `alpine:3` and answers ten requests through the
+CLI in 7 ms each, client start-up included; the LLM tool comes up under
+`seccomp = "strict"`, evaluates an expression, refuses the injection its
+README shows, and is killed at its two-second deadline on `9 ** 9 ** 9`.
+
+That last line is where the run earned its keep. The tool's README promised
+`exit 137: the deadline killed the whole process tree`, and the request *was*
+killed — the supervisor reported SIGKILL — but `zygo exec` exited 1, because it
+had always folded every failure into 1. A caller could not tell "the tool
+ran out of time" from "the tool raised" without parsing stderr, which is
+precisely what the README told them they would not have to do. `exec` now
+exits with the request's own status: 137 for a deadline kill, the program's
+own code for a warm-exec function that exited, 1 for a handler that raised.
+The README had described the behaviour the design intended; the example test
+was the first thing to hold the binary to it.
+
+---
+
+## Phase 2.4 and 2.8 — secrets, and the HTTP front door
+
+**Secrets are delivered without the agent ever seeing them.** The design says
+"as a file, to the child only, and the zygote does not see them" (§3.10). The
+obvious implementation — put the values in `EXEC` and have the child write
+them out — satisfies the first half and breaks the second: the agent parses
+`EXEC`, so it has held every value in memory.
+
+Instead the supervisor writes `/run/secrets/<name>` from *outside* the
+sandbox, through `/proc/<agent-pid>/root`, between `FORKED` and `GO`, and
+removes the files when the last request in flight finishes. No protocol change,
+no agent code, and ownership needs no `chown`: the supervisor's host uid is
+exactly the uid the sandbox's user namespace maps to the handler. Verified by
+looking rather than trusting — the handler reads the value, the file is absent
+once nothing is running, present for exactly the life of a request, and the
+agent's own `/proc/<pid>/environ` never contains it.
+
+Where the values come from matters as much as where they go. The supervisor is
+started by whichever command needed one first and inherits *that* environment,
+which is nobody's idea of where `STRIPE_KEY` lives. So the client reads them:
+`zygo serve` and `zygo up` resolve the spec locally — resolution is pure, so
+this is free and cannot disagree with the supervisor — take the secret names
+from it, read the values from their own environment, and send them in `SERVE`.
+A name with no value is a spec error naming the variable, reported before any
+sandbox exists, and no value ever appears in an error message.
+
+**The HTTP API is a client of the supervisor, not a second copy of it.**
+`zygo api` turns each route into one control request over the unix socket —
+the same boundary the CLI crosses — so ADR-005's single RPC boundary on the
+request path is kept: HTTP → supervisor *replaces* CLI → supervisor rather than
+adding to it. A pool of control connections, one per request in flight, is what
+turns concurrent HTTP requests into concurrent sandbox requests.
+
+The status codes are §4.6's, and one of them needed a fact the API did not
+have. A deadline kill and an OOM kill both arrive as exit 137 with the same
+message; only the supervisor knows which it enforced. So `Outcome` gained a
+`timed_out` flag set by the side that killed the request, and a 408 is now a
+statement rather than a guess. Measured: a handler that never returns, served
+with `--timeout 2s`, answers 408 in 2053 ms over HTTP.
+
+Two refusals, both P6: an unauthenticated listener is refused on anything but
+loopback or a unix socket, because "no auth" on a reachable address is code
+execution for anyone who can route to it; and bearer auth with no
+`ZYGO_API_TOKEN` is refused rather than silently open. Seventeen end-to-end
+checks cover the routes, the auth, and both refusals.
+
+---
+
+## Phase 2.7 — the venv cache, built where it will run
+
+`requirements.txt` becomes `cache/venvs/<hash>/`, bound read-only at `/venv`
+with `/venv/bin` first on `PATH`. The decision that matters is *where* it is
+built: inside a one-shot sandbox from the same image, with that image's own
+`pip`. Building on the host would produce a venv for the host's Python, and a
+wheel compiled against the wrong interpreter or libc fails at import time
+inside the sandbox with a message that points nowhere useful.
+
+That decision also dictates the cache key — the image's manifest digest plus
+the file's bytes. The same requirements against a different image are a
+different venv; the same requirements from two projects are one. Measured:
+**3970 ms** to build, **111 ms** for a second function to reuse it, one
+directory in the cache, and a write attempt from inside the sandbox refused.
+
+The design called for an embedded `uv`. Not done, on arithmetic: `uv` is about
+30 MB and requirement N6 caps the entire binary at 15 MB. The image's `pip` is
+slower and already there.
+
+The build sandbox is given host networking — the one place Zygo does that
+without `--allow-host-net`, justified narrowly: it installs the user's own
+requirements file, once, before any tenant code exists, and the warm sandbox
+keeps the spec's `network`.
+
+One launcher assumption surfaced: `SandboxConfig.stdio` was documented as a pty
+slave and step 4 made the process its session leader with `TIOCSCTTY`; the
+builder hands it a pipe to capture `pip`, and the ioctl said ENOTTY. It now
+adopts a controlling terminal only when the descriptor is one, which is what
+the field should always have meant.
+
+---
+
+## Phase 2.3 — warm-exec: a held sandbox, and a fresh process per request
+
+The other half of the warm model (§3.4, layer 1), for everything that is not an
+interpreter worth keeping warm. The sandbox — namespaces, mounts, cgroup,
+hardening — is built once and *held*; each request is a fresh process entered
+into it. There is no agent in the box, and nothing from the image has to exist
+for the sandbox to stay up: the init is Zygo's own code, a reaping loop that
+never `execve`s.
+
+Two hops, because two rules cannot be satisfied by one process. The supervisor
+forks a helper; the helper enters the user, pid, net, ipc, uts and cgroup
+namespaces and forks the request; the request, after `GO`, enters the mount
+namespace itself, wires its pipes onto stdin/stdout/stderr, runs exactly the
+hardening the init ran, and `execve`s `cmd`. Entering `pid` affects children,
+so the request is born inside — and because the helper is still in the host's
+pid namespace, the pid `fork()` returns is the **host** pid. The path that
+needed translation in §2.2b needs none here.
+
+This is rootless for the reason PoC 9's third row measured: `setns` into a user
+namespace needs `CAP_SYS_ADMIN` in it, and a process in the parent namespace
+with the creator's uid has every capability there. The supervisor created it;
+the helper is its fork.
+
+### What it costs
+
+5.10/aarch64, 250 requests/s, through the library:
+
+| | p50 | p99 | max |
+|---|---|---|---|
+| `sh -c cat` | **2210 µs** | 2950 | 3368 |
+| `python3 -c 'json.load(sys.stdin)'` | **54 550 µs** | 59 868 | 60 902 |
+| the agent path, for comparison | 1684 | 2926 | 4390 |
+
+The first row is the design's "1–3 ms plus the program's own start-up", with
+`sh` starting as part of it: enter (fork, six `setns`, fork, report) 480 µs,
+admit 168 µs, run — mount namespace, hardening, `execve`, the program, end of
+file — 1499 µs. Through the CLI, ten round trips averaged 7 ms each with the
+client process's own start-up included.
+
+The second row is the whole argument for the agent model in one number.
+Starting an interpreter per request is 54 ms; forking a warm one is 1.7 ms.
+Warm-exec is for the programs that start in a millisecond and would gain
+nothing from an agent, and `bench warm -- CMD` judges it against the phase 2
+criterion for that case — 3 ms — rather than the agent's 2 ms.
+
+### The held init
+
+It is a fork of the supervisor that never execs, sitting in the same namespaces
+as tenant code under the same uid, and it still maps the supervisor's memory.
+Three things make that safe, checked rather than assumed: it drops every
+capability (`CapEff` is zero); it sets itself non-dumpable, which refuses
+`ptrace` and `/proc/1/mem` to same-uid code (the seccomp profile denies
+`ptrace` as well, and this holds even if it did not); and it closes every
+descriptor from 3 up the moment it has signalled ready. It costs ~0 MB
+resident.
+
+### The bug the first run found
+
+`sh -c cat` printed the right JSON and then waited out the full 30 s deadline.
+`cat` echoes as it reads and exits on end of file — and end of file never came.
+`fork` had given the helper the supervisor's entire descriptor table,
+including the *parent's* write end of the request's own stdin; the helper
+closed the child-side ends it knew about and kept the rest until the request
+exited, which the request could not do until the helper let go.
+
+The same inheritance is a concurrency hazard — a second request's helper would
+have held the first request's stdin — so it was fixed as a rule rather than a
+list: the helper `dup`s exactly the thirteen descriptors it and the request
+need down to 3–15 (copies first, so no `dup2` overwrites one not yet copied)
+and `close_range`s everything above. After that, 2.2 ms.
+
+Twelve end-to-end checks cover the mode: the init's identity and capabilities,
+stdin in and stdout out, fresh pids, one process at rest, the deadline, the
+sandbox still serving afterwards, and secrets arriving at `/run/secrets` by the
+same mechanism the agent path uses.
+
+---
+
 ### An inventory of the bugs found in the tests themselves
 
-Seven times in this project a test looked green because it measured the wrong
-thing — or showed the wrong thing red. All of them fall into one of two
-patterns:
+Twenty times in this project a test looked green because it measured the
+wrong thing — or showed the wrong thing red. All of them fall into one of a
+few patterns:
 
 | # | Where | What the test thought | The reality |
 |---|---|---|---|
@@ -806,6 +2033,19 @@ patterns:
 | 5 | Escape suite | the sandbox could rewrite its `uid_map` | Python's buffered `write` swallowed the error in `__del__`; the kernel had returned EPERM |
 | 6 | Escape suite | a symlink escaped to the host root | the baseline had been taken from a *different* sandbox; the difference was only the `/rw` mount point |
 | 7 | `bench warm` | the warm path's p99 exceeds the budget | a closed loop with no think time sat the tenant on **its own CPU quota**; what was measured was the quota, not the runtime |
+| 8 | Supervisor suite | the per-request cgroup is populated | `[ -s cgroup.procs ]` tests file size, and cgroupfs reports 0 for every file however full it is; only the content is evidence |
+| 9 | Supervisor suite | a timed-out function stays warm | the JSON grep assumed `"name"` is followed by `"state"`, but serde sorts object keys; it could only ever have passed by accident |
+| 10 | Egress suite | a destination off the allowlist was refused | "refused" was the `case` *fallthrough*, so when `up` failed and the function did not exist, the error text matched nothing and three negative checks passed against it |
+| 11 | Egress suite | no `pasta` process leaks after `down` | none had ever started; the check now asserts one per networked sandbox **while they are up**, before asserting none afterwards |
+| 12 | `make test-linux` | the Linux suite passes | the recipe ended in `\|\| true`, so the container's exit code was always zero — a build that did not compile reported success, and had done for as long as the target existed |
+| 13 | Examples suite | ten warm-exec requests averaged 3 ms | the function had never come up; `exec` was failing in 3 ms and the loop counted time, not answers. Every request is now checked for a real result first |
+| 14 | Examples suite | the Go program's result came back | the pattern assumed `"words"` before `"squared"`; serde sorts keys. Number 9 again, on the first day a new script existed |
+| 15 | Syscall sweep | the per-syscall timeout would cut a blocking call short | the `SIGALRM` handler returned instead of raising, so PEP 475 restarted the interrupted read; the sweep hung for eleven minutes without producing a line |
+| 16 | Syscall sweep | the profiles were compared as sets | `sort -n` then `comm`, which compares as *strings*: the comparison was answering from input it considered unsorted, and said so only on stderr, where nothing was looking. It now fails if `comm` writes anything at all |
+| 17 | gVisor suite | `backend list --json` said gvisor was available | the pattern assumed `"backend"` then `"status"`; serde sorts keys and puts `detail` between them. **Number 9 and number 14 for the third time**, on the first day of another new script — so the rule needs to be a habit and not a memory: never match more than one JSON key in one pattern |
+| 18 | gVisor suite | the `ns` baseline would be there to compare against | `ns` was run *after* a dozen gvisor runs, by which point the harness's cgroup wrapper could no longer place it, and every comparison reported a vacuous failure. The baseline is captured first now, and checked before it is used |
+| 19 | Every suite | the harness had put `zygo` in a usable cgroup | it hard-coded `/sys/fs/cgroup`, which is the hierarchy root in a container and unwritable on a real host. On the first run on a Raspberry Pi, `verify_launcher.sh` reported 24 failures on a launcher that worked — the wrapper was breaking every invocation, and each check dutifully reported the empty output as the launcher's fault. The harness is shared now and reads its root from `/proc/self/cgroup`; it also says which branch it took, because a run that silently prepared nothing proves nothing |
+| 20 | Supervisor suite | exactly one venv directory meant the cache had deduplicated | it asserted on a cache without ensuring the cache started empty. In a container that is free — the container is new — and on a host `/tmp` survives, so it counted a previous run's half-built venv and reported a caching bug that did not exist. An isolated repro deduplicated correctly. The suites clear their data directory first now, and the check means what it says |
 
 Written up as three rules and put in the README:
 
@@ -819,3 +2059,15 @@ Written up as three rules and put in the README:
 
 The first five were found after the first two rules were applied; the sixth
 (uid_map) produced the rule itself, and the seventh produced the third rule.
+Eight and nine are both the first rule again, in its subtlest form: `-s` and a
+key-order grep are each *reading a property* rather than looking at the thing
+itself, and both would have reported a working feature as broken.
+
+Ten, eleven and twelve are a fourth pattern, and the most dangerous one,
+because all three fail **open**:
+
+4. **A negative check must first prove the thing ran.** "The connection was
+   refused", "no process leaked" and "the suite exited zero" are all satisfied
+   by nothing having happened at all. Every one of them now establishes the
+   positive case first — the handler answered, a `pasta` is running, the
+   command's status is the command's — and only then asserts the negative.

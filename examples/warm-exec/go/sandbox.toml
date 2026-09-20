@@ -1,0 +1,9 @@
+# A compiled program as a warm function: no runtime, no agent. Zygo holds the
+# sandbox and runs `cmd` per request with the event on stdin.
+[fn.parse]
+image   = "alpine:3"
+mounts  = ["./bin/parse:/app/parse:ro"]
+cmd     = ["/app/parse"]
+mem     = "64M"
+scratch = "16M"    # /tmp counts against mem, so it has to be smaller
+pids    = 8

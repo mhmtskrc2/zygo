@@ -1,0 +1,96 @@
+{
+  "_": "Wire fixtures for spec/protocol.md v1. Read by the Rust suite (crates/zygo-core/src/protocol/mod.rs) and the Python suite (agents/python/test_zygo_agent.py), so the two implementations are held to one set of bytes rather than to each other. `canonical` messages must re-serialise to exactly this JSON; the others only have to decode. `frames` carry the exact bytes on the wire, header included.",
+  "proto": 1,
+  "messages": [
+    {
+      "name": "ready",
+      "direction": "agent -> supervisor",
+      "canonical": true,
+      "message": {"type": "READY", "proto": 1, "pid": 42, "imports_ms": 312.5, "rss_kb": 41200, "runtime": "python/3.12.4"}
+    },
+    {
+      "name": "exec",
+      "direction": "supervisor -> agent",
+      "canonical": true,
+      "message": {"type": "EXEC", "id": "01f3", "event": {"url": "https://example.com", "n": 3}, "timeout_ms": 30000, "env_overrides": {"LANG": "C"}}
+    },
+    {
+      "name": "exec-without-overrides",
+      "direction": "supervisor -> agent",
+      "canonical": true,
+      "message": {"type": "EXEC", "id": "01f4", "event": null, "timeout_ms": 5000}
+    },
+    {
+      "name": "forked",
+      "direction": "agent -> supervisor",
+      "canonical": true,
+      "message": {"type": "FORKED", "id": "01f3", "pid": 1234}
+    },
+    {
+      "name": "go",
+      "direction": "supervisor -> agent",
+      "canonical": true,
+      "message": {"type": "GO", "id": "01f3"}
+    },
+    {
+      "name": "result",
+      "direction": "child -> agent",
+      "canonical": true,
+      "message": {"type": "RESULT", "id": "01f3", "exit_code": 0, "result": {"status": 200}, "stdout": "hi\n", "stderr": "", "peak_rss_kb": 41200, "wall_ms": 12.3, "cpu_ms": 9.1}
+    },
+    {
+      "name": "result-minimal",
+      "direction": "child -> agent",
+      "canonical": false,
+      "message": {"type": "RESULT", "id": "01f3", "exit_code": 0}
+    },
+    {
+      "name": "done-failed",
+      "direction": "agent -> supervisor",
+      "canonical": true,
+      "message": {"type": "DONE", "id": "01f3", "exit_code": 1, "result": null, "stdout": "", "stderr": "Traceback (most recent call last):\n", "error": "ZeroDivisionError: division by zero", "peak_rss_kb": 0, "wall_ms": 0.5, "cpu_ms": 0.4}
+    },
+    {
+      "name": "ping",
+      "direction": "supervisor -> agent",
+      "canonical": true,
+      "message": {"type": "PING", "seq": 7}
+    },
+    {
+      "name": "pong",
+      "direction": "agent -> supervisor",
+      "canonical": true,
+      "message": {"type": "PONG", "seq": 7}
+    },
+    {
+      "name": "shutdown",
+      "direction": "supervisor -> agent",
+      "canonical": true,
+      "message": {"type": "SHUTDOWN", "grace_ms": 5000}
+    },
+    {
+      "name": "error",
+      "direction": "either",
+      "canonical": true,
+      "message": {"type": "ERROR", "id": "01f3", "code": "handler_load", "message": "no module named handler"}
+    },
+    {
+      "name": "error-without-id",
+      "direction": "either",
+      "canonical": true,
+      "message": {"type": "ERROR", "code": "bad_message", "message": "body is not valid JSON"}
+    }
+  ],
+  "frames": [
+    {
+      "name": "ping-frame",
+      "message": {"type": "PING", "seq": 7},
+      "hex": "000000177b2274797065223a2250494e47222c22736571223a377d"
+    },
+    {
+      "name": "go-frame",
+      "message": {"type": "GO", "id": "01f3"},
+      "hex": "000000197b2274797065223a22474f222c226964223a2230316633227d"
+    }
+  ]
+}

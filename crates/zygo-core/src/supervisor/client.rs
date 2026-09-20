@@ -26,10 +26,35 @@ use super::protocol::{CONTROL_VERSION, ControlError, Request, Response};
 /// a second supervisor, which is the one outcome worth ruling out.
 pub const START_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long to wait for an answer to a request that should be instant.
+///
+/// `ps`, `stop`, `logs`, `status`: all of them read data the supervisor
+/// already has. Thirty seconds is far longer than any of them can honestly
+/// need, and finite, which is the point — see [`Client::budget`].
+pub const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long to wait for a `serve`.
+///
+/// Warming can legitimately take minutes: a venv build runs `pip` and a
+/// derived layer runs `apt`, both inside a sandbox, both over the network.
+/// The budget is for a supervisor that has *stopped*, not for a slow one.
+pub const SERVE_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+
+/// Added to a request's own deadline before the client gives up on it.
+///
+/// The supervisor enforces the deadline and then still has to reply; a client
+/// that gave up at exactly the same moment would race it and report a
+/// timeout for a request that was answered.
+pub const REPLY_GRACE: Duration = Duration::from_secs(10);
+
 /// A connection to a supervisor, greeted and ready.
 pub struct Client {
     reader: FrameReader<UnixStream, Response>,
     writer: FrameWriter<UnixStream, Request>,
+    /// A third handle on the same socket, kept only to set the read timeout
+    /// before each request. The reader owns its own clone and offers no way
+    /// to reach the socket underneath.
+    deadline: UnixStream,
     /// What the supervisor said about itself, for `zygo ps` headers.
     pub supervisor_pid: u32,
     pub supervisor_version: String,
@@ -71,15 +96,17 @@ impl Client {
     }
 
     fn greet(stream: UnixStream) -> Result<Client> {
-        let reader = FrameReader::new(
-            stream
-                .try_clone()
-                .map_err(|e| Error::primitive("dup", "control socket", e))?,
-        );
+        let dup = |s: &UnixStream| {
+            s.try_clone()
+                .map_err(|e| Error::primitive("dup", "control socket", e))
+        };
+        let reader = FrameReader::new(dup(&stream)?);
+        let deadline = dup(&stream)?;
         let writer = FrameWriter::new(stream);
         let mut client = Client {
             reader,
             writer,
+            deadline,
             supervisor_pid: 0,
             supervisor_version: String::new(),
         };
@@ -107,23 +134,109 @@ impl Client {
         }
     }
 
-    /// Send one request and read its answer.
+    /// Send one request and read its answer, within that request's budget.
     pub fn send(&mut self, request: &Request) -> Result<Response> {
+        self.send_within(request, Client::budget(request))
+    }
+
+    /// How long this request may take before the client stops believing in it.
+    ///
+    /// Per request rather than one number, because the honest budgets differ
+    /// by three orders of magnitude: `ps` reads a map, `serve` may run `apt`.
+    /// A single short timeout would break warming; a single long one would be
+    /// the same as none, which is what this used to have.
+    pub fn budget(request: &Request) -> Duration {
+        match request {
+            Request::Serve { .. } => SERVE_TIMEOUT,
+            // The supervisor owns the deadline and then has to answer, so the
+            // client waits for the deadline *and* the reply.
+            Request::Exec { timeout_ms, .. } => {
+                Duration::from_millis(*timeout_ms).saturating_add(REPLY_GRACE)
+            }
+            // A follow is the caller's own loop of short requests; each one is
+            // ordinary. Everything else reads state the supervisor has.
+            _ => CONTROL_TIMEOUT,
+        }
+    }
+
+    /// Send one request with an explicit budget.
+    ///
+    /// The budget is a **liveness** check, not a deadline for the work: it is
+    /// there so that a supervisor which has stopped answering — a deadlocked
+    /// thread, a wedged launcher — produces an error rather than a client that
+    /// waits for ever. Before this, every hang in this project looked like the
+    /// host had locked up, and three separate investigations began by ruling
+    /// that out.
+    pub fn send_within(&mut self, request: &Request, budget: Duration) -> Result<Response> {
         self.writer
             .write(request)
             .map_err(|e| Error::primitive("write", "control socket", std::io::Error::other(e)))?;
-        match self
-            .reader
-            .read()
-            .map_err(|e| Error::primitive("read", "control socket", std::io::Error::other(e)))?
-        {
-            Some(response) => Ok(response),
-            None => Err(Error::BackendUnavailable {
+
+        // Set for this request and cleared after it, so a long `serve` cannot
+        // leave its budget behind for the `ps` that follows on the same
+        // connection.
+        let _ = self.deadline.set_read_timeout(Some(budget));
+        let answer = self.reader.read();
+        let _ = self.deadline.set_read_timeout(None);
+
+        match answer {
+            Ok(Some(response)) => Ok(response),
+            Ok(None) => Err(Error::BackendUnavailable {
                 backend: "supervisor",
                 reason: "the supervisor closed the connection without answering".into(),
                 remedy: "check `zygo logs` for why it exited".into(),
             }),
+            Err(e) if is_timeout(&e) => Err(Error::BackendUnavailable {
+                backend: "supervisor",
+                reason: format!(
+                    "the supervisor did not answer {} within {}s",
+                    name_of(request),
+                    budget.as_secs()
+                ),
+                remedy: "it is running but not replying — check `zygo logs`, and \
+                         `zygo stop --all` to restart it; report it if it repeats"
+                    .into(),
+            }),
+            Err(e) => Err(Error::primitive(
+                "read",
+                "control socket",
+                std::io::Error::other(e),
+            )),
         }
+    }
+}
+
+/// Whether a framing error is the read timeout expiring.
+///
+/// A socket read timeout surfaces as `WouldBlock` on Linux and `TimedOut` on
+/// some other platforms; both mean the same thing here.
+fn is_timeout(e: &crate::protocol::frame::FrameError) -> bool {
+    match e {
+        crate::protocol::frame::FrameError::Io(io) => matches!(
+            io.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
+        // A read that timed out part way through a frame surfaces as a short
+        // read rather than as the error, because the reader had already
+        // consumed the length prefix.
+        crate::protocol::frame::FrameError::Truncated { .. } => false,
+        _ => false,
+    }
+}
+
+/// The request's name, for an error a user reads.
+fn name_of(request: &Request) -> &'static str {
+    match request {
+        Request::Hello { .. } => "the greeting",
+        Request::Serve { .. } => "serve",
+        Request::Exec { .. } => "exec",
+        Request::List => "ps",
+        Request::Stop { .. } => "stop",
+        Request::Shutdown => "shutdown",
+        Request::Ping => "ping",
+        Request::Shell { .. } => "shell",
+        Request::Logs { .. } => "logs",
+        Request::Warm { .. } => "warm",
     }
 }
 
@@ -203,6 +316,99 @@ mod tests {
     use super::*;
     use crate::supervisor::{Listener, Supervisor};
     use std::sync::Arc;
+
+    /// A supervisor that greets and then stops answering, which is what a
+    /// deadlocked thread looks like from the outside.
+    ///
+    /// The real one did exactly this on a Raspberry Pi — a launcher thread
+    /// parked on a futex — and every client that spoke to it waited for ever,
+    /// because the control socket had no timeout at all. The symptom was
+    /// indistinguishable from the machine having locked up.
+    #[test]
+    fn a_supervisor_that_stops_answering_is_an_error_not_a_hang() {
+        use std::io::{Read, Write};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::rooted(dir.path());
+        std::fs::create_dir_all(paths.supervisor_sock().parent().expect("parent"))
+            .expect("run dir");
+        let listener =
+            std::os::unix::net::UnixListener::bind(paths.supervisor_sock()).expect("bind");
+
+        let wedged = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            // Read the Hello frame: four bytes of length, then the body.
+            let mut header = [0u8; 4];
+            stream.read_exact(&mut header).expect("header");
+            let mut body = vec![0u8; u32::from_be_bytes(header) as usize];
+            stream.read_exact(&mut body).expect("body");
+            let welcome = crate::protocol::frame::encode(&Response::Welcome {
+                control: CONTROL_VERSION,
+                version: "test".into(),
+                pid: 1,
+            })
+            .expect("encode");
+            stream.write_all(&welcome).expect("welcome");
+            // And now nothing, ever. Held so the socket stays open: a closed
+            // one would be an end of file, which the client already handled.
+            std::thread::sleep(Duration::from_secs(30));
+        });
+
+        let mut client = Client::connect(&paths).expect("the greeting is answered");
+        let started = Instant::now();
+        let err = client
+            .send_within(&Request::List, Duration::from_millis(300))
+            .expect_err("a supervisor that never answers must be an error");
+        let waited = started.elapsed();
+
+        assert!(
+            waited < Duration::from_secs(5),
+            "waited {waited:?} for a 300ms budget"
+        );
+        let message = err.to_string();
+        assert!(message.contains("did not answer"), "{message}");
+        assert!(message.contains("ps"), "the request is named: {message}");
+        drop(client);
+        drop(wedged);
+    }
+
+    /// The budgets differ by three orders of magnitude on purpose: one number
+    /// would either break a warm-up or be the same as no timeout at all.
+    #[test]
+    fn each_request_gets_a_budget_that_fits_what_it_does() {
+        let serve = Client::budget(&Request::Serve {
+            name: "x".into(),
+            spec: None,
+            layer: Box::default(),
+            base_dir: "/tmp".into(),
+            allow_host_net: false,
+            allow_private_net: false,
+            allow_unlimited: false,
+            secrets: Default::default(),
+            if_changed: false,
+        });
+        assert_eq!(serve, SERVE_TIMEOUT);
+        assert!(
+            serve > Duration::from_secs(60),
+            "a venv build or an apt layer takes minutes"
+        );
+
+        // An exec waits for the request's own deadline and then for the reply.
+        let exec = Client::budget(&Request::Exec {
+            name: "x".into(),
+            event: serde_json::Value::Null,
+            timeout_ms: 5_000,
+        });
+        assert_eq!(exec, Duration::from_secs(5) + REPLY_GRACE);
+
+        // Everything else reads state the supervisor already has.
+        assert_eq!(Client::budget(&Request::List), CONTROL_TIMEOUT);
+        assert_eq!(
+            Client::budget(&Request::Stop { name: None }),
+            CONTROL_TIMEOUT
+        );
+        assert!(CONTROL_TIMEOUT < Duration::from_secs(60));
+    }
 
     /// A supervisor on a scratch socket, torn down when the guard drops.
     struct Running {
@@ -308,8 +514,7 @@ mod tests {
     fn failing_executable(dir: &Path, message: &str) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join("fake-supervisor");
-        std::fs::write(&path, format!("#!/bin/sh\necho '{message}' >&2\nexit 3\n"))
-            .expect("write");
+        std::fs::write(&path, format!("#!/bin/sh\necho '{message}' >&2\nexit 3\n")).expect("write");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         path
     }

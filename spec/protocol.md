@@ -76,6 +76,14 @@ A supervisor that sees an unknown `proto` refuses the agent rather than guessing
 `id` correlates every later message for this request. `event` is arbitrary JSON.
 `env_overrides` is optional and may be omitted when empty.
 
+**Secrets are deliberately not in this message.** A function's `secrets` are
+delivered as files at `/run/secrets/<name>`, written by the supervisor from
+*outside* the sandbox between `FORKED` and `GO` and removed when the last
+request in flight finishes. The agent never receives a value, so an agent
+cannot leak one: it is not in `EXEC`, not in the zygote's memory, and not on
+this connection. An agent needs to do nothing for secrets to work, and must
+not try to — the files appear before `GO` and are the child's to read.
+
 ### `FORKED` — agent → supervisor
 
 ```json
@@ -163,7 +171,15 @@ with a non-zero `exit_code`). `code` is one of:
 ## 3. Required agent behaviour
 
 An implementation is conforming if and only if all of the following hold. These
-are what `zygo agent test <binary>` checks.
+are what `zygo agent test <binary> -- [args…]` checks: it starts the agent with
+the control socket at descriptor 3 and runs the conversation against it.
+
+The handler the agent is started with has to satisfy a small contract, or there
+is nothing the suite can assert about the answers — return the event unchanged,
+write `event.stdout` to stdout and `event.stderr` to stderr when they are
+strings. [`examples/agents/`](../examples/agents) has one per agent, and a
+complete agent in POSIX sh to check the suite against something that is not
+Python.
 
 1. **One process per request.** Every request runs in its own process, or at
    minimum a pid that can be moved into its own cgroup.
@@ -175,10 +191,28 @@ are what `zygo agent test <binary>` checks.
    memory stays in the "just after a clean import" state, so request *n* cannot
    observe anything request *n-1* did.
 5. **No silent loss.** Every `EXEC` is answered by exactly one `DONE` or one
-   `ERROR` with the same `id`.
+   `ERROR` with the same `id`. Concurrency is *not* required: an agent that
+   serves one request at a time answers the second with `overloaded`, which is
+   conforming. Losing it is not.
+6. **A protocol error is reported, not fatal.** A frame that arrives whole but
+   whose body is not a message leaves the stream aligned at a frame boundary,
+   so the agent answers `ERROR` / `bad_message` and carries on. An agent that
+   dies there takes every request in flight with it. (An announced length past
+   the 32 MiB cap is different: nothing was consumed, the stream cannot be
+   resynchronised, and closing the connection is the only correct answer.)
 
 ### Strongly recommended
 
+- **Honour `ZYGO_CHILD_SECCOMP`.** When the supervisor sets it, the value is
+  base64 of a raw seccomp-bpf program (`struct sock_filter[]`, the host's byte
+  order) that the *child* is to install — `prctl(PR_SET_SECCOMP,
+  SECCOMP_MODE_FILTER, &prog)` after `PR_SET_NO_NEW_PRIVS` — after `GO` and
+  before any handler code. It is how the `strict` profile removes `execve`
+  and process creation from the child without removing them from the agent.
+  An agent that cannot install it must fail the request, not run it
+  unfiltered; a value it cannot decode is a start-up `ERROR`. An agent that
+  does not implement this is still conforming, and its documentation should
+  say so, because a `strict` function on it has the sandbox filter only.
 - **Import nothing lazily on the request path.** Every module the child touches
   must already be loaded in the agent, so the child inherits it through
   copy-on-write. This is the easiest mistake to make and the most expensive: in

@@ -679,7 +679,16 @@ impl AllowRule {
         {
             return false;
         }
-        let host = host.to_ascii_lowercase();
+        self.matches_host(host)
+    }
+
+    /// Whether this rule names `host`, whatever the port.
+    ///
+    /// What the egress resolver asks: a DNS query has a name and no port, and
+    /// the answer decides whether the name resolves at all. A CIDR rule never
+    /// names a host — it names addresses, and those need no resolving.
+    pub fn matches_host(&self, host: &str) -> bool {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
         match &self.host {
             HostPattern::Exact(h) => *h == host,
             HostPattern::Wildcard(suffix) => host

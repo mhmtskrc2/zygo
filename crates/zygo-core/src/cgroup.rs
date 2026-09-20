@@ -5,11 +5,17 @@
 //! ├── system/                     supervisor, image GC   memory.min = 512M
 //! └── tenants/                    memory.max = tenant budget
 //!     ├── tenant-A/               memory.max, pids.max, cpu.max
-//!     │   ├── zygote
-//!     │   ├── req-01f3…
-//!     │   └── req-01f4…
+//!     │   └── g4242-1/            one generation of the sandbox
+//!     │       ├── zygote
+//!     │       ├── req-01f3…
+//!     │       └── req-01f4…
 //!     └── tenant-B/
 //! ```
+//!
+//! The tenant carries the limits and outlives any one sandbox; a *generation*
+//! is what one sandbox — its zygote and its requests — lives in and is torn
+//! down with. Replacing or rewarming a function starts the new sandbox in a
+//! generation of its own, so retiring the old one takes only the old one.
 //!
 //! The point of `system/` having a `memory.min` reservation is that a thousand
 //! tenants all pressed against their limits must not be able to OOM the
@@ -20,6 +26,7 @@
 //! Linux host.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{Error, IoContext, Result};
 use crate::sandbox::limits::{CgroupWrite, Limits};
@@ -112,23 +119,41 @@ impl Hierarchy {
         self.tenants().join(sanitise(name))
     }
 
-    /// Where the tenant's long-lived process actually sits.
+    /// A fresh generation of a tenant's sandbox: `tenants/<name>/g<pid>-<n>`.
     ///
-    /// Not the tenant cgroup itself: that one carries the limits *and* parents
-    /// the per-request cgroups, and cgroup v2 forbids a cgroup from holding
-    /// processes while delegating to children. The design's own diagram (§3.6)
-    /// shows this — `tenant-A/zygote` alongside `tenant-A/req-…` — and writing
-    /// a pid into `tenant-A` directly returns EBUSY.
-    pub fn zygote(&self, name: &str) -> PathBuf {
-        self.tenant(name).join("zygote")
+    /// Before generations existed the old and the new sandbox of a replaced
+    /// function shared the tenant cgroup, and on a kernel with `cgroup.kill`
+    /// (5.14+) retiring the old one killed its replacement — and then every
+    /// rewarm after it, each retiring the one before. Found on 6.5; invisible
+    /// on the 5.10 phase 0 measured on, where the fallback signalled one pid.
+    ///
+    /// The name is unique per supervisor lifetime: the pid keeps it apart from
+    /// a dead supervisor's leftovers, the counter from this supervisor's own
+    /// earlier generations of the same tenant.
+    pub fn generation(&self, name: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        self.tenant(name)
+            .join(format!("g{}-{n}", std::process::id()))
     }
 
-    /// Per-request cgroup. A directory per request costs a `mkdir` and three
-    /// small writes (~50 µs), and buys `cgroup.kill`: one write tears down the
-    /// whole tree on timeout (open question A2 in the design doc).
-    pub fn request(&self, tenant: &str, request_id: &str) -> PathBuf {
-        self.tenant(tenant)
-            .join(format!("req-{}", sanitise(request_id)))
+    /// Where a generation's long-lived process actually sits.
+    ///
+    /// Not the generation cgroup itself: that one parents the per-request
+    /// cgroups, and cgroup v2 forbids a cgroup from holding processes while
+    /// delegating to children. The design's own diagram (§3.6) shows this —
+    /// `zygote` alongside `req-…` — and writing a pid one level up returns
+    /// EBUSY.
+    pub fn zygote(generation: &Path) -> PathBuf {
+        generation.join("zygote")
+    }
+
+    /// Per-request cgroup, under the generation the request was forked in. A
+    /// directory per request costs a `mkdir` and three small writes (~50 µs),
+    /// and buys `cgroup.kill`: one write tears down the whole tree on timeout
+    /// (open question A2 in the design doc).
+    pub fn request(generation: &Path, request_id: &str) -> PathBuf {
+        generation.join(format!("req-{}", sanitise(request_id)))
     }
 
     /// Create the top-level layout and its budgets. Idempotent.
@@ -231,17 +256,24 @@ impl Hierarchy {
         }
 
         apply(&dir, &limits.cgroup_writes())?;
+        Ok(dir)
+    }
 
-        // The leaf the process will live in. Limits stay on the parent so they
-        // cover the zygote and every per-request child together.
-        create(&dir.join("zygote"))?;
+    /// Create a generation under an existing tenant, with the leaf the
+    /// sandbox's process will live in. Limits stay on the tenant so they cover
+    /// every generation, the zygote and every per-request child together.
+    pub fn create_generation(&self, name: &str) -> Result<PathBuf> {
+        let dir = self.generation(name);
+        create(&dir)?;
+        enable_controllers(&dir, CONTROLLERS)?;
+        create(&Self::zygote(&dir))?;
         Ok(dir)
     }
 
     /// Create a per-request cgroup. Limits are inherited from the tenant; only
     /// the wall-clock kill switch is per request.
-    pub fn create_request(&self, tenant: &str, request_id: &str) -> Result<PathBuf> {
-        let dir = self.request(tenant, request_id);
+    pub fn create_request(generation: &Path, request_id: &str) -> Result<PathBuf> {
+        let dir = Self::request(generation, request_id);
         create(&dir)?;
         Ok(dir)
     }
@@ -269,6 +301,57 @@ impl Hierarchy {
             Err(e) => Err(Error::io(dir, e)),
         }
     }
+
+    /// Remove tenant cgroups left behind by a supervisor that is gone.
+    ///
+    /// When a supervisor dies its sandboxes die with it (`PDEATHSIG`), but the
+    /// directories do not: cgroups outlive their processes. A restarted
+    /// supervisor would otherwise accumulate a `tenants/<name>` tree per
+    /// lifetime, each with its own `req-*` leftovers, and reuse stale limits
+    /// for a name it serves again.
+    ///
+    /// Only *empty* cgroups are removed, checked by reading `cgroup.procs`
+    /// rather than by assuming. Anything still holding a process belongs to
+    /// something alive, and leaving it is the safe reading — `Listener::bind`
+    /// has already established that no other supervisor is listening, so this
+    /// should find nothing, and if it does, the honest thing is not to kill it.
+    ///
+    /// Returns the names it cleaned up.
+    pub fn clean_stale_tenants(&self) -> Vec<String> {
+        let mut cleaned = Vec::new();
+        let Ok(entries) = std::fs::read_dir(self.tenants()) else {
+            return cleaned;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            if !is_empty_subtree(&path) {
+                continue;
+            }
+            if Self::remove(&path).is_ok() && !path.exists() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    cleaned.push(name.to_string());
+                }
+            }
+        }
+        cleaned
+    }
+}
+
+/// Whether a cgroup and everything beneath it holds no processes.
+fn is_empty_subtree(dir: &Path) -> bool {
+    if !members(dir).is_empty() {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return true;
+    };
+    entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .all(|e| is_empty_subtree(&e.path()))
 }
 
 /// Move a process into a cgroup by writing its pid to `cgroup.procs`.
@@ -276,17 +359,69 @@ pub fn attach(dir: &Path, pid: u32) -> Result<()> {
     write_file(&dir.join("cgroup.procs"), &pid.to_string())
 }
 
-/// Kill every process in the subtree with a single write (kernel ≥ 5.14).
+/// Kill every process in a cgroup.
 ///
-/// The fallback for older kernels is signalling the pid namespace's init, which
-/// the launcher owns; this function reports whether the fast path exists.
+/// One write on kernel 5.14 and above, where `cgroup.kill` does it atomically.
+/// Below that it falls back to [`kill_by_freezing`], which achieves the same
+/// thing with three writes and a loop. Either way the guarantee is the one that
+/// matters: *everything* in the cgroup dies, not just the process we happen to
+/// have a pid for.
+///
+/// Returns whether anything was killed, so a caller can tell "nothing was
+/// there" from "this kernel cannot do it".
 pub fn kill(dir: &Path) -> Result<bool> {
     let path = dir.join("cgroup.kill");
     if !path.exists() {
-        return Ok(false);
+        return kill_by_freezing(dir);
     }
     write_file(&path, "1")?;
     Ok(true)
+}
+
+/// Kill everything in a cgroup on a kernel without `cgroup.kill` (below 5.14).
+///
+/// Signalling the one pid we know about is not enough: a handler that forked
+/// its own helpers leaves them running, still holding the result pipe open, so
+/// the agent never sees end of file and never answers. Measured on 5.10 before
+/// this existed — a handler that forked four spinners left all four alive and
+/// wedged its function.
+///
+/// Freezing first is what makes the list of pids trustworthy: without it a
+/// process can fork between the read and the signal, and the child is created
+/// already unsignalled. Frozen tasks do not act on a pending `SIGKILL`, so the
+/// thaw at the end is what actually kills them — and it has to happen even if a
+/// signal failed, or the cgroup would be left frozen for ever.
+fn kill_by_freezing(dir: &Path) -> Result<bool> {
+    if !dir.join("cgroup.procs").exists() {
+        return Ok(false);
+    }
+    // A cgroup with no freezer is still worth killing pid by pid; it just
+    // cannot be done race-free.
+    let froze = freeze(dir, true).is_ok();
+
+    let mut signalled = false;
+    for pid in members(dir) {
+        // SAFETY: the pid came from this cgroup's `cgroup.procs` a moment ago.
+        // A pid that has since exited is an unreaped child of ours or already
+        // gone; `kill` returns ESRCH and nothing happens.
+        if unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) } == 0 {
+            signalled = true;
+        }
+    }
+
+    if froze {
+        freeze(dir, false)?;
+    }
+    Ok(signalled)
+}
+
+/// Pids currently in a cgroup, in the writer's own pid namespace.
+pub fn members(dir: &Path) -> Vec<u32> {
+    std::fs::read_to_string(dir.join("cgroup.procs"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.trim().parse().ok())
+        .collect()
 }
 
 /// Freeze or thaw a subtree — how `idle_timeout` parks a warm zygote without
@@ -336,6 +471,56 @@ pub fn missing_controllers(dir: &Path) -> Vec<&'static str> {
         .filter(|c| !have.iter().any(|h| h == c))
         .collect()
 }
+
+/// Whether a sandbox could actually be given limits from `dir` — by
+/// **attempting** it rather than by reading `cgroup.controllers`.
+///
+/// Reading is not enough, and a real host is where that shows. On a systemd
+/// machine an ssh login sits in a `session-N.scope`, whose `cgroup.controllers`
+/// dutifully lists everything `user.slice` delegated — and which still refuses
+/// `mkdir`, because the scope itself is not delegated and systemd owns the
+/// directory. `zygo doctor` reported `cgroup v2 … ok` on exactly such a host
+/// while `zygo run` failed on the very next line. That is requirement N4's
+/// failure mode wearing the opposite mask: not a silent lack of limits, but a
+/// confident promise of them.
+///
+/// So this does the first thing [`Hierarchy::ensure`] does — create a child —
+/// and then removes it. Nothing is moved and nothing is left behind.
+///
+/// `Ok` carries the controllers that are available; `Err` is a reason fit to
+/// print.
+pub fn probe_delegation(dir: &Path) -> std::result::Result<Vec<String>, String> {
+    let missing = missing_controllers(dir);
+    if !missing.is_empty() {
+        return Err(format!("not delegated (missing: {})", missing.join(" ")));
+    }
+    let probe = dir.join(format!("zygo-doctor-{}", std::process::id()));
+    // A leftover from a crashed probe would make this look like a success it
+    // did not earn.
+    let _ = std::fs::remove_dir(&probe);
+    match std::fs::create_dir(&probe) {
+        Ok(()) => {
+            let _ = std::fs::remove_dir(&probe);
+            Ok(available_controllers(dir))
+        }
+        Err(e) => Err(format!(
+            "the controllers are delegated but this cgroup will not take a child ({e})"
+        )),
+    }
+}
+
+/// What to do about a cgroup that cannot hold a sandbox.
+///
+/// Both halves, because on a systemd host neither works alone: the user
+/// manager has to pass the controllers down, *and* whatever runs Zygo has to
+/// be somewhere delegated. Applying only the first and trying again from the
+/// same ssh session fails identically, which is what happened here.
+pub const DELEGATION_REMEDY: &str = "mkdir -p ~/.config/systemd/user/user@.service.d && \
+     printf '[Service]\\nDelegate=cpu cpuset io memory pids\\n' > \
+     ~/.config/systemd/user/user@.service.d/delegate.conf && \
+     systemctl --user daemon-reexec\n  \
+     → then run Zygo from a delegated cgroup, not straight from an ssh \
+     session: systemd-run --user --scope -p Delegate=yes -- zygo ...";
 
 /// Controllers Zygo enables for its subtree.
 const CONTROLLERS: &[&str] = &["cpu", "io", "memory", "pids"];
@@ -456,12 +641,92 @@ mod tests {
     use super::*;
     use crate::spec::{Cpu, Duration};
 
+    // --- cleaning up after a dead supervisor -------------------------------
+    //
+    // These test `is_empty_subtree`, which is where the whole decision lives.
+    // The removal itself is not unit tested: `rmdir` on a real cgroup succeeds
+    // with its control files in place, and on an ordinary filesystem it does
+    // not, so a temporary directory cannot stand in for one. That half is
+    // covered end to end in `poc/verify_supervisor.sh`, against a real kernel.
+
+    /// A fake cgroup with the given pids in its `cgroup.procs`.
+    fn fake_cgroup(dir: &Path, pids: &str) {
+        std::fs::create_dir_all(dir).expect("mkdir");
+        std::fs::write(dir.join("cgroup.procs"), pids).expect("procs");
+    }
+
+    #[test]
+    fn a_cgroup_holding_nothing_is_empty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("tenant");
+        fake_cgroup(&dir, "");
+        assert!(is_empty_subtree(&dir));
+    }
+
+    #[test]
+    fn a_cgroup_holding_a_process_is_not_empty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("tenant");
+        fake_cgroup(&dir, "4242\n");
+        assert!(!is_empty_subtree(&dir));
+    }
+
+    #[test]
+    fn a_process_deep_in_the_tree_still_counts() {
+        // The case a check that only looked at the top level would get wrong:
+        // the tenant and its zygote are empty and only a request cgroup holds
+        // anything, but the tenant is very much in use.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let h = Hierarchy::new(tmp.path().join("zygo.slice"));
+        let g = h.generation("resize");
+        fake_cgroup(&h.tenant("resize"), "");
+        fake_cgroup(&g, "");
+        fake_cgroup(&Hierarchy::zygote(&g), "");
+        fake_cgroup(&Hierarchy::request(&g, "00000001"), "99\n");
+
+        assert!(!is_empty_subtree(&h.tenant("resize")));
+        assert!(
+            h.clean_stale_tenants().is_empty(),
+            "a tenant with a running request was cleaned up"
+        );
+        assert!(Hierarchy::zygote(&g).exists());
+    }
+
+    #[test]
+    fn a_whole_empty_tree_is_empty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let h = Hierarchy::new(tmp.path().join("zygo.slice"));
+        let g = h.generation("resize");
+        fake_cgroup(&h.tenant("resize"), "");
+        fake_cgroup(&g, "");
+        fake_cgroup(&Hierarchy::zygote(&g), "");
+        fake_cgroup(&Hierarchy::request(&g, "00000001"), "");
+        assert!(is_empty_subtree(&h.tenant("resize")));
+    }
+
+    #[test]
+    fn a_directory_that_is_not_there_is_empty() {
+        // Racing with something else's cleanup is not an error.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert!(is_empty_subtree(&tmp.path().join("gone")));
+    }
+
+    #[test]
+    fn a_hierarchy_that_was_never_created_is_not_an_error() {
+        // The first supervisor on a fresh machine takes this path.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let h = Hierarchy::new(tmp.path().join("zygo.slice"));
+        assert!(h.clean_stale_tenants().is_empty());
+    }
+
     fn limits() -> Limits {
         Limits {
             mem: Bytes::from_mib(256),
             mem_high: Bytes::from_mib(230),
             swap: Bytes(0),
             oom_group: true,
+            connections: 256,
+            bandwidth: None,
             cpu: Cpu(0.5),
             pids: 64,
             timeout: Duration::from_secs(30),
@@ -518,10 +783,25 @@ mod tests {
             h.tenant("tenant-A"),
             Path::new("/sys/fs/cgroup/zygo.slice/tenants/tenant-A")
         );
-        assert_eq!(
-            h.request("tenant-A", "01f3"),
-            Path::new("/sys/fs/cgroup/zygo.slice/tenants/tenant-A/req-01f3")
+        let g = h.generation("tenant-A");
+        assert_eq!(g.parent().unwrap(), h.tenant("tenant-A"));
+        assert!(
+            g.file_name().unwrap().to_str().unwrap().starts_with('g'),
+            "{}",
+            g.display()
         );
+        assert_eq!(Hierarchy::zygote(&g), g.join("zygote"));
+        assert_eq!(Hierarchy::request(&g, "01f3"), g.join("req-01f3"));
+    }
+
+    /// Two generations of one tenant never collide, even in one process.
+    #[test]
+    fn generations_are_unique() {
+        let h = Hierarchy::new("/cg/zygo.slice");
+        let a = h.generation("t");
+        let b = h.generation("t");
+        assert_ne!(a, b);
+        assert_eq!(a.parent(), b.parent());
     }
 
     #[test]
@@ -537,8 +817,9 @@ mod tests {
             );
         }
         // And the same for request ids, which come from the same direction.
-        let p = h.request("t", "../../x");
-        assert_eq!(p.parent().unwrap(), h.tenant("t"));
+        let g = h.generation("t");
+        let p = Hierarchy::request(&g, "../../x");
+        assert_eq!(p.parent().unwrap(), g);
     }
 
     #[test]
@@ -583,6 +864,32 @@ mod tests {
         assert_eq!(read("memory.oom.group"), "1");
         assert_eq!(read("pids.max"), "64");
         assert_eq!(read("cpu.max"), "50000 100000");
+    }
+
+    /// Replacing a function must not let the old sandbox's teardown reach the
+    /// new one: each gets a generation of its own under the shared tenant, and
+    /// removing one leaves the other — and the tenant's limits — in place.
+    #[test]
+    fn generations_of_one_tenant_are_torn_down_independently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let h = Hierarchy::new(tmp.path().join("zygo.slice"));
+        h.ensure(Bytes(8 * (1 << 30))).unwrap();
+        fake_delegation(&h.tenant("acme"));
+        h.create_tenant("acme", &limits()).unwrap();
+
+        let old = h.create_generation("acme").unwrap();
+        let new = h.create_generation("acme").unwrap();
+        assert_ne!(old, new);
+        assert!(Hierarchy::zygote(&old).is_dir());
+        assert!(Hierarchy::zygote(&new).is_dir());
+
+        Hierarchy::remove(&old).unwrap();
+        assert!(!old.exists());
+        assert!(Hierarchy::zygote(&new).is_dir(), "the replacement survived");
+        assert!(
+            h.tenant("acme").join("memory.max").exists(),
+            "limits stay on the tenant"
+        );
     }
 
     /// Requirement N4: a sandbox must never start with limits that are not

@@ -46,18 +46,29 @@ pub enum Command {
     /// Start a warm zygote for a handler.
     Serve(ServeArgs),
 
-    /// Call a warm function.
+    /// Call a warm function: the result on stdout, the request's own exit
+    /// status (137 when its deadline killed it).
     Exec(ExecArgs),
 
     /// List warm sandboxes.
     Ps,
 
-    /// Show zygote and request logs.
+    /// Show a function's recent log: the zygote's own output and one line
+    /// per request, with its stdout and stderr.
+    ///
+    /// The supervisor keeps the last 500 entries per function, across
+    /// replacements and cold spells. `--json` prints one entry per line.
     Logs {
         name: String,
-        /// Follow the log.
+        /// Keep printing as new entries arrive.
         #[arg(short, long)]
         follow: bool,
+        /// How many of the most recent entries to start with.
+        #[arg(short = 'n', long, default_value_t = 50)]
+        tail: u32,
+        /// Only requests that failed: a non-zero exit, or an error.
+        #[arg(long)]
+        failed: bool,
     },
 
     /// Stop a sandbox.
@@ -102,9 +113,18 @@ pub enum Command {
     Login { registry: String },
 
     /// Start every function in the spec file.
+    ///
+    /// Writes `zygo.lock` beside the spec: the image digest each function
+    /// resolved to, and the versions `apt` chose for its `system` packages.
+    /// A later `up` refuses a function whose image has moved under an
+    /// unedited spec, until `--relock` says that is wanted.
     Up {
         #[command(flatten)]
         file: SpecFileArgs,
+
+        /// Accept an image that has moved and rewrite `zygo.lock`.
+        #[arg(long)]
+        relock: bool,
     },
 
     /// Stop everything `up` started.
@@ -133,14 +153,42 @@ pub enum Command {
     Doctor,
 
     /// Interactive shell inside a sandbox, for debugging.
-    Shell { name: String },
+    ///
+    /// A fresh process entered into the function's namespaces; the warm agent
+    /// is untouched, keeps its memory and keeps serving. It sees the sandbox's
+    /// filesystem, pids, network and hostname, holds no capabilities, and is
+    /// deliberately **not** under the seccomp filter, the Landlock ruleset or
+    /// the tenant's cgroup — a debug shell that the memory limit kills is not
+    /// one.
+    Shell {
+        name: String,
+        /// Command to run instead of an interactive shell, after `--`.
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
 
     /// Run the HTTP API in the foreground.
-    Api,
+    Api(ApiArgs),
 
     /// Measure the warm path.
     #[command(subcommand)]
     Bench(BenchCommand),
+
+    /// Print a shell completion script.
+    ///
+    /// Generated from the parser itself, so it can never drift from the flags
+    /// the binary actually accepts — which is what a hand-written one does the
+    /// first time a command is added.
+    ///
+    /// ```text
+    /// zygo completion bash > /etc/bash_completion.d/zygo
+    /// zygo completion zsh  > "${fpath[1]}/_zygo"
+    /// zygo completion fish > ~/.config/fish/completions/zygo.fish
+    /// ```
+    Completion {
+        /// bash, zsh, fish, elvish or powershell.
+        shell: clap_complete::Shell,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -175,7 +223,17 @@ pub enum BackendCommand {
 #[derive(Debug, Subcommand)]
 pub enum AgentCommand {
     /// Run the protocol conformance suite against a third-party agent.
-    Test { binary: PathBuf },
+    ///
+    /// The agent is started with the control socket at descriptor 3 — where a
+    /// sandboxed agent finds it too — and everything after the binary is passed
+    /// through as its arguments. The handler it loads has to echo the event and
+    /// honour `stdout`/`stderr`; see `examples/agents/`.
+    Test {
+        binary: PathBuf,
+        /// Arguments for the agent, after `--`.
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -195,16 +253,37 @@ pub enum BenchCommand {
         /// CPU quota for the tenant, in cores. Defaults to the spec's `1.0`.
         #[arg(long)]
         cpu: Option<f64>,
+        /// Measure warm-exec instead of the agent: the sandbox is held and this
+        /// command runs per request, reading the event on stdin. Given after
+        /// `--`, so its own flags are not mistaken for ours:
+        /// `zygo bench warm --rate 250 -- sh -c cat` is the smallest program
+        /// that completes the contract.
+        #[arg(last = true, value_name = "CMD")]
+        cmd: Vec<String>,
     },
-    /// Cold `run` latency.
+    /// Cold `run` latency: build a sandbox, run a trivial program, tear it down.
     Cold {
         #[arg(long, default_value_t = 50)]
         n: u32,
+        /// Image to start. The default is what requirement N2 is written about.
+        #[arg(long, default_value = "python:3.12-slim")]
+        image: String,
+        /// Command to run. Defaults to starting the interpreter and exiting,
+        /// because N2's budget includes the interpreter.
+        #[arg(long, num_args = 1.., value_delimiter = ' ')]
+        command: Option<Vec<String>>,
     },
-    /// Sustained throughput.
+    /// Sustained throughput through one warm function.
     Load {
-        #[arg(long, default_value_t = 30)]
+        #[arg(long, default_value_t = 10)]
         seconds: u32,
+        /// Clients calling at once. The design document's acceptance criterion
+        /// is >= 600 requests/s at 4.
+        #[arg(long, default_value_t = 4)]
+        concurrency: u32,
+        /// CPU quota for the tenant, in cores.
+        #[arg(long)]
+        cpu: Option<f64>,
     },
 }
 
@@ -256,6 +335,34 @@ pub struct RunArgs {
     pub dry_run: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct ApiArgs {
+    #[command(flatten)]
+    pub spec_file: SpecFileArgs,
+
+    /// Where to listen: `HOST:PORT`, or `unix://PATH`. Overrides `[api] listen`.
+    #[arg(long)]
+    pub listen: Option<String>,
+
+    /// Serve without authentication. Overrides `[api] auth`.
+    ///
+    /// Only accepted on a unix socket or a loopback address: an unauthenticated
+    /// API on a reachable interface lets anyone on the network run code as you.
+    #[arg(long)]
+    pub no_auth: bool,
+
+    /// Push metrics to an OTLP/HTTP collector at this base URL, e.g.
+    /// `http://localhost:4318` (`/v1/metrics` is appended). The same numbers
+    /// as `/metrics`, JSON-encoded; `OTEL_EXPORTER_OTLP_HEADERS` adds request
+    /// headers (`key=value,…`).
+    #[arg(long, value_name = "URL", env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
+    pub otlp_endpoint: Option<String>,
+
+    /// How often to push to the OTLP collector.
+    #[arg(long, value_name = "DURATION", default_value = "60s", value_parser = parse_duration)]
+    pub otlp_interval: Duration,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum SupervisorCommand {
     /// Run the supervisor in this process until it is told to stop.
@@ -291,6 +398,11 @@ pub struct ServeArgs {
     /// Handler calling convention.
     #[arg(long, value_parser = parse_mode)]
     pub mode: Option<HandlerMode>,
+
+    /// A secret to deliver to the handler as `/run/secrets/<NAME>`, taken from
+    /// this shell's environment. Repeatable.
+    #[arg(long = "secret", value_name = "NAME")]
+    pub secrets: Vec<String>,
 
     #[command(flatten)]
     pub limits: LimitArgs,
@@ -468,6 +580,7 @@ impl ServeArgs {
             concurrency: self.concurrency,
             idle_timeout: self.idle_timeout,
             mode: self.mode,
+            secrets: (!self.secrets.is_empty()).then(|| self.secrets.clone()),
             ..Default::default()
         };
         self.limits.apply(&mut layer);
@@ -504,6 +617,63 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn completion_is_generated_for_every_shell_and_follows_the_parser() {
+        // Generated rather than written by hand, so it cannot drift from the
+        // commands the binary accepts. The assertion is that a command added
+        // to the enum appears without anyone remembering to add it here.
+        for shell in [
+            clap_complete::Shell::Bash,
+            clap_complete::Shell::Zsh,
+            clap_complete::Shell::Fish,
+            clap_complete::Shell::Elvish,
+            clap_complete::Shell::PowerShell,
+        ] {
+            let mut out = Vec::new();
+            clap_complete::generate(shell, &mut Cli::command(), "zygo", &mut out);
+            let script = String::from_utf8(out).expect("completions are text");
+            assert!(!script.is_empty(), "{shell} produced nothing");
+            for command in ["serve", "exec", "up", "down", "agent", "completion"] {
+                assert!(script.contains(command), "{shell} is missing `{command}`");
+            }
+        }
+    }
+
+    #[test]
+    fn every_subcommand_is_reachable_from_the_parser() {
+        // A command that is declared but never dispatched is worse than one
+        // that is missing: `--help` promises it.
+        let command = Cli::command();
+        let names: Vec<String> = command
+            .get_subcommands()
+            .map(|c| c.get_name().to_string())
+            .collect();
+        for expected in [
+            "run",
+            "serve",
+            "exec",
+            "ps",
+            "stop",
+            "up",
+            "down",
+            "api",
+            "agent",
+            "doctor",
+            "spec",
+            "image",
+            "images",
+            "pull",
+            "backend",
+            "bench",
+            "completion",
+        ] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "`{expected}` is not a subcommand; have {names:?}"
+            );
+        }
     }
 
     #[test]

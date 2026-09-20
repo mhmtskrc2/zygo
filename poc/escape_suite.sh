@@ -12,29 +12,18 @@
 # Run:  make escape-linux
 set -u
 
-ZYGO=/src/poc/zygo-linux
+# Where the checkout is: `/src` inside the containers `make` starts, the
+# workspace in CI. Everything below is relative to it.
+SRC=${SRC:-/src}
+
+ZYGO=${ZYGO:-$SRC/poc/zygo-linux}
 IMAGE=python:3.12-slim
 PASS=0
 FAIL=0
 SKIP=0
 
-CG=/sys/fs/cgroup
-mkdir -p "$CG/harness" "$CG/launch" 2>/dev/null
-for p in $(cat "$CG/cgroup.procs" 2>/dev/null); do
-    echo "$p" > "$CG/harness/cgroup.procs" 2>/dev/null
-done
-for c in memory pids cpu; do echo "+$c" > "$CG/cgroup.subtree_control" 2>/dev/null; done
-
-zygo() {
-    sh -c '
-        CG=/sys/fs/cgroup
-        if [ -d "$CG/launch/zygo.slice/system" ]; then
-            echo $$ > "$CG/launch/zygo.slice/system/cgroup.procs" 2>/dev/null
-        else
-            echo $$ > "$CG/launch/cgroup.procs" 2>/dev/null
-        fi
-        exec "$@"' _ "$ZYGO" "$@"
-}
+# Two environments need opposite cgroup preparation; the shared prelude picks.
+. "$(dirname "$0")/cgroup_harness.sh"
 
 say()  { printf '%s\n' "$*"; }
 ok()   { PASS=$((PASS+1)); say "  BLOCKED  $*"; }
@@ -270,17 +259,23 @@ esac
 # --- 12. escaping through a writable mount with a symlink -------------------
 
 say "12. follow a symlink out of a writable mount"
-mkdir -p /tmp/escape-rw
-rm -f /tmp/escape-rw/root-link
+# Per uid, so a root run and a rootless run on the same host do not share the
+# directory: a rootless sandbox handed a root-owned `/rw` cannot even create
+# the symlink, and the case comes out empty rather than blocked — the harness
+# disturbing what it measures.
+RW=/tmp/escape-rw-$(id -u)
+MARKER=/tmp/escape-host-marker-$(id -u)
+mkdir -p "$RW"
+rm -f "$RW/root-link"
 # Marker on the host, outside anything mounted into the sandbox. If the symlink
 # escaped, it would show up.
-echo marker > /tmp/escape-host-marker
+echo marker > "$MARKER"
 
 # The comparison happens *inside* one sandbox. Comparing against a baseline
 # taken from a second, differently-mounted sandbox is not the same measurement:
 # the first version of this check compared 21 entries against 20 and called it
 # an escape, when the difference was simply the `/rw` mount point itself.
-out=$(zygo run --mount /tmp/escape-rw:/rw:rw "$IMAGE" python3 -c "
+out=$(zygo run --mount "$RW:/rw:rw" "$IMAGE" python3 -c "
 import os
 os.symlink('/', '/rw/root-link')
 try:
@@ -290,7 +285,7 @@ except OSError as e:
 else:
     direct = sorted(os.listdir('/'))
     same = 'same' if through == direct else 'different:%s' % (set(through) ^ set(direct))
-    leaked = os.path.exists('/rw/root-link/tmp/escape-host-marker')
+    leaked = os.path.exists('/rw/root-link$MARKER')
     print('%s leaked=%s' % (same, leaked))" 2>/dev/null)
 case "$out" in
     "same leaked=False")
@@ -302,7 +297,7 @@ case "$out" in
     *)
         bad "inconclusive: '$out'" ;;
 esac
-rm -f /tmp/escape-rw/root-link /tmp/escape-host-marker
+rm -f "$RW/root-link" "$MARKER"
 
 # --- 13. regaining privilege through a setuid binary ------------------------
 

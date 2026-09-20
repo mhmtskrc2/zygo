@@ -19,19 +19,57 @@ Design document: [ahmed.md](ahmed.md). Plan and status: [todo.md](todo.md).
 > sandbox with namespaces, cgroup limits, `pivot_root`, capability dropping, a
 > seccomp allowlist and Landlock. The warm pool works too: `zygo serve`,
 > `exec`, `ps` and `stop` run against a supervisor in the user's own session,
-> with per-tenant concurrency limits and backpressure.
+> with per-tenant concurrency limits, backpressure, request deadlines enforced
+> against the whole process tree, automatic rewarming after a crash, and idle
+> functions that pause and wake in single-digit milliseconds.
 >
-> What is verified rather than asserted: the warm path measures **p50 1.32 ms,
-> p99 1.97 ms** through the shipping code at 250 requests/s, against budgets of
-> 2 ms and 10 ms ([docs/poc-report.md](docs/poc-report.md)). Drive the same
+> What is verified rather than asserted: the warm path measures **p50 1.70 ms,
+> p99 2.81 ms** through the shipping code at 250 requests/s, against budgets of
+> 2 ms and 10 ms, and sustains **981 requests/s** at a concurrency of 4
+> ([docs/poc-report.md](docs/poc-report.md)). Drive the same
 > tenant past its own CPU quota and the p99 becomes 47 ms — that is the quota
 > being enforced, and `zygo bench warm` says so rather than reporting it as
-> Zygo's cost. The launcher is checked by 52 scenarios against a real kernel, 16
-> of them actual escape attempts, and the supervisor by 22 end-to-end ones.
+> Zygo's cost. A cold `zygo run` with the image cached measures **p50 18.4 ms**
+> against a 50 ms budget. The launcher is checked by 52 scenarios against a real
+> kernel, 16 of them actual escape attempts, and the supervisor by 151 end-to-end
+> ones. Every syscall number the architecture has is swept against all three
+> seccomp profiles, and the `gvisor` backend is checked against a real `runsc`
+> by 19 more.
 >
-> Still missing from phase 2: request timeouts with `cgroup.kill`, idle tiering,
-> crash recovery, the `vm` backend, and the HTTP API. See [todo.md](todo.md) for
-> exactly what is built, what is measured, and what is still unverified.
+> Those suites now run in two places, which turned out to matter: a privileged
+> container, and a Raspberry Pi as an ordinary user with a systemd session.
+> Everything until then had been measured as root in one container, and the
+> second environment found five bugs in a day — including secrets that could
+> never be delivered to a warm-exec function without privilege, and a
+> supervisor that stopped for ever rather than failing.
+>
+> Phase 2 is complete except for the `vm` backend, which needs KVM: warm-exec
+> (a held sandbox, a fresh process per request — p50 2.2 ms), secrets delivered
+> as files the agent never sees, a venv cache built inside the image, and an
+> HTTP API with bearer auth. Phase 3 has started: `zygo up` and `zygo down`
+> bring a whole `sandbox.toml` up and down, `up` is a deploy rather than a
+> restart — it replaces only what changed, blue/green — `system = [...]`
+> installs apt packages once, as a layer of their own, without a Dockerfile,
+> and `network = "egress"` gives a sandbox an allowlist enforced by nftables
+> inside its own namespace, with no privilege anywhere. `zygo agent test` makes
+> the "language independent protocol" claim checkable — there is a complete
+> agent in POSIX sh that passes it — and `zygo shell` gets you inside a warm
+> sandbox without disturbing it.
+>
+> Phase 4 has started: the **`gvisor` backend runs**. `zygo backend install
+> gvisor` fetches and verifies the runtime, and `zygo run --isolation gvisor`
+> gives the same answers as `ns` while `uname -r` inside reports a different
+> kernel — the boundary really moved. One-shot only: warm functions and
+> networked sandboxes on it are refused with a reason rather than weakened.
+> Every syscall number is also swept against all three seccomp profiles.
+> See [todo.md](todo.md) for exactly what is built, what is measured, and what
+> is still unverified.
+
+**Docs:** [quickstart](docs/quickstart.md) ·
+[concepts](docs/concepts.md) · [`sandbox.toml` reference](docs/spec-reference.md) ·
+[seccomp profiles](docs/seccomp-profiles.md) · [threat model](docs/threat-model.md) ·
+[comparison](docs/comparison.md) · [examples](examples/) ·
+[writing an agent](examples/agents/README.md) · [the protocol](spec/protocol.md)
 
 ---
 
@@ -100,6 +138,7 @@ network   = "none"
 [fn.resize]
 entry        = "./resize.py"       # defines handler(event)
 requirements = "./requirements.txt"
+system       = ["libwebp7"]        # apt packages, installed once as a layer
 mem          = "512M"
 mounts       = ["./cache:/cache:rw"]
 
@@ -108,10 +147,12 @@ image = "golang:1.23"              # no runtime → warm-exec
 cmd   = ["/app/parser"]            # stdin: JSON event, stdout: JSON result
 
 [fn.fetch]
-entry   = "./fetch.py"
-network = "egress"
-allow   = ["api.stripe.com:443", "*.example.com:443"]
-secrets = ["STRIPE_KEY"]           # delivered as a file, only to the child
+entry       = "./fetch.py"
+network     = "egress"             # nothing else is reachable
+allow       = ["api.stripe.com:443", "*.example.com:443", "203.0.113.0/24:5432"]
+connections = 32                   # concurrent TCP connections
+bandwidth   = "2M"                 # bytes/s the function may send
+secrets     = ["STRIPE_KEY"]       # delivered as a file, only to the child
 ```
 
 Precedence, highest first: **CLI flag → `[fn.<name>]` → `[defaults]` → built-in
@@ -120,6 +161,76 @@ default**. `zygo spec explain <fn>` prints the result.
 Every limit has a default, and there is no way to disable one without
 `--allow-unlimited`. Anything that widens the boundary — host networking,
 private-range egress, a writable mount — must be spelled out.
+
+`requirements` and `system` never touch the image: the venv is built inside a
+sandbox with the image's own `pip`, and the packages are installed inside a
+writable copy of the image and diffed into a layer of their own. Both are
+keyed on the image digest and the list, built once, and shared by every
+function that names the same thing.
+
+### Networking
+
+`none` (the default) gives the sandbox an empty network namespace — loopback
+and nothing else. `egress` and `full` hand that namespace to
+[`pasta`](https://passt.top), which moves packets in userspace as your own
+user, and install an nftables allowlist *inside* it:
+
+| | reachable |
+|---|---|
+| `none` | nothing |
+| `egress` | exactly what `allow` names, plus DNS |
+| `full` | the public internet |
+| `host` | everything, no namespace (needs `--allow-host-net`) |
+
+Private and link-local ranges — the host and its neighbours — stay refused in
+every namespaced mode unless you pass `--allow-private-net`. DNS is forced to a
+resolver Zygo controls, so a handler cannot reach a resolver of its own to work
+around the list, and the host's search domains never enter the sandbox. If
+`pasta` or `nft` is missing, a networked sandbox **does not start** rather than
+starting unconfined.
+
+`allow` takes `host:port`, `*.domain:port` and `CIDR:port`. Under `egress` the
+sandbox's resolver is Zygo's own, running inside the sandbox's namespace: a
+name the list does not cover does not resolve, and one it covers has its
+addresses admitted to the filter before the answer goes back — so a wildcard
+is enforced on the name asked for, and a service that changes address keeps
+working.
+
+Two more limits apply to a networked function: `connections` (default 256
+concurrent TCP connections, refused with a reset past that) and `bandwidth`
+(bytes per second the sandbox may *send*; what it receives is shaped too where
+the host has an `ifb` device, and `zygo doctor`'s advice applies where it does
+not).
+
+### Deploying a project
+
+```bash
+zygo up        # every [fn.*] warm; run it again and only what changed restarts
+zygo down      # stops what this spec declares, nothing else
+```
+
+```bash
+zygo shell resize                    # a debug shell inside the warm sandbox
+zygo shell resize -- cat /proc/1/cgroup
+zygo logs resize -f                  # the zygote's output and every request
+zygo logs resize --failed -n 20      # only the ones that failed
+zygo completion zsh > "${fpath[1]}/_zygo"
+```
+
+`up` compares each function's resolved spec, secret values and the bytes of its
+handler and requirements files against what the supervisor already holds.
+An unchanged function is left alone — warm pages, request counters and all — and
+a changed one is replaced blue/green: the new sandbox is warm before the old one
+stops taking requests, requests the old one had accepted finish on it, and
+requests queued behind it are admitted to the new one. `zygo serve` on a name
+always replaces, because you just said what you want it to be.
+
+It also writes **`zygo.lock`** beside the spec: the digest each `image`
+resolved to and the versions `apt` chose for each `system` package. Commit it.
+A later `up` whose spec nobody edited, on an image that has moved, stops and
+prints both digests rather than quietly running something else; `zygo up
+--relock` accepts the move. Editing the spec re-locks that function without
+asking, because you just asked for the change.
 
 ## Handler contract
 
@@ -138,10 +249,24 @@ def handler(event: dict) -> dict:
     return {"image": base64.b64encode(out.getvalue()).decode(), "size": img.size}
 ```
 
-Other languages either use a built-in agent (Node, Go) or warm-exec with JSON on
-stdin and stdout. The wire protocol is language independent and documented in
-[spec/protocol.md](spec/protocol.md); `examples/agents/` will hold reference
-implementations.
+Any other language runs as warm-exec: give the function a `cmd` and no runtime,
+and each request is a fresh process in the held sandbox with the event on stdin
+and JSON expected on stdout.
+
+Where starting your runtime is expensive enough to be worth amortising, write an
+*agent* instead. The wire protocol is language independent
+([spec/protocol.md](spec/protocol.md)) and `zygo agent test` checks an
+implementation against it:
+
+```bash
+zygo agent test /bin/sh -- examples/agents/sh/agent.sh examples/agents/sh/handler.sh
+```
+
+[`examples/agents/`](examples/agents) has the guide, a Node agent with a
+worker pool, and a complete agent in POSIX sh — about 130 lines, passing the
+same nine checks the Python one does. For a language that starts fast there is
+nothing to amortise: [`examples/warm-exec/go`](examples/warm-exec/go) is a Go
+program as a warm function, and the whole integration is a `cmd`.
 
 ## Layout
 
@@ -166,13 +291,15 @@ make test           # Rust + Python suites
 make check-linux    # type-check the Linux-only code from a non-Linux host
 make test-linux     # the full suite inside a Linux container
 make verify-linux   # 36 isolation and limit checks against a real kernel
-make verify-supervisor-linux  # 22 end-to-end supervisor lifecycle checks
+make verify-supervisor-linux  # 151 end-to-end supervisor lifecycle checks
 make escape-linux   # 16 escape attempts against a real kernel
+make fuzz-linux     # every syscall number, against all three seccomp profiles
+make gvisor-linux   # the gvisor backend against a real runsc, compared with ns
 make dist-linux     # the static musl binary, checked against N6
 make lint
 ```
 
-Three rules the test suite is built on, all learned the hard way here:
+Four rules the test suite is built on, all learned the hard way here:
 
 - **A test must attempt the thing, not inspect a setting.** Reading a flag
   passes on a kernel that ignores the flag. Every escape case runs the escape.
@@ -184,9 +311,13 @@ Three rules the test suite is built on, all learned the hard way here:
   warm` reads the tenant's `cpu.stat` and declines to judge the p99 budget when
   the tenant was throttled, because that number would be about the limit rather
   than about this code.
+- **A negative check must first prove the thing ran.** "The connection was
+  refused", "no process leaked" and "the suite exited zero" are all satisfied by
+  nothing having happened at all — the failure mode that fails *open*. Each one
+  establishes the positive case first.
 
 Several checks here passed — or failed — for the wrong reason before those rules
-were applied; [docs/poc-report.md](docs/poc-report.md) lists all seven.
+were applied; [docs/poc-report.md](docs/poc-report.md) lists all twelve.
 
 Zygo is Linux-first. The `ns` backend needs Linux **5.3+** — the floor is
 `clone3`, which has no fallback — plus user namespaces and delegated cgroup v2
@@ -197,6 +328,23 @@ appendix C. `zygo doctor` reports each one and prints the fix.
 
 On other platforms the code still builds and the platform-independent layers are
 fully tested — macOS gets a hidden Linux VM in phase 5.
+
+## Security
+
+Zygo runs other people's code on purpose, so an escape is the most serious kind
+of bug it can have. [SECURITY.md](SECURITY.md) is how to report one — privately,
+through GitHub, not as an issue — and what is in scope.
+[docs/threat-model.md](docs/threat-model.md) lists every vector, the control
+against it, and whether the escape suite actually attempts it. It also has a
+section on where the boundary is weaker than it looks, which is the part worth
+reading before you trust this with anything.
+
+[docs/seccomp-profiles.md](docs/seccomp-profiles.md) describes the three
+syscall profiles and the compatibility matrix — five reference packages
+exercised under `default` and `strict`, every cell an attempt — including the
+two bugs the first run of that matrix found in the profile itself.
+
+No external audit has been done yet; that is phase 4.
 
 ## Licence
 

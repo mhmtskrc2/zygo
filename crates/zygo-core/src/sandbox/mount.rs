@@ -362,6 +362,8 @@ mod tests {
             mem_high: Bytes::from_mib(230),
             swap: Bytes(0),
             oom_group: true,
+            connections: 256,
+            bandwidth: None,
             cpu: Cpu(1.0),
             pids: 64,
             timeout: Duration::from_secs(30),

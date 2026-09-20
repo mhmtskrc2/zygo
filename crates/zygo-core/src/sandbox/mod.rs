@@ -8,6 +8,7 @@
 
 pub mod limits;
 pub mod mount;
+pub mod oneshot;
 
 use std::path::PathBuf;
 
@@ -57,12 +58,14 @@ pub struct SandboxConfig {
     /// uid/gid inside the sandbox, mapped to an unprivileged host range.
     pub uid: u32,
     pub gid: u32,
-    /// A terminal for the sandbox to use as its stdin, stdout and stderr.
+    /// A descriptor for the sandbox to use as its stdin, stdout and stderr.
     ///
     /// `None` means the sandbox inherits the caller's — which is what makes a
     /// daemonless `zygo run` feel native, but also hands tenant code a writable
-    /// descriptor to the user's terminal. `Some(fd)` is the slave side of a pty
-    /// the caller allocated, so the sandbox never sees the real one.
+    /// descriptor to the user's terminal. `Some(fd)` replaces all three: the
+    /// slave side of a pty the caller allocated (`--tty`), which the sandbox
+    /// also adopts as its controlling terminal, or a plain pipe, which is how
+    /// the venv builder captures what `pip` says.
     pub stdio: Option<std::os::fd::RawFd>,
     /// A connected socket for the runtime agent, placed at
     /// [`crate::pool::AGENT_FD`] in the sandbox.
@@ -70,7 +73,42 @@ pub struct SandboxConfig {
     /// Passing a descriptor rather than a socket path means nothing has to
     /// exist in the sandbox's filesystem for the agent to reach the supervisor.
     pub agent_fd: Option<std::os::fd::RawFd>,
+    /// Build the sandbox and then *hold* it instead of running `argv`.
+    ///
+    /// Warm-exec (design doc §3.4, layer 1): the namespaces, mounts, cgroup
+    /// and hardening are set up once and kept; each request is a fresh process
+    /// entered into them by the supervisor. The init process stays as Zygo's
+    /// own code — a reaping loop, never `execve` — so nothing from the image
+    /// has to exist for a sandbox to stay up.
+    pub hold: bool,
+    /// Leave the root writable instead of remounting it read-only.
+    ///
+    /// Only the derived-layer builder sets this, on a private copy of the
+    /// image that exists to be written to and is diffed afterwards. A sandbox
+    /// running anyone's code keeps the read-only root: the plan's `bind ro`
+    /// is a guarantee, not a default.
+    pub writable_root: bool,
+    /// The egress allowlist, as the spec wrote it, with every hostname already
+    /// resolved to addresses ([`crate::net`]).
+    ///
+    /// Resolution happens on the host, before the sandbox exists, so nothing
+    /// inside it can influence what the filter permits.
+    pub allow: Vec<crate::spec::AllowRule>,
+    pub allow_resolved: crate::net::Allowed,
+    /// Whether the private and link-local rejects are lifted.
+    pub allow_private_net: bool,
+    /// Where `pasta` writes its pid, so the sandbox can take it down again.
+    /// `None` for a sandbox that needs no `pasta`.
+    pub pasta_pid_file: Option<PathBuf>,
 }
+
+/// `PATH` inside a sandbox whose image sets none.
+///
+/// What a stock Debian or Alpine image exports, so `python3` and `sh` resolve
+/// the way they would under `docker run`. Shared by the launcher's `execve`
+/// candidate search and by the venv cache, which has to put `/venv/bin` in
+/// front of exactly this.
+pub const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// The state machine a warm sandbox moves through (design doc appendix A).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -145,6 +183,15 @@ impl SandboxConfig {
             gid: uid,
             stdio: None,
             agent_fd: None,
+            hold: false,
+            writable_root: false,
+            allow: f.allow.clone(),
+            // Resolution reaches the network, so it is the caller's to do —
+            // and to decide when. An empty set with a non-empty `allow` means
+            // the caller has not done it yet, which the launcher refuses.
+            allow_resolved: crate::net::Allowed::default(),
+            allow_private_net: f.allow_private_net,
+            pasta_pid_file: None,
         }
     }
 }

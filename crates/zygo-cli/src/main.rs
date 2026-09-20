@@ -7,15 +7,41 @@
 mod cli;
 mod cmd;
 mod output;
+mod scope;
 mod tty;
 
 use clap::Parser;
 
 use cli::{Cli, Command};
 
+/// Die on a closed pipe the way every other Unix tool does.
+///
+/// Rust's runtime sets `SIGPIPE` to `SIG_IGN`, so a write to a pipe nobody is
+/// reading returns `EPIPE`, `println!` panics on it, and this binary is built
+/// with `panic = "abort"` — which is why `zygo doctor | head` printed
+/// `Aborted` after perfectly good output. Restoring the default disposition
+/// makes the process end quietly at the point the reader went away.
+///
+/// # Safety
+///
+/// Called before any thread exists, which is the only requirement.
+#[cfg(unix)]
+fn die_quietly_on_a_closed_pipe() {
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn die_quietly_on_a_closed_pipe() {}
+
 fn main() -> std::process::ExitCode {
+    die_quietly_on_a_closed_pipe();
     let cli = Cli::parse();
     init_tracing(cli.verbose, cli.json);
+    // May replace this process: see `scope`. Before anything is opened or
+    // connected, so nothing has to survive the exec.
+    scope::ensure_delegated(&cli);
 
     match run(&cli) {
         Ok(code) => std::process::ExitCode::from(code),
@@ -42,23 +68,35 @@ fn run(cli: &Cli) -> anyhow::Result<u8> {
         Command::Run(args) => cmd::run::run(cli, args),
         Command::Backend(sub) => cmd::backend::run(cli, sub),
         Command::Bench(sub) => cmd::bench::run(cli, sub),
+        Command::Completion { shell } => {
+            use clap::CommandFactory;
+            clap_complete::generate(*shell, &mut Cli::command(), "zygo", &mut std::io::stdout());
+            Ok(0)
+        }
 
         // Phase 2 onwards. Each says which phase it belongs to rather than
         // failing as an unknown command, so `--help` stays honest.
         Command::Serve(args) => cmd::supervisor::serve(cli, args),
         Command::Exec(args) => cmd::supervisor::exec(cli, args),
         Command::Ps => cmd::supervisor::ps(cli),
-        Command::Logs { .. } => pending("zygo logs", "2.2"),
+        Command::Logs {
+            name,
+            follow,
+            tail,
+            failed,
+        } => cmd::logs::run(cli, name, *follow, *tail, *failed),
         Command::Stop { name, all } => cmd::supervisor::stop(cli, name.as_deref(), *all),
         Command::Supervisor(command) => cmd::supervisor::supervisor(cli, command),
         Command::Top => pending("zygo top", "3"),
         Command::Stats { .. } => pending("zygo stats", "3"),
-        Command::Api => pending("zygo api", "2.8"),
-        Command::Up { .. } => pending("zygo up", "3"),
-        Command::Down { .. } => pending("zygo down", "3"),
+        Command::Api(args) => cmd::api::run(cli, args),
+        Command::Up { file, relock } => cmd::supervisor::up(cli, file.path(), *relock),
+        Command::Down { file } => cmd::supervisor::down(cli, file.path()),
         Command::Login { .. } => pending("zygo login", "1.2"),
-        Command::Agent(_) => pending("zygo agent test", "2.1"),
-        Command::Shell { .. } => pending("zygo shell", "3"),
+        Command::Agent(crate::cli::AgentCommand::Test { binary, args }) => {
+            cmd::agent::test(cli, binary, args)
+        }
+        Command::Shell { name, command } => cmd::shell::run(cli, name, command),
     }
 }
 

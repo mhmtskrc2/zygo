@@ -1,10 +1,15 @@
 //! Command implementations.
 
+pub mod agent;
+pub mod api;
 pub mod backend;
 pub mod bench;
 pub mod doctor;
 pub mod image;
+pub mod logs;
+pub mod otlp;
 pub mod run;
+pub mod shell;
 pub mod spec;
 pub mod supervisor;
 

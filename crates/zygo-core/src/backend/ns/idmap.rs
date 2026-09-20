@@ -178,6 +178,25 @@ pub fn render_id_map(map: &[IdMapEntry]) -> String {
         .join("\n")
 }
 
+/// The one line of a rendered map an unprivileged process may write itself:
+/// the entry that maps to its own host id.
+///
+/// Without `newuidmap` the kernel allows exactly one entry, and only for the
+/// writer's own uid. That entry is not necessarily the first line — the map
+/// is sorted by the inside id, and the default sandbox user of 1000 puts the
+/// subordinate range for 0..1000 first — so it is picked by the outside id,
+/// not by position. Found on a host with `/etc/subuid` configured but the
+/// `uidmap` package missing: the first line asked for the subordinate range,
+/// and the answer was EPERM.
+pub fn identity_line(map: &str, outside: u32) -> String {
+    let wanted = outside.to_string();
+    map.lines()
+        .find(|l| l.split_whitespace().nth(1) == Some(wanted.as_str()))
+        .or_else(|| map.lines().next())
+        .unwrap_or("")
+        .to_string()
+}
+
 /// Read the subordinate range configured for the current user.
 ///
 /// Without one, every tenant maps to the same host uid and the uid-level
@@ -355,5 +374,29 @@ dave:300000:0
         let text = render_id_map(&map);
         assert_eq!(text.lines().count(), map.len());
         assert!(text.lines().next().unwrap().starts_with("0 100000 1000"));
+    }
+
+    /// The helper-less fallback must write the caller's own identity entry,
+    /// which with a sandbox user of 1000 is the *second* line, not the first.
+    #[test]
+    fn the_identity_line_is_found_by_host_id_not_position() {
+        let map = id_map(
+            1000,
+            501,
+            Some(SubIdRange {
+                start: 100_000,
+                count: 2000,
+            }),
+        );
+        let text = render_id_map(&map);
+        assert_eq!(identity_line(&text, 501), "1000 501 1");
+        // No subordinate range: the single entry is the identity.
+        assert_eq!(identity_line("0 501 1", 501), "0 501 1");
+        // An id that is not in the map at all falls back to the first line
+        // rather than to nothing, so the kernel's error names the real cause.
+        assert_eq!(
+            identity_line("0 100000 1000\n1000 501 1", 7),
+            "0 100000 1000"
+        );
     }
 }

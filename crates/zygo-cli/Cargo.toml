@@ -17,12 +17,22 @@ zygo-core.workspace = true
 
 anyhow.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+# OTLP export from `zygo api`, and the runsc download. Already in the tree
+# through zygo-core's registry client, so these are names, not dependencies.
+reqwest.workspace = true
+sha2.workspace = true
+hex.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

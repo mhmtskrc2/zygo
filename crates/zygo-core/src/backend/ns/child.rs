@@ -110,7 +110,37 @@ pub unsafe fn child_main(plan: &PreparedLaunch, ready_fd: c_int, err_fd: c_int) 
         }
     }
 
-    // 7. Limits and privilege.
+    // 6b. `/run/secrets`, and its descriptor out to the supervisor.
+    //
+    //     Here and nowhere else: the directory needs the mounts, which are
+    //     done, and creating it needs capabilities this process is about to
+    //     drop. See `hand_out_secrets_dir` for why a descriptor rather than a
+    //     path.
+    if let Some(sock) = plan.secrets_fd {
+        unsafe { hand_out_secrets_dir(sock, err_fd) };
+    }
+
+    // 7–10. Limits, privilege, Landlock, seccomp, and dying with the parent.
+    unsafe { harden(plan, err_fd) };
+
+    // 11. Hand the sandbox over — to the program, or to a loop that keeps it.
+    if plan.hold {
+        unsafe { hold(err_fd) }
+    }
+    unsafe { exec_or_fail(plan, err_fd) }
+}
+
+/// Steps 7–10: everything that turns a process with the sandbox's view of the
+/// world into one that cannot get out of it.
+///
+/// Shared by the sandbox init and by every warm-exec request process, which is
+/// a fresh fork that has *entered* the namespaces and has to be constrained
+/// exactly as the init was — or the second path would be a hole the first one
+/// closed.
+///
+/// # Safety
+/// Child side of a clone or fork: nothing here may allocate.
+pub(super) unsafe fn harden(plan: &PreparedLaunch, err_fd: c_int) {
     for (resource, value) in &plan.rlimits {
         let limit = libc::rlimit {
             rlim_cur: *value as libc::rlim_t,
@@ -131,44 +161,135 @@ pub unsafe fn child_main(plan: &PreparedLaunch, ready_fd: c_int, err_fd: c_int) 
         fail(err_fd, Step::DropCapabilities);
     }
 
-    // 8. Landlock, before seccomp: building the ruleset needs `open`, which the
-    //    seccomp profile still permits but which is cleaner to do while the
-    //    process is otherwise unconstrained. Both require `no_new_privs`, set
-    //    just above.
+    // Landlock, before seccomp: building the ruleset needs `open`, which the
+    // seccomp profile still permits but which is cleaner to do while the
+    // process is otherwise unconstrained. Both require `no_new_privs`, set
+    // just above.
     if !plan.landlock.is_empty()
         && let Err(e) = unsafe { super::landlock::apply(&plan.landlock) }
     {
         fail_with(err_fd, Step::ApplyLandlock, e.raw_os_error().unwrap_or(0));
     }
 
-    // 9. The syscall filter. After `no_new_privs` (the kernel requires it for
-    //    an unprivileged caller) and after every other setup step, because the
-    //    filter denies most of what those steps needed.
+    // The syscall filter. After `no_new_privs` (the kernel requires it for an
+    // unprivileged caller) and after every other setup step, because the
+    // filter denies most of what those steps needed.
     if !plan.seccomp.is_empty()
         && let Err(e) = unsafe { super::seccomp::install(&plan.seccomp) }
     {
         fail_with(err_fd, Step::InstallSeccomp, e.raw_os_error().unwrap_or(0));
     }
 
-    // 10. Die with the launcher. Checked immediately afterwards, because a
-    //    parent that exited *before* the prctl would never trigger it.
+    // Die with the parent. Checked immediately afterwards, because a parent
+    // that exited *before* the prctl would never trigger it. `getppid` is 0
+    // when the parent is outside this pid namespace — the warm-exec helper —
+    // and that is not "the parent died".
     unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) };
     if unsafe { libc::getppid() } == 1 {
         fail_with(err_fd, Step::ParentDied, libc::ESRCH);
     }
+}
 
-    // 11. Hand the sandbox over to the program. On success this never returns
-    //    and `err_fd` closes on exec, which is how the parent learns it worked.
-    //
-    //    The candidates are the `PATH` search, pre-computed by the parent:
-    //    `execvp` would do it here, but it allocates, which this side of the
-    //    clone may not. The last failure is the one reported, so a command
-    //    that simply does not exist reports ENOENT rather than the errno of
-    //    whichever directory happened to be checked last.
+/// Step 11: `execve` the program. On success this never returns and `err_fd`
+/// closes on exec, which is how the parent learns it worked.
+///
+/// The candidates are the `PATH` search, pre-computed by the parent: `execvp`
+/// would do it here, but it allocates, which this side of the clone may not.
+/// The last failure is the one reported, so a command that simply does not
+/// exist reports ENOENT rather than the errno of whichever directory happened
+/// to be checked last.
+///
+/// # Safety
+/// Child side of a clone or fork: nothing here may allocate.
+pub(super) unsafe fn exec_or_fail(plan: &PreparedLaunch, err_fd: c_int) -> ! {
     for candidate in &plan.program_candidates {
         unsafe { libc::execve(candidate.as_ptr(), plan.argv(), plan.envp()) };
     }
     fail(err_fd, Step::Execve);
+}
+
+/// Create `/run/secrets` and hand its descriptor to the supervisor.
+///
+/// The supervisor delivers secrets as files it writes from *outside* the
+/// sandbox, so that nothing inside ever holds a value. It used to reach them
+/// through `/proc/<init>/root` — which works only while that process is
+/// **dumpable**, and writing the id map cleared that for everything in here
+/// before the mounts even began. As root the check is bypassed and nobody
+/// noticed; unprivileged, every write was refused.
+///
+/// A descriptor has no such problem: it names the directory itself, it
+/// survives the process that opened it, and it needs no `/proc` at all. This
+/// is the one moment it can be taken — after the root is committed, so the
+/// directory can exist, and before `harden`, which drops the capabilities
+/// that creating it needs and may install a Landlock ruleset that forbids it.
+///
+/// The child keeps nothing: the descriptor is closed here, and the socket
+/// with it. For a held sandbox this process goes on to `hold`, which is
+/// deliberately unreadable to anything else; a copy of this descriptor left
+/// open in it would be a way back in.
+///
+/// # Safety
+/// Child side of the clone: nothing here allocates, and every call is
+/// async-signal-safe.
+unsafe fn hand_out_secrets_dir(sock: std::os::fd::RawFd, err_fd: c_int) {
+    unsafe {
+        let path = c"/run/secrets";
+        // `EEXIST` is fine and expected on a rewarm into a reused tmpfs.
+        if libc::mkdir(path.as_ptr(), 0o700) != 0 && *libc::__errno_location() != libc::EEXIST {
+            fail(err_fd, Step::HandOutSecretsDir);
+        }
+        let dir = libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        );
+        if dir < 0 {
+            fail(err_fd, Step::HandOutSecretsDir);
+        }
+        if crate::net::linux::send_fd(sock, dir).is_err() {
+            fail(err_fd, Step::HandOutSecretsDir);
+        }
+        libc::close(dir);
+        libc::close(sock);
+    }
+}
+
+/// Keep a warm-exec sandbox alive as its init, forever.
+///
+/// Two duties. First, it is pid 1 of the pid namespace, so anything a request
+/// leaves orphaned reparents here and has to be reaped or it stays a zombie
+/// inside the sandbox. Second, it must be *unreadable*: this process is a
+/// fork of the supervisor and still maps the supervisor's memory, in the same
+/// namespaces as tenant code running under the same uid. `PR_SET_DUMPABLE`
+/// off is what refuses `ptrace` and `/proc/1/mem` to that code; the seccomp
+/// profile denies `ptrace` too, and this holds even if it did not.
+///
+/// Closing `err_fd` is the "ready" signal: the parent is waiting for end of
+/// file on it, which `execve` would have provided and this never reaches.
+///
+/// # Safety
+/// Child side of the clone: nothing here may allocate.
+unsafe fn hold(err_fd: c_int) -> ! {
+    unsafe {
+        libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+        libc::close(err_fd);
+        // Nothing else is needed, and everything else is the supervisor's:
+        // its control socket, the agents' connections, whatever was open at
+        // the clone. An init that never execs keeps them for ever otherwise.
+        super::enter::close_from(3);
+    }
+    loop {
+        let mut status: c_int = 0;
+        // Blocks while there is an orphan to wait for; ECHILD when there is
+        // none, in which case sleep and look again. A second of latency in
+        // reaping a stray zombie is nothing, and it costs no CPU to wait.
+        if unsafe { libc::waitpid(-1, &mut status, 0) } < 0 {
+            let pause = libc::timespec {
+                tv_sec: 1,
+                tv_nsec: 0,
+            };
+            unsafe { libc::nanosleep(&pause, core::ptr::null_mut()) };
+        }
+    }
 }
 
 /// Apply one prepared mount.
@@ -206,7 +327,11 @@ unsafe fn apply(op: &PreparedOp, err_fd: c_int) {
             }
         }
 
-        PreparedOp::BindRoot { source, target } => {
+        PreparedOp::BindRoot {
+            source,
+            target,
+            readonly,
+        } => {
             let rc = unsafe {
                 libc::mount(
                     source.as_ptr(),
@@ -220,18 +345,21 @@ unsafe fn apply(op: &PreparedOp, err_fd: c_int) {
                 fail(err_fd, Step::MountRoot);
             }
             // A bind mount ignores flags at mount time; read-only has to be a
-            // second, explicit remount.
-            let rc = unsafe {
-                libc::mount(
-                    null,
-                    target.as_ptr(),
-                    null,
-                    READONLY_REMOUNT as libc::c_ulong,
-                    core::ptr::null(),
-                )
-            };
-            if rc != 0 {
-                fail(err_fd, Step::MountRoot);
+            // second, explicit remount. Skipped only for a derived-layer build,
+            // whose root is a private copy made to be written.
+            if *readonly {
+                let rc = unsafe {
+                    libc::mount(
+                        null,
+                        target.as_ptr(),
+                        null,
+                        READONLY_REMOUNT as libc::c_ulong,
+                        core::ptr::null(),
+                    )
+                };
+                if rc != 0 {
+                    fail(err_fd, Step::MountRoot);
+                }
             }
         }
 
@@ -456,7 +584,11 @@ unsafe fn adopt_terminal(fd: c_int, err_fd: c_int) {
     if unsafe { libc::setsid() } < 0 {
         fail(err_fd, Step::AdoptTerminal);
     }
-    if unsafe { libc::ioctl(fd, TIOCSCTTY as _, 0) } != 0 {
+    // A terminal becomes the controlling one. Anything else — a pipe, which
+    // is what the venv builder hands over to capture `pip` — is simply used as
+    // stdio: `TIOCSCTTY` says ENOTTY, and that is the one refusal that means
+    // "not applicable" rather than "failed".
+    if unsafe { libc::ioctl(fd, TIOCSCTTY as _, 0) } != 0 && errno() != libc::ENOTTY {
         fail(err_fd, Step::AdoptTerminal);
     }
     for target in 0..3 {
@@ -575,10 +707,15 @@ unsafe fn drop_all_capabilities() -> bool {
     unsafe { libc::syscall(SYS_CAPSET, &header, data.as_ptr()) == 0 }
 }
 
+/// The current `errno`. Reads the thread-local through libc; nothing is
+/// allocated, so it is usable on the child side of the clone.
+pub(super) fn errno() -> c_int {
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+}
+
 /// Report the failing step with the current `errno` and exit.
-fn fail(err_fd: c_int, step: Step) -> ! {
-    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-    fail_with(err_fd, step, errno)
+pub(super) fn fail(err_fd: c_int, step: Step) -> ! {
+    fail_with(err_fd, step, errno())
 }
 
 /// Report a step and an explicit errno, then exit.

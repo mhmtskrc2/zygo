@@ -19,6 +19,16 @@ use crate::output::{self, Style};
 const WARM_P50_BUDGET_US: f64 = 2_000.0;
 const WARM_P99_BUDGET_US: f64 = 10_000.0;
 
+/// The phase 2 acceptance criterion for warm-exec: "a Go binary under 3 ms".
+///
+/// A different budget because it is a different thing: an agent request is a
+/// `fork()` of a warm interpreter, a warm-exec request is a fresh process
+/// entered into the sandbox and `execve`d — six `setns` calls, the full
+/// hardening sequence and the program's own start-up, every time. Measured at
+/// p50 2.2 ms for `sh -c cat`; with `python3` per request it is 54 ms, which is
+/// exactly why interpreters get an agent instead.
+const EXEC_P50_BUDGET_US: f64 = 3_000.0;
+
 pub fn run(cli: &Cli, command: &BenchCommand) -> anyhow::Result<u8> {
     match command {
         BenchCommand::Warm {
@@ -26,13 +36,21 @@ pub fn run(cli: &Cli, command: &BenchCommand) -> anyhow::Result<u8> {
             no_cgroup,
             rate,
             cpu,
-        } => warm(cli, *n, !no_cgroup, *rate, *cpu),
-        BenchCommand::Cold { n } => {
-            anyhow::bail!("zygo bench cold is not implemented yet (todo.md, phase 2.9); n={n}")
-        }
-        BenchCommand::Load { seconds } => anyhow::bail!(
-            "zygo bench load needs the supervisor's queue (todo.md, phase 2.2); seconds={seconds}"
+            cmd,
+        } => warm(
+            cli,
+            *n,
+            !no_cgroup,
+            *rate,
+            *cpu,
+            (!cmd.is_empty()).then_some(cmd.as_slice()),
         ),
+        BenchCommand::Cold { n, image, command } => cold(cli, *n, image, command.as_deref()),
+        BenchCommand::Load {
+            seconds,
+            concurrency,
+            cpu,
+        } => load(cli, *seconds, *concurrency, *cpu),
     }
 }
 
@@ -42,6 +60,7 @@ fn warm(
     per_request_cgroup: bool,
     rate: Option<f64>,
     cpu: Option<f64>,
+    cmd: Option<&[String]>,
 ) -> anyhow::Result<u8> {
     let paths = super::paths(cli);
     let pool = Pool::new(PoolConfig {
@@ -49,7 +68,8 @@ fn warm(
         ..PoolConfig::new(paths.clone())
     })?;
 
-    // An empty handler, so what is measured is overhead and nothing else.
+    // An empty handler, so what is measured is overhead and nothing else —
+    // or, for warm-exec, the smallest program that completes the contract.
     let dir = tempfile::tempdir()?;
     let handler = dir.path().join("handler.py");
     std::fs::write(&handler, "def handler(event):\n    return None\n")?;
@@ -58,7 +78,9 @@ fn warm(
     let resolved = spec.resolve(
         None,
         &Layer {
-            entry: Some(handler.clone()),
+            entry: cmd.is_none().then(|| handler.clone()),
+            cmd: cmd.map(<[String]>::to_vec),
+            image: cmd.is_some().then(|| "python:3.12-slim".to_string()),
             cpu: cpu.map(zygo_core::spec::Cpu),
             ..Default::default()
         },
@@ -70,14 +92,18 @@ fn warm(
 
     let style = Style::stdout();
     eprintln!(
-        "{} {}  {}",
+        "{} {}  {}{}",
         style.dim("image"),
         resolved.image,
         style.dim(if per_request_cgroup {
             "per-request cgroup"
         } else {
             "no per-request cgroup"
-        })
+        }),
+        match cmd {
+            Some(c) => format!("  {}", style.dim(&format!("warm-exec: {}", c.join(" ")))),
+            None => String::new(),
+        }
     );
 
     let warmup_started = Instant::now();
@@ -159,18 +185,389 @@ fn warm(
     // machine the floor can be most of the budget.
     let floor = measure_fork_floor(500);
 
-    let report = Report::of(&samples, elapsed, n, quota);
+    let mut report = Report::of(&samples, elapsed, n, quota);
+    if cmd.is_some() {
+        report.p50_budget = EXEC_P50_BUDGET_US;
+        report.label = "warm-exec request overhead";
+    }
     if cli.json {
         output::json(&report.to_json())?;
     } else {
         report.print(&style);
         print_phases(&phases);
-        print_handler_share(&phases, &handler_us);
+        if cmd.is_none() {
+            print_handler_share(&phases, &handler_us);
+        }
         print_floor(&style, &floor, &report);
     }
 
     let _ = function.shutdown();
     Ok(u8::from(!report.within_budget()))
+}
+
+/// Requirement N2: a cold `run` with the image already in the store.
+const COLD_BUDGET_MS: f64 = 50.0;
+
+/// The design document's phase 2 acceptance criterion for throughput.
+const LOAD_TARGET_PER_SECOND: f64 = 600.0;
+
+/// `zygo bench cold` — build a sandbox, run a program, tear it down.
+///
+/// This is requirement N2, and the default command is the one N2 is written
+/// about: starting a Python interpreter and exiting. The image must already be
+/// in the store, because N2 is explicitly about the cached case — pulling is a
+/// network measurement and belongs nowhere near this number.
+fn cold(cli: &Cli, n: u32, image: &str, command: Option<&[String]>) -> anyhow::Result<u8> {
+    use zygo_core::image::{Reference, Store};
+    use zygo_core::sandbox::SandboxConfig;
+
+    let paths = super::paths(cli);
+    paths.ensure()?;
+    let store = Store::new(paths.clone());
+    let reference: Reference = image.parse()?;
+    let entry = store.get(&reference).with_context(|| {
+        format!("`{image}` is not in the store\n  → pull it first: zygo pull {image}")
+    })?;
+
+    let argv: Vec<String> = match command {
+        Some(cmd) => cmd.to_vec(),
+        None => ["python3", "-c", "pass"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    };
+
+    let spec = Spec::default();
+    let resolved = spec.resolve(
+        None,
+        &Layer {
+            image: Some(image.to_string()),
+            cmd: Some(argv.clone()),
+            ..Default::default()
+        },
+        &ResolveOptions {
+            one_shot: true,
+            ..Default::default()
+        },
+    )?;
+
+    let overlay = zygo_core::doctor::run()
+        .checks
+        .iter()
+        .any(|c| c.name == "overlayfs (userns)" && c.status == zygo_core::doctor::Status::Ok);
+    let mount_points = zygo_core::sandbox::mount::required_mount_points(&resolved.mounts);
+    let view = store.rootfs_view(&entry.layers, overlay, &mount_points)?;
+    let backend = zygo_core::backend::for_isolation(resolved.isolation)?;
+
+    let style = Style::stdout();
+    eprintln!(
+        "{} {image} {}  {}",
+        style.dim("cold"),
+        argv.join(" "),
+        style.dim(if overlay { "overlayfs" } else { "flattened" })
+    );
+
+    let mut samples = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        // A fresh root per iteration: reusing one would measure a warm page
+        // cache for the mount points rather than what a real `run` does.
+        let newroot = paths
+            .tmp()
+            .join(format!("bench-cold-{}-{i}", std::process::id()));
+        std::fs::create_dir_all(&newroot)?;
+        let config = SandboxConfig::from_resolved(&resolved, &view, &newroot, argv.clone(), &[]);
+
+        let t0 = Instant::now();
+        let mut sandbox = backend
+            .start(&config)
+            .with_context(|| format!("iteration {i} could not start"))?;
+        let code = sandbox.wait()?;
+        samples.push(t0.elapsed().as_secs_f64() * 1000.0);
+
+        anyhow::ensure!(code == 0, "iteration {i} exited {code}");
+        let _ = std::fs::remove_dir_all(&newroot);
+    }
+
+    samples.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
+    let q = |p: f64| percentile(&samples, p);
+    let p50 = q(50.0);
+
+    if cli.json {
+        output::json(&serde_json::json!({
+            "image": image,
+            "command": argv,
+            "runs": n,
+            "p50_ms": p50,
+            "p90_ms": q(90.0),
+            "p99_ms": q(99.0),
+            "max_ms": samples.last().copied().unwrap_or(0.0),
+            "budget_ms": COLD_BUDGET_MS,
+            "pass": p50 < COLD_BUDGET_MS,
+            "rootfs": if overlay { "overlayfs" } else { "flattened" },
+        }))?;
+    } else {
+        println!("cold start over {n} runs, image already in the store");
+        println!(
+            "  p50 {:>7.1} ms   p90 {:>7.1}   p99 {:>7.1}   max {:>7.1}",
+            p50,
+            q(90.0),
+            q(99.0),
+            samples.last().copied().unwrap_or(0.0)
+        );
+        println!();
+        let ok = p50 < COLD_BUDGET_MS;
+        println!(
+            "  p50 < {COLD_BUDGET_MS:.0} ms   {}",
+            if ok {
+                style.green("PASS")
+            } else {
+                style.red("FAIL")
+            }
+        );
+        if !overlay {
+            // Worth saying: a flattened rootfs is a different measurement, and
+            // on this host it is the only one available.
+            println!(
+                "{}",
+                style.dim(
+                    "  note: this host has no unprivileged overlayfs, so the rootfs is\n  \
+                     flattened — the same bind mount every run, which is the cheap case"
+                )
+            );
+        }
+    }
+    let within_budget = p50 < COLD_BUDGET_MS;
+    Ok(u8::from(!within_budget))
+}
+
+/// `zygo bench load` — sustained throughput through one warm function.
+///
+/// The design document's phase 2 acceptance criterion is ≥ 600 requests/s at a
+/// concurrency of 4. Measuring it needs concurrent callers, and the interesting
+/// number is not just the total: [`CallTiming::lock`] says how much of each
+/// request was spent waiting for the connection, which is the difference
+/// between "the machine is busy" and "the callers are queueing behind each
+/// other".
+fn load(cli: &Cli, seconds: u32, concurrency: u32, cpu: Option<f64>) -> anyhow::Result<u8> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    anyhow::ensure!(concurrency >= 1, "concurrency must be at least 1");
+
+    let paths = super::paths(cli);
+    let pool = Pool::new(PoolConfig::new(paths.clone()))?;
+
+    let dir = tempfile::tempdir()?;
+    let handler = dir.path().join("handler.py");
+    std::fs::write(&handler, "def handler(event):\n    return None\n")?;
+
+    let spec = Spec::default();
+    let resolved = spec.resolve(
+        None,
+        &Layer {
+            entry: Some(handler.clone()),
+            cpu: cpu.map(zygo_core::spec::Cpu),
+            concurrency: Some(concurrency),
+            ..Default::default()
+        },
+        &ResolveOptions {
+            one_shot: true,
+            ..Default::default()
+        },
+    )?;
+
+    let style = Style::stdout();
+    let function = Arc::new(
+        pool.serve(&resolved)
+            .with_context(|| format!("could not warm `{}`", resolved.image))?,
+    );
+    eprintln!(
+        "{} {} clients for {seconds}s",
+        style.dim("load"),
+        concurrency
+    );
+
+    for _ in 0..50 {
+        function.call(serde_json::Value::Null)?;
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let cpu_before = function.cpu_accounting();
+    let started = Instant::now();
+
+    let workers: Vec<_> = (0..concurrency)
+        .map(|_| {
+            let (function, stop) = (Arc::clone(&function), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                let mut samples = Vec::new();
+                let mut lock_us = Vec::new();
+                let mut failures = 0u64;
+                let mut served = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    served += 1;
+                    let t0 = Instant::now();
+                    match function.call_timed(serde_json::Value::Null, Duration::from_secs(30)) {
+                        Ok((outcome, timing)) => {
+                            samples.push(t0.elapsed().as_secs_f64() * 1e6);
+                            lock_us.push(timing.lock.as_secs_f64() * 1e6);
+                            if !outcome.succeeded() {
+                                failures += 1;
+                            }
+                        }
+                        Err(_) => failures += 1,
+                    }
+                }
+                (samples, lock_us, failures, served)
+            })
+        })
+        .collect();
+
+    std::thread::sleep(Duration::from_secs(u64::from(seconds)));
+    stop.store(true, Ordering::Relaxed);
+
+    let mut samples = Vec::new();
+    let mut lock_us = Vec::new();
+    let mut failures = 0u64;
+    // Per worker, because a total hides starvation completely: one client
+    // taking every slot and three taking none looks exactly like four clients
+    // sharing fairly.
+    let mut per_worker = Vec::new();
+    for w in workers {
+        let (s, l, f, served) = w.join().map_err(|_| anyhow::anyhow!("a worker panicked"))?;
+        samples.extend(s);
+        lock_us.extend(l);
+        failures += f;
+        per_worker.push(served);
+    }
+    per_worker.sort_unstable();
+    let elapsed = started.elapsed();
+    let quota = match (cpu_before, function.cpu_accounting()) {
+        (Some(before), Some(after)) => Some(after.since(&before)),
+        _ => None,
+    };
+
+    let count = samples.len() as u32;
+    let report = Report::of(&samples, elapsed, count, quota);
+    lock_us.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
+
+    let met = report.per_second >= LOAD_TARGET_PER_SECOND;
+    if cli.json {
+        let mut json = report.to_json();
+        json["concurrency"] = concurrency.into();
+        json["failures"] = failures.into();
+        json["target_per_second"] = LOAD_TARGET_PER_SECOND.into();
+        json["meets_target"] = met.into();
+        json["lock_p50_us"] = percentile(&lock_us, 50.0).into();
+        json["lock_max_us"] = lock_us.last().copied().unwrap_or(0.0).into();
+        json["requests_per_client"] = per_worker.clone().into();
+        output::json(&json)?;
+    } else {
+        println!(
+            "sustained load: {concurrency} clients, {:.1}s, empty handler",
+            elapsed.as_secs_f64()
+        );
+        println!(
+            "  {:.0} requests/s   {count} requests   {failures} failed",
+            report.per_second
+        );
+        println!(
+            "  p50 {:>7.0} µs   p90 {:>7.0}   p99 {:>7.0}   max {:>8.0}",
+            report.p50, report.p90, report.p99, report.max
+        );
+        println!();
+        println!(
+            "  >= {LOAD_TARGET_PER_SECOND:.0} requests/s   {}",
+            if met {
+                style.green("PASS")
+            } else {
+                style.red("FAIL")
+            }
+        );
+        print_contention(&style, &lock_us, &report, concurrency);
+        print_fairness(&style, &per_worker);
+        report.print_quota(&style);
+    }
+
+    let _ = function.shutdown();
+    Ok(u8::from(!met))
+}
+
+/// Show how the work was split between clients.
+///
+/// A throughput total says nothing about fairness, and fairness is where an
+/// unfair lock shows up: one client taking nearly every slot while the others
+/// wait reads as healthy throughput right up until you look at a percentile of
+/// *their* latency.
+fn print_fairness(style: &Style, per_worker: &[u64]) {
+    if per_worker.len() < 2 {
+        return;
+    }
+    let (min, max) = (per_worker[0], per_worker[per_worker.len() - 1]);
+    let total: u64 = per_worker.iter().sum();
+    let fair = total / per_worker.len() as u64;
+    println!();
+    println!("  requests per client: min {min}, max {max}, even would be {fair}");
+    if min * 4 < max {
+        println!(
+            "{}",
+            style.yellow(
+                "  The work is not being shared. A warm function serialises on one
+                   connection, and the lock guarding it is not fair, so a client that
+                   releases and immediately re-acquires can starve the others for seconds
+                   at a time. Until the agent can hold several forks at once, concurrency
+                   above 1 buys nothing and costs fairness."
+            )
+        );
+    }
+}
+
+/// Say how much of each request was spent waiting for the connection.
+///
+/// This is the number that says *why* a concurrency target is or is not met. A
+/// warm function serialises on its own connection, because the wire protocol is
+/// one request in flight per agent; adding callers therefore adds queueing
+/// rather than throughput until the agent itself can hold several forks at once.
+fn print_contention(style: &Style, lock_us: &[f64], report: &Report, concurrency: u32) {
+    if lock_us.is_empty() {
+        return;
+    }
+    let lock_p50 = percentile(lock_us, 50.0);
+    let share = lock_p50 / report.p50.max(1.0) * 100.0;
+    println!();
+    println!(
+        "  waiting for the connection: p50 {lock_p50:>6.0} µs   p99 {:>7.0}            max {:>9.0}   ({share:.0}% of p50)",
+        percentile(lock_us, 99.0),
+        lock_us.last().copied().unwrap_or(0.0)
+    );
+
+    // The tail, not the median, is where this hurts. Measured at concurrency 4:
+    // the requests-per-client split was a reasonable 684 to 1166, while one
+    // client still waited 2.17 s for the connection — so a percentile of the
+    // pooled samples reports zero contention right up to the maximum.
+    let lock_max = lock_us.last().copied().unwrap_or(0.0);
+    if concurrency > 1 && lock_max > report.p50 * 20.0 {
+        println!(
+            "{}",
+            style.yellow(
+                "  One client waited far longer for the connection than a request takes.\n  \
+                 A warm function serves one request at a time — the agent handles one\n  \
+                 `EXEC` to completion before reading the next — and the lock guarding\n  \
+                 that connection is not fair, so waiting is unbounded and badly skewed.\n  \
+                 Until the agent can hold several forks at once, concurrency above 1\n  \
+                 buys no throughput and costs a long latency tail."
+            )
+        );
+    } else if concurrency > 1 && share > 30.0 {
+        println!(
+            "{}",
+            style.yellow(
+                "  Most of each request is spent queueing behind another one: the agent\n  \
+                 handles one `EXEC` to completion before reading the next, so\n  \
+                 `concurrency` bounds what the supervisor admits, not what the agent\n  \
+                 can overlap."
+            )
+        );
+    }
 }
 
 /// The gap between request starts for an offered load in requests/s.
@@ -197,15 +594,13 @@ struct Report {
     elapsed: Duration,
     /// What the tenant's CPU quota did during the run, when it could be read.
     quota: Option<CpuAccounting>,
+    /// The p50 budget this run is judged against: the agent's or warm-exec's.
+    p50_budget: f64,
+    label: &'static str,
 }
 
 impl Report {
-    fn of(
-        samples: &[f64],
-        elapsed: Duration,
-        count: u32,
-        quota: Option<CpuAccounting>,
-    ) -> Report {
+    fn of(samples: &[f64], elapsed: Duration, count: u32, quota: Option<CpuAccounting>) -> Report {
         let mut sorted = samples.to_vec();
         sorted.sort_by(|a, b| a.partial_cmp(b).expect("no NaN in a duration"));
 
@@ -220,6 +615,8 @@ impl Report {
             count,
             elapsed,
             quota,
+            p50_budget: WARM_P50_BUDGET_US,
+            label: "warm request overhead",
         }
     }
 
@@ -243,21 +640,17 @@ impl Report {
     /// the phase-0 report records twice under test methodology. It is not a
     /// pass either: the p99 simply was not measured, which the output says.
     fn within_budget(&self) -> bool {
-        self.p50 < WARM_P50_BUDGET_US
-            && (!self.p99_is_meaningful() || self.p99 < WARM_P99_BUDGET_US)
+        self.p50 < self.p50_budget && (!self.p99_is_meaningful() || self.p99 < WARM_P99_BUDGET_US)
     }
 
     /// How much of the budget is left. The number worth watching: phase 0
     /// measured 6%, and the supervisor's own work still has to fit in it.
     fn headroom_percent(&self) -> f64 {
-        (WARM_P50_BUDGET_US - self.p50) / WARM_P50_BUDGET_US * 100.0
+        (self.p50_budget - self.p50) / self.p50_budget * 100.0
     }
 
     fn print(&self, style: &Style) {
-        println!(
-            "warm request overhead over {} requests, empty handler",
-            self.count
-        );
+        println!("{} over {} requests, empty handler", self.label, self.count);
         println!(
             "  p50 {:>7.0} µs   p90 {:>7.0}   p99 {:>7.0}   p99.9 {:>8.0}   max {:>8.0}   mean {:>7.0}",
             self.p50, self.p90, self.p99, self.p999, self.max, self.mean
@@ -274,10 +667,10 @@ impl Report {
         };
         println!(
             "  p50 < {:.0} µs   {}",
-            WARM_P50_BUDGET_US,
+            self.p50_budget,
             verdict(
-                self.p50 < WARM_P50_BUDGET_US,
-                if self.p50 < WARM_P50_BUDGET_US {
+                self.p50 < self.p50_budget,
+                if self.p50 < self.p50_budget {
                     "PASS"
                 } else {
                     "FAIL"
@@ -389,7 +782,7 @@ impl Report {
             "max_us": self.max,
             "mean_us": self.mean,
             "requests_per_second": self.per_second,
-            "budget": { "p50_us": WARM_P50_BUDGET_US, "p99_us": WARM_P99_BUDGET_US },
+            "budget": { "p50_us": self.p50_budget, "p99_us": WARM_P99_BUDGET_US },
             "headroom_p50_percent": self.headroom_percent(),
             "pass": self.within_budget(),
             "p99_measured": self.p99_is_meaningful(),
@@ -587,7 +980,10 @@ mod tests {
             "300 requests/s is 3.3 ms apart, not 300 s; got {gap:?}"
         );
         assert_eq!(request_interval(Some(1.0)), Some(Duration::from_secs(1)));
-        assert_eq!(request_interval(Some(1000.0)), Some(Duration::from_millis(1)));
+        assert_eq!(
+            request_interval(Some(1000.0)),
+            Some(Duration::from_millis(1))
+        );
     }
 
     #[test]

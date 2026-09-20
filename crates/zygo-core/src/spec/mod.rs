@@ -73,6 +73,11 @@ pub struct Layer {
     pub io_read: Option<Bytes>,
     pub io_write: Option<Bytes>,
     pub nofile: Option<u64>,
+    /// Concurrent TCP connections a networked sandbox may hold open.
+    pub connections: Option<u32>,
+    /// Network bandwidth, bytes per second, each direction. `None` is
+    /// unlimited, with a warning.
+    pub bandwidth: Option<Bytes>,
 
     // --- network (design doc §3.8) ----------------------------------------
     pub network: Option<Network>,
@@ -157,6 +162,8 @@ impl Layer {
             io_read,
             io_write,
             nofile,
+            connections,
+            bandwidth,
             network,
             allow,
             mounts,

@@ -83,6 +83,11 @@ impl Paths {
     pub fn flat_cache(&self) -> PathBuf {
         self.data.join("cache/flat")
     }
+    /// Records of derived system layers, by cache key: which packages, at
+    /// which versions. The layers themselves live in the image store.
+    pub fn system_cache(&self) -> PathBuf {
+        self.data.join("cache/system")
+    }
     pub fn tenant_data(&self, name: &str) -> PathBuf {
         self.data.join("tenants").join(name)
     }
@@ -110,6 +115,7 @@ impl Paths {
             self.tmp(),
             self.venv_cache(),
             self.flat_cache(),
+            self.system_cache(),
             self.runtime.clone(),
         ] {
             std::fs::create_dir_all(&dir).at(&dir)?;

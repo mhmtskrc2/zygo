@@ -20,6 +20,7 @@
 
 pub mod child;
 pub mod clone;
+pub mod enter;
 pub mod idmap;
 pub mod landlock;
 pub mod prepare;
@@ -39,6 +40,72 @@ use crate::sandbox::{SandboxConfig, SandboxState};
 use crate::spec::Isolation;
 
 pub use idmap::{IdMapEntry, NamespaceSet, SubIdRange, id_map, parse_subid, render_id_map};
+
+/// How long a sandbox has to reach `execve` — or say why it could not.
+///
+/// Everything before that point is mounts, a `pivot_root` and hardening:
+/// milliseconds on a laptop, and seconds at worst on a small board with a
+/// cold page cache. Finite because the launcher is one thread: a child that
+/// hangs here is a supervisor that never serves anything again.
+pub const START_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Read a pipe to end of file, giving up after `budget`.
+///
+/// `std::fs::File` has no read timeout, so the descriptor is polled and then
+/// read; `poll` is also the only way to tell "nothing yet" from "nothing ever"
+/// on a pipe whose writer is still open.
+fn read_to_end_within(fd: OwnedFd, budget: Duration) -> Result<Vec<u8>> {
+    use rustix::event::{PollFd, PollFlags, poll};
+
+    let deadline = Instant::now() + budget;
+    let mut payload = Vec::new();
+    let mut buf = [0u8; 512];
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(Error::BackendUnavailable {
+                backend: "ns",
+                reason: format!(
+                    "the sandbox did not start within {}s: it neither ran its \
+                     program nor reported a failure",
+                    budget.as_secs()
+                ),
+                remedy: "run `zygo doctor`; if this repeats, please report it with \
+                         the spec — a sandbox should reach `execve` in milliseconds"
+                    .into(),
+            });
+        }
+        let mut fds = [PollFd::new(&fd, PollFlags::IN)];
+        let left = rustix::fs::Timespec {
+            tv_sec: left.as_secs() as _,
+            tv_nsec: left.subsec_nanos() as _,
+        };
+        match poll(&mut fds, Some(&left)) {
+            Ok(0) => continue, // timed out; the deadline check above ends it
+            Ok(_) => {}
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(e) => {
+                return Err(Error::primitive(
+                    "poll launch status",
+                    "internal launcher error",
+                    e.into(),
+                ));
+            }
+        }
+        match rustix::io::read(&fd, &mut buf) {
+            Ok(0) => return Ok(payload), // end of file: the child exec'd
+            Ok(n) => payload.extend_from_slice(&buf[..n]),
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(e) => {
+                return Err(Error::primitive(
+                    "read launch status",
+                    "internal launcher error",
+                    e.into(),
+                ));
+            }
+        }
+    }
+}
 
 /// The `ns` backend.
 #[derive(Debug, Default)]
@@ -115,6 +182,18 @@ pub struct NsSandbox {
     /// Wall-clock budget, enforced by [`NsSandbox::wait`].
     timeout: Duration,
     exit_code: Option<i32>,
+    /// Open only for a held (warm-exec) sandbox: what a request enters.
+    namespaces: Option<crate::backend::NamespaceFds>,
+    /// Where the `pasta` serving this sandbox wrote its pid, when it has one.
+    /// `pasta` holds the network namespace open, so it outlives the sandbox
+    /// unless it is told to stop.
+    pasta_pid_file: Option<PathBuf>,
+    /// The egress resolver, for a sandbox that has one. Dropped with the
+    /// sandbox, which stops its thread.
+    dns: Option<crate::net::DnsProxy>,
+    /// `/run/secrets` inside this sandbox, handed out by the child before it
+    /// hardened. The only way in: see `child::hand_out_secrets_dir`.
+    secrets_dir: Option<std::os::fd::OwnedFd>,
 }
 
 impl NsSandbox {
@@ -178,8 +257,23 @@ impl NsSandbox {
         let code = exit_code_of(status);
         self.exit_code = Some(code);
         self.state = SandboxState::Cold;
+        // The resolver first: its thread may be mid-way through handing an
+        // address to `nft` inside a namespace that is about to go.
+        drop(self.dns.take());
+        // Before the cgroup, because `pasta` is not in it: it runs on the host
+        // as an ordinary process of this user, and nothing else would end it.
+        if let Some(file) = &self.pasta_pid_file {
+            crate::net::stop_pasta(file);
+        }
         if let Some(dir) = &self.cgroup_dir {
             let _ = cgroup::Hierarchy::remove(dir);
+            // The tenant above it is left for its other generations; if this
+            // was the last, the now-empty directory goes too. `remove_dir` is
+            // not recursive, so a tenant that still holds a generation — a
+            // replacement — stays, ENOTEMPTY and all.
+            if let Some(tenant) = dir.parent() {
+                let _ = std::fs::remove_dir(tenant);
+            }
         }
         Ok(Some(code))
     }
@@ -195,8 +289,20 @@ fn exit_code_of(status: libc::c_int) -> i32 {
 }
 
 impl Sandbox for NsSandbox {
+    fn cgroup(&self) -> Option<&std::path::Path> {
+        self.cgroup_dir.as_deref()
+    }
+
     fn pid(&self) -> u32 {
         self.pid
+    }
+
+    fn namespaces(&self) -> Option<&crate::backend::NamespaceFds> {
+        self.namespaces.as_ref()
+    }
+
+    fn secrets_dir(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        self.secrets_dir.as_ref().map(std::os::fd::AsFd::as_fd)
     }
 
     fn state(&self) -> SandboxState {
@@ -220,11 +326,13 @@ impl Sandbox for NsSandbox {
             if Instant::now() >= deadline {
                 self.kill_tree()?;
                 let _ = self.reap(true);
+                // `ETIMEDOUT` is not decoration: `Error::exit_code` reads it to
+                // report 137 rather than 125, so a caller can tell "killed for
+                // running too long" from "this host cannot run sandboxes".
                 return Err(Error::Primitive {
-                    operation: "timeout",
+                    operation: "the sandbox",
                     remedy: format!(
-                        "the sandbox exceeded its {:?} budget and was killed; \
-                         raise `timeout` if the work legitimately takes longer",
+                        "raise `timeout` if {:?} is not long enough for this work",
                         self.timeout
                     ),
                     source: std::io::Error::from_raw_os_error(libc::ETIMEDOUT),
@@ -257,7 +365,7 @@ impl Drop for NsSandbox {
 /// Start a sandbox.
 pub fn launch(config: &SandboxConfig, hierarchy: Option<&cgroup::Hierarchy>) -> Result<NsSandbox> {
     // Everything that can allocate happens here, before the clone.
-    let plan = prepare::prepare(config).map_err(|e| Error::Primitive {
+    let mut plan = prepare::prepare(config).map_err(|e| Error::Primitive {
         operation: "prepare launch",
         remedy: "the sandbox configuration contains a path that cannot be passed to the kernel"
             .into(),
@@ -274,19 +382,40 @@ pub fn launch(config: &SandboxConfig, hierarchy: Option<&cgroup::Hierarchy>) -> 
     let uid_map = idmap::render_id_map(&idmap::id_map(config.uid, outer_uid, sub));
     let gid_map = idmap::render_id_map(&idmap::id_map(config.gid, outer_gid, sub));
 
-    let tenant_cgroup = match hierarchy {
+    // The tenant carries the limits and outlives this sandbox; the generation
+    // is what this one launch attaches to, kills and removes, so retiring it
+    // cannot reach a replacement started under the same name.
+    let generation = match hierarchy {
         Some(h) => {
             // Builds `zygo.slice/{system,tenants}` and moves this process into
             // `system`, without which the controllers below cannot be
             // delegated. Idempotent, so every launch may call it.
             h.ensure(cgroup::Hierarchy::host_ram())?;
-            Some(h.create_tenant(&config.id.tenant, &config.limits)?)
+            h.create_tenant(&config.id.tenant, &config.limits)?;
+            Some(h.create_generation(&config.id.tenant)?)
         }
         None => None,
     };
 
     let (ready_read, ready_write) = pipe()?;
     let (err_read, err_write) = pipe_cloexec()?;
+
+    // A held sandbox hands `/run/secrets` back over this pair. Only a held
+    // one: an agent is `execve`d, which resets `PR_SET_DUMPABLE`, so the
+    // supervisor can still reach its `/proc`. The init of a warm-exec sandbox
+    // never execs and is deliberately unreadable, which is why a descriptor
+    // is the only route in.
+    let secrets_pair = if config.hold {
+        Some(
+            std::os::unix::net::UnixStream::pair()
+                .map_err(|e| Error::primitive("socketpair", "internal launcher error", e))?,
+        )
+    } else {
+        None
+    };
+    if let Some((_, theirs)) = &secrets_pair {
+        plan.secrets_fd = Some(theirs.as_raw_fd());
+    }
 
     // SAFETY: `plan` is fully materialised, the child touches only syscalls,
     // and both pipe ends are owned here.
@@ -303,27 +432,69 @@ pub fn launch(config: &SandboxConfig, hierarchy: Option<&cgroup::Hierarchy>) -> 
             // Nothing below may allocate. `child_main` never returns.
             drop(ready_write);
             drop(err_read);
+            if let Some((ours, _)) = secrets_pair {
+                drop(ours);
+            }
             unsafe { child::child_main(&plan, ready_read.as_raw_fd(), err_write.as_raw_fd()) }
         }
 
         clone::CloneResult::Parent { child: pid } => {
             drop(ready_read);
             drop(err_write);
+            // The child's end belongs to the child; holding a copy here would
+            // stop `recv` ever reporting the child's failure as end of file.
+            let secrets_sock = secrets_pair.map(|(ours, theirs)| {
+                drop(theirs);
+                ours
+            });
 
             let mut sandbox = NsSandbox {
                 pid,
                 state: SandboxState::Starting,
-                cgroup_dir: tenant_cgroup.clone(),
+                cgroup_dir: generation.clone(),
                 timeout: config.limits.timeout.get(),
                 exit_code: None,
+                namespaces: None,
+                pasta_pid_file: None,
+                dns: None,
+                secrets_dir: None,
             };
+
+            // For a held sandbox, open its namespaces now, while the child is
+            // parked waiting for its id maps. A namespace is the same object
+            // before and after the child pivots into it, so nothing is lost by
+            // taking the descriptors this early — and this is the one moment
+            // the child is guaranteed still dumpable, so no capability
+            // argument is needed for `/proc/<pid>/ns` to be readable.
+            if config.hold {
+                match crate::backend::NamespaceFds::open(pid) {
+                    Ok(fds) => sandbox.namespaces = Some(fds),
+                    Err(e) => {
+                        let _ = sandbox.kill();
+                        return Err(e);
+                    }
+                }
+            }
 
             // The child is blocked waiting for its identity. Give it one, then
             // put it in its cgroup — both must happen before it runs any code.
             let identity = write_id_maps(pid, &uid_map, &gid_map);
-            if let Some(dir) = &tenant_cgroup
+            if let Some(dir) = &generation
                 && identity.is_ok()
-                && let Err(e) = cgroup::attach(&dir.join("zygote"), pid)
+                && let Err(e) = cgroup::attach(&cgroup::Hierarchy::zygote(dir), pid)
+            {
+                let _ = sandbox.kill();
+                return Err(e);
+            }
+
+            // The network, while the child is still parked. `pasta` enters the
+            // user namespace, so it has to come after the id maps; the ruleset
+            // has to come before the child is released, or a sandbox would be
+            // briefly reachable with no allowlist at all. Any failure here
+            // takes the sandbox down rather than starting it unconfined.
+            if identity.is_ok()
+                && crate::net::needs_configuration(config.network)
+                && let Err(e) = configure_network(config, pid, &mut sandbox)
             {
                 let _ = sandbox.kill();
                 return Err(e);
@@ -344,21 +515,79 @@ pub fn launch(config: &SandboxConfig, hierarchy: Option<&cgroup::Hierarchy>) -> 
 
             // The write end is CLOEXEC, so a successful execve closes it and
             // this read sees EOF. Anything else is the child's failure report.
-            let mut payload = Vec::new();
-            let mut reader = std::fs::File::from(err_read);
-            reader.read_to_end(&mut payload).map_err(|e| {
-                Error::primitive("read launch status", "internal launcher error", e)
-            })?;
+            //
+            // Bounded: the launcher thread runs one sandbox at a time, so a
+            // child that neither execs nor reports leaves every later `serve`
+            // queued behind it for ever. That is what a wedged supervisor on
+            // a Raspberry Pi turned out to be — this thread parked in
+            // `pipe_read` with no end in sight.
+            let payload = match read_to_end_within(err_read, START_TIMEOUT) {
+                Ok(payload) => payload,
+                Err(e) => {
+                    let _ = sandbox.reap(true);
+                    return Err(e);
+                }
+            };
 
             if !payload.is_empty() {
                 let _ = sandbox.reap(true);
                 return Err(launch_failure(&payload));
             }
 
+            // The sandbox is up, so the child sent this before it hardened and
+            // it is sitting in the socket buffer. Bounded anyway: an unbounded
+            // read here would be one more way for a launcher thread to stop
+            // for ever, which is a lesson this file has already learned once.
+            if let Some(sock) = secrets_sock {
+                let _ = sock.set_read_timeout(Some(Duration::from_secs(10)));
+                match crate::net::linux::recv_fd(sock.as_raw_fd()) {
+                    Ok(dir) => sandbox.secrets_dir = Some(dir),
+                    Err(e) => {
+                        let _ = sandbox.reap(true);
+                        return Err(Error::primitive(
+                            "recvmsg",
+                            "the sandbox did not hand back /run/secrets; \
+                             secrets cannot be delivered to it",
+                            e,
+                        ));
+                    }
+                }
+            }
+
             sandbox.state = SandboxState::Warm;
             Ok(sandbox)
         }
     }
+}
+
+/// Hand the sandbox's network namespace to `pasta` and install its allowlist.
+///
+/// The pid file is recorded on the sandbox before `pasta` is started, so a
+/// `pasta` that came up and then failed the ruleset step is still stopped when
+/// the sandbox is torn down.
+fn configure_network(config: &SandboxConfig, pid: u32, sandbox: &mut NsSandbox) -> Result<()> {
+    let pid_file = config
+        .pasta_pid_file
+        .clone()
+        .ok_or_else(|| Error::BackendUnavailable {
+            backend: "network",
+            reason: format!(
+                "`network = \"{}\"` needs somewhere to record pasta's pid",
+                config.network
+            ),
+            remedy: "this is a Zygo bug: the caller did not set `pasta_pid_file`".into(),
+        })?;
+    sandbox.pasta_pid_file = Some(pid_file.clone());
+    sandbox.dns = crate::net::configure(
+        pid,
+        config.network,
+        &config.allow,
+        &config.allow_resolved,
+        config.allow_private_net,
+        &config.limits,
+        &pid_file,
+    )?;
+    Ok(())
 }
 
 /// Turn the child's `(step, errno)` report into a message that names the
@@ -407,9 +636,13 @@ fn write_id_maps(pid: u32, uid_map: &str, gid_map: &str) -> Result<()> {
     // unprivileged process.
     let _ = std::fs::write(format!("/proc/{pid}/setgroups"), "deny");
 
-    let single = |map: &str| map.lines().next().unwrap_or("").to_string();
+    // Without the helpers exactly one entry may be written: the caller's own.
+    // Which line that is depends on the sandbox user — see `identity_line`.
     let (uid_line, gid_line) = if multi_line {
-        (single(uid_map), single(gid_map))
+        (
+            idmap::identity_line(uid_map, unsafe { libc::getuid() }),
+            idmap::identity_line(gid_map, unsafe { libc::getgid() }),
+        )
     } else {
         (uid_map.to_string(), gid_map.to_string())
     };

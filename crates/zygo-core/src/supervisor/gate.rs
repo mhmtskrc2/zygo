@@ -117,9 +117,7 @@ impl Gate {
         state.queued += 1;
         let (mut state, timeout) = self
             .slot_freed
-            .wait_timeout_while(state, wait, |s| {
-                !s.closed && s.in_flight >= self.limit
-            })
+            .wait_timeout_while(state, wait, |s| !s.closed && s.in_flight >= self.limit)
             .expect("gate");
         // Decremented here rather than on each exit path below, so no early
         // return can leak a queue slot and shrink the queue for good.

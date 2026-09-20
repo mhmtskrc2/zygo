@@ -69,6 +69,16 @@ pub struct ImageEntry {
     pub size: u64,
     /// Unix seconds of the last pull.
     pub pulled_at: u64,
+    /// Digest of the multi-platform index the manifest was selected from,
+    /// when the registry served one. This is what `zygo.lock` pins, because
+    /// it names the same image on every architecture; `manifest` names this
+    /// host's build of it. `None` for a single-platform image, for images
+    /// pulled before this field existed, and for derived images.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<String>,
+    /// `os/arch` the manifest was selected for. `None` where `index` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
 }
 
 /// The on-disk image store.
@@ -265,8 +275,14 @@ impl Store {
             return Ok(RootfsView::Overlay { lower });
         }
 
-        let dir = self.flatten(layers)?;
-        create_mount_points(&dir, mount_points)?;
+        // The mount points are part of the key, not something written into a
+        // shared directory afterwards. Without that, two functions on the same
+        // image share one flattened rootfs and overwrite each other's mount
+        // points: measured with `zygo up` on a three-function spec, where a
+        // handler that did not exist created `/zygo/handler.py` as a directory
+        // and the next two functions failed with ENOTDIR trying to bind a file
+        // onto it. Identical shapes still share, which is the common case.
+        let dir = self.flatten_with_mount_points(layers, mount_points)?;
         Ok(RootfsView::Flat { dir })
     }
 
@@ -305,10 +321,34 @@ impl Store {
     /// Materialise layers into a single directory, applying whiteouts. Cached
     /// under `cache/flat/<key>` and shared by every image with the same stack.
     pub fn flatten(&self, layers: &[String]) -> Result<PathBuf> {
+        self.flatten_with_mount_points(layers, &[])
+    }
+
+    /// Flatten, with the mount points a sandbox needs baked in.
+    ///
+    /// Keyed on both, because the mount points are created *inside* the result:
+    /// a directory keyed on the layers alone would be shared by every function
+    /// using that image, and the first one to run would decide whether
+    /// `/zygo/handler.py` is a file or a directory for all of them.
+    pub fn flatten_with_mount_points(
+        &self,
+        layers: &[String],
+        mount_points: &[MountPoint],
+    ) -> Result<PathBuf> {
         let mut key = Sha256::new();
         for d in layers {
             key.update(d.as_bytes());
             key.update(b"\n");
+        }
+        let mut sorted: Vec<MountPoint> = mount_points.to_vec();
+        sorted.sort_by(|a, b| a.path.cmp(&b.path));
+        sorted.dedup_by(|a, b| a.path == b.path);
+        for p in &sorted {
+            key.update(p.path.as_os_str().as_encoded_bytes());
+            key.update(match p.kind {
+                MountPointKind::Directory => b"/d\n".as_slice(),
+                MountPointKind::File => b"/f\n".as_slice(),
+            });
         }
         let key = hex::encode(key.finalize());
         let dir = self.paths.flat_cache().join(&key);
@@ -320,6 +360,7 @@ impl Store {
         if dir.join(LAYER_DONE).is_file() {
             return Ok(dir);
         }
+        let mount_points = sorted;
         if dir.exists() {
             std::fs::remove_dir_all(&dir).at(&dir)?;
         }
@@ -345,6 +386,11 @@ impl Store {
             }
             copy_tree(&src, &dir)?;
         }
+
+        // After the layers, so the image's own version of a path wins, and
+        // before the done marker, so nobody sees a rootfs whose mount points
+        // are only half there.
+        create_mount_points(&dir, &mount_points)?;
 
         let done = dir.join(LAYER_DONE);
         std::fs::write(&done, b"").at(&done)?;
@@ -630,12 +676,18 @@ fn unpack_err(e: std::io::Error) -> crate::Error {
 
 /// Recursive copy used by [`Store::flatten`]. Later layers overwrite earlier
 /// ones, which is exactly overlay semantics.
+/// Whether a directory entry is the store's own bookkeeping rather than part
+/// of an image: the done marker and the whiteout sidecar.
+pub(crate) fn is_internal_entry(name: &std::ffi::OsStr) -> bool {
+    name == LAYER_DONE || name == WHITEOUT_FILE
+}
+
 fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     for entry in std::fs::read_dir(src).at(src)? {
         let entry = entry.at(src)?;
         let name = entry.file_name();
         // Internal bookkeeping never reaches the rootfs.
-        if name == LAYER_DONE || name == WHITEOUT_FILE {
+        if is_internal_entry(&name) {
             continue;
         }
         let from = entry.path();
@@ -1060,6 +1112,87 @@ mod tests {
         assert_eq!(std::fs::read(flat.join("f")).unwrap(), b"new");
     }
 
+    /// Put one layer in the store and return its digest.
+    fn write_layer(s: &Store, files: &[(&str, &[u8])]) -> String {
+        let tar = tar_of(files);
+        let digest = sha256_of(&tar);
+        s.write_blob(&digest, &tar[..]).unwrap();
+        s.unpack_layer(&digest, LayerCompression::None).unwrap();
+        digest
+    }
+
+    #[test]
+    fn two_functions_on_one_image_do_not_share_a_mount_point_kind() {
+        // Found by `zygo up` on a three-function spec: the flattened rootfs was
+        // keyed on the layers alone, so the first function to run decided
+        // whether `/zygo/handler.py` was a file or a directory and the next two
+        // failed with ENOTDIR trying to bind a file onto it.
+        let (_t, s) = store();
+        let layer = write_layer(&s, &[("bin/sh", b"#!/bin/sh")]);
+        let layers = vec![layer];
+
+        let as_file = [MountPoint {
+            path: "zygo/handler.py".into(),
+            kind: MountPointKind::File,
+        }];
+        let as_dir = [MountPoint {
+            path: "zygo/handler.py".into(),
+            kind: MountPointKind::Directory,
+        }];
+
+        let file_root = s.flatten_with_mount_points(&layers, &as_file).unwrap();
+        let dir_root = s.flatten_with_mount_points(&layers, &as_dir).unwrap();
+
+        assert_ne!(file_root, dir_root, "the two shapes shared a rootfs");
+        assert!(file_root.join("zygo/handler.py").is_file());
+        assert!(dir_root.join("zygo/handler.py").is_dir());
+        // And the first one is still intact after the second was built.
+        assert!(
+            file_root.join("zygo/handler.py").is_file(),
+            "building the second rootfs changed the first"
+        );
+    }
+
+    #[test]
+    fn the_same_shape_still_shares_one_rootfs() {
+        // The saving that made a shared directory tempting in the first place:
+        // every function of the same image with the same mounts is the common
+        // case, and it must not become a copy each.
+        let (_t, s) = store();
+        let layer = write_layer(&s, &[("bin/sh", b"#!/bin/sh")]);
+        let layers = vec![layer];
+        let points = [MountPoint {
+            path: "zygo/handler.py".into(),
+            kind: MountPointKind::File,
+        }];
+
+        let first = s.flatten_with_mount_points(&layers, &points).unwrap();
+        let second = s.flatten_with_mount_points(&layers, &points).unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn mount_points_are_there_before_the_rootfs_is_declared_ready() {
+        // Half-built rootfs directories are what the done marker exists to
+        // prevent, and the mount points are part of being built.
+        let (_t, s) = store();
+        let layer = write_layer(&s, &[("bin/sh", b"#!/bin/sh")]);
+        let points = [
+            MountPoint {
+                path: "zygo/agent.py".into(),
+                kind: MountPointKind::File,
+            },
+            MountPoint {
+                path: "tmp".into(),
+                kind: MountPointKind::Directory,
+            },
+        ];
+        let root = s.flatten_with_mount_points(&[layer], &points).unwrap();
+        assert!(root.join(LAYER_DONE).is_file());
+        assert!(root.join("zygo/agent.py").is_file());
+        assert!(root.join("tmp").is_dir());
+    }
+
     #[test]
     fn rootfs_view_prefers_overlay_but_flattens_when_whiteouts_exist() {
         let (_t, s) = store();
@@ -1141,6 +1274,8 @@ mod tests {
             layers: vec![sha256_of(b"l")],
             size: 10,
             pulled_at: 1,
+            index: None,
+            platform: None,
         };
         s.put(entry.clone()).unwrap();
         s.put(ImageEntry {
@@ -1178,6 +1313,8 @@ mod tests {
             layers: vec![kept_d],
             size: 1,
             pulled_at: 1,
+            index: None,
+            platform: None,
         })
         .unwrap();
 

@@ -22,6 +22,11 @@ pub enum Error {
 
     /// A kernel primitive the sandbox depends on failed or is unavailable.
     /// `remedy` is shown to the user verbatim.
+    ///
+    /// `operation` is written to read as the subject of "failed", so it is
+    /// usually a syscall name — but not always: a wall-clock timeout reads
+    /// better as "the sandbox failed: Connection timed out" than as the
+    /// syscall that noticed.
     #[error("{operation} failed: {source}\n  → {remedy}")]
     Primitive {
         operation: &'static str,
@@ -73,10 +78,21 @@ impl Error {
 
     /// Process exit code for this error, following the CLI convention:
     /// 1 = generic failure, 2 = usage/spec error, 125 = environment cannot run
-    /// the sandbox (mirrors `docker run`'s "daemon error" code).
+    /// the sandbox (mirrors `docker run`'s "daemon error" code), 137 = the
+    /// sandbox was killed.
+    ///
+    /// A sandbox that overran its wall-clock budget reports **137**, not 125.
+    /// 125 means "the host could not run this"; a timeout means the host ran it
+    /// and then killed it, which is a different thing for anything reading exit
+    /// codes. 137 is `128 + SIGKILL`, the same answer `docker run` gives and
+    /// literally what happened — the deadline is enforced with `cgroup.kill` or
+    /// a `SIGKILL` to every member of the request's cgroup.
     pub fn exit_code(&self) -> i32 {
         match self {
             Error::Spec(_) => 2,
+            Error::Primitive { source, .. } if source.raw_os_error() == Some(libc::ETIMEDOUT) => {
+                128 + libc::SIGKILL
+            }
             Error::BackendUnavailable { .. } | Error::Primitive { .. } => 125,
             _ => 1,
         }
@@ -91,5 +107,54 @@ pub trait IoContext<T> {
 impl<T> IoContext<T> for std::result::Result<T, std::io::Error> {
     fn at(self, path: impl Into<PathBuf>) -> Result<T> {
         self.map_err(|e| Error::io(path, e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn primitive(errno: i32) -> Error {
+        Error::primitive(
+            "timeout",
+            "raise `timeout` if the work legitimately takes longer",
+            std::io::Error::from_raw_os_error(errno),
+        )
+    }
+
+    #[test]
+    fn a_timed_out_sandbox_reports_that_it_was_killed() {
+        // 137 = 128 + SIGKILL, the same answer `docker run` gives — and what
+        // actually happened, since the deadline is enforced by killing the
+        // request's cgroup.
+        assert_eq!(primitive(libc::ETIMEDOUT).exit_code(), 137);
+    }
+
+    #[test]
+    fn a_host_that_cannot_run_the_sandbox_is_a_different_code() {
+        // The distinction a script branches on: 125 is "this host could not
+        // run it", 137 is "it ran and was killed".
+        assert_eq!(primitive(libc::ENOSYS).exit_code(), 125);
+        assert_eq!(
+            Error::BackendUnavailable {
+                backend: "ns",
+                reason: "no cgroup v2".into(),
+                remedy: "delegate controllers".into(),
+            }
+            .exit_code(),
+            125
+        );
+    }
+
+    #[test]
+    fn a_spec_problem_is_a_usage_error() {
+        assert_eq!(
+            Error::Spec(crate::spec::SpecError::Read {
+                file: "sandbox.toml".into(),
+                message: "no such file".into(),
+            })
+            .exit_code(),
+            2
+        );
     }
 }

@@ -39,6 +39,16 @@ pub struct Limits {
     pub nofile: u64,
     /// `RLIMIT_FSIZE`.
     pub fsize: Bytes,
+    /// Concurrent TCP connections, enforced by an nftables connection count
+    /// inside the sandbox's network namespace. Meaningless for a sandbox
+    /// without a network, and harmless there.
+    pub connections: u32,
+    /// Bytes per second the sandbox may **send**, enforced by a `tc` token
+    /// bucket inside the namespace. What it receives is shaped the same way
+    /// only where the host has an `ifb` device to queue ingress through;
+    /// without one it is not shaped, and the supervisor says so. `None` leaves
+    /// the link unlimited.
+    pub bandwidth: Option<Bytes>,
 }
 
 /// One `(file, contents)` pair to write under a cgroup v2 directory.
@@ -172,6 +182,8 @@ mod tests {
             mem_high: Bytes::from_mib(256).scaled(0.9),
             swap: Bytes(0),
             oom_group: true,
+            connections: 256,
+            bandwidth: None,
             cpu: Cpu(0.5),
             pids: 64,
             timeout: Duration::from_secs(30),

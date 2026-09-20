@@ -19,6 +19,9 @@
 //! - [`protocol`] — the language-independent warm execution wire protocol.
 //! - [`supervisor`] — the process that owns the warm pool between commands,
 //!   and the control protocol the CLI reaches it over.
+//! - [`venv`] — the dependency cache: `requirements.txt` built once, inside
+//!   the image it will run in, and shared by every function that lists the
+//!   same one.
 //! - [`doctor`] — environment probing, shared by `zygo doctor` and by backend
 //!   preflight checks.
 //!
@@ -27,15 +30,20 @@
 
 pub mod backend;
 pub mod cgroup;
+pub mod derive;
 pub mod doctor;
 pub mod error;
 pub mod image;
+pub mod lock;
+pub mod net;
+pub mod oci;
 pub mod paths;
 pub mod pool;
 pub mod protocol;
 pub mod sandbox;
 pub mod spec;
 pub mod supervisor;
+pub mod venv;
 
 pub use error::{Error, Result};
 pub use paths::Paths;

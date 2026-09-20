@@ -103,7 +103,7 @@ impl RegistryClient {
             reference: reference.to_string(),
         });
 
-        let (manifest, manifest_digest) = self.resolve_manifest(reference).await?;
+        let (manifest, manifest_digest, index_digest) = self.resolve_manifest(reference).await?;
 
         // Config first: it is small, and a failure here is a cheap failure.
         let config_bytes = self
@@ -154,6 +154,11 @@ impl RegistryClient {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
+            index: index_digest,
+            platform: Some(format!(
+                "{}/{}",
+                self.platform.os, self.platform.architecture
+            )),
         };
         self.store.put(entry.clone())?;
 
@@ -166,7 +171,14 @@ impl RegistryClient {
 
     /// Fetch the manifest, resolving a multi-platform index to the entry for
     /// this platform.
-    async fn resolve_manifest(&self, reference: &Reference) -> Result<(Manifest, String)> {
+    ///
+    /// Returns the manifest, its digest, and the digest of the index it was
+    /// selected from when there was one — the name that means the same image
+    /// on every architecture, which is what a lock file has to record.
+    async fn resolve_manifest(
+        &self,
+        reference: &Reference,
+    ) -> Result<(Manifest, String, Option<String>)> {
         let url = format!(
             "{}/{}/manifests/{}",
             self.base_url(reference),
@@ -219,12 +231,17 @@ impl RegistryClient {
                         },
                     })?;
 
+            let index_digest = digest.unwrap_or_else(|| {
+                use sha2::{Digest, Sha256};
+                format!("sha256:{}", hex::encode(Sha256::digest(&body)))
+            });
             // Recurse once, pinned to the selected manifest digest.
             let pinned = Reference {
                 digest: Some(descriptor.digest.clone()),
                 ..reference.clone()
             };
-            return Box::pin(self.resolve_manifest(&pinned)).await;
+            let (manifest, manifest_digest, _) = Box::pin(self.resolve_manifest(&pinned)).await?;
+            return Ok((manifest, manifest_digest, Some(index_digest)));
         }
 
         let manifest: Manifest = serde_json::from_slice(&body)
@@ -236,7 +253,7 @@ impl RegistryClient {
         });
 
         self.store.write_blob(&digest, body.as_ref())?;
-        Ok((manifest, digest))
+        Ok((manifest, digest, None))
     }
 
     /// Read the image config, for default argv and environment.

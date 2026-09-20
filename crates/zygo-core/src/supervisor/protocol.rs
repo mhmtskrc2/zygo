@@ -49,6 +49,23 @@ pub enum Request {
         allow_host_net: bool,
         allow_private_net: bool,
         allow_unlimited: bool,
+        /// Secret values by name, read from the *client's* environment.
+        ///
+        /// The client's, not the supervisor's: the supervisor was started by
+        /// whichever command needed one first and inherited that environment,
+        /// which is nobody's idea of where `STRIPE_KEY` lives. The spec names
+        /// the secrets; the shell that runs `zygo serve` supplies them.
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        secrets: std::collections::BTreeMap<String, String>,
+        /// Leave the function alone if what is registered under this name is
+        /// already exactly this: the same resolved spec, the same secret
+        /// values, the same handler and requirements bytes on disk.
+        ///
+        /// `zygo up` sets this, so running it twice is not two deploys. A bare
+        /// `zygo serve` leaves it off: the user just said what they want, and
+        /// "already running" is not an answer to that.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        if_changed: bool,
     },
 
     /// Call a warm function.
@@ -70,6 +87,62 @@ pub enum Request {
     /// Liveness probe, used by the client to decide whether an existing socket
     /// belongs to a supervisor that is actually running.
     Ping,
+
+    /// Where to enter a function's sandbox, for `zygo shell`.
+    ///
+    /// The supervisor answers with a pid and stops there. It does not run the
+    /// shell: a terminal would then have to be proxied over this socket, and
+    /// the client can do the whole thing itself — it runs as the same user, so
+    /// entering the user namespace Zygo created grants it the same capability
+    /// set inside that namespace as the supervisor would have had.
+    Shell { name: String },
+
+    /// A function's recent log: the zygote's own output and one entry per
+    /// request.
+    ///
+    /// `after` is the sequence number to start from — zero for "the last
+    /// `limit`", anything else for "everything since", which is how
+    /// `zygo logs -f` follows without a stream.
+    Logs {
+        name: String,
+        #[serde(default)]
+        after: u64,
+        #[serde(default = "default_log_limit")]
+        limit: u32,
+        #[serde(default)]
+        failed: bool,
+    },
+
+    /// Make a registered function warm now, without calling it.
+    ///
+    /// For the moment after a deploy: a function that went cold, or one that
+    /// is paused, is brought back so the first real request does not pay for
+    /// it. A function that was never served is `not_found` — this warms, it
+    /// does not register.
+    Warm { name: String },
+}
+
+fn default_log_limit() -> u32 {
+    50
+}
+
+/// What a `SERVE` did to the name it served.
+///
+/// A deploy tool reads this to say "3 replaced, 7 unchanged" rather than
+/// listing ten green ticks that hide which functions actually restarted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Change {
+    /// Nothing held the name; a sandbox was started.
+    #[default]
+    Started,
+    /// Something held the name and this is its replacement: the new sandbox
+    /// was warm before the old one stopped taking requests, and requests the
+    /// old one had accepted finish on it.
+    Replaced,
+    /// The function already registered was identical, so it was kept —
+    /// counters, resident pages and all. Only with `if_changed`.
+    Unchanged,
 }
 
 /// Supervisor → CLI. Exactly one per request.
@@ -93,14 +166,48 @@ pub enum Response {
         warm_ms: f64,
         /// Non-fatal resolution notes. The CLI prints them.
         warnings: Vec<String>,
+        /// What serving did to whatever held the name before.
+        #[serde(default)]
+        change: Change,
     },
 
     /// A request ran. `outcome.succeeded()` says whether the handler liked it.
-    Executed { outcome: Box<Outcome> },
+    Executed {
+        outcome: Box<Outcome>,
+    },
 
-    Functions { functions: Vec<Status> },
+    Functions {
+        functions: Vec<Status>,
+    },
 
-    Stopped { names: Vec<String> },
+    Stopped {
+        names: Vec<String>,
+    },
+
+    /// Answer to `Shell`: the sandbox's first process, on the host.
+    ///
+    /// `/proc/<pid>/ns/*` is every namespace the sandbox is made of. The pid is
+    /// only useful to a client on the same host and as the same user, which is
+    /// the only kind this socket has.
+    Sandbox {
+        name: String,
+        pid: u32,
+        /// The function's `workdir`, so the shell starts where a request does.
+        workdir: std::path::PathBuf,
+    },
+
+    /// Answer to `Logs`. `next` is what to pass as `after` to continue.
+    Logs {
+        name: String,
+        entries: Vec<crate::pool::LogEntry>,
+        next: u64,
+    },
+
+    /// Answer to `Warm`: the function's state afterwards.
+    Warmed {
+        name: String,
+        state: crate::sandbox::SandboxState,
+    },
 
     Pong,
 
@@ -201,6 +308,11 @@ mod tests {
                 allow_host_net: false,
                 allow_private_net: true,
                 allow_unlimited: false,
+                secrets: std::collections::BTreeMap::from([(
+                    "STRIPE_KEY".to_string(),
+                    "sk_test_123".to_string(),
+                )]),
+                if_changed: true,
             },
             Request::Exec {
                 name: "resize".into(),
@@ -214,6 +326,18 @@ mod tests {
             Request::Stop { name: None },
             Request::Shutdown,
             Request::Ping,
+            Request::Warm {
+                name: "resize".into(),
+            },
+            Request::Shell {
+                name: "resize".into(),
+            },
+            Request::Logs {
+                name: "resize".into(),
+                after: 17,
+                limit: 20,
+                failed: true,
+            },
         ];
         for r in &requests {
             assert_eq!(&roundtrip_request(r), r, "{r:?}");
@@ -235,6 +359,7 @@ mod tests {
                 imports_ms: 120.5,
                 warm_ms: 310.0,
                 warnings: vec!["scratch is larger than memory".into()],
+                change: Change::Replaced,
             },
             Response::Functions {
                 functions: vec![Status {
@@ -249,6 +374,39 @@ mod tests {
             },
             Response::Stopped {
                 names: vec!["resize".into()],
+            },
+            Response::Warmed {
+                name: "resize".into(),
+                state: crate::sandbox::SandboxState::Warm,
+            },
+            Response::Sandbox {
+                name: "resize".into(),
+                pid: 4242,
+                workdir: "/zygo".into(),
+            },
+            Response::Logs {
+                name: "resize".into(),
+                entries: vec![
+                    crate::pool::LogEntry {
+                        seq: 3,
+                        at_ms: 1_700_000_000_000,
+                        kind: crate::pool::LogKind::Zygote,
+                        text: "warming up".into(),
+                    },
+                    crate::pool::LogEntry {
+                        seq: 4,
+                        at_ms: 1_700_000_000_500,
+                        kind: crate::pool::LogKind::Request {
+                            id: "01f3".into(),
+                            exit_code: 1,
+                            wall_ms: 12.5,
+                            error: Some("ZeroDivisionError".into()),
+                            stderr: "Traceback".into(),
+                        },
+                        text: String::new(),
+                    },
+                ],
+                next: 5,
             },
             Response::Busy {
                 name: "resize".into(),
@@ -279,6 +437,7 @@ mod tests {
                 wall_ms: 1.25,
                 ..Default::default()
             },
+            timed_out: false,
         };
         let sent = Response::Executed {
             outcome: Box::new(outcome.clone()),
@@ -301,6 +460,7 @@ mod tests {
             stderr: "Traceback...\n".into(),
             error: Some("ZeroDivisionError: division by zero".into()),
             metrics: crate::protocol::Metrics::default(),
+            timed_out: false,
         };
         let sent = Response::Executed {
             outcome: Box::new(outcome),
@@ -333,7 +493,8 @@ mod tests {
         .expect("json");
         assert_eq!(json["type"], "BUSY");
 
-        let json = serde_json::to_value(Response::error(ControlError::NotFound, "x")).expect("json");
+        let json =
+            serde_json::to_value(Response::error(ControlError::NotFound, "x")).expect("json");
         assert_eq!(json["type"], "ERROR");
         assert_eq!(json["code"], "not_found");
     }
@@ -354,6 +515,61 @@ mod tests {
                 serde_json::to_value(code).expect("json"),
                 serde_json::Value::String(want.into()),
                 "`as_str` and serde must not drift apart"
+            );
+        }
+    }
+
+    #[test]
+    fn a_serve_with_no_secrets_does_not_put_an_empty_map_on_the_wire() {
+        // Keeps the common frame small, and keeps a client that predates the
+        // field able to read the JSON a newer one produces.
+        let request = Request::Serve {
+            name: "f".into(),
+            spec: None,
+            layer: Box::default(),
+            base_dir: "/p".into(),
+            allow_host_net: false,
+            allow_private_net: false,
+            allow_unlimited: false,
+            secrets: Default::default(),
+            if_changed: false,
+        };
+        // The *top-level* key, not the word: the layer inside has a `secrets`
+        // field of its own (the names), and that one is allowed to be there.
+        let json = serde_json::to_value(&request).expect("json");
+        assert!(json.get("secrets").is_none(), "{json}");
+        assert!(json.get("if_changed").is_none(), "{json}");
+        assert_eq!(roundtrip_request(&request), request);
+    }
+
+    #[test]
+    fn a_frame_from_before_blue_green_still_parses() {
+        // Both sides default the fields blue/green added, so a client and a
+        // supervisor from either side of that change keep understanding each
+        // other without a control-version bump.
+        let serve = br#"{"type":"SERVE","name":"f","spec":null,"layer":{},"base_dir":"/p",
+            "allow_host_net":false,"allow_private_net":false,"allow_unlimited":false}"#;
+        match crate::protocol::frame::decode::<Request>(serve).expect("decode") {
+            Request::Serve { if_changed, .. } => assert!(!if_changed),
+            other => panic!("{other:?}"),
+        }
+
+        let served = br#"{"type":"SERVED","name":"f","runtime":"exec","rss_kb":1,
+            "imports_ms":0.0,"warm_ms":2.0,"warnings":[]}"#;
+        match crate::protocol::frame::decode::<Response>(served).expect("decode") {
+            Response::Served { change, .. } => assert_eq!(change, Change::Started),
+            other => panic!("{other:?}"),
+        }
+
+        // And the names a deploy script will grep for.
+        for (change, want) in [
+            (Change::Started, "started"),
+            (Change::Replaced, "replaced"),
+            (Change::Unchanged, "unchanged"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(change).expect("json"),
+                serde_json::Value::String(want.into())
             );
         }
     }

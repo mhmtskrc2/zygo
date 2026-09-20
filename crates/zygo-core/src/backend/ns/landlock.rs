@@ -131,6 +131,64 @@ pub struct PathRule {
     pub rights: u64,
 }
 
+/// One TCP port the sandbox may use, and for what (ABI v4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetRule {
+    pub port: u16,
+    pub rights: u64,
+}
+
+/// What the network policy asks Landlock to do at the process level, on top
+/// of — never instead of — the nftables ruleset inside the namespace.
+///
+/// Landlock's network rules are by port only; they cannot say *where*. So they
+/// are defence in depth: a second, independent mechanism that refuses a
+/// `connect()` to a port nothing in the allowlist names before a packet
+/// exists, and refuses `bind()` in every networked mode because no mode has
+/// ingress.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetPolicy {
+    /// No network at all: deny both `bind` and `connect`.
+    Sealed,
+    /// Egress allowlist: deny `bind`; allow `connect` on exactly these ports.
+    /// An empty list means *every* port is allowed, because a rule with no
+    /// port permits them all and Landlock cannot express "any port to this
+    /// host".
+    Egress(Vec<u16>),
+    /// Unrestricted egress: deny `bind` only.
+    Open,
+    /// The host's network namespace: Landlock has nothing to add.
+    Unrestricted,
+}
+
+impl NetPolicy {
+    /// Derive the policy from the resolved function.
+    pub fn of(network: Network, allow: &[crate::spec::AllowRule]) -> NetPolicy {
+        match network {
+            Network::None => NetPolicy::Sealed,
+            Network::Host => NetPolicy::Unrestricted,
+            Network::Full => NetPolicy::Open,
+            Network::Egress => {
+                let mut ports = Vec::new();
+                for rule in allow {
+                    match rule.port {
+                        Some(p) => ports.push(p),
+                        // A host with no port means any port. Landlock cannot
+                        // narrow that, so it steps aside on `connect` and
+                        // leaves it to nftables, which can.
+                        None => return NetPolicy::Egress(Vec::new()),
+                    }
+                }
+                // DNS over TCP, to the forced resolver. UDP is not Landlock's.
+                ports.push(53);
+                ports.sort_unstable();
+                ports.dedup();
+                NetPolicy::Egress(ports)
+            }
+        }
+    }
+}
+
 /// The whole ruleset, materialised before `clone3`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ruleset {
@@ -138,6 +196,8 @@ pub struct Ruleset {
     pub handled_fs: u64,
     pub handled_net: u64,
     pub rules: Vec<PathRule>,
+    /// Empty unless the ABI is v4+ and the policy names ports.
+    pub net_rules: Vec<NetRule>,
 }
 
 impl Ruleset {
@@ -156,13 +216,14 @@ impl Ruleset {
 ///
 /// `abi == 0` means the kernel has no Landlock; the result is empty and the
 /// caller skips it.
-pub fn build(abi: u32, plan: &MountPlan, network: Network) -> Ruleset {
+pub fn build(abi: u32, plan: &MountPlan, network: NetPolicy) -> Ruleset {
     if abi == 0 {
         return Ruleset {
             abi: 0,
             handled_fs: 0,
             handled_net: 0,
             rules: Vec::new(),
+            net_rules: Vec::new(),
         };
     }
 
@@ -189,19 +250,37 @@ pub fn build(abi: u32, plan: &MountPlan, network: Network) -> Ruleset {
     rules.sort_by(|a, b| a.path.cmp(&b.path));
     rules.dedup_by(|a, b| a.path == b.path);
 
+    // Handling a right while adding no rule for it denies it outright. That
+    // is the whole mechanism: `bind` is handled everywhere a namespace exists
+    // and never granted, so no mode can listen; `connect` is handled where
+    // the allowlist names ports, and granted on exactly those.
+    let (handled_net, net_rules) = if handled_net_access(abi) == 0 {
+        (0, Vec::new())
+    } else {
+        match &network {
+            NetPolicy::Sealed => (ACCESS_NET_BIND_TCP | ACCESS_NET_CONNECT_TCP, Vec::new()),
+            NetPolicy::Open => (ACCESS_NET_BIND_TCP, Vec::new()),
+            NetPolicy::Egress(ports) if ports.is_empty() => (ACCESS_NET_BIND_TCP, Vec::new()),
+            NetPolicy::Egress(ports) => (
+                ACCESS_NET_BIND_TCP | ACCESS_NET_CONNECT_TCP,
+                ports
+                    .iter()
+                    .map(|&port| NetRule {
+                        port,
+                        rights: ACCESS_NET_CONNECT_TCP,
+                    })
+                    .collect(),
+            ),
+            NetPolicy::Unrestricted => (0, Vec::new()),
+        }
+    };
+
     Ruleset {
         abi,
         handled_fs: handled_fs_access(abi),
-        // Handling a right while adding no rule for it denies it outright, so
-        // a sandbox with no network gets TCP refused at the process level too —
-        // on top of having no interfaces to use (design doc §3.8).
-        handled_net: match network {
-            Network::None => handled_net_access(abi),
-            // Egress and full still go through nftables and pasta; restricting
-            // `connect` here would break them, and the allowlist lives there.
-            _ => 0,
-        },
+        handled_net,
         rules,
+        net_rules,
     }
 }
 
@@ -223,6 +302,16 @@ const SYS_LANDLOCK_RESTRICT_SELF: libc::c_long = 446;
 
 const CREATE_RULESET_VERSION: libc::c_uint = 1;
 const RULE_PATH_BENEATH: libc::c_uint = 1;
+/// `LANDLOCK_RULE_NET_PORT`, ABI v4.
+const RULE_NET_PORT: libc::c_uint = 2;
+
+/// `struct landlock_net_port_attr`: two `u64`s, no packing surprises.
+#[repr(C)]
+#[derive(Debug)]
+struct NetPortAttr {
+    allowed_access: u64,
+    port: u64,
+}
 
 /// `struct landlock_ruleset_attr`.
 ///
@@ -334,6 +423,27 @@ pub unsafe fn apply(ruleset: &Ruleset) -> Result<(), std::io::Error> {
         }
     }
 
+    for rule in &ruleset.net_rules {
+        let attr = NetPortAttr {
+            allowed_access: rule.rights,
+            port: u64::from(rule.port),
+        };
+        let rc = unsafe {
+            libc::syscall(
+                SYS_LANDLOCK_ADD_RULE,
+                ruleset_fd,
+                RULE_NET_PORT,
+                &attr as *const NetPortAttr,
+                0usize,
+            )
+        };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            unsafe { libc::close(ruleset_fd) };
+            return Err(err);
+        }
+    }
+
     let rc = unsafe { libc::syscall(SYS_LANDLOCK_RESTRICT_SELF, ruleset_fd, 0usize) };
     unsafe { libc::close(ruleset_fd) };
     if rc != 0 {
@@ -355,6 +465,8 @@ mod tests {
             mem_high: Bytes::from_mib(230),
             swap: Bytes(0),
             oom_group: true,
+            connections: 256,
+            bandwidth: None,
             cpu: Cpu(1.0),
             pids: 64,
             timeout: Duration::from_secs(30),
@@ -376,7 +488,7 @@ mod tests {
 
     #[test]
     fn an_unavailable_abi_produces_nothing_to_apply() {
-        let r = build(0, &plan(&[]), Network::None);
+        let r = build(0, &plan(&[]), NetPolicy::Sealed);
         assert!(r.is_empty());
         assert!(r.rules.is_empty());
         assert_eq!(r.handled_fs, 0);
@@ -388,7 +500,7 @@ mod tests {
             "/host/ro:/ro".parse::<Mount>().unwrap(),
             "/host/rw:/rw:rw".parse::<Mount>().unwrap(),
         ];
-        let r = build(1, &plan(&mounts), Network::None);
+        let r = build(1, &plan(&mounts), NetPolicy::Sealed);
 
         let rights = |p: &str| {
             r.rules
@@ -421,7 +533,7 @@ mod tests {
 
     #[test]
     fn writable_paths_are_named_as_the_sandbox_sees_them() {
-        let r = build(1, &plan(&[]), Network::None);
+        let r = build(1, &plan(&[]), NetPolicy::Sealed);
         for rule in &r.rules {
             let path = rule.path.to_str().unwrap();
             assert!(path.starts_with('/'), "{path} is not absolute");
@@ -434,7 +546,7 @@ mod tests {
 
     #[test]
     fn rules_are_sorted_and_unique() {
-        let r = build(1, &plan(&[]), Network::None);
+        let r = build(1, &plan(&[]), NetPolicy::Sealed);
         let mut sorted = r.rules.clone();
         sorted.sort_by(|a, b| a.path.cmp(&b.path));
         assert_eq!(r.rules, sorted);
@@ -489,23 +601,99 @@ mod tests {
     }
 
     /// Handling a network right while adding no rule for it denies it. That is
-    /// wanted for `network = "none"` and wrong for egress, where the allowlist
-    /// lives in nftables and pasta.
+    /// the whole mechanism: `bind` is handled and never granted wherever a
+    /// namespace exists, so nothing can listen; `connect` is handled only where
+    /// the allowlist names ports, and granted on exactly those.
     #[test]
-    fn tcp_is_denied_only_when_the_sandbox_has_no_network_at_all() {
-        let none = build(4, &plan(&[]), Network::None);
-        assert_ne!(
-            none.handled_net, 0,
-            "a no-network sandbox should not reach TCP"
+    fn a_sealed_sandbox_can_neither_bind_nor_connect() {
+        let none = build(4, &plan(&[]), NetPolicy::Sealed);
+        assert_eq!(
+            none.handled_net,
+            ACCESS_NET_BIND_TCP | ACCESS_NET_CONNECT_TCP
         );
+        assert!(none.net_rules.is_empty(), "handled and never granted");
+    }
 
-        for network in [Network::Egress, Network::Full, Network::Host] {
-            let r = build(4, &plan(&[]), network);
-            assert_eq!(
-                r.handled_net, 0,
-                "{network} routes through the network policy, not Landlock"
+    #[test]
+    fn no_networked_mode_may_listen() {
+        // No mode has ingress, so `bind` is refused at the process level in
+        // every one of them — including `full`, whose egress is unrestricted.
+        for policy in [
+            NetPolicy::Open,
+            NetPolicy::Egress(vec![443]),
+            NetPolicy::Egress(vec![]),
+        ] {
+            let r = build(4, &plan(&[]), policy.clone());
+            assert_ne!(r.handled_net & ACCESS_NET_BIND_TCP, 0, "{policy:?}");
+            assert!(
+                r.net_rules
+                    .iter()
+                    .all(|n| n.rights & ACCESS_NET_BIND_TCP == 0),
+                "{policy:?} granted bind"
             );
         }
+        let host = build(4, &plan(&[]), NetPolicy::Unrestricted);
+        assert_eq!(
+            host.handled_net, 0,
+            "the host's namespace is not ours to police"
+        );
+    }
+
+    #[test]
+    fn egress_grants_connect_on_exactly_the_listed_ports() {
+        let r = build(4, &plan(&[]), NetPolicy::Egress(vec![53, 443, 5432]));
+        assert_ne!(r.handled_net & ACCESS_NET_CONNECT_TCP, 0);
+        let ports: Vec<u16> = r.net_rules.iter().map(|n| n.port).collect();
+        assert_eq!(ports, [53, 443, 5432]);
+        assert!(
+            r.net_rules
+                .iter()
+                .all(|n| n.rights == ACCESS_NET_CONNECT_TCP)
+        );
+    }
+
+    #[test]
+    fn a_rule_without_a_port_leaves_connect_to_nftables() {
+        // Landlock cannot say "any port to this host", so handling `connect`
+        // with a port list would refuse what the allowlist permits. It steps
+        // aside on `connect` and keeps only the `bind` denial.
+        let r = build(4, &plan(&[]), NetPolicy::Egress(vec![]));
+        assert_eq!(r.handled_net, ACCESS_NET_BIND_TCP);
+        assert!(r.net_rules.is_empty());
+    }
+
+    #[test]
+    fn the_policy_is_derived_from_the_allowlist() {
+        let rules: Vec<crate::spec::AllowRule> = ["api.example.com:443", "10.0.0.0/8:5432"]
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        // Sorted, de-duplicated, and with 53 added for DNS over TCP.
+        assert_eq!(
+            NetPolicy::of(Network::Egress, &rules),
+            NetPolicy::Egress(vec![53, 443, 5432])
+        );
+
+        let any_port: Vec<crate::spec::AllowRule> = vec!["example.com".parse().unwrap()];
+        assert_eq!(
+            NetPolicy::of(Network::Egress, &any_port),
+            NetPolicy::Egress(vec![])
+        );
+        assert_eq!(NetPolicy::of(Network::None, &rules), NetPolicy::Sealed);
+        assert_eq!(NetPolicy::of(Network::Full, &rules), NetPolicy::Open);
+        assert_eq!(
+            NetPolicy::of(Network::Host, &rules),
+            NetPolicy::Unrestricted
+        );
+    }
+
+    #[test]
+    fn before_abi_v4_the_network_policy_is_silently_nothing() {
+        // A v1–v3 kernel is given an 8-byte attr and must not be asked to
+        // handle rights it has never heard of.
+        let r = build(3, &plan(&[]), NetPolicy::Egress(vec![443]));
+        assert_eq!(r.handled_net, 0);
+        assert!(r.net_rules.is_empty());
     }
 
     #[test]
@@ -574,7 +762,7 @@ mod tests {
     #[test]
     fn building_against_this_hosts_real_abi_is_consistent() {
         let abi = abi_version();
-        let r = build(abi, &plan(&[]), Network::None);
+        let r = build(abi, &plan(&[]), NetPolicy::Sealed);
         assert_eq!(r.abi, abi);
         if abi == 0 {
             assert!(r.is_empty(), "no ABI means nothing may be claimed");

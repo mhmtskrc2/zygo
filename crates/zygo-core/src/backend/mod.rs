@@ -9,10 +9,10 @@ use crate::error::{Error, Result};
 use crate::sandbox::{SandboxConfig, SandboxState};
 use crate::spec::Isolation;
 
+pub mod gvisor;
 #[cfg(target_os = "linux")]
 pub mod ns;
 
-/// A started sandbox.
 /// A started sandbox, owned by whoever will outlive it.
 ///
 /// `Sync` as well as `Send` because the supervisor shares one `WarmFn` — and so
@@ -23,6 +23,34 @@ pub trait Sandbox: Send + Sync {
     /// Host pid of the sandbox's init process.
     fn pid(&self) -> u32;
 
+    /// The sandbox's namespaces, held open, for a held (warm-exec) sandbox.
+    ///
+    /// `None` for a sandbox that ran a program: nothing needs to enter it.
+    fn namespaces(&self) -> Option<&NamespaceFds> {
+        None
+    }
+
+    /// The cgroup this sandbox — and everything it forks — lives in, for a
+    /// backend that has one.
+    ///
+    /// Per-request cgroups go under it, and it is what tearing the sandbox
+    /// down kills. Nothing outside it belongs to this sandbox, which is what
+    /// lets a replacement start while this one is still running.
+    fn cgroup(&self) -> Option<&std::path::Path> {
+        None
+    }
+
+    /// The sandbox's `/run/secrets`, for a backend whose sandboxes hand one
+    /// out.
+    ///
+    /// A descriptor rather than a path because a held sandbox cannot be
+    /// reached through `/proc` at all: it is not dumpable, and nothing an
+    /// unprivileged supervisor does changes that. `None` where the supervisor
+    /// can still use a path — an agent, which `execve` made readable again.
+    fn secrets_dir(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        None
+    }
+
     fn state(&self) -> SandboxState;
 
     /// Wait for the sandbox to exit and return its exit code.
@@ -30,6 +58,52 @@ pub trait Sandbox: Send + Sync {
 
     /// Kill the whole process tree.
     fn kill(&mut self) -> Result<()>;
+}
+
+/// Open descriptors on a sandbox's namespaces, in the order `setns` wants
+/// them: user first, because it is what grants the capability to enter the
+/// rest.
+///
+/// Held by the supervisor for the life of a warm-exec sandbox. A descriptor
+/// pins its namespace, so these also keep the namespaces alive independently
+/// of which processes happen to be in them at any moment.
+#[derive(Debug)]
+pub struct NamespaceFds {
+    pub user: std::os::fd::OwnedFd,
+    pub pid: std::os::fd::OwnedFd,
+    pub net: std::os::fd::OwnedFd,
+    pub ipc: std::os::fd::OwnedFd,
+    pub uts: std::os::fd::OwnedFd,
+    pub cgroup: std::os::fd::OwnedFd,
+    /// Entered last, by the request process itself, after everything that
+    /// needs the host's view of the filesystem is done.
+    pub mnt: std::os::fd::OwnedFd,
+}
+
+impl NamespaceFds {
+    /// Open every namespace of `pid` from `/proc`.
+    ///
+    /// Needs ptrace-read access to the process. From the supervisor that is
+    /// always granted for a sandbox it created: same host uid, and full
+    /// capabilities in the child user namespace it owns.
+    pub fn open(pid: u32) -> crate::error::Result<NamespaceFds> {
+        use crate::error::IoContext;
+        let open = |kind: &str| {
+            let path = std::path::PathBuf::from(format!("/proc/{pid}/ns/{kind}"));
+            std::fs::File::open(&path)
+                .at(&path)
+                .map(std::os::fd::OwnedFd::from)
+        };
+        Ok(NamespaceFds {
+            user: open("user")?,
+            pid: open("pid")?,
+            net: open("net")?,
+            ipc: open("ipc")?,
+            uts: open("uts")?,
+            cgroup: open("cgroup")?,
+            mnt: open("mnt")?,
+        })
+    }
 }
 
 /// Starts sandboxes.
@@ -93,11 +167,7 @@ pub fn for_isolation(isolation: Isolation) -> Result<Box<dyn Backend>> {
             reason: "the libkrun backend is not built into this binary yet".into(),
             remedy: "track phase 2 in todo.md; use --isolation ns meanwhile".into(),
         }),
-        Isolation::Gvisor => Box::new(Unimplemented {
-            name: "gvisor",
-            reason: "the gVisor backend is not implemented yet".into(),
-            remedy: "track phase 4 in todo.md; use --isolation ns or vm meanwhile".into(),
-        }),
+        Isolation::Gvisor => Box::new(gvisor::GvisorBackend::new()),
     };
 
     match backend.availability().into_error(backend.name()) {
@@ -145,13 +215,28 @@ mod tests {
         }
     }
 
+    /// `gvisor` is built now, so the only way it is unavailable is a host
+    /// that cannot run it — and then it must say which of the two reasons it
+    /// is, because "install runsc" and "you are on macOS" have different
+    /// answers. A backend that is merely absent must never read as a bug.
     #[test]
-    fn unimplemented_backends_explain_themselves() {
-        let err = expect_error(Isolation::Gvisor);
-        let msg = err.to_string();
-        assert!(msg.contains("gvisor"), "{msg}");
-        assert!(msg.contains("phase 4"), "{msg}");
-        assert_eq!(err.exit_code(), 125);
+    fn gvisor_is_unavailable_only_for_a_reason_the_user_can_act_on() {
+        match for_isolation(Isolation::Gvisor) {
+            // A host with runsc on its PATH: nothing to assert but that it
+            // resolved to the real backend rather than a placeholder.
+            Ok(backend) => assert_eq!(backend.name(), "gvisor"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(msg.contains("gvisor"), "{msg}");
+                if cfg!(target_os = "linux") {
+                    assert!(msg.contains("runsc"), "{msg}");
+                    assert!(msg.contains("zygo backend install gvisor"), "{msg}");
+                } else {
+                    assert!(msg.contains("Linux"), "{msg}");
+                }
+                assert_eq!(e.exit_code(), 125);
+            }
+        }
     }
 
     #[test]

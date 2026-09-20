@@ -112,11 +112,18 @@ impl Report {
             .unwrap_or(Status::Ok)
     }
 
-    /// Whether a given backend can be used on this host.
+    /// Whether **the host** has what a backend needs.
+    ///
+    /// Deliberately not "whether you can use it": that also depends on
+    /// whether this build implements the backend, and asking a backend here
+    /// is a cycle — [`crate::backend::ns::NsBackend::availability`] calls
+    /// [`run`], so a `supports` that consulted it recursed until the stack
+    /// ran out. It did, on a real host, as a `SIGSEGV` from `zygo doctor`.
+    /// The two questions are joined where the claim is actually printed,
+    /// in the CLI's `doctor`, which is the layer that may know both.
     ///
     /// `Degraded` counts as usable: it means a fallback applies, which is the
-    /// whole point of having one. Only `Failed` — something mandatory missing —
-    /// disqualifies a backend. A kernel without unprivileged overlayfs still
+    /// point of having one. A kernel without unprivileged overlayfs still
     /// runs sandboxes; the store just flattens the layers.
     pub fn supports(&self, isolation: Isolation) -> bool {
         let needed: &[&str] = match isolation {
@@ -182,6 +189,111 @@ pub const OVERLAY_KERNEL: (u32, u32) = (5, 11);
 /// `cgroup.kill`, `memory.peak`.
 pub const RECOMMENDED_KERNEL: (u32, u32) = (6, 1);
 
+/// When each upstream kernel series was released, as `(major, minor, year,
+/// month)`, ordered oldest first.
+///
+/// Used to say how old a host's kernel *series* is, which is the closest
+/// honest thing to a CVE warning that needs no network and no feed. It is a
+/// floor on knowledge, not a claim of completeness: a series newer than the
+/// last row is newer than anything this table knows and is never warned
+/// about, and one older than the first row is warned about as "older than".
+/// Add a row when a series ships; a stale table under-warns, never over-warns.
+pub const SERIES_RELEASED: &[(u32, u32, i32, u32)] = &[
+    (5, 4, 2019, 11),
+    (5, 10, 2020, 12),
+    (5, 15, 2021, 10),
+    (6, 0, 2022, 10),
+    (6, 1, 2022, 12),
+    (6, 2, 2023, 2),
+    (6, 3, 2023, 4),
+    (6, 4, 2023, 6),
+    (6, 5, 2023, 8),
+    (6, 6, 2023, 10),
+    (6, 7, 2024, 1),
+    (6, 8, 2024, 3),
+    (6, 9, 2024, 5),
+    (6, 10, 2024, 7),
+    (6, 11, 2024, 9),
+    (6, 12, 2024, 11),
+    (6, 13, 2025, 1),
+    (6, 14, 2025, 3),
+];
+
+/// Series that are still receiving upstream stable updates when this was
+/// written. A long-term series two years old is a different proposition from
+/// a development series two years old, and the warning should say which.
+pub const LTS_SERIES: &[(u32, u32)] = &[(5, 4), (5, 10), (5, 15), (6, 1), (6, 6), (6, 12)];
+
+/// How old a series may be before `zygo doctor` says so.
+///
+/// Two years: long enough that an ordinary distro upgrade cycle does not trip
+/// it, short enough that a host nobody has touched since the last engineer
+/// left does.
+pub const KERNEL_AGE_WARN_MONTHS: i64 = 24;
+
+/// What is known about a kernel's age.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KernelAge {
+    /// Months since the series was released upstream.
+    pub months: i64,
+    /// `false` when the series predates the table, so `months` is a minimum.
+    pub exact: bool,
+    pub lts: bool,
+}
+
+impl KernelAge {
+    pub fn is_old(self) -> bool {
+        self.months >= KERNEL_AGE_WARN_MONTHS
+    }
+}
+
+/// How old `version`'s series is at `now`, or `None` when it is newer than
+/// anything [`SERIES_RELEASED`] knows — in which case it cannot be old.
+pub fn kernel_age(version: KernelVersion, now: std::time::SystemTime) -> Option<KernelAge> {
+    let secs = now.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64;
+    let (year, month, _) = civil_from_unix(secs);
+    let lts = LTS_SERIES.contains(&(version.major, version.minor));
+
+    let newest = SERIES_RELEASED.last()?;
+    if (version.major, version.minor) > (newest.0, newest.1) {
+        return None;
+    }
+    // The newest row at or below this series: a kernel between two known
+    // series is at least as old as the one below it.
+    let (row, exact) = match SERIES_RELEASED
+        .iter()
+        .rev()
+        .find(|(ma, mi, _, _)| (*ma, *mi) <= (version.major, version.minor))
+    {
+        Some(row) => (row, (row.0, row.1) == (version.major, version.minor)),
+        // Older than every row: use the oldest, and say it is a minimum.
+        None => (SERIES_RELEASED.first()?, false),
+    };
+    Some(KernelAge {
+        months: (year - row.2) as i64 * 12 + (month as i64 - row.3 as i64),
+        exact,
+        lts,
+    })
+}
+
+/// Unix seconds → `(year, month, day)`.
+///
+/// Howard Hinnant's `civil_from_days`, which is exact and needs no date
+/// library. Only the year and month are used, but the whole conversion is
+/// cheaper to write correctly than to write partially.
+fn civil_from_unix(secs: i64) -> (i32, u32, u32) {
+    let days = secs.div_euclid(86_400) + 719_468;
+    let era = days.div_euclid(146_097);
+    let doe = days.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let year = (yoe + era * 400 + i64::from(month <= 2)) as i32;
+    (year, month, day)
+}
+
 /// What a given Landlock ABI level can restrict (design doc appendix C).
 pub fn landlock_features(abi: u32) -> &'static str {
     match abi {
@@ -209,6 +321,7 @@ mod probe {
     pub fn all() -> Vec<Check> {
         vec![
             kernel(),
+            kernel_age_check(),
             user_namespaces(),
             cgroup_v2(),
             overlayfs(),
@@ -217,7 +330,43 @@ mod probe {
             subuid(),
             kvm(),
             runsc(),
+            egress(),
         ]
+    }
+
+    /// What `network = "egress"` and `"full"` need: `pasta` to move packets
+    /// without a privilege, and `nft` to install the allowlist inside the
+    /// sandbox's own network namespace.
+    ///
+    /// Absent rather than failed: the default is `network = "none"`, and a host
+    /// that only ever runs sealed sandboxes is not broken for lacking these.
+    fn egress() -> Check {
+        match (which("pasta"), which("nft")) {
+            (Some(pasta), Some(_)) => match which("tc") {
+                Some(_) => Check::ok("egress (pasta + nft + tc)", pasta),
+                // Not degraded: `tc` is only needed by a `bandwidth` limit,
+                // and a sandbox that sets one without it refuses to start
+                // with the package named.
+                None => Check::ok(
+                    "egress (pasta + nft + tc)",
+                    format!("{pasta}; no `tc`, so `bandwidth` limits are unavailable"),
+                ),
+            },
+            (pasta, nft) => {
+                let mut missing = Vec::new();
+                if pasta.is_none() {
+                    missing.push("passt");
+                }
+                if nft.is_none() {
+                    missing.push("nftables");
+                }
+                Check::absent(
+                    "egress (pasta + nft)",
+                    format!("{} not installed", missing.join(" and ")),
+                    format!("sudo apt install {}", missing.join(" ")),
+                )
+            }
+        }
     }
 
     fn kernel() -> Check {
@@ -246,6 +395,61 @@ mod probe {
                 ),
             ),
             Some(v) => Check::ok("kernel", v.to_string()),
+        }
+    }
+
+    /// How old the kernel *series* is, which is as close to a CVE warning as
+    /// something with no network and no feed can honestly get.
+    ///
+    /// Age is not the same as unpatched: a distro backports fixes into an old
+    /// series without changing its version, which is exactly what the LTS
+    /// series are for. What age does say is how much of a decade of kernel
+    /// hardening this host is behind, and that `ns` leans on one kernel.
+    fn kernel_age_check() -> Check {
+        let release = rustix::system::uname()
+            .release()
+            .to_string_lossy()
+            .into_owned();
+        let Some(v) = KernelVersion::parse(&release) else {
+            return Check::absent("kernel age", "unknown", "the kernel version did not parse");
+        };
+        match kernel_age(v, std::time::SystemTime::now()) {
+            // Newer than this build's table: it cannot be old, and guessing
+            // would be a warning that ages into a lie.
+            None => Check::ok("kernel age", format!("{v} is newer than this build knows")),
+            Some(age) if !age.is_old() => Check::ok(
+                "kernel age",
+                format!(
+                    "{}.{} released about {} months ago",
+                    v.major, v.minor, age.months
+                ),
+            ),
+            Some(age) => {
+                let years = age.months / 12;
+                let detail = format!(
+                    "{}.{} is {}{} years old{}",
+                    v.major,
+                    v.minor,
+                    if age.exact { "" } else { "at least " },
+                    years,
+                    if age.lts { ", a long-term series" } else { "" }
+                );
+                Check::degraded(
+                    "kernel age",
+                    detail,
+                    if age.lts {
+                        "a long-term series still gets stable updates, so this is about \
+                         features and hardening rather than open CVEs — keep it patched, \
+                         and prefer a newer series for untrusted code"
+                            .to_string()
+                    } else {
+                        "this series is out of upstream stable support; every `ns` control \
+                         is a kernel feature, so an unpatched kernel defeats all of them \
+                         at once — upgrade, or run untrusted code on `vm`"
+                            .to_string()
+                    },
+                )
+            }
         }
     }
 
@@ -278,28 +482,19 @@ mod probe {
                 "boot with systemd.unified_cgroup_hierarchy=1",
             );
         }
-        let own = current_cgroup_dir();
-        let missing = own
-            .as_deref()
-            .map(cgroup::missing_controllers)
-            .unwrap_or_default();
-        if missing.is_empty() {
-            let have = own
-                .as_deref()
-                .map(cgroup::available_controllers)
-                .unwrap_or_default();
-            Check::ok("cgroup v2", format!("delegated ({})", have.join(" ")))
-        } else {
-            // This is the R2 case: without these, limits are not enforced and a
-            // sandbox must not start at all.
-            Check::failed(
+        let Some(own) = current_cgroup_dir() else {
+            return Check::failed(
                 "cgroup v2",
-                format!("not delegated (missing: {})", missing.join(" ")),
-                "mkdir -p ~/.config/systemd/user/user@.service.d && \
-                 printf '[Service]\\nDelegate=cpu cpuset io memory pids\\n' > \
-                 ~/.config/systemd/user/user@.service.d/delegate.conf && \
-                 systemctl --user daemon-reexec",
-            )
+                "cannot read /proc/self/cgroup",
+                cgroup::DELEGATION_REMEDY,
+            );
+        };
+        // Attempted, not read: see `cgroup::probe_delegation`. This is the R2
+        // case — without a cgroup it can own, a sandbox has no limits and must
+        // not start at all.
+        match cgroup::probe_delegation(&own) {
+            Ok(have) => Check::ok("cgroup v2", format!("delegated ({})", have.join(" "))),
+            Err(reason) => Check::failed("cgroup v2", reason, cgroup::DELEGATION_REMEDY),
         }
     }
 
@@ -403,7 +598,23 @@ mod probe {
                 .unwrap_or(false)
         });
         if has_range {
-            Check::ok("subuid/subgid", "configured")
+            // A range is only usable through the setuid helpers; without them
+            // the launcher falls back to mapping the caller's single uid, and
+            // the uid-level separation between tenants (§3.10) is lost.
+            let helpers = ["newuidmap", "newgidmap"].iter().all(|h| {
+                std::env::var_os("PATH")
+                    .is_some_and(|paths| std::env::split_paths(&paths).any(|d| d.join(h).is_file()))
+            });
+            if helpers {
+                Check::ok("subuid/subgid", "configured")
+            } else {
+                Check::degraded(
+                    "subuid/subgid",
+                    "range configured, but newuidmap/newgidmap are missing; \
+                     every tenant maps to one host uid",
+                    "install the uidmap package (apt-get install uidmap)",
+                )
+            }
         } else {
             Check::degraded(
                 "subuid/subgid",
@@ -430,9 +641,13 @@ mod probe {
             .open(path)
         {
             Ok(_) => Check::ok("kvm", "/dev/kvm"),
-            Err(_) => Check::degraded(
+            // Absent rather than degraded: a `/dev/kvm` this user cannot open
+            // is not a weaker `vm` backend, it is no `vm` backend. Reporting it
+            // as degraded made `zygo doctor` list `vm` under "backends
+            // available" on a host where it could not have started one.
+            Err(_) => Check::absent(
                 "kvm",
-                "/dev/kvm not writable",
+                "/dev/kvm is not readable and writable by this user",
                 "sudo usermod -aG kvm $USER, then log in again",
             ),
         }
@@ -531,6 +746,148 @@ mod tests {
         assert_eq!(landlock_features(5), "fs + net + ioctl");
     }
 
+    /// The date conversion the age check rests on, against dates whose
+    /// answers are known — including the leap-year cases that are the only
+    /// way a hand-written civil calendar goes wrong.
+    #[test]
+    fn unix_seconds_convert_to_the_right_civil_date() {
+        assert_eq!(civil_from_unix(0), (1970, 1, 1));
+        assert_eq!(civil_from_unix(951_782_400), (2000, 2, 29), "a leap year");
+        assert_eq!(civil_from_unix(1_709_164_800), (2024, 2, 29), "another");
+        assert_eq!(civil_from_unix(1_735_689_599), (2024, 12, 31));
+        assert_eq!(civil_from_unix(1_735_689_600), (2025, 1, 1));
+    }
+
+    fn at(year: i32, month: u32) -> std::time::SystemTime {
+        // Midday on the first, so no timezone or leap second can move the month.
+        let days: i64 = (1970..year)
+            .map(|y| if leap(y) { 366 } else { 365 })
+            .sum::<i64>()
+            + (1..month).map(|m| i64::from(days_in(year, m))).sum::<i64>();
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs((days * 86_400 + 43_200) as u64)
+    }
+    fn leap(y: i32) -> bool {
+        (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+    }
+    fn days_in(y: i32, m: u32) -> u32 {
+        match m {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            _ if leap(y) => 29,
+            _ => 28,
+        }
+    }
+
+    #[test]
+    fn a_kernel_series_is_aged_against_its_release() {
+        let v = |ma, mi| KernelVersion {
+            major: ma,
+            minor: mi,
+            patch: 0,
+        };
+        // 6.8 shipped in March 2024.
+        let age = kernel_age(v(6, 8), at(2024, 9)).expect("known series");
+        assert_eq!(age.months, 6);
+        assert!(age.exact);
+        assert!(!age.is_old());
+        assert!(!age.lts);
+
+        let age = kernel_age(v(6, 8), at(2026, 9)).expect("known series");
+        assert_eq!(age.months, 30);
+        assert!(age.is_old(), "two and a half years is old");
+
+        // A series between two known rows is at least as old as the one below.
+        let age = kernel_age(v(6, 5), at(2026, 8)).unwrap();
+        assert!(age.exact, "6.5 is in the table");
+        let between = kernel_age(
+            KernelVersion {
+                major: 6,
+                minor: 12,
+                patch: 40,
+            },
+            at(2026, 11),
+        )
+        .unwrap();
+        assert_eq!(between.months, 24);
+        assert!(between.lts, "6.12 is a long-term series");
+    }
+
+    /// The table is a floor on knowledge. A kernel newer than every row must
+    /// not be warned about, or the warning ages into a lie the moment this
+    /// build is a year old.
+    #[test]
+    fn a_kernel_newer_than_the_table_is_never_called_old() {
+        let newest = SERIES_RELEASED.last().expect("a table");
+        let newer = KernelVersion {
+            major: newest.0,
+            minor: newest.1 + 1,
+            patch: 0,
+        };
+        assert_eq!(kernel_age(newer, at(2030, 1)), None);
+        let much_newer = KernelVersion {
+            major: newest.0 + 2,
+            minor: 0,
+            patch: 0,
+        };
+        assert_eq!(kernel_age(much_newer, at(2030, 1)), None);
+    }
+
+    /// And older than everything it knows is aged from the oldest row, marked
+    /// as a minimum rather than reported as an exact figure.
+    #[test]
+    fn a_kernel_older_than_the_table_is_a_lower_bound() {
+        let age = kernel_age(
+            KernelVersion {
+                major: 4,
+                minor: 19,
+                patch: 0,
+            },
+            at(2026, 9),
+        )
+        .expect("aged from the oldest row");
+        assert!(!age.exact, "the figure is a minimum");
+        assert!(age.is_old());
+        // The oldest row is 5.4, November 2019.
+        assert_eq!(age.months, (2026 - 2019) * 12 + 9 - 11);
+    }
+
+    #[test]
+    fn the_table_is_ordered_and_its_lts_series_are_in_it() {
+        let mut previous = (0, 0);
+        for (major, minor, year, month) in SERIES_RELEASED {
+            assert!(
+                (*major, *minor) > previous,
+                "{major}.{minor} is out of order"
+            );
+            previous = (*major, *minor);
+            assert!((1..=12).contains(month), "{major}.{minor}: month {month}");
+            assert!((2019..2100).contains(year), "{major}.{minor}: year {year}");
+        }
+        for (major, minor) in LTS_SERIES {
+            assert!(
+                SERIES_RELEASED
+                    .iter()
+                    .any(|(ma, mi, _, _)| (ma, mi) == (major, minor)),
+                "{major}.{minor} is called long-term but has no release date"
+            );
+        }
+    }
+
+    /// An old kernel is a warning, never a refusal: `ns` still works on it,
+    /// and a doctor that failed would stop a host that is merely behind.
+    #[test]
+    fn an_old_kernel_does_not_disqualify_a_backend() {
+        let r = report(vec![
+            ("kernel", Status::Ok),
+            ("kernel age", Status::Degraded),
+            ("user namespaces", Status::Ok),
+            ("cgroup v2", Status::Ok),
+            ("seccomp", Status::Ok),
+        ]);
+        assert!(r.supports(Isolation::Ns));
+        assert_eq!(r.exit_code(), 0, "degraded is not a failure");
+    }
+
     fn report(checks: Vec<(&'static str, Status)>) -> Report {
         Report {
             checks: checks
@@ -578,6 +935,19 @@ mod tests {
         assert!(r.supports(Isolation::Ns));
         assert!(!r.supports(Isolation::Vm), "no KVM, no vm backend");
         assert!(!r.supports(Isolation::Gvisor));
+
+        // A host that has everything a backend needs is not a host that can
+        // *run* it, if this build does not implement it. `vm` is the live
+        // case: `doctor` printed `backends available: ns, vm` on a machine
+        // with `/dev/kvm` while `backend list` said, correctly, that `vm` is
+        // not built. `supports` answers only the host half by design — the
+        // two are joined in the CLI, because doing it here recurses.
+        let with_kvm = report(vec![("kvm", Status::Ok)]);
+        assert!(with_kvm.supports(Isolation::Vm), "the host has KVM");
+        assert!(
+            crate::backend::for_isolation(Isolation::Vm).is_err(),
+            "and the vm backend is not built, which is the other half"
+        );
 
         // Missing cgroup delegation disqualifies `ns` entirely (requirement N4).
         let r = report(vec![

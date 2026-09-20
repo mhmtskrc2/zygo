@@ -8,9 +8,11 @@
 use std::sync::Arc;
 
 use anyhow::Context;
+use zygo_core::lock::LockFile;
+use zygo_core::pool::Outcome;
 use zygo_core::spec::Spec;
 use zygo_core::supervisor::client::Client;
-use zygo_core::supervisor::{ControlError, Listener, Request, Response, Supervisor};
+use zygo_core::supervisor::{Change, ControlError, Listener, Request, Response, Supervisor};
 
 use crate::cli::{Cli, ExecArgs, ServeArgs, SupervisorCommand};
 use crate::output::{self, Style};
@@ -73,6 +75,35 @@ fn status(cli: &Cli) -> anyhow::Result<u8> {
     }
 }
 
+/// Values for the secrets a function names, from this process's environment.
+///
+/// This process, because it is the user's shell that has `STRIPE_KEY` set —
+/// not the supervisor, which inherited the environment of whichever command
+/// happened to start it. Every missing name is reported at once rather than
+/// one per attempt, and no value is ever printed.
+fn secrets_from_env(
+    names: &[String],
+) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    let mut values = std::collections::BTreeMap::new();
+    let mut missing = Vec::new();
+    for name in names {
+        match std::env::var(name) {
+            Ok(value) => {
+                values.insert(name.clone(), value);
+            }
+            Err(_) => missing.push(name.as_str()),
+        }
+    }
+    anyhow::ensure!(
+        missing.is_empty(),
+        "no value for secret{} {} in this environment\n  → export {} before running this command",
+        if missing.len() == 1 { "" } else { "s" },
+        missing.join(", "),
+        missing.join(" ")
+    );
+    Ok(values)
+}
+
 /// `zygo serve <handler> --name <name>` — warm a function, starting the
 /// supervisor if there is not one.
 pub fn serve(cli: &Cli, args: &ServeArgs) -> anyhow::Result<u8> {
@@ -87,10 +118,28 @@ pub fn serve(cli: &Cli, args: &ServeArgs) -> anyhow::Result<u8> {
         None => std::env::current_dir().context("cannot read the working directory")?,
     };
 
+    let options = args.sandbox.resolve_options();
+
+    // Resolve here as well, purely to learn which secrets the function names.
+    // Resolution touches no files, so this costs nothing and cannot disagree
+    // with what the supervisor will conclude from the same inputs.
+    let names = spec
+        .clone()
+        .unwrap_or_default()
+        .resolve_for_serve(
+            &args.name,
+            &layer,
+            &zygo_core::spec::ResolveOptions {
+                base_dir: Some(base_dir.clone()),
+                ..options.clone()
+            },
+        )?
+        .secrets;
+    let secrets = secrets_from_env(&names)?;
+
     let exe = std::env::current_exe().context("cannot find this binary to start a supervisor")?;
     let mut client = Client::connect_or_start(&paths, &exe)?;
 
-    let options = args.sandbox.resolve_options();
     let response = client.send(&Request::Serve {
         name: args.name.clone(),
         spec: spec.map(Box::new),
@@ -99,6 +148,9 @@ pub fn serve(cli: &Cli, args: &ServeArgs) -> anyhow::Result<u8> {
         allow_host_net: options.allow_host_net,
         allow_private_net: options.allow_private_net,
         allow_unlimited: options.allow_unlimited,
+        secrets,
+        // Always replace: the user just typed what they want this name to be.
+        if_changed: false,
     })?;
 
     let style = Style::stdout();
@@ -110,6 +162,7 @@ pub fn serve(cli: &Cli, args: &ServeArgs) -> anyhow::Result<u8> {
             imports_ms,
             warm_ms,
             warnings,
+            change,
         } => {
             for w in &warnings {
                 output::warn(w);
@@ -122,6 +175,7 @@ pub fn serve(cli: &Cli, args: &ServeArgs) -> anyhow::Result<u8> {
                     "imports_ms": imports_ms,
                     "warm_ms": warm_ms,
                     "warnings": warnings,
+                    "change": change,
                 }))?;
             } else {
                 println!(
@@ -129,12 +183,288 @@ pub fn serve(cli: &Cli, args: &ServeArgs) -> anyhow::Result<u8> {
                     style.green("✓"),
                     rss_kb / 1024
                 );
+                if change == Change::Replaced {
+                    println!(
+                        "  {}",
+                        style.dim(
+                            "replaced the previous one; requests it had accepted finish on it"
+                        )
+                    );
+                }
                 println!("  {}", style.dim(&format!("zygo exec {name} '{{}}'")));
             }
             Ok(0)
         }
         other => report_failure(cli, &other),
     }
+}
+
+/// `zygo up` — bring every function in the spec file up warm.
+///
+/// The spec file is the unit of deployment: `zygo serve` is for one handler on
+/// the command line, this is for a project. Functions are brought up in the
+/// order they are declared and each one reports on its own line, because a spec
+/// with ten functions where the sixth cannot start should say which one.
+///
+/// Running it again is not a second deploy. A function whose spec, secrets and
+/// source files are what is already registered is left alone — warm pages,
+/// request counters and all — and one that changed is replaced blue/green: the
+/// new sandbox is warm before the old one stops taking requests. So editing one
+/// handler and running `up` restarts one function.
+pub fn up(cli: &Cli, file: Option<&std::path::Path>, relock: bool) -> anyhow::Result<u8> {
+    let spec = Spec::discover(file)?.with_context(|| {
+        "no sandbox.toml found\n           → create one, or serve a single handler: zygo serve <handler> --name <name>"
+    })?;
+    let names: Vec<String> = spec.function_names().map(str::to_string).collect();
+    anyhow::ensure!(
+        !names.is_empty(),
+        "{} declares no functions\n  → add a [fn.<name>] section",
+        file.map_or_else(|| "the spec file".into(), |p| p.display().to_string())
+    );
+
+    let base_dir = absolute(&spec.base_dir())?;
+    let paths = super::paths(cli);
+    let exe = std::env::current_exe().context("cannot find this binary to start a supervisor")?;
+    let mut client = Client::connect_or_start(&paths, &exe)?;
+
+    let store = zygo_core::image::Store::new(paths.clone());
+    let lock_path = LockFile::beside(&base_dir);
+    let mut lock = LockFile::load(&lock_path)?.unwrap_or_default();
+    let lock_before = lock.clone();
+
+    let style = Style::stdout();
+    let mut brought_up = Vec::new();
+    let mut replaced = Vec::new();
+    let mut unchanged = Vec::new();
+    let mut failed = Vec::new();
+
+    for name in &names {
+        let resolved = spec
+            .resolve(
+                Some(name),
+                &zygo_core::spec::Layer::default(),
+                &zygo_core::spec::ResolveOptions {
+                    base_dir: Some(base_dir.clone()),
+                    ..Default::default()
+                },
+            )
+            .ok();
+        let secret_names = resolved
+            .as_ref()
+            .map(|r| r.secrets.clone())
+            .unwrap_or_default();
+
+        // What the spec resolves to on this host, read before anything is
+        // served. An image that is not pulled yet says nothing — the serve
+        // below reports that as the error it is.
+        let observed = match &resolved {
+            Some(r) => zygo_core::lock::LockedFn::observe(
+                &store,
+                &r.image,
+                &r.system,
+                r.requirements.as_deref(),
+                &base_dir,
+            )
+            .unwrap_or(None),
+            None => None,
+        };
+        // A tag that has moved under a spec nobody edited is the one thing
+        // the lock refuses. It changes nothing by itself: it stops.
+        if !relock && let (Some(locked), Some(observed)) = (lock.functions.get(name), &observed) {
+            let comparison = locked.compare(observed);
+            if comparison.changes.is_empty()
+                && let Some(drift) = comparison.image_drift()
+            {
+                if !cli.json {
+                    println!(
+                        "{} {name} — {drift}\n    {}",
+                        style.red("✗"),
+                        style.dim(
+                            "→ run `zygo up --relock` to accept it, or pull the locked digest"
+                        )
+                    );
+                }
+                failed.push(name.clone());
+                continue;
+            }
+        }
+
+        let secrets = match secrets_from_env(&secret_names) {
+            Ok(values) => values,
+            Err(e) => {
+                if !cli.json {
+                    println!("{} {name} — {e:#}", style.red("✗"));
+                }
+                failed.push(name.clone());
+                continue;
+            }
+        };
+        let response = client.send(&Request::Serve {
+            name: name.clone(),
+            spec: Some(Box::new(spec.clone())),
+            layer: Box::new(zygo_core::spec::Layer::default()),
+            base_dir: base_dir.clone(),
+            // `up` reads a file rather than flags, so the `--allow-*` escapes
+            // are not available here: a spec that needs one has to be served
+            // deliberately, which is the point of them being flags.
+            allow_host_net: false,
+            allow_private_net: false,
+            allow_unlimited: false,
+            secrets,
+            if_changed: true,
+        })?;
+        match response {
+            Response::Served {
+                runtime,
+                rss_kb,
+                warm_ms,
+                warnings,
+                change,
+                ..
+            } => {
+                for w in &warnings {
+                    output::warn(w);
+                }
+                if !cli.json {
+                    match change {
+                        Change::Started => println!(
+                            "{} {name} — {runtime}, {} MB, ready in {warm_ms:.0} ms",
+                            style.green("✓"),
+                            rss_kb / 1024
+                        ),
+                        Change::Replaced => println!(
+                            "{} {name} — replaced: {runtime}, {} MB, ready in {warm_ms:.0} ms",
+                            style.green("✓"),
+                            rss_kb / 1024
+                        ),
+                        Change::Unchanged => println!(
+                            "{} {name} — {}",
+                            style.dim("·"),
+                            style.dim(&format!("unchanged ({runtime}, {} MB)", rss_kb / 1024))
+                        ),
+                    }
+                }
+                match change {
+                    Change::Started => {}
+                    Change::Replaced => replaced.push(name.clone()),
+                    Change::Unchanged => unchanged.push(name.clone()),
+                }
+                brought_up.push(name.clone());
+
+                // Recorded only now: the system layer was built during the
+                // serve, so the package versions exist after it and not
+                // before. Read again for the same reason.
+                if let Some(r) = &resolved
+                    && let Ok(Some(now)) = zygo_core::lock::LockedFn::observe(
+                        &store,
+                        &r.image,
+                        &r.system,
+                        r.requirements.as_deref(),
+                        &base_dir,
+                    )
+                {
+                    if let Some(previous) = lock.functions.get(name) {
+                        // Versions that moved under an unchanged package list
+                        // are recorded, not refused: `apt` does not keep old
+                        // versions, so refusing would strand every fresh host.
+                        for drift in previous.compare(&now).drifts {
+                            if !matches!(drift, zygo_core::lock::Drift::Image { .. }) {
+                                output::warn(&format!("{name}: {drift}"));
+                            }
+                        }
+                    }
+                    lock.functions.insert(name.clone(), now);
+                }
+            }
+            other => {
+                // Keep going: one function that cannot start is not a reason to
+                // leave the rest of the project down.
+                if !cli.json {
+                    print!("{} {name} — ", style.red("✗"));
+                }
+                report_failure(cli, &other)?;
+                failed.push(name.clone());
+            }
+        }
+    }
+
+    // Entries for functions the spec no longer declares would otherwise
+    // accumulate forever; a lock file is a record of this spec.
+    lock.functions.retain(|name, _| names.contains(name));
+    let locked_now = lock != lock_before;
+    if locked_now {
+        lock.save(&lock_path)?;
+    }
+
+    if cli.json {
+        output::json(&serde_json::json!({
+            "up": brought_up,
+            "replaced": replaced,
+            "unchanged": unchanged,
+            "failed": failed,
+            "locked": locked_now,
+        }))?;
+    } else if !failed.is_empty() {
+        println!();
+        println!(
+            "{}",
+            style.yellow(&format!(
+                "  {} of {} functions are up; {} did not start",
+                brought_up.len(),
+                names.len(),
+                failed.len()
+            ))
+        );
+    }
+    Ok(u8::from(!failed.is_empty()))
+}
+
+/// `zygo down` — stop every function the spec file declares.
+///
+/// Only those: a supervisor may be holding functions from another project or
+/// from a bare `zygo serve`, and `down` in one directory must not take them
+/// with it. `zygo stop --all` is the blunt instrument.
+pub fn down(cli: &Cli, file: Option<&std::path::Path>) -> anyhow::Result<u8> {
+    let spec = Spec::discover(file)?.with_context(
+        || "no sandbox.toml found\n  → to stop everything instead: zygo stop --all",
+    )?;
+    let names: Vec<String> = spec.function_names().map(str::to_string).collect();
+
+    let paths = super::paths(cli);
+    let mut client = match Client::connect(&paths) {
+        Ok(client) => client,
+        // Nothing running is the state `down` is trying to reach.
+        Err(_) => {
+            if cli.json {
+                output::json(&serde_json::json!({ "stopped": [] }))?;
+            } else {
+                println!("{}", Style::stdout().dim("no supervisor running"));
+            }
+            return Ok(0);
+        }
+    };
+
+    let mut stopped = Vec::new();
+    for name in &names {
+        if let Response::Stopped { names } = client.send(&Request::Stop {
+            name: Some(name.clone()),
+        })? {
+            stopped.extend(names);
+        }
+        // A function the spec declares but that was never served is not an
+        // error here: `down` is about reaching a state, not about auditing.
+    }
+
+    if cli.json {
+        output::json(&serde_json::json!({ "stopped": stopped }))?;
+    } else if stopped.is_empty() {
+        println!("{}", Style::stdout().dim("nothing to stop"));
+    } else {
+        for name in &stopped {
+            println!("stopped {name}");
+        }
+    }
+    Ok(0)
 }
 
 /// `zygo exec <name> [json]`.
@@ -170,24 +500,43 @@ pub fn exec(cli: &Cli, args: &ExecArgs) -> anyhow::Result<u8> {
             }
             if let Some(error) = &outcome.error {
                 output::error(&anyhow::anyhow!("{error}"));
-                return Ok(1);
+                return Ok(exit_status(&outcome));
             }
             if cli.json {
                 output::json(&outcome.result)?;
             } else {
                 println!("{}", serde_json::to_string_pretty(&outcome.result)?);
             }
-            Ok(u8::from(!outcome.succeeded()))
+            Ok(exit_status(&outcome))
         }
         other => report_failure(cli, &other),
+    }
+}
+
+/// The request's own exit status, as the shell would report it.
+///
+/// A request killed at its deadline is 137 here exactly as a process killed
+/// in a shell is, so a caller can tell "the tool ran out of time" from "the
+/// tool raised" (1) without parsing stderr. The request cannot have exited 0
+/// and failed unless the supervisor added an error of its own (a result that
+/// was not JSON); that is still a failure.
+fn exit_status(outcome: &Outcome) -> u8 {
+    match outcome.exit_code {
+        0 if outcome.error.is_none() => 0,
+        1..=255 => outcome.exit_code as u8,
+        _ => 1,
     }
 }
 
 /// The wall-clock budget when `--timeout` is not given.
 ///
 /// The function's own `timeout` is the real limit and the supervisor enforces
-/// it; this only bounds how long the *client* waits, so it is deliberately
-/// longer than any sensible handler.
+/// it; this bounds the request the client asks for, and — through
+/// [`zygo_core::supervisor::client::Client::budget`] — how long the client
+/// waits for the answer. Deliberately longer than any sensible handler.
+///
+/// That second half used to be a comment rather than a fact: nothing set a
+/// socket timeout, so a client spoke to a wedged supervisor for ever.
 const DEFAULT_EXEC_TIMEOUT_MS: u64 = 60_000;
 
 fn read_event(args: &ExecArgs) -> anyhow::Result<serde_json::Value> {
@@ -315,7 +664,7 @@ pub fn stop(cli: &Cli, name: Option<&str>, all: bool) -> anyhow::Result<u8> {
 /// `BUSY` is not an error: it is the answer to "can you take this right now",
 /// and it gets its own exit code so a shell loop can tell it from a failure and
 /// retry rather than give up.
-fn report_failure(cli: &Cli, response: &Response) -> anyhow::Result<u8> {
+pub(super) fn report_failure(cli: &Cli, response: &Response) -> anyhow::Result<u8> {
     match response {
         Response::Busy {
             name,
@@ -410,6 +759,32 @@ mod tests {
     }
 
     #[test]
+    fn exec_exits_with_the_request_s_own_status() {
+        let outcome = |exit_code: i32, error: Option<&str>| Outcome {
+            exit_code,
+            result: serde_json::Value::Null,
+            stdout: String::new(),
+            stderr: String::new(),
+            error: error.map(str::to_string),
+            metrics: Default::default(),
+            timed_out: false,
+        };
+        assert_eq!(exit_status(&outcome(0, None)), 0);
+        // A handler that raised: the agent reports 1.
+        assert_eq!(exit_status(&outcome(1, Some("ZeroDivisionError"))), 1);
+        // Killed at the deadline: 137, as a shell would say it, so a caller
+        // can tell "out of time" from "raised" without reading stderr.
+        assert_eq!(exit_status(&outcome(137, Some("killed by SIGKILL"))), 137);
+        // A warm-exec program's own status passes through.
+        assert_eq!(exit_status(&outcome(3, Some("the program exited 3"))), 3);
+        // Exit 0 with a supervisor-side error (stdout was not JSON) is still
+        // a failure, and a status the shell cannot hold is a plain failure.
+        assert_eq!(exit_status(&outcome(0, Some("stdout is not JSON"))), 1);
+        assert_eq!(exit_status(&outcome(-1, Some("?"))), 1);
+        assert_eq!(exit_status(&outcome(300, Some("?"))), 1);
+    }
+
+    #[test]
     fn a_missing_function_is_a_different_exit_code_from_a_broken_one() {
         let missing = report_failure(
             &cli(),
@@ -466,6 +841,37 @@ mod tests {
                 .expect("a path need not exist")
                 .is_absolute()
         );
+    }
+
+    #[test]
+    fn every_missing_secret_is_named_at_once_and_no_value_is_echoed() {
+        // Serialised through an environment variable this test owns; the
+        // names are chosen so no real shell would have them.
+        unsafe { std::env::set_var("ZYGO_TEST_SECRET_PRESENT", "hunter2") };
+        let err = secrets_from_env(&[
+            "ZYGO_TEST_SECRET_PRESENT".into(),
+            "ZYGO_TEST_SECRET_MISSING_A".into(),
+            "ZYGO_TEST_SECRET_MISSING_B".into(),
+        ])
+        .expect_err("two are missing");
+        let text = err.to_string();
+        assert!(
+            text.contains("MISSING_A") && text.contains("MISSING_B"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("PRESENT"),
+            "the one that exists is not a problem: {text}"
+        );
+        assert!(
+            !text.contains("hunter2"),
+            "a value must never appear in an error: {text}"
+        );
+        assert!(text.contains("export"), "tell them what to do: {text}");
+
+        let values = secrets_from_env(&["ZYGO_TEST_SECRET_PRESENT".into()]).expect("present");
+        assert_eq!(values["ZYGO_TEST_SECRET_PRESENT"], "hunter2");
+        unsafe { std::env::remove_var("ZYGO_TEST_SECRET_PRESENT") };
     }
 
     #[test]

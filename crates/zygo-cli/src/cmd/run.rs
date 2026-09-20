@@ -58,12 +58,45 @@ pub fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<u8> {
         }
     };
 
+    // `system = [...]` from the spec: the packages installed once, as a layer.
+    let entry = if resolved.system.is_empty() {
+        entry
+    } else {
+        let derived = zygo_core::derive::ensure(&store, &entry, &resolved.system)?;
+        if derived.built {
+            eprintln!(
+                "{} {}",
+                Style::stdout().dim("installed"),
+                derived.versions.join(" ")
+            );
+        }
+        derived.image
+    };
+
+    // The network, when this run has one: the allowlist is resolved here on
+    // the host, and `/etc/resolv.conf` is bound in rather than written.
+    // `--dry-run` wants the mount in the plan it prints, so this comes first.
+    let mut resolved = resolved;
+    let net = zygo_core::net::setup(store.paths(), &resolved.name, &resolved)?;
+    if let Some(mount) = net.mount.clone() {
+        resolved.mounts.push(mount);
+    }
+    for w in &net.warnings {
+        output::warn(w);
+    }
+    let resolved = resolved;
+
     // Overlay needs a kernel that permits it inside a user namespace; the store
     // falls back to a flattened rootfs when it does not.
-    let overlay_supported = zygo_core::doctor::run()
-        .checks
-        .iter()
-        .any(|c| c.name == "overlayfs (userns)" && c.status == zygo_core::doctor::Status::Ok);
+    //
+    // `gvisor` always takes the flattened one: an OCI bundle's `root.path` is a
+    // single directory, so there is nowhere for a stack of lowerdirs to go.
+    // gVisor's Sentry keeps an overlay of its own above it in any case.
+    let overlay_supported = resolved.isolation != zygo_core::spec::Isolation::Gvisor
+        && zygo_core::doctor::run()
+            .checks
+            .iter()
+            .any(|c| c.name == "overlayfs (userns)" && c.status == zygo_core::doctor::Status::Ok);
 
     // The sandbox root is read-only, so every path the launcher mounts over has
     // to exist before it is assembled; the store fills in what the image lacks.
@@ -100,6 +133,8 @@ pub fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<u8> {
 
     let mut config =
         SandboxConfig::from_resolved(&resolved, &view, &newroot, argv, &image_config.env_pairs());
+    config.allow_resolved = net.allowed;
+    config.pasta_pid_file = net.pid_file;
 
     if args.dry_run {
         return print_plan(cli, &resolved, &view, &config);

@@ -223,7 +223,8 @@ mod tests {
         let mut stream = Vec::new();
         FrameWriter::new(&mut stream).write(&ready()).unwrap();
 
-        let mut r: FrameReader<_, Message> = FrameReader::new(Trickle(std::io::Cursor::new(stream)));
+        let mut r: FrameReader<_, Message> =
+            FrameReader::new(Trickle(std::io::Cursor::new(stream)));
         assert_eq!(r.read().unwrap(), Some(ready()));
     }
 
@@ -239,7 +240,8 @@ mod tests {
 
     #[test]
     fn a_truncated_header_is_an_error_too() {
-        let mut r: FrameReader<_, Message> = FrameReader::new(std::io::Cursor::new(vec![0u8, 0, 1]));
+        let mut r: FrameReader<_, Message> =
+            FrameReader::new(std::io::Cursor::new(vec![0u8, 0, 1]));
         assert!(matches!(
             r.read(),
             Err(FrameError::Truncated { want: 4, got: 3 })
