@@ -115,9 +115,20 @@ zygo run --tty alpine:3 /bin/sh               # with a terminal of its own
 zygo run --dry-run --json python:3.12-slim    # the plan, without running it
 ```
 
-Sandboxes need Linux. On any other host everything still builds and the
-platform-independent layers are fully tested; `zygo doctor` says plainly what is
-missing rather than failing obscurely.
+Sandboxes need Linux, and on a Mac they get one. Every command except
+`doctor`, `completion` and `agent test` is run by a Linux `zygo` inside a VM
+Zygo starts for itself, with the same arguments, the same working directory
+and the same streams; the exit status comes back out. Install `lima` and the
+lines above work unchanged:
+
+```bash
+brew install lima
+```
+
+The VM mounts your home directory at *the same path*, writable, so
+`./handler.py` is one file seen from two sides. That is also the limit and it
+is enforced: a command run from outside `$HOME` is refused, and the message
+names both directories rather than quietly running somewhere else.
 
 `--dry-run` prints the resolved configuration, the mount plan and the cgroup
 values the launcher will apply — how to review a sandbox's boundaries without
@@ -295,6 +306,7 @@ make verify-supervisor-linux  # 151 end-to-end supervisor lifecycle checks
 make escape-linux   # 16 escape attempts against a real kernel
 make fuzz-linux     # every syscall number, against all three seccomp profiles
 make gvisor-linux   # the gvisor backend against a real runsc, compared with ns
+make verify-shim    # 13 macOS checks, against the Linux VM the shim manages
 make dist-linux     # the static musl binary, checked against N6
 make lint
 ```
@@ -317,7 +329,7 @@ Four rules the test suite is built on, all learned the hard way here:
   establishes the positive case first.
 
 Several checks here passed — or failed — for the wrong reason before those rules
-were applied; [docs/poc-report.md](docs/poc-report.md) lists all twelve.
+were applied; [docs/poc-report.md](docs/poc-report.md) lists all twenty-six.
 
 Zygo is Linux-first. The `ns` backend needs Linux **5.3+** — the floor is
 `clone3`, which has no fallback — plus user namespaces and delegated cgroup v2
@@ -326,8 +338,18 @@ unprivileged overlayfs (below it the store flattens image layers, which costs
 disk and first-run time) and 6.1 has everything in the design document's
 appendix C. `zygo doctor` reports each one and prints the fix.
 
-On other platforms the code still builds and the platform-independent layers are
-fully tested — macOS gets a hidden Linux VM in phase 5.
+On macOS the code builds, the platform-independent layers are fully tested, and
+sandboxes run in a Linux VM the shim manages — `zygo doctor` prints what that
+VM says about itself and exits with its answer. A warm `exec` from the Mac
+round-trips in 96 ms; `make verify-shim` is 13 checks against a real VM.
+
+One thing to know before running Zygo on Ubuntu 24.04 or later:
+`kernel.apparmor_restrict_unprivileged_userns=1` lets an unprivileged process
+create a user namespace and then refuses the first mount inside it, which is
+the first thing every sandbox does. `zygo doctor` detects it by attempting
+that mount, and prints the one-line fix — read
+[docs/threat-model.md](docs/threat-model.md) first, because the fix turns off
+a protection for every process on the machine, not only Zygo's.
 
 ## Security
 
