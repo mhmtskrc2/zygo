@@ -152,21 +152,25 @@ jobs:
           ZYGO_DATA_HOME: /tmp/zygo-ci
           SRC: ${{ github.workspace }}
 
-      # Temporary: CI reports `/bin/sh: can't fork: Operation not permitted`
-      # from an alpine sandbox on every runner, while the syscall sweep forks
-      # per syscall in the same job and passes. Four one-line questions that
-      # separate the filter from the image from the profile.
+      # Temporary. x86_64 runners refuse the fork; the arm one does not, and
+      # neither the seccomp profile nor the image nor `--pids` changes it. So
+      # ask from *inside* a sandbox, using only shell builtins — reading a
+      # file through a redirection and `ulimit` both avoid the fork that is
+      # the thing under investigation.
       - name: Why a sandbox cannot fork (diagnostic)
         if: ${{ !cancelled() }}
         run: |
           . poc/ci_cgroup.sh
           Z=target/release/zygo
           $Z pull alpine:3 >/dev/null 2>&1 || true
-          $Z pull python:3.12-slim >/dev/null 2>&1 || true
-          echo "alpine, default:     $($Z run alpine:3 /bin/sh -c 'ls /proc >/dev/null && echo forked' 2>&1 | tail -1)"
-          echo "alpine, permissive:  $($Z run --seccomp permissive alpine:3 /bin/sh -c 'ls /proc >/dev/null && echo forked' 2>&1 | tail -1)"
-          echo "debian, default:     $($Z run python:3.12-slim /bin/sh -c 'ls /proc >/dev/null && echo forked' 2>&1 | tail -1)"
-          echo "alpine, pids:        $($Z run --pids 64 alpine:3 /bin/sh -c 'ls /proc >/dev/null && echo forked' 2>&1 | tail -1)"
+          echo "--- host ---"
+          echo "nproc on the host: $(ulimit -u)"
+          echo "threads-max:       $(cat /proc/sys/kernel/threads-max 2>/dev/null)"
+          echo "pid_max:           $(cat /proc/sys/kernel/pid_max 2>/dev/null)"
+          echo "--- the plan zygo will apply ---"
+          $Z run --dry-run --json alpine:3 /bin/true 2>&1 | head -40
+          echo "--- from inside the sandbox, without forking ---"
+          $Z run alpine:3 /bin/sh -c 'ulimit -u; while read -r l; do case $l in Seccomp*|CapEff*|NoNewPrivs*|Uid:*) echo "$l";; esac; done < /proc/self/status' 2>&1 | head -12
         env:
           ZYGO_DATA_HOME: /tmp/zygo-diag
           SRC: ${{ github.workspace }}
