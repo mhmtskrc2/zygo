@@ -992,18 +992,22 @@ else
     # all fail for the same single reason — twelve red lines saying one
     # thing, with the one thing buried.
     egress_up=no
-    why=$(grep -v '^$' /tmp/up-net.log | tail -3 | tr '\n' ' ' | cut -c1-220)
+    # The *whole* log, not its last lines: the reason `up` failed is on the
+    # first line and the per-function ticks are on the last, so a `tail` here
+    # reports four functions that "did not start" and hides why.
+    why=$(grep -v '^$' /tmp/up-net.log | tr '\n' ' ' | cut -c1-220)
+    # `pasta` refusing before Zygo has said anything is a prerequisite that is
+    # present but does not work. The Raspberry Pi this was found on carries
+    # the passt Ubuntu shipped in June 2023, which cannot bring up a namespace
+    # for an ordinary user at all — `pasta --config-net -- /bin/true` fails
+    # there with no Zygo in the picture. Counting that as a Zygo failure sent
+    # a day into a fix for a bug that did not exist; see docs/poc-report.md.
     case $why in
-        # `pasta` refusing before Zygo has said anything is a prerequisite
-        # that is present but does not work — the Raspberry Pi here carries
-        # the passt Ubuntu shipped in June 2023, which cannot sandbox itself
-        # as an ordinary user and says so in its own words. That is not a
-        # result about Zygo and should not be counted as one. Anything else
-        # is ours.
         *"pasta could not configure"*)
             say "  SKIP  \`pasta\` on this host cannot configure a sandbox's network:"
             say "        $why"
-            say "        → this is passt, not Zygo; a newer one is the fix" ;;
+            say "        → this is passt, not Zygo. Check it on its own with"
+            say "          \`pasta --config-net -- /bin/true\`" ;;
         *) bad "up with egress failed: $why" ;;
     esac
     say "  SKIP  the rest of this section needs those functions; skipping it"

@@ -1528,45 +1528,50 @@ on the Pi, as an ordinary user, before:  error: … Permission denied
                                  after:  {"k": "sk_live_9"}
 ```
 
-**The same window, a second time: rootless networking never worked.** With
-the secrets path fixed, `zygo up` on a function with `network = "egress"`
-still refused, and the message was `pasta could not configure the sandbox's
+**A day spent on a bug that was not ours, and how it was settled.** With the
+secrets path fixed, `zygo up` on a function with `network = "egress"` still
+refused on the Raspberry Pi: `pasta could not configure the sandbox's
 network: Couldn't open user namespace /proc/<pid>/ns/user: Permission
-denied`. That is the sentence above in different clothes. `pasta` is handed
-the sandbox's user and network namespaces by path, it runs *after* the id map
-is written, and `/proc/<pid>/ns` is closed by then to anything that does not
-hold a capability in that namespace. The supervisor holds one, because it
-created the namespace; `pasta` is a separate process and holds nothing. As
-root in a container the check is skipped entirely, which is the only reason
-this shipped — **every rootless networked sandbox this project ever started
-was refused**, and the suite that would have caught it had only ever run as
-root.
+denied`. That is the sentence above in different clothes, and the obvious
+reading was that it *is* the sentence above — `pasta` runs after the id map
+is written, and `/proc/<pid>/ns` had just been shown to close at exactly that
+moment. Acting on the reading, the launcher was changed to take the
+namespaces early and hand `pasta` descriptors instead of paths.
 
-It reproduces with no Zygo in the picture at all:
+It was wrong, and two measurements said so. The first: the container, running
+as root, went from twenty-odd passing egress checks to `Couldn't open user
+namespace /proc/self/fd/3: No such device or address` — `pasta` had already
+put a socket of its own on that descriptor. The second is the one that
+mattered. `/proc/<pid>/ns` on a parked sandbox turns out to be *readable*: it
+is owned by the starting uid, mode `dr-x--x--x`, and an ordinary sibling
+shell opens it without ceremony.
 
 ```
-$ unshare -Ur --net --pid --fork sleep 60 &
+$ unshare -Ur --net --pid --fork sleep 30 & sleep 2
+$ head -c0 /proc/$!/ns/user && echo readable
+readable
 $ pasta --config-net --userns /proc/$!/ns/user --netns /proc/$!/ns/net
-Couldn't open user namespace /proc/65548/ns/user: Permission denied
+Couldn't open user namespace /proc/66312/ns/user: Permission denied
 ```
 
-The fix is the one the file next door already uses. The launcher opens the
-two namespaces in the window where it still can — the same window it already
-uses for a held sandbox's descriptors, before the map — and `pasta` is given
-`/proc/self/fd/3` and `/proc/self/fd/4`, descriptors dup'd into place by
-`pre_exec`. A descriptor names the namespace itself; there is no `/proc`
-lookup left to refuse. `nft` and `tc` never had the problem, because
-`run_in_namespace` had been passing them descriptors since it was written.
+A shell can open the file; `pasta` cannot. On the same host `pasta
+--config-net -- /bin/true`, which involves no Zygo at all, fails too — `mount
+/: Permission denied`, inside its own self-sandboxing. That machine carries
+the passt Ubuntu 23.10 shipped in **June 2023**, and it simply does not work
+rootless. The launcher change was reverted in full.
 
-What is *not* proven yet is the rest of the path. The Raspberry Pi gets past
-the refusal and then fails inside `pasta`'s own self-sandboxing with `mount
-/: Permission denied` — that machine runs the passt Ubuntu 23.10 shipped in
-June 2023, and `pasta --config-net -- /bin/true`, with no Zygo involved,
-fails there too. So the suite now tells the two apart: a failure whose text
-begins `pasta could not configure` is reported as a prerequisite that is
-present but does not work, and the section is skipped rather than counted.
-CI's ubuntu-24.04 runner, rootless and current, is where the fixed path gets
-its first honest run.
+Two things are worth keeping from it. The suite now tells the cases apart: a
+failure whose text begins `pasta could not configure` is reported as a
+prerequisite that is present but does not work, and the section is skipped
+rather than counted against Zygo — the same treatment a missing package
+already got. And the diagnosis discipline held only because the container was
+re-run: without that second environment the change would have looked like a
+fix, because the environment that could not disprove it was the only one
+being asked.
+
+Rootless egress therefore remains **unproven**, not broken: no environment
+available to this project can run `pasta` rootless. CI's ubuntu-24.04 runner
+is current and unprivileged, and is where the answer comes from.
 
 **The verification suites only knew how to run in a container.** Each one
 hard-coded `/sys/fs/cgroup` as the place to build its harness, which is the
@@ -2071,7 +2076,7 @@ same mechanism the agent path uses.
 
 ### An inventory of the bugs found in the tests themselves
 
-Twenty-three times in this project a test looked green because it measured
+Twenty-four times in this project a test looked green because it measured
 the wrong thing — or showed the wrong thing red. All of them fall into one of
 a few patterns:
 
@@ -2100,6 +2105,7 @@ a few patterns:
 | 21 | Supervisor suite | a function was there to exercise | `serve` was called for its side effect with its output thrown away, so when it failed the ten checks that used the function each reported `no function named \`spin\``. Ten red lines, no cause, and the cause was one line above them. Serving goes through a `served()` helper now that says why once and returns a status the section can branch on |
 | 22 | Every suite | `ZYGO_HARNESS` being `unusable` would be noticed | the harness set the flag, printed a remedy, and carried on — and nothing read it. A run started outside a delegated scope reported *121 passed, 13 failed* on a build with no bug in it. The harness now steps into a scope of its own the way `zygo` does, and when it still cannot, every summary carries a note saying the number above it is not a verdict |
 | 23 | Supervisor suite | a bandwidth limit could be shown by comparing against an unlimited upload | the assertion was `limited ≥ 3.5 s AND limited > 2 × unlimited`. The first half is arithmetic — 500 KB at 100 KB/s cannot finish sooner — and the second is a control for a slow endpoint. On a busy link the control *inverted*: the unlimited upload took 3.6 s, the ratio failed, and a working limit was reported broken. A control that cannot control for anything has to say so rather than vote |
+| 24 | Supervisor suite | a networked function that did not start was Zygo's fault | the section counted `pasta could not configure the sandbox's network` as a failure. `pasta` on that host cannot bring up a namespace for an ordinary user *at all* — `pasta --config-net -- /bin/true` fails there with no Zygo involved — so the suite was reporting a three-year-old package as a runtime bug, and a day went into fixing something that was not broken. A prerequisite that is present but does not work now skips the section, the way a missing one already did |
 
 Written up as three rules and put in the README:
 
