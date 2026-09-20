@@ -31,19 +31,19 @@ impl Credential {
     }
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, serde::Serialize, Default)]
 struct DockerConfig {
     #[serde(default)]
     auths: BTreeMap<String, DockerAuthEntry>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, serde::Serialize, Default)]
 struct DockerAuthEntry {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     auth: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     username: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     password: Option<String>,
 }
 
@@ -96,6 +96,79 @@ impl CredentialStore {
         Self::default_path()
             .map(|p| Self::from_file(&p))
             .unwrap_or_default()
+    }
+
+    /// Where `zygo login` keeps what it was told.
+    ///
+    /// Zygo's own directory, not `~/.docker/config.json`. Writing into
+    /// another tool's configuration file is a surprise at best and a
+    /// clobbered credential helper at worst, and the compatibility that
+    /// matters is the *read* — principle P4 is that somebody who has already
+    /// logged in with Docker does not log in again, not that Zygo starts
+    /// editing Docker's files.
+    pub fn zygo_path(paths: &crate::Paths) -> PathBuf {
+        paths.data().join("auth.json")
+    }
+
+    /// Docker's credentials, then Zygo's own on top.
+    ///
+    /// Zygo's win, because `zygo login` is the more specific statement: a
+    /// user who typed it meant that registry, now, with those credentials.
+    pub fn load(paths: &crate::Paths) -> Self {
+        let mut store = Self::load_default();
+        for (host, cred) in Self::from_file(&Self::zygo_path(paths)).entries {
+            store.entries.insert(host, cred);
+        }
+        store
+    }
+
+    /// Write the store in Docker's shape, readable by its owner alone.
+    ///
+    /// The same shape because there is no reason to invent another one, and
+    /// because a user can then look at it, edit it, or delete a line with an
+    /// editor rather than a subcommand.
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let cfg = DockerConfig {
+            auths: self
+                .entries
+                .iter()
+                .map(|(host, cred)| {
+                    (
+                        host.clone(),
+                        DockerAuthEntry {
+                            auth: Some(
+                                base64::engine::general_purpose::STANDARD
+                                    .encode(format!("{}:{}", cred.username, cred.password)),
+                            ),
+                            username: None,
+                            password: None,
+                        },
+                    )
+                })
+                .collect(),
+        };
+        let json = serde_json::to_string_pretty(&cfg).unwrap_or_else(|_| "{}".to_string());
+
+        // Written with the mode it must end up with, not chmodded afterwards:
+        // between `create` and `set_permissions` the file is world-readable,
+        // and what it holds is a password.
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)?;
+            f.write_all(json.as_bytes())
+        }
+        #[cfg(not(unix))]
+        std::fs::write(path, json)
     }
 
     /// Look up a registry. Docker Hub is stored under a handful of legacy
@@ -267,6 +340,88 @@ impl TokenResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_is_saved_is_what_comes_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+
+        let mut store = CredentialStore::default();
+        store.insert(
+            "ghcr.io",
+            Credential {
+                username: "someone".into(),
+                // A colon, because the encoding splits on the first one and a
+                // password is allowed to contain them.
+                password: "pa:ss word".into(),
+            },
+        );
+        store.save(&path).unwrap();
+
+        let back = CredentialStore::from_file(&path);
+        let cred = back
+            .get("ghcr.io")
+            .expect("the entry survived the round trip");
+        assert_eq!(cred.username, "someone");
+        assert_eq!(cred.password, "pa:ss word");
+    }
+
+    /// The file holds a password, so it is created with the mode it must end
+    /// up with rather than chmodded afterwards — between `create` and
+    /// `set_permissions` it would be readable by anyone.
+    #[cfg(unix)]
+    #[test]
+    fn the_file_is_readable_by_its_owner_alone() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let mut store = CredentialStore::default();
+        store.insert(
+            "ghcr.io",
+            Credential {
+                username: "u".into(),
+                password: "p".into(),
+            },
+        );
+        store.save(&path).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a file holding a password was {mode:o}");
+    }
+
+    /// A second `login` must not take the first one's line with it. Obvious,
+    /// and exactly the kind of thing a write-the-whole-file implementation
+    /// gets wrong once.
+    #[test]
+    fn saving_one_registry_keeps_the_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+
+        let mut first = CredentialStore::default();
+        first.insert(
+            "ghcr.io",
+            Credential {
+                username: "a".into(),
+                password: "1".into(),
+            },
+        );
+        first.save(&path).unwrap();
+
+        let mut second = CredentialStore::from_file(&path);
+        second.insert(
+            "registry.example.com",
+            Credential {
+                username: "b".into(),
+                password: "2".into(),
+            },
+        );
+        second.save(&path).unwrap();
+
+        let back = CredentialStore::from_file(&path);
+        assert!(back.get("ghcr.io").is_some(), "the first entry is gone");
+        assert!(back.get("registry.example.com").is_some());
+    }
 
     #[test]
     fn basic_auth_entries_decode() {

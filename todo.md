@@ -37,7 +37,8 @@ live here.
 | `zygo logs` | **Works** — the zygote's output and one entry per request, per name, across replacements; `-f`, `-n`, `--failed`, `--json` |
 | Node agent / Go template | **Works** — `examples/agents/node` passes the nine checks; `examples/warm-exec/go` runs for real on alpine |
 | `seccomp = "strict"` | **Works** — all five reference packages, after `clone3` → `ENOSYS` and the socket data calls were kept (3.0g) |
-| Other commands | Declared; they exit saying which phase brings them |
+| `zygo login` | **Works** — verified against the registry before it is stored, `auth.json` at 0600, Docker's file read and never written |
+| `zygo top` / `zygo stats` | Declared; they exit saying which phase brings them |
 
 Test status: **559 Rust tests on Linux** (466 on macOS) + 34 Python +
 **275 Linux integration / escape / supervisor / backend / example checks** +
@@ -178,7 +179,16 @@ equivalent of `docker run`".
 - [x] Flatten fallback (when overlayfs is unavailable) + a `cache/flat/<hash>` cache
 - [x] `zygo pull`, `zygo images`
 - [x] `zygo image prune` (reference counting + GC, `--dry-run`)
-- [ ] `zygo login <registry>` (credential storage)
+- [x] **`zygo login <registry>`.** Checked against the registry before it is
+      stored — a `login` that writes what it was told is a setting, and the
+      typo surfaces hours later on a `pull` looking like a wrong image name.
+      Written to Zygo's own `auth.json` at mode 0600, in Docker's shape;
+      `~/.docker/config.json` is read and never edited, which is what P4
+      actually promises. There is deliberately no `--password` flag: an
+      argument is visible in `ps` to every process on the machine. 15 checks
+      in `poc/verify_login.sh` against a real `registry:2` with htpasswd
+      authentication, including that the stored credential is the one a
+      `pull` then uses.
 
 ### 1.3 Launcher — the `ns` backend
 - [x] Mount plan generation (overlayfs lowerdir, tmpfs scratch, binds, `/proc`

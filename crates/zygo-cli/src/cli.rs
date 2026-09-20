@@ -109,8 +109,25 @@ pub enum Command {
     #[command(subcommand)]
     Image(ImageCommand),
 
-    /// Store registry credentials.
-    Login { registry: String },
+    /// Store a credential for a private registry.
+    ///
+    /// The password is read from the terminal with echo off, or from standard
+    /// input with `--password-stdin`. There is deliberately no `--password`
+    /// flag: an argument is visible in `ps` to every process on the machine
+    /// and lands in the shell's history.
+    ///
+    /// It is checked against the registry before it is stored, and written to
+    /// Zygo's own `auth.json` — never to `~/.docker/config.json`, which Zygo
+    /// reads and does not edit.
+    Login {
+        registry: String,
+        /// The account name. Prompted for when not given.
+        #[arg(short, long)]
+        username: Option<String>,
+        /// Read the password from standard input, for CI and secret managers.
+        #[arg(long)]
+        password_stdin: bool,
+    },
 
     /// Start every function in the spec file.
     ///

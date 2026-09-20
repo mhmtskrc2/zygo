@@ -73,6 +73,24 @@ examples-go-linux:
 
 # The `ns` backend, the cgroup hierarchy and the doctor probes are all behind
 # `#[cfg(target_os = "linux")]`, so a macOS `cargo check` never sees them.
+# `zygo login` against a registry that really refuses people.
+#
+# Two containers: a `registry:2` with htpasswd authentication, and the suite
+# sharing its network namespace so the registry is at `127.0.0.1:5000` — one
+# of the names Zygo reaches over plain HTTP. Nothing here needs a sandbox, so
+# it needs no privileges either.
+verify-login-linux:
+	@mkdir -p /tmp/zygo-reg-auth
+	@docker run --rm httpd:2 htpasswd -Bbn zygotest s3cret > /tmp/zygo-reg-auth/htpasswd
+	@docker rm -f zygo-reg >/dev/null 2>&1 || true
+	@docker run -d --name zygo-reg -v /tmp/zygo-reg-auth:/auth \
+		-e REGISTRY_AUTH=htpasswd -e REGISTRY_AUTH_HTPASSWD_REALM=zygo \
+		-e REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd registry:2 >/dev/null
+	@sleep 3
+	-docker run --rm --network container:zygo-reg -v "$(PWD):/src:ro" \
+		python:3.12-slim sh /src/poc/verify_login.sh
+	@docker rm -f zygo-reg >/dev/null 2>&1 || true
+
 # The macOS shim: a real Lima VM, a real Linux kernel, from this Mac. Skips
 # itself anywhere else, and where `limactl` is not installed.
 verify-shim: build

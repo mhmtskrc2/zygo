@@ -18,6 +18,27 @@ pub const DEFAULT_REGISTRY_ENDPOINT: &str = "registry-1.docker.io";
 pub const DEFAULT_NAMESPACE: &str = "library";
 pub const DEFAULT_TAG: &str = "latest";
 
+/// The API endpoint for a bare registry name, without parsing a reference.
+///
+/// `docker.io` is a display name and has been since 2015; the requests go to
+/// `registry-1.docker.io`. `zygo login docker.io` has to reach the same place
+/// a pull does, or it would check a password against a host that never sees
+/// one.
+pub fn endpoint_for(registry: &str) -> &str {
+    if registry == DEFAULT_REGISTRY {
+        DEFAULT_REGISTRY_ENDPOINT
+    } else {
+        registry
+    }
+}
+
+/// Whether a registry is one of the loopback names, which are reached over
+/// plain HTTP. Same rule as [`Reference::is_insecure_local`], for a bare name.
+pub fn is_insecure_local(registry: &str) -> bool {
+    let host = registry.split(':').next().unwrap_or("");
+    host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
 /// A parsed reference: `[registry/]repository[:tag][@digest]`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Reference {
@@ -59,8 +80,7 @@ impl Reference {
     /// are overwhelmingly `localhost:5000` test registries; anything else must
     /// be TLS.
     pub fn is_insecure_local(&self) -> bool {
-        let host = self.registry.split(':').next().unwrap_or("");
-        host == "localhost" || host == "127.0.0.1" || host == "::1"
+        is_insecure_local(&self.registry)
     }
 
     /// Filesystem-safe key for the image index.

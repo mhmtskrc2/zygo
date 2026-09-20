@@ -9,7 +9,7 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use tokio::sync::Mutex;
 
-use super::auth::{Challenge, CredentialStore, TokenResponse};
+use super::auth::{Challenge, Credential, CredentialStore, TokenResponse};
 use super::media::{self, Index, LayerCompression, Manifest, Platform};
 use super::store::{ImageEntry, Store};
 use super::{ImageConfig, ImageError, Reference};
@@ -43,6 +43,16 @@ pub enum PullProgress {
     },
 }
 
+/// What a registry said about a credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verified {
+    /// The registry took the credential.
+    Accepted,
+    /// The registry serves `/v2/` to anyone, so nothing was checked and
+    /// nothing needs storing. Worth saying rather than reporting success.
+    NoCredentialsNeeded,
+}
+
 /// A Distribution API client.
 pub struct RegistryClient {
     http: reqwest::Client,
@@ -61,10 +71,11 @@ impl RegistryClient {
             .build()
             .map_err(|e| ImageError::Registry(e.to_string()))?;
 
+        let credentials = CredentialStore::load(store.paths());
         Ok(Self {
             http,
             store,
-            credentials: CredentialStore::load_default(),
+            credentials,
             platform: Platform::host(),
             tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
         })
@@ -376,6 +387,85 @@ impl RegistryClient {
         req.send()
             .await
             .map_err(|e| ImageError::Registry(format!("{url}: {e}")).into())
+    }
+
+    /// Check a credential against a registry, the way `docker login` does.
+    ///
+    /// Attempted, not stored on trust. A `login` that writes a password
+    /// without trying it is a setting, and the failure surfaces much later as
+    /// a `pull` that looks like a wrong image name. This makes the same
+    /// unauthenticated request a pull starts with, reads the challenge, and
+    /// exchanges the credential for a token — so a typo is a typo now.
+    ///
+    /// No repository, so no scope: that is what `docker login` asks for too,
+    /// and it is the question "are these credentials valid here", not "may I
+    /// read that image".
+    pub async fn verify(&self, registry: &str, credential: &Credential) -> Result<Verified> {
+        let scheme = if super::reference::is_insecure_local(registry) {
+            "http"
+        } else {
+            "https"
+        };
+        let url = format!(
+            "{scheme}://{}/v2/",
+            super::reference::endpoint_for(registry)
+        );
+
+        let probe = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| ImageError::Registry(format!("{url}: {e}")))?;
+
+        if probe.status().is_success() {
+            return Ok(Verified::NoCredentialsNeeded);
+        }
+        if probe.status() != reqwest::StatusCode::UNAUTHORIZED {
+            return Err(ImageError::Registry(format!(
+                "{url} answered {} before any credential was offered",
+                probe.status()
+            ))
+            .into());
+        }
+
+        let challenge = probe
+            .headers()
+            .get(reqwest::header::WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(Challenge::parse);
+
+        let response = match &challenge {
+            // Bearer: exchange the credential for a token at the realm.
+            Some(c) => {
+                let token_url = c.token_url("");
+                self.http
+                    .get(&token_url)
+                    .header(reqwest::header::AUTHORIZATION, credential.basic_header())
+                    .send()
+                    .await
+                    .map_err(|e| ImageError::Registry(format!("{token_url}: {e}")))?
+            }
+            // No Bearer challenge: a Basic-only registry. Ask again with the
+            // credential and see whether the answer changes.
+            None => self
+                .http
+                .get(&url)
+                .header(reqwest::header::AUTHORIZATION, credential.basic_header())
+                .send()
+                .await
+                .map_err(|e| ImageError::Registry(format!("{url}: {e}")))?,
+        };
+
+        if response.status().is_success() {
+            Ok(Verified::Accepted)
+        } else {
+            Err(ImageError::Auth {
+                registry: registry.to_string(),
+                reason: format!("the registry answered {}", response.status()),
+            }
+            .into())
+        }
     }
 
     async fn fetch_token(&self, challenge: &Challenge, reference: &Reference) -> Result<String> {

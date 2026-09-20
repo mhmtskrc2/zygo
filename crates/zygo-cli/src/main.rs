@@ -109,7 +109,11 @@ fn run(cli: &Cli) -> anyhow::Result<u8> {
         Command::Api(args) => cmd::api::run(cli, args),
         Command::Up { file, relock } => cmd::supervisor::up(cli, file.path(), *relock),
         Command::Down { file } => cmd::supervisor::down(cli, file.path()),
-        Command::Login { .. } => pending("zygo login", "1.2"),
+        Command::Login {
+            registry,
+            username,
+            password_stdin,
+        } => cmd::login::run(cli, registry, username.as_deref(), *password_stdin),
         Command::Agent(crate::cli::AgentCommand::Test { binary, args }) => {
             cmd::agent::test(cli, binary, args)
         }

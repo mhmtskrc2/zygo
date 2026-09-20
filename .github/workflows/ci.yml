@@ -234,6 +234,17 @@ jobs:
         env:
           SRC: ${{ github.workspace }}
 
+      # `zygo login` against a real `registry:2` with htpasswd
+      # authentication, in two containers sharing a network namespace. No
+      # sandbox and no privileges, so it runs once rather than per matrix
+      # entry: it is the client half of the image store and does not vary
+      # with the kernel.
+      - name: Registry credentials
+        if: ${{ !cancelled() && matrix.os == 'ubuntu-24.04' && matrix.privilege == 'rootless' }}
+        run: |
+          install -m 0755 target/release/zygo poc/zygo-linux
+          make verify-login-linux
+
       - name: Examples
         # Run even when an earlier suite failed: they test different
         # things, and one job that reports all of them is one round trip

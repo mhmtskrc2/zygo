@@ -19,7 +19,7 @@ pub use reference::Reference;
 pub use store::{ImageEntry, Store, Whiteouts};
 
 #[cfg(feature = "registry")]
-pub use registry::{PullProgress, RegistryClient};
+pub use registry::{PullProgress, RegistryClient, Verified};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ImageError {

@@ -307,6 +307,7 @@ make escape-linux   # 16 escape attempts against a real kernel
 make fuzz-linux     # every syscall number, against all three seccomp profiles
 make gvisor-linux   # the gvisor backend against a real runsc, compared with ns
 make verify-shim    # 14 macOS checks, against the Linux VM the shim manages
+make verify-login-linux  # 15 checks against a registry that really refuses people
 make dist-linux     # the static musl binary, checked against N6
 make lint
 ```

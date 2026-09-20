@@ -6,6 +6,7 @@ pub mod backend;
 pub mod bench;
 pub mod doctor;
 pub mod image;
+pub mod login;
 pub mod logs;
 pub mod otlp;
 pub mod run;
