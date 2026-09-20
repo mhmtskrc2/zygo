@@ -152,6 +152,25 @@ jobs:
           ZYGO_DATA_HOME: /tmp/zygo-ci
           SRC: ${{ github.workspace }}
 
+      # Temporary: CI reports `/bin/sh: can't fork: Operation not permitted`
+      # from an alpine sandbox on every runner, while the syscall sweep forks
+      # per syscall in the same job and passes. Four one-line questions that
+      # separate the filter from the image from the profile.
+      - name: Why a sandbox cannot fork (diagnostic)
+        if: ${{ !cancelled() }}
+        run: |
+          . poc/ci_cgroup.sh
+          Z=target/release/zygo
+          $Z pull alpine:3 >/dev/null 2>&1 || true
+          $Z pull python:3.12-slim >/dev/null 2>&1 || true
+          echo "alpine, default:     $($Z run alpine:3 /bin/sh -c 'ls /proc >/dev/null && echo forked' 2>&1 | tail -1)"
+          echo "alpine, permissive:  $($Z run --seccomp permissive alpine:3 /bin/sh -c 'ls /proc >/dev/null && echo forked' 2>&1 | tail -1)"
+          echo "debian, default:     $($Z run python:3.12-slim /bin/sh -c 'ls /proc >/dev/null && echo forked' 2>&1 | tail -1)"
+          echo "alpine, pids:        $($Z run --pids 64 alpine:3 /bin/sh -c 'ls /proc >/dev/null && echo forked' 2>&1 | tail -1)"
+        env:
+          ZYGO_DATA_HOME: /tmp/zygo-diag
+          SRC: ${{ github.workspace }}
+
       - name: Escape suite
         # Run even when an earlier suite failed: they test different
         # things, and one job that reports all of them is one round trip
