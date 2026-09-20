@@ -232,6 +232,52 @@ fi
 "$ZYGO" stop jam >/dev/null 2>&1
 
 say ""
+say "the zygote stays clean"
+
+# Copy-on-write is the whole economy of the warm path: a request is a fork,
+# and what it costs is the pages it dirties. Pages the *zygote* dirties are
+# worse than that — they are copied for every later fork and never shared
+# again, so a zygote that grows per request makes every request after it more
+# expensive. Nothing in the protocol should write to the parent, and this is
+# how that stays true.
+#
+# Measured by reading `ps`, which touches nothing: reading the zygote's own
+# `/proc` would be the check disturbing what it measures.
+printf 'def handler(event):\n    data = [i * i for i in range(20000)]\n    return {"n": len(data)}\n' > cow.py
+if served cow cow.py --name cow; then
+    zygote_rss() {
+        "$ZYGO" --json ps 2>/dev/null | python3 -c '
+import json
+import sys
+
+listing = json.load(sys.stdin)
+rows = listing["functions"] if isinstance(listing, dict) else listing
+print(next((r["rss_kb"] for r in rows if r["name"] == "cow"), 0))
+'
+    }
+    # One request first, so the warm-up's own allocations are behind us and
+    # what is measured is the steady state.
+    "$ZYGO" exec cow '{}' >/dev/null 2>&1
+    before=$(zygote_rss)
+    n=0
+    while [ "$n" -lt 50 ]; do
+        "$ZYGO" exec cow '{}' >/dev/null 2>&1
+        n=$((n + 1))
+    done
+    after=$(zygote_rss)
+    growth=$((${after:-0} - ${before:-0}))
+    # Generous: the measured growth over fifty requests is zero, and a budget
+    # of two megabytes catches a regression that dirties pages per request
+    # without failing on an allocator that rounds up once.
+    if [ "$growth" -le 2048 ]; then
+        ok "50 requests left the zygote ${growth} kB larger (${before} → ${after} kB), inside the 2 MB this allows"
+    else
+        bad "the zygote grew ${growth} kB over 50 requests (${before} → ${after} kB); every later fork pays for those pages"
+    fi
+    "$ZYGO" stop cow >/dev/null 2>&1
+fi
+
+say ""
 say "secrets"
 # Delivered as a file to the child only (design doc §3.10). Three things have
 # to be true, and each is checked by looking rather than trusting: the handler

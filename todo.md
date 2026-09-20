@@ -42,9 +42,9 @@ live here.
 | `zygo top` | Declared; it exits saying which phase brings it |
 
 Test status: **566 Rust tests on Linux** (473 on macOS) + 34 Python +
-**292 Linux integration / escape / supervisor / backend / example / registry
+**293 Linux integration / escape / supervisor / backend / example / registry
 checks** + **14 macOS shim checks**
-(36 launcher, 16 escape vectors, 13 syscall-sweep, 19 gvisor, 153 supervisor,
+(36 launcher, 16 escape vectors, 13 syscall-sweep, 19 gvisor, 154 supervisor,
 12 examples, 15 registry credentials, 10 seccomp-matrix cells, 9 Python and
 9 Node conformance),
 `clippy -D warnings`.
@@ -833,7 +833,14 @@ that, `sh -c cat` answers in 2.2 ms.
       folded every failure into 1 until the agent-tool example's test held it
       to what that example's README promised; it now exits with the request's
       own status (137 killed, the program's code for warm-exec, 1 raised)
-- [ ] A CoW pollution regression test
+- [x] **A copy-on-write pollution regression test.** Copy-on-write is the
+      whole economy of the warm path: a request is a fork and what it costs is
+      the pages it dirties, and pages the *zygote* dirties are worse — copied
+      for every later fork and never shared again. Fifty requests through a
+      handler that allocates leave the zygote **0 kB** larger (16492 → 16492),
+      against a 2 MB budget that would catch a regression writing to the
+      parent per request. Read through `ps`, because reading the zygote's own
+      `/proc` would be the check disturbing what it measures.
 
 #### 2.9a What `bench load` says about the phase 2 throughput criterion
 
