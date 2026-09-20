@@ -48,6 +48,14 @@ pub use idmap::{IdMapEntry, NamespaceSet, SubIdRange, id_map, parse_subid, rende
 /// hangs here is a supervisor that never serves anything again.
 pub const START_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How long a killed sandbox has to actually exit.
+///
+/// Generous for a process that has been sent `SIGKILL`: anything not in an
+/// uninterruptible sleep goes within milliseconds. What the number is really
+/// for is the case where the signal reached nothing — see [`NsSandbox::
+/// wait_within`].
+const REAP_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Read a pipe to end of file, giving up after `budget`.
 ///
 /// `std::fs::File` has no read timeout, so the descriptor is polled and then
@@ -217,19 +225,70 @@ impl NsSandbox {
         Ok(())
     }
 
+    /// `waitpid`, with an end to it.
+    ///
+    /// The blocking form has no deadline, and the thread that calls it is the
+    /// launcher — the one thread that starts sandboxes, one at a time. A
+    /// child that will not die therefore does not fail one request; it stops
+    /// the supervisor from serving anything, ever, while still answering
+    /// `ping` and looking healthy.
+    ///
+    /// So it polls, sends one more `SIGKILL` halfway through in case the
+    /// first went somewhere that no longer existed, and gives up with an
+    /// error naming the pid. Giving up leaks a process, which is bad; parking
+    /// the launcher leaks the whole supervisor, which is worse, and says
+    /// nothing while it does it.
+    fn wait_within(&self, status: &mut libc::c_int, budget: Duration) -> Result<libc::pid_t> {
+        let pid = self.pid as libc::pid_t;
+        let deadline = Instant::now() + budget;
+        let mut nudged = false;
+        loop {
+            // SAFETY: `status` is a live local; `WNOHANG` cannot block.
+            let rc = unsafe { libc::waitpid(pid, status, libc::WNOHANG) };
+            if rc != 0 {
+                return Ok(rc);
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(Error::primitive(
+                    "waitpid",
+                    format!(
+                        "sandbox process {pid} did not exit within {}s of being killed; \
+                         it has been left running rather than blocking the launcher",
+                        budget.as_secs()
+                    ),
+                    std::io::Error::from(std::io::ErrorKind::TimedOut),
+                ));
+            }
+            if !nudged && left < budget / 2 {
+                nudged = true;
+                let _ = self.signal(libc::SIGKILL);
+            }
+            std::thread::sleep(Duration::from_millis(10).min(left));
+        }
+    }
+
     /// Kill everything in the sandbox.
     ///
     /// Prefers `cgroup.kill`, which takes down the whole subtree in one write.
     /// On kernels before 5.14 it falls back to killing the pid namespace's
     /// init, which the kernel turns into a SIGKILL for every member.
     fn kill_tree(&mut self) -> Result<()> {
-        let killed_via_cgroup = match &self.cgroup_dir {
-            Some(dir) => cgroup::kill(dir).unwrap_or(false),
-            None => false,
-        };
-        if !killed_via_cgroup {
-            let _ = self.signal(libc::SIGKILL);
+        if let Some(dir) = &self.cgroup_dir {
+            let _ = cgroup::kill(dir);
         }
+        // *And* the process itself, not "or". `cgroup::kill` reports that the
+        // write to `cgroup.kill` succeeded, which it does on an empty cgroup
+        // too — and a sandbox that failed early has not been attached to one
+        // yet. Taking that as proof of death meant no signal was ever sent,
+        // and the blocking `waitpid` below then parked the launcher thread
+        // for ever. Every later `serve` queued behind it: a Raspberry Pi
+        // supervisor sat like that for fourteen minutes with a live child it
+        // had already decided was dead.
+        //
+        // Sending both is free and always safe: the child has not been reaped,
+        // so its pid is still ours and cannot have been reused.
+        let _ = self.signal(libc::SIGKILL);
         Ok(())
     }
 
@@ -239,8 +298,12 @@ impl NsSandbox {
         }
 
         let mut status: libc::c_int = 0;
-        let flags = if block { 0 } else { libc::WNOHANG };
-        let rc = unsafe { libc::waitpid(self.pid as libc::pid_t, &mut status, flags) };
+        let rc = if block {
+            self.wait_within(&mut status, REAP_TIMEOUT)?
+        } else {
+            // SAFETY: `status` is a live local; `WNOHANG` cannot block.
+            unsafe { libc::waitpid(self.pid as libc::pid_t, &mut status, libc::WNOHANG) }
+        };
 
         if rc == 0 {
             return Ok(None); // still running
