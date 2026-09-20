@@ -2291,7 +2291,7 @@ life.
 
 ### An inventory of the bugs found in the tests themselves
 
-Thirty times in this project a test looked green because it measured the
+Thirty-one times in this project a test looked green because it measured the
 wrong thing — or showed the wrong thing red. All of them fall into one of
 a few patterns:
 
@@ -2327,6 +2327,7 @@ a few patterns:
 | 28 | Supervisor suite | counting host processes called `python3` counted sandboxes | true on a machine that runs nothing else, which is what a container is. A CI runner has its own, and `no sandbox outlived the supervisor` reported two that were not sandboxes. Counted by cgroup now — under a `zygo.slice` is Zygo's by construction, whatever it is running |
 | 29 | Supervisor suite | `pasta` is called `pasta` | `passt` ships CPU-tuned builds and `/usr/bin/pasta` is a symlink to one, so `comm` reads `pasta.avx2` on x86_64. Matching the name exactly found none and reported "expected a pasta per networked sandbox, found 0" while four were serving |
 | 30 | Syscall sweep | a syscall that kills the process means the filter killed it | `uretprobe` (x86_64 335, kernel 6.11) exists to be called from the kernel's own trampoline and answers a direct call with SIGILL, whatever any filter says. The check subtracts the ones that die under `permissive` too, rather than excusing numbers by name — a list would be another thing to maintain per architecture and wrong the next time the kernel adds one |
+| 31 | Supervisor suite | watching `ps`' `rss_kb` for movement measured the zygote growing | it measured a constant. For an agent function that field was whatever the agent announced in `READY` and never changed again, so a copy-on-write regression test written against it would have passed on a zygote ballooning to half a gigabyte — and `zygo ps` reported sixteen megabytes for exactly that. Found by asking how the new check could fail, before trusting it: the answer was that it could not. It reads the process now, and the check was then made to fail on purpose — one line in the agent keeping a megabyte per request takes it from 0 to 61 MB of growth |
 
 Written up as three rules and put in the README:
 

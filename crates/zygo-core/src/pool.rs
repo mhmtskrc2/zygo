@@ -857,7 +857,17 @@ impl WarmFn {
             name: self.name.clone(),
             state: self.state(),
             runtime: self.runtime.clone(),
-            rss_kb: self.rss_kb,
+            // Read now, not remembered from the warm-up. `self.rss_kb` is what
+            // the agent announced in `READY` and never changes again, so
+            // `zygo ps` reported sixteen megabytes for a function that had
+            // grown to five hundred — and any check watching that number for
+            // movement was watching a constant. The warm-up figure is the
+            // fallback for a process that has gone, where it is the last true
+            // thing known about it.
+            //
+            // The warm-exec path has always done this; only the agent path
+            // had the frozen copy.
+            rss_kb: resident_kb(self.agent_host_pid).unwrap_or(self.rss_kb),
             imports_ms: self.imports_ms,
             requests: counters.requests,
             failures: counters.failures,
@@ -1937,6 +1947,16 @@ fn into_outcome(
         },
         timed_out: c.timed_out,
     })
+}
+
+/// `VmRSS` of a process, for `zygo ps`.
+///
+/// `None` where there is no `/proc` to read it from, which leaves the caller
+/// with the last figure it knew rather than a zero that would read as "this
+/// function is using no memory".
+#[cfg(not(target_os = "linux"))]
+fn resident_kb(_pid: u32) -> Option<u64> {
+    None
 }
 
 /// `VmRSS` of a process, for `zygo ps`.

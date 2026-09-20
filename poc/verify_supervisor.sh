@@ -243,6 +243,13 @@ say "the zygote stays clean"
 #
 # Measured by reading `ps`, which touches nothing: reading the zygote's own
 # `/proc` would be the check disturbing what it measures.
+#
+# And the check was made to fail before it was trusted. With one line added to
+# the Python agent — a megabyte kept in the *parent* per request — the same
+# fifty requests take the zygote from 17.8 MB to 79.5 MB, which this reports
+# as 61 MB of growth. A handler cannot do that from inside a request, because
+# the fork is what isolates it; only Zygo's own code in the parent can, which
+# is exactly what this guards.
 printf 'def handler(event):\n    data = [i * i for i in range(20000)]\n    return {"n": len(data)}\n' > cow.py
 if served cow cow.py --name cow; then
     zygote_rss() {
