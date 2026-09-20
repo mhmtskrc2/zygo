@@ -1,0 +1,104 @@
+# The Linux VM macOS runs Zygo's sandboxes in.
+#
+# Nothing here is about Zygo's isolation — that is built inside the sandboxes
+# this VM hosts, by the same `ns` backend that runs on any Linux box. This
+# file is about making the VM invisible, which comes down to three things:
+# the guest kernel has to be new enough for the features the backend needs,
+# the user's files have to be at the same paths on both sides, and starting
+# it must not ask anybody anything.
+
+# 24.04 is kernel 6.8: Landlock ABI v4 (network rules, 6.7), `cgroup.kill`
+# (5.14) and unprivileged overlayfs (5.11) are all present. The docs' support
+# floor is 5.15, and a VM is the one place the kernel is Zygo's own choice
+# rather than the host's, so it takes the newer one.
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img"
+    arch: "x86_64"
+
+# Apple's own hypervisor on macOS 13+, and virtiofs with it: the file sharing
+# is the part the user feels, because every `serve handler.py` reads through
+# it.
+vmType: "vz"
+mountType: "virtiofs"
+rosetta:
+  enabled: false
+  binfmt: false
+
+# **Writable**, and this is the whole path contract. Lima shares the home
+# directory read-only by default, which would let `zygo serve` read a handler
+# and then fail to write anything beside it. `zygo` resolves relative paths
+# against the working directory, and `limactl shell --workdir` puts the guest
+# in the same one, so `./handler.py` is one file seen from two sides rather
+# than two files that happen to match.
+mounts:
+  - location: "~"
+    writable: true
+
+# Small on purpose. The warm pool's memory is the tenant's, and a laptop
+# running an editor should not lose four gigabytes to an idle VM; `serve`
+# fails against its own cgroup limit long before this becomes the binding
+# constraint.
+cpus: 2
+memory: "4GiB"
+disk: "20GiB"
+
+# Zygo's own requirement N5: sandboxes run as an ordinary user. The VM is no
+# exception, so the guest needs subordinate id ranges to hand out — without
+# them every tenant shares one uid and `zygo doctor` reports it as degraded.
+# cloud-init gives the default user a range; this makes sure of it rather
+# than assuming, and delegates the cgroup controllers that a rootless
+# supervisor cannot delegate to itself.
+provision:
+  - mode: system
+    script: |
+      #!/bin/sh
+      set -eu
+      # Not guarded on `newuidmap`: the cloud image already has `uidmap`, so
+      # one guard covering all four packages skipped the other three and the
+      # VM came up without `passt` — a networked function refusing to start
+      # for a reason that is this file's fault.
+      missing=
+      for p in uidmap passt nftables iproute2 jq; do
+          dpkg -s "$p" >/dev/null 2>&1 || missing="$missing $p"
+      done
+      if [ -n "$missing" ]; then
+          apt-get update
+          # shellcheck disable=SC2086
+          apt-get install -y --no-install-recommends $missing
+      fi
+      # Ubuntu 24.04 ships `kernel.apparmor_restrict_unprivileged_userns=1`,
+      # which lets an ordinary user *create* a user namespace and then refuses
+      # to let them write its id map — so `zygo doctor` says user namespaces
+      # are enabled and the sandbox dies four steps later on `mount
+      # --make-rprivate /: Permission denied`. Every boundary Zygo builds
+      # starts with that map.
+      #
+      # Turning it off is a decision about *this VM*, not about the user's
+      # Mac: it exists to run sandboxes, it is the only thing in it, and the
+      # confinement that matters is the one Zygo builds inside it. On a shared
+      # Linux host the narrower answer is an AppArmor profile for the `zygo`
+      # binary; `zygo doctor` says so when it finds this set.
+      cat > /etc/sysctl.d/99-zygo-userns.conf <<'EOF'
+      kernel.apparmor_restrict_unprivileged_userns = 0
+      EOF
+      sysctl --system >/dev/null
+
+      # Delegation has to be on the *user manager*, not on a login session:
+      # a session scope is a dead end no matter what is delegated to it.
+      mkdir -p /etc/systemd/system/user@.service.d
+      cat > /etc/systemd/system/user@.service.d/delegate.conf <<'EOF'
+      [Service]
+      Delegate=cpu cpuset io memory pids
+      EOF
+      systemctl daemon-reload
+
+  - mode: user
+    script: |
+      #!/bin/sh
+      # A shell that says what is wrong is better than a command that fails
+      # four layers in, so the guest checks itself once, at provision time.
+      set -eu
+      grep -q "^$(id -un):" /etc/subuid ||
+          echo "warning: no subuid range; sandboxes will share one uid" >&2

@@ -97,5 +97,82 @@ pub fn run(cli: &Cli) -> anyhow::Result<u8> {
         println!("backends available: {}", style.bold(&usable.join(", ")));
     }
 
+    // On macOS the host's own answer is always the same and always no. The
+    // one worth printing is the VM's, so it goes below and its exit code is
+    // the one that leaves.
+    if let Some(code) = vm_section(&style) {
+        return Ok(code);
+    }
+
     Ok(report.exit_code() as u8)
+}
+
+/// Print what the Linux VM says about itself, and return its exit code.
+///
+/// `None` anywhere but macOS, where there is no VM to ask.
+#[cfg(target_os = "macos")]
+fn vm_section(style: &Style) -> Option<u8> {
+    use crate::shim::{self, Vm};
+
+    let report = shim::describe_vm();
+    println!();
+    match &report.limactl {
+        Some(path) => println!("the Linux VM   limactl at {}", path.display()),
+        None => {
+            println!(
+                "{} `limactl` is not installed, so there is no Linux VM to run sandboxes in",
+                style.red("✗")
+            );
+            println!("{}", style.dim("  → brew install lima"));
+            return Some(1);
+        }
+    }
+
+    match report.vm {
+        Vm::Running => println!(
+            "               instance `zygo` is {}",
+            style.green("running")
+        ),
+        Vm::Stopped => {
+            println!(
+                "               instance `zygo` is {}",
+                style.yellow("stopped")
+            );
+            println!(
+                "{}",
+                style.dim("  → it starts by itself on the next command")
+            );
+            return Some(1);
+        }
+        Vm::Absent => {
+            println!(
+                "               instance `zygo` {}",
+                style.yellow("does not exist yet")
+            );
+            println!(
+                "{}",
+                style.dim("  → it is created by the first command that needs it")
+            );
+            return Some(1);
+        }
+    }
+
+    let Some((text, code)) = report.guest else {
+        println!(
+            "{}",
+            style.dim("  → the VM is running but did not answer `zygo doctor`")
+        );
+        return Some(1);
+    };
+    println!();
+    println!("what that VM says about itself:");
+    for line in text.lines() {
+        println!("  {line}");
+    }
+    Some(code)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn vm_section(_style: &Style) -> Option<u8> {
+    None
 }

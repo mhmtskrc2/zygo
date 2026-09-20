@@ -73,6 +73,11 @@ examples-go-linux:
 
 # The `ns` backend, the cgroup hierarchy and the doctor probes are all behind
 # `#[cfg(target_os = "linux")]`, so a macOS `cargo check` never sees them.
+# The macOS shim: a real Lima VM, a real Linux kernel, from this Mac. Skips
+# itself anywhere else, and where `limactl` is not installed.
+verify-shim: build
+	sh poc/verify_shim.sh
+
 # Type-checking against a Linux target does, without needing a Linux host.
 # `--no-default-features` drops the registry client, whose TLS stack needs a
 # cross C toolchain that is not worth installing for a type check.

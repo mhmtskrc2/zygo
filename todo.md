@@ -39,8 +39,9 @@ live here.
 | `seccomp = "strict"` | **Works** — all five reference packages, after `clone3` → `ENOSYS` and the socket data calls were kept (3.0g) |
 | Other commands | Declared; they exit saying which phase brings them |
 
-Test status: **539 Rust tests on Linux** (451 on macOS) + 34 Python +
-**275 Linux integration / escape / supervisor / backend / example checks**
+Test status: **552 Rust tests on Linux** (462 on macOS) + 34 Python +
+**275 Linux integration / escape / supervisor / backend / example checks** +
+**13 macOS shim checks**
 (36 launcher, 16 escape vectors, 13 syscall-sweep, 19 gvisor, 151 supervisor,
 12 examples, 10 seccomp-matrix cells, 9 Python and 9 Node conformance),
 `clippy -D warnings`.
@@ -1647,18 +1648,49 @@ every backend, so the fallback now happens in the bundle.
 
 ## Phase 5 — macOS
 
-- [ ] Shim mode on macOS; the Linux binary + a minimal VM image (~300 MB) via Homebrew
-- [ ] VM lifecycle through Virtualization.framework (a Swift helper) or Lima
-      (first start < 3 s, later ones < 1 s)
-- [ ] virtiofs: paths under `$HOME` appear at the same path inside the VM
-- [ ] Command forwarding over vsock/SSH; `zygo ps` works transparently
+- [x] **Shim mode on macOS.** `crates/zygo-cli/src/shim.rs`: every command
+      except `doctor`, `completion` and `agent test` is run by a Linux `zygo`
+      inside a VM, with the same arguments, the same working directory and the
+      same streams, and its exit status comes back out. The three that stay
+      here stay for a reason each, written down beside the list. The shim also
+      keeps the VM's binary level with this one, comparing a stamp on the host
+      rather than asking the guest, because that check runs before every
+      command.
+- [x] **VM lifecycle through Lima** (`shim/lima.yaml`), not a
+      Virtualization.framework helper: it needs no signed binary, `brew
+      install lima` is one line, and everything above the provider is
+      provider-independent if that changes. Ubuntu 24.04, kernel 6.8 —
+      **Landlock ABI v4 runs here for the first time in this project**.
+      Measured: first create and boot **90 s** (including the image download),
+      a command against a running VM **79 ms**.
+- [x] **virtiofs: `$HOME` at the same path, writable.** That is the whole
+      path contract, and it is enforced rather than hoped for — a command run
+      from outside `$HOME` is refused and the message names both directories,
+      because forwarding it would run against a directory that is not the one
+      in front of the user.
+- [x] **Command forwarding**, over Lima's ssh rather than vsock. `ps`, `serve`,
+      `exec`, `run`, `stop` all work from the Mac; stdin crosses, and an exit
+      status of 7 arrives as 7.
 - [ ] Keeping the VM in the background and shutting it down when idle
 - [ ] An optional Apple container runtime backend on Apple Silicon (research)
-- [ ] CI: an end-to-end test on a macOS runner
+- [ ] CI: an end-to-end test on a macOS runner — **blocked**: GitHub's hosted
+      macOS runners are themselves VMs and offer no nested virtualization, so
+      Lima cannot boot there. `make verify-shim` skips itself when `limactl`
+      is absent and says why; the shim's own decisions are unit-tested on
+      every platform, including in CI.
 
-**Acceptance:** `brew install zygo && zygo run python:3.12 python -c pass` under
-60 s the first time and under 100 ms the second · `serve`/`exec` identical to
-Linux.
+**Acceptance:** `zygo run python:3.12-slim python -c pass` on macOS: **117 ms**
+with the VM up, against a target of 100 ms — the ssh hop is 46 ms of it, and
+vsock is where that goes if it matters. `serve` warms in **104 ms** and a warm
+`exec` round-trips in **96 ms**, which is the Linux number plus the hop.
+`make verify-shim` is 13 checks, all passing.
+
+Two product bugs came out of running Zygo somewhere that was neither a
+container nor a test harness, and both would have stopped a first-time user on
+Linux too: the client and the supervisor computed different socket paths, and
+the supervisor could not delegate cgroup controllers out of a cgroup its own
+client was sitting in. Both fixed, both with regression tests. See
+docs/poc-report.md.
 
 ---
 

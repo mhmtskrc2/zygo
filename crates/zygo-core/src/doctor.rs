@@ -494,7 +494,21 @@ mod probe {
         // not start at all.
         match cgroup::probe_delegation(&own) {
             Ok(have) => Check::ok("cgroup v2", format!("delegated ({})", have.join(" "))),
-            Err(reason) => Check::failed("cgroup v2", reason, cgroup::DELEGATION_REMEDY),
+            // This cgroup will not take a child, which is the normal state of
+            // an ssh session's scope and not by itself a problem: the commands
+            // that build a sandbox step into a scope of their own. Ask whether
+            // *that* works before calling anything broken.
+            Err(reason) => match cgroup::probe_delegation_via_scope() {
+                Ok(()) => Check::ok(
+                    "cgroup v2",
+                    "delegated through a scope of its own, which Zygo enters by itself",
+                ),
+                Err(scope_reason) => Check::failed(
+                    "cgroup v2",
+                    format!("{reason}; and no transient scope either ({scope_reason})"),
+                    cgroup::DELEGATION_REMEDY,
+                ),
+            },
         }
     }
 
@@ -681,14 +695,22 @@ mod probe {
     use super::*;
 
     /// On a non-Linux host there is nothing to enforce isolation with. Rather
-    /// than printing a page of failures, say the one true thing: this platform
-    /// needs the shim, which is phase 5 (design doc §3.11).
+    /// than printing a page of failures, say the one true thing: every
+    /// boundary Zygo builds is a Linux kernel feature, so this platform runs
+    /// them somewhere else.
+    ///
+    /// On macOS that somewhere is a Linux VM, and the answer a user actually
+    /// wants is *its* — which the CLI appends, because knowing how to reach
+    /// the VM is the shim's business and not this library's.
     pub fn all() -> Vec<Check> {
         vec![Check::failed(
             "platform",
-            format!("{} is not a Zygo host", std::env::consts::OS),
-            "Zygo sandboxes are Linux-only. macOS support runs a hidden Linux VM \
-             (phase 5); until then, run Zygo inside a Linux VM or container.",
+            format!(
+                "{} has no kernel to build a sandbox in",
+                std::env::consts::OS
+            ),
+            "this host runs sandboxes in a Linux VM; what that VM says about \
+             itself is below",
         )]
     }
 }

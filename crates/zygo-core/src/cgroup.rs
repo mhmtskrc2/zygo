@@ -526,6 +526,41 @@ pub fn probe_delegation(dir: &Path) -> std::result::Result<Vec<String>, String> 
     }
 }
 
+/// The same question, asked the way Zygo itself answers it.
+///
+/// A cgroup that will not take a child is not the end of the story: for the
+/// commands that build a sandbox, `zygo` re-executes itself inside a
+/// transient delegated scope rather than making the user type
+/// `systemd-run --user --scope` every time. A check that stops at the first
+/// answer therefore reports `FAIL` on a machine where `zygo serve` works,
+/// which is the most misleading thing a diagnostic can do.
+///
+/// So this attempts the fallback instead of describing it: a scope is created
+/// and the same `mkdir` is tried inside it. Nothing is left behind — the scope
+/// ends with the probe.
+pub fn probe_delegation_via_scope() -> std::result::Result<(), String> {
+    // A raw string: the shell wants both kinds of quote and Rust must not
+    // read either of them.
+    let probe = r#"d=$(sed -n 's/^0:://p' /proc/self/cgroup | head -1)
+p="/sys/fs/cgroup$d/zygo-doctor-$$"
+mkdir "$p" && rmdir "$p""#;
+    let output = std::process::Command::new("systemd-run")
+        .args(["--user", "--scope", "-p", "Delegate=yes", "-q", "--"])
+        .args(["/bin/sh", "-c", probe])
+        .output()
+        .map_err(|e| format!("systemd-run could not be started ({e})"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .next_back()
+            .unwrap_or("systemd-run could not make a delegated scope")
+            .trim()
+            .to_string())
+    }
+}
+
 /// What to do about a cgroup that cannot hold a sandbox.
 ///
 /// Both halves, because on a systemd host neither works alone: the user

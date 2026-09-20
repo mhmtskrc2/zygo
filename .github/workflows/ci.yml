@@ -83,6 +83,16 @@ jobs:
           ./target/release/zygo agent test node -- \
             examples/agents/node/agent.js examples/agents/node/handler.js
 
+      # The macOS shim, end to end against a real Linux VM. It will skip here
+      # and say so: GitHub's hosted macOS runners are themselves virtual
+      # machines and offer no nested virtualization, so Lima cannot boot. The
+      # shim's own decisions — what forwards, what a path maps to, what
+      # `limactl` is asked — are plain functions covered by `cargo test`
+      # above, on every platform in the matrix.
+      - name: macOS shim
+        if: runner.os == 'macOS'
+        run: make verify-shim
+
   # The launcher can only be exercised on Linux, and the interesting question is
   # whether it works *without* root — requirement N5.
   launcher:

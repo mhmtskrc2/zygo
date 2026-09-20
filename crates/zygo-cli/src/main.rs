@@ -8,6 +8,11 @@ mod cli;
 mod cmd;
 mod output;
 mod scope;
+// Compiled everywhere and used on one platform: the rules about what
+// forwards and where it runs are worth checking on every host, not only on
+// the machine that can act on them. `scope` does the same in reverse.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod shim;
 mod tty;
 
 use clap::Parser;
@@ -42,6 +47,18 @@ fn main() -> std::process::ExitCode {
     // May replace this process: see `scope`. Before anything is opened or
     // connected, so nothing has to survive the exec.
     scope::ensure_delegated(&cli);
+
+    // On macOS almost everything belongs to a Linux VM, and the answer comes
+    // back as that command's own exit status. Before `run`, because there is
+    // no host to run it against.
+    match shim::forward(&cli) {
+        Ok(Some(code)) => return std::process::ExitCode::from(code),
+        Ok(None) => {}
+        Err(e) => {
+            output::error(&e);
+            return std::process::ExitCode::from(125u8);
+        }
+    }
 
     match run(&cli) {
         Ok(code) => std::process::ExitCode::from(code),
