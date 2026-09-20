@@ -364,4 +364,5 @@ fi
 say ""
 say "----------------------------------------"
 say "launcher verification: $PASS passed, $FAIL failed"
+harness_verdict
 [ "$FAIL" -eq 0 ] || exit 1

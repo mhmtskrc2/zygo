@@ -157,4 +157,5 @@ fi
 say ""
 say "----------------------------------------"
 say "examples verification: $PASS passed, $FAIL failed"
+harness_verdict
 [ "$FAIL" -eq 0 ]

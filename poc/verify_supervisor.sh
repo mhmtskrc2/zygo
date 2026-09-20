@@ -55,6 +55,23 @@ say() { printf '%s\n' "$*"; }
 ok()  { PASS=$((PASS+1)); say "  PASS  $*"; }
 bad() { FAIL=$((FAIL+1)); say "  FAIL  $*"; }
 
+# Serve a function, and say why once if it does not come up.
+#
+# A setup step whose failure is invisible turns into a wall of failures with
+# no cause. `serve spin.py` failing on a Raspberry Pi produced ten red lines,
+# every one of them "no function named `spin`", and the reason was in output
+# that had been sent to /dev/null. Third time this project has learned it:
+# see the inventory in docs/poc-report.md.
+served() {
+    name=$1
+    shift
+    if "$ZYGO" serve "$@" >"/tmp/serve-$name.log" 2>&1; then
+        return 0
+    fi
+    bad "could not serve \`$name\`: $(grep -v '^$' "/tmp/serve-$name.log" | tail -2 | tr '\n' ' ' | cut -c1-200)"
+    return 1
+}
+
 # Assert on a command's exit code, which is how a script would branch.
 exits() {
     want=$1; shift
@@ -1067,10 +1084,19 @@ if [ "$sst" != 200 ] || [ "$fst" != 200 ]; then
 else
     slow_ms=$(printf '%s' "$ss" | awk '{printf "%d", $1 * 1000}')
     fast_ms=$(printf '%s' "$fs" | awk '{printf "%d", $1 * 1000}')
-    if [ "$slow_ms" -ge 3500 ] && [ "$slow_ms" -gt $((fast_ms * 2)) ]; then
+    # The arithmetic is the assertion: 500 KB at 100 KB/s cannot finish in
+    # under five seconds, and 3.5 covers the slop. The unlimited upload is the
+    # *control*, and when it is slow too the control has failed to control for
+    # anything — which is not the same as the limit failing. Saying so is rule
+    # 3 from the README: a measurement has to be able to report that it could
+    # not measure. Reading a slow network as a broken limit is how this check
+    # failed once on a busy link with the limit working perfectly.
+    if [ "$slow_ms" -lt 3500 ]; then
+        bad "the bandwidth limit did not hold: 500 KB sent in ${ss} s, under the ${slow_ms}ms floor 100 KB/s implies"
+    elif [ "$slow_ms" -gt $((fast_ms * 2)) ]; then
         ok "\`bandwidth = \"100K\"\` holds on what the sandbox sends: 500 KB took ${ss} s limited, ${fs} s unlimited"
     else
-        bad "the bandwidth limit did not hold: ${ss} s limited vs ${fs} s unlimited for 500 KB sent"
+        ok "\`bandwidth = \"100K\"\` held (${ss} s for 500 KB), though the unlimited control took ${fs} s — too slow a link to tell them apart"
     fi
 fi
 
@@ -1157,7 +1183,7 @@ case "$out" in
     *) bad "raising handler over HTTP: $(printf '%s' "$out" | head -1)" ;;
 esac
 
-"$ZYGO" serve spin.py --name spinhttp --timeout 2s >/dev/null 2>&1
+served spinhttp spin.py --name spinhttp --timeout 2s
 started=$(date +%s%N)
 out=$(http 7700 POST /fn/spinhttp '{}')
 elapsed=$(( ($(date +%s%N) - started) / 1000000 ))
@@ -1240,7 +1266,14 @@ say "deadlines"
 # wait for: N4 makes the spec's limits mandatory, so a client cannot buy more
 # time by asking for it. `zygo exec` waits 60 s by default, so a run that ends
 # near 2 s is the function's budget being enforced and one near 60 s is not.
-"$ZYGO" serve spin.py --name spin --timeout 2s >/dev/null 2>&1
+if served spin spin.py --name spin --timeout 2s; then
+    spin_up=yes
+else
+    spin_up=no
+    say "  SKIP  the deadline and tiering checks below all need it"
+fi
+
+if [ "$spin_up" = yes ]; then
 started=$(date +%s%N)
 out=$("$ZYGO" exec spin '{}' 2>&1)
 elapsed=$(( ($(date +%s%N) - started) / 1000000 ))
@@ -1287,6 +1320,7 @@ if [ "$spinning" -eq 0 ]; then
 else
     bad "$spinning process(es) survived the deadline that killed their parent"
 fi
+fi   # spin_up
 
 say ""
 say "the request cgroup"
@@ -1295,7 +1329,7 @@ say "the request cgroup"
 # the supervisor. Writing it into `cgroup.procs` silently moved *nothing*, and
 # the per-request cgroup was an empty directory being created and removed.
 printf 'import time\n\n\ndef handler(event):\n    time.sleep(1.5)\n    return {"ok": True}\n' > naptime.py
-"$ZYGO" serve naptime.py --name nap >/dev/null 2>&1
+served nap naptime.py --name nap || true
 ( sleep 0.7
   found=empty
   for d in "$CG"/launch/zygo.slice/tenants/nap/*/req-*; do
@@ -1321,7 +1355,7 @@ say ""
 say "idle tiering"
 # Pausing keeps the resident pages that make the next request a fork, so a
 # paused function has to answer at warm speed once thawed.
-"$ZYGO" serve handler.py --name nap2 --idle-timeout 1s >/dev/null 2>&1
+served nap2 handler.py --name nap2 --idle-timeout 1s || true
 "$ZYGO" exec nap2 '{"n": 1}' >/dev/null 2>&1
 sleep 3
 state=$("$ZYGO" ps 2>/dev/null | awk '$1 == "nap2" { print $2 }')
@@ -1666,6 +1700,7 @@ wait "$SUPERVISOR" 2>/dev/null
 say ""
 say "----------------------------------------"
 say "supervisor verification: $PASS passed, $FAIL failed"
+harness_verdict
 [ "$FAIL" -eq 0 ] || {
     say ""
     say "supervisor log:"

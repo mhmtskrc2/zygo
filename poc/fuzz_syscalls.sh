@@ -178,6 +178,7 @@ done
 [ "$FAIL" -eq 0 ] || {
     say ""
     say "syscall sweep: $PASS passed, $FAIL failed"
+    harness_verdict
     exit 1
 }
 
@@ -297,4 +298,5 @@ fi
 say ""
 say "----------------------------------------"
 say "syscall sweep: $PASS passed, $FAIL failed"
+harness_verdict
 [ "$FAIL" -eq 0 ] || exit 1

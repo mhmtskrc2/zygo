@@ -56,15 +56,56 @@ if mkdir -p "$ZYGO_HARNESS_ROOT/harness" "$ZYGO_HARNESS_ROOT/launch" 2>/dev/null
     for c in memory pids cpu; do
         echo "+$c" > "$ZYGO_HARNESS_ROOT/cgroup.subtree_control" 2>/dev/null
     done
+elif [ -z "${ZYGO_HARNESS_SCOPE:-}" ] && command -v systemd-run >/dev/null 2>&1 &&
+    systemd-run --user --scope -q -- true >/dev/null 2>&1; then
+    # A systemd session that has not delegated anything. Telling the caller to
+    # re-run under `systemd-run` is a step they will forget, and forgetting it
+    # does not look like a missing scope — it looks like a dozen ordinary
+    # failures, which is how a Raspberry Pi run reported the launcher broken
+    # when the launcher was fine. `zygo` itself steps into a delegated scope
+    # rather than asking (crates/zygo-cli/src/scope.rs); the suites do the
+    # same here, once, guarded so a scope that still cannot delegate falls
+    # through to `unusable` below instead of re-execing forever.
+    case $0 in
+        /*) harness_suite=$0 ;;
+        *) harness_suite=$PWD/$0 ;;
+    esac
+    # Re-exec through the interpreter already running, not through `$0`'s
+    # executable bit: the suites are started as `sh poc/<name>.sh`, and one of
+    # them is bash.
+    if [ -n "${BASH_VERSION:-}" ]; then harness_sh=bash; else harness_sh=sh; fi
+
+    ZYGO_HARNESS_SCOPE=1
+    export ZYGO_HARNESS_SCOPE
+    echo "  harness: no delegated cgroup here; re-running inside a scope of our own" >&2
+    exec systemd-run --user --scope -p Delegate=yes -q -- \
+        "$harness_sh" "$harness_suite" "$@"
 else
-    # Neither a writable hierarchy nor a delegated scope. Nothing below will
-    # work, and saying so here beats twenty failures that look like the
-    # launcher's.
+    # Neither a writable hierarchy nor a delegated scope, and no way to make
+    # one. Nothing below will work, and saying so here beats twenty failures
+    # that look like the launcher's.
     ZYGO_HARNESS=unusable
     echo "  harness: cannot create a cgroup under $ZYGO_HARNESS_ROOT" >&2
     echo "  → in a container, run privileged; on a host, start this suite with" >&2
     echo "    systemd-run --user --scope -p Delegate=yes -- sh \$0" >&2
 fi
+
+# Printed under a suite's summary line.
+#
+# A failure count collected without a usable cgroup is not a count of bugs,
+# and a summary that does not say so is read as one: an early Raspberry Pi run
+# reported "121 passed, 13 failed" when the whole difference was this file
+# having nowhere to build. The banner above scrolls past; this is at the
+# bottom, next to the number somebody will quote.
+harness_verdict() {
+    [ "$ZYGO_HARNESS" = ready ] && return 0
+    # On stdout, unlike the harness's other messages: this one has to land
+    # directly under the summary, and a suite's summary goes to stdout.
+    printf '%s\n' "" \
+        "  NOTE  this run had no cgroup it could write, so anything resting on" \
+        "        limits, or on reading a sandbox's processes, failed for that" \
+        "        reason rather than its own. The count above is not a verdict."
+}
 
 # Run zygo in `launch/`, which holds nothing else, so it can build its slice
 # underneath. `exec` matters: the shell must not survive inside that cgroup.

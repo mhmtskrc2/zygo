@@ -10,6 +10,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Several jobs here depend on what a runner happens to provide — a kernel
+  # version, a `/dev/kvm`, a working `runsc` download. Being able to re-run
+  # the matrix without an empty commit is worth one line.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -112,6 +116,7 @@ jobs:
       # checkout inside its containers; here the checkout is the workspace.
       - name: Isolation and limits
         run: |
+          . poc/ci_cgroup.sh
           install -m 0755 target/release/zygo poc/zygo-linux
           if [ "${{ matrix.privilege }}" = root ]; then
             sudo -E sh poc/verify_launcher.sh
@@ -124,6 +129,7 @@ jobs:
 
       - name: Escape suite
         run: |
+          . poc/ci_cgroup.sh
           install -m 0755 target/release/zygo poc/zygo-linux
           sh poc/escape_suite.sh
         env:
@@ -134,7 +140,9 @@ jobs:
       # kernel answered. The escape suite attempts the vectors somebody
       # thought of; this one needs no imagination.
       - name: Syscall sweep
-        run: bash poc/fuzz_syscalls.sh
+        run: |
+          . poc/ci_cgroup.sh
+          bash poc/fuzz_syscalls.sh
         env:
           ZYGO_DATA_HOME: /tmp/zygo-ci
           SRC: ${{ github.workspace }}
@@ -142,7 +150,9 @@ jobs:
       # The gvisor backend against a real runsc, including the same command
       # run on both backends (requirement N8). Downloads ~114 MB.
       - name: gVisor backend
-        run: sh poc/verify_gvisor.sh
+        run: |
+          . poc/ci_cgroup.sh
+          sh poc/verify_gvisor.sh
         env:
           ZYGO_DATA_HOME: /tmp/zygo-gvisor
           SRC: ${{ github.workspace }}
@@ -153,6 +163,7 @@ jobs:
       # and no in-process test can see it.
       - name: Supervisor lifecycle
         run: |
+          . poc/ci_cgroup.sh
           install -m 0755 target/release/zygo poc/zygo-linux
           sudo apt-get install -y --no-install-recommends passt nftables iproute2 jq >/dev/null
           sh poc/verify_supervisor.sh
@@ -163,12 +174,15 @@ jobs:
       # real. Both need the network; both are the checks that found the
       # `clone3` bug (docs/seccomp-profiles.md).
       - name: Seccomp compatibility matrix
-        run: sh poc/seccomp_matrix.sh
+        run: |
+          . poc/ci_cgroup.sh
+          sh poc/seccomp_matrix.sh
         env:
           SRC: ${{ github.workspace }}
 
       - name: Examples
         run: |
+          . poc/ci_cgroup.sh
           (cd examples/warm-exec/go && CGO_ENABLED=0 go build -o bin/parse .) || echo "::warning::no Go toolchain; the Go example is skipped"
           sh poc/verify_examples.sh
         env:

@@ -1536,17 +1536,28 @@ worked perfectly** — every one of them an empty string where output should
 have been, because the wrapper was breaking the invocation. The seven suites
 now share `poc/cgroup_harness.sh`, which reads the starting cgroup from
 `/proc/self/cgroup` and builds relative to it. The same file runs in both
-places; on a host the suite is started with
+places, and the reason it has to is not cosmetic: cgroup v2 forbids a cgroup
+from holding processes *and* delegating to its children, so the shell running
+the suite has to step out of the way or `zygo` cannot enable the controllers
+its tenants need. That rule is why the container harness existed; reading the
+root from `/proc` is all it took to make it general.
 
-```bash
-systemd-run --user --scope -p Delegate=yes -- sh poc/verify_launcher.sh
-```
+Reading the root was not all it took to make it *reliable*. For a while the
+harness printed a remedy — start the suite under `systemd-run --user --scope
+-p Delegate=yes` — and carried on when nobody had. A step a human has to
+remember is a step a human forgets, and forgetting it does not look like a
+forgotten step: the next Raspberry Pi run reported **121 passed, 13 failed**,
+and every one of the thirteen was the missing scope. So the harness now does
+what `zygo` itself does and steps into a scope of its own, once, guarded
+against re-execing forever.
 
-and the reason is not cosmetic: cgroup v2 forbids a cgroup from holding
-processes *and* delegating to its children, so the shell running the suite has
-to step out of the way or `zygo` cannot enable the controllers its tenants
-need. That rule is why the container harness existed; reading the root from
-`/proc` is all it took to make it general.
+A CI runner has neither a writable hierarchy nor a user bus to ask, so it
+gets the third route: `poc/ci_cgroup.sh`, sourced by each suite step, makes a
+cgroup with `sudo`, hands it to the job's user, and has root move the shell
+into it — a migration the kernel will not let an unprivileged process make
+across a root-owned ancestor. And when all three routes fail, every suite's
+summary now carries a note saying the count above it is not a verdict, which
+is the part that was missing all along.
 
 ---
 
@@ -2020,9 +2031,9 @@ same mechanism the agent path uses.
 
 ### An inventory of the bugs found in the tests themselves
 
-Twenty times in this project a test looked green because it measured the
-wrong thing — or showed the wrong thing red. All of them fall into one of a
-few patterns:
+Twenty-three times in this project a test looked green because it measured
+the wrong thing — or showed the wrong thing red. All of them fall into one of
+a few patterns:
 
 | # | Where | What the test thought | The reality |
 |---|---|---|---|
@@ -2046,6 +2057,9 @@ few patterns:
 | 18 | gVisor suite | the `ns` baseline would be there to compare against | `ns` was run *after* a dozen gvisor runs, by which point the harness's cgroup wrapper could no longer place it, and every comparison reported a vacuous failure. The baseline is captured first now, and checked before it is used |
 | 19 | Every suite | the harness had put `zygo` in a usable cgroup | it hard-coded `/sys/fs/cgroup`, which is the hierarchy root in a container and unwritable on a real host. On the first run on a Raspberry Pi, `verify_launcher.sh` reported 24 failures on a launcher that worked — the wrapper was breaking every invocation, and each check dutifully reported the empty output as the launcher's fault. The harness is shared now and reads its root from `/proc/self/cgroup`; it also says which branch it took, because a run that silently prepared nothing proves nothing |
 | 20 | Supervisor suite | exactly one venv directory meant the cache had deduplicated | it asserted on a cache without ensuring the cache started empty. In a container that is free — the container is new — and on a host `/tmp` survives, so it counted a previous run's half-built venv and reported a caching bug that did not exist. An isolated repro deduplicated correctly. The suites clear their data directory first now, and the check means what it says |
+| 21 | Supervisor suite | a function was there to exercise | `serve` was called for its side effect with its output thrown away, so when it failed the ten checks that used the function each reported `no function named \`spin\``. Ten red lines, no cause, and the cause was one line above them. Serving goes through a `served()` helper now that says why once and returns a status the section can branch on |
+| 22 | Every suite | `ZYGO_HARNESS` being `unusable` would be noticed | the harness set the flag, printed a remedy, and carried on — and nothing read it. A run started outside a delegated scope reported *121 passed, 13 failed* on a build with no bug in it. The harness now steps into a scope of its own the way `zygo` does, and when it still cannot, every summary carries a note saying the number above it is not a verdict |
+| 23 | Supervisor suite | a bandwidth limit could be shown by comparing against an unlimited upload | the assertion was `limited ≥ 3.5 s AND limited > 2 × unlimited`. The first half is arithmetic — 500 KB at 100 KB/s cannot finish sooner — and the second is a control for a slow endpoint. On a busy link the control *inverted*: the unlimited upload took 3.6 s, the ratio failed, and a working limit was reported broken. A control that cannot control for anything has to say so rather than vote |
 
 Written up as three rules and put in the README:
 

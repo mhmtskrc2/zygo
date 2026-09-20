@@ -61,6 +61,7 @@ else
         bad "install: $(tail -2 /tmp/gvisor-install.log | tr '\n' ' ' | cut -c1-200)"
         say ""
         say "gvisor verification: $PASS passed, $FAIL failed"
+        harness_verdict
         exit 1
     fi
 fi
@@ -215,4 +216,5 @@ gv_kernel=$(zygo run --isolation gvisor "$IMAGE" /bin/uname -r 2>/dev/null)
 say ""
 say "----------------------------------------"
 say "gvisor verification: $PASS passed, $FAIL failed"
+harness_verdict
 [ "$FAIL" -eq 0 ] || exit 1

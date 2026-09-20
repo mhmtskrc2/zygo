@@ -350,4 +350,5 @@ print(','.join(reachable) if reachable else 'none')")
 say ""
 say "----------------------------------------"
 say "escape suite: $PASS blocked, $FAIL escaped, $SKIP skipped"
+harness_verdict
 [ "$FAIL" -eq 0 ] || exit 1

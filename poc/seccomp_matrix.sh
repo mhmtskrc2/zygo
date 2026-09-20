@@ -189,4 +189,5 @@ say ""
 say "strict removes: socket socketpair connect bind listen accept4 ptrace mount umount2"
 say "and, in the forked child only: execve execveat fork vfork, and clone without CLONE_THREAD"
 say "(every strict cell above ran its handler under that child filter; see docs/seccomp-profiles.md)"
+harness_verdict
 "$ZYGO" stop --all >/dev/null 2>&1
