@@ -178,8 +178,25 @@ impl Hierarchy {
         vacate(&self.root, &self.system())?;
 
         // Delegation has to be enabled from the parent downwards: a controller
-        // that the parent does not pass down cannot be enabled below it.
+        // that the parent does not pass down cannot be enabled below it — and
+        // a cgroup holding processes may not pass anything down at all.
+        //
+        // The parent is normally the transient scope Zygo re-executed itself
+        // into, and the process that *started* the supervisor is sitting in it:
+        // `zygo serve` re-execs into a scope, spawns the supervisor there, and
+        // waits. So the supervisor stepping aside is not enough; its client is
+        // still in the way, and the write below fails with `EBUSY` — leaving a
+        // tenant cgroup with no `memory.max` and the message about delegation,
+        // on a host where everything *was* delegated.
+        //
+        // Only Zygo's own processes are moved. Anything else in that cgroup
+        // belongs to somebody, and taking it over would be a worse surprise
+        // than the error; if it blocks delegation the check below still says
+        // so. The verification suites have moved these processes by hand since
+        // the first Raspberry Pi run, which is exactly why no suite could see
+        // this: the harness was supplying what the product was missing.
         if let Some(parent) = self.root.parent() {
+            vacate_ours(parent, &self.system())?;
             enable_controllers(parent, CONTROLLERS)?;
         }
         enable_controllers(&self.root, CONTROLLERS)?;
@@ -570,6 +587,34 @@ fn vacate(from: &Path, into: &Path) -> Result<()> {
     for pid in procs.split_whitespace() {
         // A process that exits between the read and the write is not an error.
         let _ = std::fs::write(into.join("cgroup.procs"), pid);
+    }
+    Ok(())
+}
+
+/// Move Zygo's *own* processes out of `from` and into `into`.
+///
+/// Same reason as [`vacate`], one level up and with a filter: the cgroup being
+/// emptied is not Zygo's, so only processes running this same binary are
+/// moved. A process that exits mid-scan, or one whose `/proc` entry cannot be
+/// read, is skipped rather than guessed at.
+fn vacate_ours(from: &Path, into: &Path) -> Result<()> {
+    let procs = match std::fs::read_to_string(from.join("cgroup.procs")) {
+        Ok(text) => text,
+        Err(_) => return Ok(()),
+    };
+    let Ok(ours) = std::fs::read_link("/proc/self/exe") else {
+        return Ok(());
+    };
+    let mut moved = false;
+    for pid in procs.split_whitespace() {
+        let exe = std::path::PathBuf::from(format!("/proc/{pid}/exe"));
+        if std::fs::read_link(&exe).is_ok_and(|target| target == ours) {
+            if !moved {
+                create(into)?;
+                moved = true;
+            }
+            let _ = std::fs::write(into.join("cgroup.procs"), pid);
+        }
     }
     Ok(())
 }

@@ -250,10 +250,25 @@ fn unexpected(response: &Response) -> Error {
 }
 
 /// Start a supervisor in the background and wait for its socket to answer.
+///
+/// The child is given the layout as **both** halves, through the environment
+/// `Paths::from_env` already reads. It used to be handed `--data-root`, which
+/// selects the rooted layout — `<root>/run` for the socket — while the parent
+/// had worked out its own runtime directory from `XDG_RUNTIME_DIR`. So on any
+/// ordinary login session the two disagreed: the supervisor came up and
+/// listened on `~/.local/share/zygo/run/supervisor.sock` while the client
+/// waited ten seconds on `/run/user/1000/zygo/supervisor.sock` and reported
+/// that it "did not answer".
+///
+/// Neither development environment could show it. Both set `ZYGO_DATA_HOME`
+/// *and* have no `XDG_RUNTIME_DIR`, so both halves came from the same place
+/// and the two layouts happened to coincide.
 fn start_supervisor(paths: &Paths, exe: &Path) -> Result<()> {
-    let mut child = Command::new(exe)
-        .arg("--data-root")
-        .arg(paths.data())
+    let mut command = Command::new(exe);
+    for (key, value) in paths.as_vars() {
+        command.env(key, value);
+    }
+    let mut child = command
         .arg("supervisor")
         .arg("run")
         .stdin(Stdio::null())
@@ -291,8 +306,13 @@ fn start_supervisor(paths: &Paths, exe: &Path) -> Result<()> {
     let _ = child.kill();
     Err(Error::BackendUnavailable {
         backend: "supervisor",
+        // Naming the socket is the difference between a mystery and a
+        // one-line diagnosis: when the supervisor is listening somewhere
+        // else, this sentence is the only place the two paths could ever
+        // have been compared.
         reason: format!(
-            "the supervisor did not answer within {} s",
+            "the supervisor did not answer on {} within {} s",
+            socket.display(),
             START_TIMEOUT.as_secs()
         ),
         remedy: "start it in the foreground with `zygo supervisor run` to see why".into(),
