@@ -29,7 +29,21 @@ bad() { FAIL=$((FAIL+1)); say "  FAIL  $*"; }
 
 # Run a shell snippet inside a sandbox and echo its stdout.
 sb() {
-    zygo run "$IMAGE" /bin/sh -c "$1" 2>/dev/null
+    zygo run "$IMAGE" /bin/sh -c "$1" 2>/tmp/sb.err
+}
+
+# What the last sandbox said on stderr, if anything — appended to a failure so
+# an empty answer comes with its reason.
+#
+# `sb` discarded stderr, and in CI that turned ten distinct failures into ten
+# blanks: `the sandbox sees  processes`, `CapEff = `, `seccomp mode is ''`.
+# Every one of them was the same unread error. `sb` runs in a command
+# substitution, so it cannot print a diagnostic itself — whatever it printed
+# would be captured as the answer — but the file it writes outlives the
+# subshell, and this reads it.
+why() {
+    said=$(grep -v '^$' /tmp/sb.err 2>/dev/null | tail -1 | cut -c1-160)
+    [ -n "$said" ] && printf ' — the sandbox said: %s' "$said"
 }
 
 say "ns launcher verification"
@@ -58,7 +72,7 @@ out=$(sb 'ls /proc | grep -c "^[0-9]*$"')
 if [ "${out:-99}" -le 3 ] 2>/dev/null; then
     ok "pid namespace: the sandbox sees $out processes, not the host's"
 else
-    bad "pid namespace: the sandbox sees $out processes"
+    bad "pid namespace: the sandbox sees $out processes$(why)"
 fi
 
 out=$(sb 'echo $$')
@@ -72,11 +86,11 @@ out=$(sb 'hostname')
 out=$(sb 'cat /proc/self/status | grep ^CapEff | awk "{print \$2}"')
 case "$out" in
     0000000000000000|0000000000000000*) ok "no capabilities: CapEff = $out" ;;
-    *) bad "capabilities remain: CapEff = $out" ;;
+    *) bad "capabilities remain: CapEff = $out$(why)" ;;
 esac
 
 out=$(sb 'cat /proc/self/status | grep ^NoNewPrivs | awk "{print \$2}"')
-[ "$out" = "1" ] && ok "no_new_privs is set" || bad "no_new_privs = '$out'"
+[ "$out" = "1" ] && ok "no_new_privs is set" || bad "no_new_privs = '$out'$(why)"
 
 # A fresh network namespace is not empty: the kernel auto-creates `tunl0` and
 # `ip6tnl0` in every one when the tunnel modules are loaded. What matters is
@@ -91,7 +105,7 @@ say "  note  sandbox: $(echo "$sb_ifaces" | tr '\n' ' ')"
 if [ -n "$hidden" ] && [ -z "$leaked" ]; then
     ok "network namespace: the host's $hidden is not reachable"
 else
-    bad "network namespace: hidden='$hidden' unexpected='$leaked'"
+    bad "network namespace: hidden='$hidden' unexpected='$leaked'$(why)"
 fi
 
 out=$(sb 'ping -c1 -W1 127.0.0.1 >/dev/null 2>&1 && echo up || echo down')
@@ -104,13 +118,13 @@ say ""
 
 out=$(sb 'touch /newfile 2>&1 >/dev/null; echo done')
 if sb 'touch /newfile 2>/dev/null && echo WRITABLE' | grep -q WRITABLE; then
-    bad "the sandbox root is writable"
+    bad "the sandbox root is writable$(why)"
 else
     ok "the sandbox root is read-only"
 fi
 
 sb 'touch /tmp/x && echo ok' | grep -q ok \
-    && ok "/tmp is writable" || bad "/tmp is not writable"
+    && ok "/tmp is writable" || bad "/tmp is not writable$(why)"
 
 # Masking replaces the path with /dev/null, so it stays *readable* and yields
 # nothing. The wrong assertion here — "it must be unreadable" — passes on an
@@ -120,7 +134,7 @@ node=$(sb 'ls -l /proc/kcore 2>/dev/null | grep -c "^c"')
 if [ "${bytes:-1}" = "0" ] && [ "${node:-0}" = "1" ]; then
     ok "/proc/kcore is masked (a character device yielding 0 bytes)"
 else
-    bad "/proc/kcore leaked $bytes bytes (char device: $node)"
+    bad "/proc/kcore leaked $bytes bytes (char device: $node)$(why)"
 fi
 
 sb 'echo 1 > /proc/sys/kernel/hostname 2>/dev/null && echo WRITABLE' | grep -q WRITABLE \
@@ -128,7 +142,7 @@ sb 'echo 1 > /proc/sys/kernel/hostname 2>/dev/null && echo WRITABLE' | grep -q W
 
 out=$(sb 'ls /dev | tr "\n" " "')
 say "  note  /dev contains: $out"
-case "$out" in *null*) ok "/dev/null exists" ;; *) bad "/dev/null missing" ;; esac
+case "$out" in *null*) ok "/dev/null exists" ;; *) bad "/dev/null missing$(why)" ;; esac
 
 # A bind mount needs its target to be the same kind of object as its source.
 # Mount points used to be created as directories unconditionally, so a file
@@ -165,7 +179,7 @@ say "seccomp and the terminal"
 
 out=$(sb 'grep ^Seccomp: /proc/self/status | awk "{print \$2}"')
 [ "$out" = "2" ] && ok "a filter is installed (Seccomp: 2 = filter mode)" \
-                 || bad "seccomp mode is '$out', expected 2"
+                 || bad "seccomp mode is '$out', expected 2$(why)"
 
 # The warm path is a fork. A filter that gates `clone` on its flags but gets the
 # jump arithmetic wrong denies every fork — which is how this was first caught.
@@ -176,7 +190,7 @@ sb '(echo forked) 2>/dev/null' | grep -q forked \
 out=$(sb 'unshare -U true 2>&1 | head -1')
 case "$out" in
     *"Operation not permitted"*) ok "unshare(CLONE_NEWUSER) is refused" ;;
-    *) bad "unshare was not refused: $out" ;;
+    *) bad "unshare was not refused: $out$(why)" ;;
 esac
 
 # strict must still be able to *start* — the filter is installed immediately
@@ -189,13 +203,13 @@ out=$(zygo run --seccomp strict "$IMAGE" /bin/sh -c \
       'wget -T1 -q -O- http://127.0.0.1 2>&1 | head -1' 2>/dev/null)
 case "$out" in
     *"Operation not permitted"*) ok "the strict profile denies socket()" ;;
-    *) bad "strict did not deny socket(): $out" ;;
+    *) bad "strict did not deny socket(): $out$(why)" ;;
 esac
 
 out=$(zygo run --seccomp permissive "$IMAGE" /bin/sh -c \
       'unshare -U true && echo allowed || echo refused' 2>/dev/null)
 [ "$out" = "allowed" ] && ok "the permissive profile allows what default denies" \
-                       || bad "permissive behaved like default: $out"
+                       || bad "permissive behaved like default: $out$(why)"
 
 # Zygo is daemonless, so the sandbox inherits the caller's terminal rather than
 # getting one of its own. A writable fd to that terminal is a way into the
@@ -223,7 +237,7 @@ except OSError as e:
         'import os, sys; sys.exit(0 if os.isatty(1) else 1)' 2>/dev/null; then
         ok "the terminal still works inside the sandbox (isatty)"
     else
-        bad "blocking TIOCSTI broke ordinary terminal use"
+        bad "blocking TIOCSTI broke ordinary terminal use$(why)"
     fi
     # `--tty` is the structural fix: the sandbox gets a pty of its own, so the
     # caller's terminal is not merely un-injectable but absent.
@@ -306,7 +320,7 @@ after=$(ls /proc | grep -c '^[0-9]*$')
 if [ "$after" -le $((before + 5)) ]; then
     ok "pids.max: the fork bomb did not leak into the host ($before → $after)"
 else
-    bad "pids.max: host processes went $before → $after"
+    bad "pids.max: host processes went $before → $after$(why)"
 fi
 
 # memory.max: a runaway allocation must be OOM-killed inside its own cgroup,
@@ -324,9 +338,9 @@ if zygo pull "$PYIMAGE" >/dev/null 2>&1; then
     if [ "$status" = "137" ] && [ "$elapsed" -lt 10 ]; then
         ok "memory.max: OOM-killed in ${elapsed}s with SIGKILL (exit 137)"
     elif [ "$status" -ne 0 ]; then
-        bad "memory.max: stopped after ${elapsed}s with exit $status, expected a prompt 137"
+        bad "memory.max: stopped after ${elapsed}s with exit $status, expected a prompt 137$(why)"
     else
-        bad "memory.max: the allocation ran to completion"
+        bad "memory.max: the allocation ran to completion$(why)"
     fi
 
     zygo run --mem 128M --scratch 16M --timeout 20s "$MEMIMG" \
@@ -345,7 +359,7 @@ elapsed=$(( $(date +%s) - start ))
 if [ "$status" -ne 0 ] && [ "$elapsed" -lt 15 ]; then
     ok "timeout: killed after ${elapsed}s (budget 2s), exit $status"
 else
-    bad "timeout: exit $status after ${elapsed}s"
+    bad "timeout: exit $status after ${elapsed}s$(why)"
 fi
 
 # The limits must actually be present in the cgroup, not merely requested.

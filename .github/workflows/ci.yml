@@ -243,8 +243,20 @@ jobs:
           SIZE=$(stat -c %s "$BIN")
           echo "size: $((SIZE / 1048576)) MB ($SIZE bytes)"
 
-          file "$BIN" | grep -q "statically linked" \
-            || { echo "::error::the binary is not statically linked"; exit 1; }
+          # `static-pie linked` and `statically linked` are both static: the
+          # question requirement N6 asks is whether there is a dynamic
+          # interpreter to satisfy at run time, and neither has one. x86_64
+          # musl produces the PIE form and aarch64 does not, so matching only
+          # the second phrase failed the architecture it was not written on.
+          # `if`, not `&&`: this step runs under `bash -e`, where a trailing
+          # `grep … && …` that finds nothing is a non-zero last command and
+          # fails the step for passing the check.
+          if ! file "$BIN" | grep -qE "static(-pie)? linked"; then
+            echo "::error::the binary is not statically linked"; exit 1
+          fi
+          if file "$BIN" | grep -q "dynamically linked"; then
+            echo "::error::the binary has a dynamic interpreter"; exit 1
+          fi
           [ "$SIZE" -lt 15728640 ] \
             || { echo "::error::binary is $((SIZE / 1048576)) MB, over the 15 MB budget"; exit 1; }
 
