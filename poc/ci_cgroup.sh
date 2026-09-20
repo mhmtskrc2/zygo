@@ -38,26 +38,38 @@ if [ -w "/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup 2>/dev/null | head
 else
     if sudo -n mkdir -p /sys/fs/cgroup/zygo-ci 2>/dev/null &&
         sudo -n chown -R "$(id -u):$(id -g)" /sys/fs/cgroup/zygo-ci 2>/dev/null; then
-        # The controllers have to be available *below* the root before a child
-        # can use them; the root cgroup is exempt from "no internal processes"
-        # so enabling them there is allowed even though it holds everything.
-        if ! echo '+memory +pids +cpu' |
-            sudo -n tee /sys/fs/cgroup/cgroup.subtree_control >/dev/null 2>&1; then
-            echo "ci_cgroup: could not enable controllers at the root"
-        fi
+        # Move first, delegate second — the order is not a preference.
+        # cgroup v2 forbids a cgroup from holding processes *and* delegating
+        # controllers, and a container's `/sys/fs/cgroup` is its own cgroup
+        # namespace root rather than the real one, so it does not get the real
+        # root's exemption. Delegating first and moving afterwards fails the
+        # move with `EIO`, which is the kernel saying exactly that.
+        #
         # Root has to do the move: cgroup v2 only lets an unprivileged process
         # migrate within a subtree it already owns, and this one's ancestor is
         # root's.
         if ! echo $$ | sudo -n tee /sys/fs/cgroup/zygo-ci/cgroup.procs >/dev/null 2>&1; then
             echo "ci_cgroup: could not move this shell into zygo-ci"
         fi
+        # One controller at a time: the write is atomic, so a kernel that
+        # refuses any one of them refuses the whole line, and a host that
+        # could have delegated two of the three would delegate none.
+        for c in memory pids cpu; do
+            echo "+$c" | sudo -n tee /sys/fs/cgroup/cgroup.subtree_control \
+                >/dev/null 2>&1 ||
+                echo "ci_cgroup: this kernel will not delegate \`$c\` from the root"
+        done
     else
         echo "ci_cgroup: could not create /sys/fs/cgroup/zygo-ci"
     fi
 
     now=$(sed -n 's/^0:://p' /proc/self/cgroup 2>/dev/null | head -1)
     if [ "$now" = /zygo-ci ]; then
-        echo "ci_cgroup: this shell is now in /sys/fs/cgroup/zygo-ci"
+        # Say what arrived, not what was asked for. Without the controllers
+        # the move is worth nothing: `zygo` gets as far as creating its slice
+        # and then finds no `memory.max` there.
+        echo "ci_cgroup: this shell is now in /sys/fs/cgroup/zygo-ci," \
+            "with controllers: [$(cat /sys/fs/cgroup/zygo-ci/cgroup.controllers 2>/dev/null)]"
     else
         # Not fatal: the harness says the same thing in its own words, and a
         # suite that runs and reports honestly beats a step that never starts.
