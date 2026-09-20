@@ -518,7 +518,7 @@ started=$(date +%s%N)
 if "$ZYGO" up >/tmp/up-sys.log 2>&1; then
     ok "\`up\` builds a system layer and brings the functions up ($(( ($(date +%s%N) - started) / 1000000 )) ms in all)"
 else
-    bad "up with a system layer failed: $(grep -v '^$' /tmp/up-sys.log | tail -3 | tr '\n' ' ' | cut -c1-200)"
+    bad "up with a system layer failed: $(grep -v '^$' /tmp/up-sys.log | tr '\n' ' ' | cut -c1-400)"
 fi
 
 out=$("$ZYGO" exec withjq '{}' 2>&1 | tr -d '\n ')
@@ -569,7 +569,7 @@ rc=$?
 if [ $rc -ne 0 ] && grep -q "apt-get exited" /tmp/up-bad.log; then
     ok "a package apt cannot find fails the deploy with apt's own words (exit $rc)"
 else
-    bad "unknown package: exit $rc, $(grep -v '^$' /tmp/up-bad.log | tail -2 | tr '\n' ' ' | cut -c1-200)"
+    bad "unknown package: exit $rc, $(grep -v '^$' /tmp/up-bad.log | tr '\n' ' ' | cut -c1-400)"
 fi
 n=$("$ZYGO" images 2>/dev/null | grep -c 'python:3.12-slim+system\.')
 [ "$n" -eq 1 ] && ok "and no half-built image was indexed" || bad "$n derived images indexed after a failed build"

@@ -226,11 +226,25 @@ say ""
 say "what the filter must never do"
 # A filter whose default action is a kill turns one bad call into a dead
 # sandbox, and takes every request in flight with it.
-killed=$(grep -c ' killed:' /tmp/fuzz/default.out || true)
-if [ "${killed:-0}" -eq 0 ]; then
-    ok "no syscall killed the process: the default action is an errno, not SIGSYS"
+#
+# Some syscalls the *kernel* kills you for calling, whatever the filter says.
+# `uretprobe` (x86_64 335, kernel 6.11+) exists only to be called from the
+# kernel's own trampoline and answers a direct call with SIGILL. The question
+# here is whether **the filter** kills, so the ones that also die under
+# `permissive` are subtracted rather than excused by name: a list of numbers
+# would be another thing to maintain per architecture and per kernel, and
+# would be wrong the next time the kernel adds one.
+killed_default=$(grep ' killed:' /tmp/fuzz/default.out | awk '{print $1}' | sort -u)
+killed_anyway=$(grep ' killed:' /tmp/fuzz/permissive.out | awk '{print $1}' | sort -u)
+ours=$(comm -23 <(printf '%s\n' "$killed_default") <(printf '%s\n' "$killed_anyway") | grep -c '[0-9]' || true)
+if [ "${ours:-0}" -eq 0 ]; then
+    note=""
+    if [ -n "$killed_default" ]; then
+        note=" (the kernel kills $(printf '%s ' $killed_default)itself, under every profile)"
+    fi
+    ok "no syscall is killed by the filter: its default action is an errno, not SIGSYS$note"
 else
-    bad "$killed syscalls killed the process under \`default\`: $(grep ' killed:' /tmp/fuzz/default.out | head -3 | tr '\n' ' ')"
+    bad "$ours syscalls killed the process under \`default\` and not under \`permissive\`: $(comm -23 <(printf '%s\n' "$killed_default") <(printf '%s\n' "$killed_anyway") | head -3 | tr '\n' ' ')"
 fi
 
 # `clone3` is the one syscall the filter answers with ENOSYS rather than
