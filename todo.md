@@ -39,7 +39,7 @@ live here.
 | `seccomp = "strict"` | **Works** — all five reference packages, after `clone3` → `ENOSYS` and the socket data calls were kept (3.0g) |
 | Other commands | Declared; they exit saying which phase brings them |
 
-Test status: **552 Rust tests on Linux** (462 on macOS) + 34 Python +
+Test status: **554 Rust tests on Linux** (466 on macOS) + 34 Python +
 **275 Linux integration / escape / supervisor / backend / example checks** +
 **14 macOS shim checks**
 (36 launcher, 16 escape vectors, 13 syscall-sweep, 19 gvisor, 151 supervisor,
