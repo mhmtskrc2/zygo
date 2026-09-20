@@ -1677,7 +1677,31 @@ every backend, so the fallback now happens in the bundle.
       idle *timer*: noticing idleness needs something running to notice it,
       and on macOS that is a launchd agent Zygo does not install. The next
       command brings the VM back in 15 s with nothing in it.
-- [ ] An optional Apple container runtime backend on Apple Silicon (research)
+- [x] **Apple's `container`, researched — not adoptable here yet, and the
+      interesting use is not the obvious one.** Apple's runtime reached 1.0 in
+      June 2026. It gives each container its own lightweight VM through
+      Virtualization.framework, with an optimised kernel, a `vminitd` init
+      speaking gRPC over vsock, and sub-second starts. It needs **macOS 26**
+      and Apple silicon; this machine is macOS 15.1, so none of it could be
+      measured rather than read, and nothing below is a result.
+
+      The obvious reading — "a per-sandbox microVM, so use it as the `vm`
+      backend on a Mac" — does not fit. Zygo's warm path is a zygote forking
+      per *request* inside one sandbox; a VM per container is a VM per
+      function, which is the granularity Zygo already has. It would buy a
+      kernel boundary per function at the cost of the thing the project is
+      for.
+
+      The use that does fit is duller and better: `container machine`, added
+      in 1.0, is a persistent Linux environment that mounts the Mac's home
+      directory automatically — which is exactly the contract `shim/lima.yaml`
+      spells out by hand. On macOS 26 it could replace Lima as the shim's
+      provider with no change above `crates/zygo-cli/src/shim.rs`'s provider
+      boundary, and one fewer thing for a user to `brew install`. Worth
+      revisiting when a macOS 26 machine is available; the questions to settle
+      there are whether a container machine delegates cgroup v2 controllers,
+      whether it permits unprivileged user namespaces, and what its start
+      latency is against Lima's 90 s and 15 s.
 - [ ] CI: an end-to-end test on a macOS runner — **blocked**: GitHub's hosted
       macOS runners are themselves VMs and offer no nested virtualization, so
       Lima cannot boot there. `make verify-shim` skips itself when `limactl`
