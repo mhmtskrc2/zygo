@@ -153,6 +153,10 @@ jobs:
           SRC: ${{ github.workspace }}
 
       - name: Escape suite
+        # Run even when an earlier suite failed: they test different
+        # things, and one job that reports all of them is one round trip
+        # instead of six. The job still fails.
+        if: ${{ !cancelled() }}
         run: |
           . poc/ci_cgroup.sh
           install -m 0755 target/release/zygo poc/zygo-linux
@@ -165,6 +169,10 @@ jobs:
       # kernel answered. The escape suite attempts the vectors somebody
       # thought of; this one needs no imagination.
       - name: Syscall sweep
+        # Run even when an earlier suite failed: they test different
+        # things, and one job that reports all of them is one round trip
+        # instead of six. The job still fails.
+        if: ${{ !cancelled() }}
         run: |
           . poc/ci_cgroup.sh
           bash poc/fuzz_syscalls.sh
@@ -175,6 +183,10 @@ jobs:
       # The gvisor backend against a real runsc, including the same command
       # run on both backends (requirement N8). Downloads ~114 MB.
       - name: gVisor backend
+        # Run even when an earlier suite failed: they test different
+        # things, and one job that reports all of them is one round trip
+        # instead of six. The job still fails.
+        if: ${{ !cancelled() }}
         run: |
           . poc/ci_cgroup.sh
           sh poc/verify_gvisor.sh
@@ -187,6 +199,10 @@ jobs:
       # in the sandbox — `PDEATHSIG` firing on thread exit was found this way
       # and no in-process test can see it.
       - name: Supervisor lifecycle
+        # Run even when an earlier suite failed: they test different
+        # things, and one job that reports all of them is one round trip
+        # instead of six. The job still fails.
+        if: ${{ !cancelled() }}
         run: |
           . poc/ci_cgroup.sh
           install -m 0755 target/release/zygo poc/zygo-linux
@@ -199,6 +215,10 @@ jobs:
       # real. Both need the network; both are the checks that found the
       # `clone3` bug (docs/seccomp-profiles.md).
       - name: Seccomp compatibility matrix
+        # Run even when an earlier suite failed: they test different
+        # things, and one job that reports all of them is one round trip
+        # instead of six. The job still fails.
+        if: ${{ !cancelled() }}
         run: |
           . poc/ci_cgroup.sh
           sh poc/seccomp_matrix.sh
@@ -206,6 +226,10 @@ jobs:
           SRC: ${{ github.workspace }}
 
       - name: Examples
+        # Run even when an earlier suite failed: they test different
+        # things, and one job that reports all of them is one round trip
+        # instead of six. The job still fails.
+        if: ${{ !cancelled() }}
         run: |
           . poc/ci_cgroup.sh
           (cd examples/warm-exec/go && CGO_ENABLED=0 go build -o bin/parse .) || echo "::warning::no Go toolchain; the Go example is skipped"
