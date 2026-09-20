@@ -251,7 +251,7 @@ jobs:
           # `if`, not `&&`: this step runs under `bash -e`, where a trailing
           # `grep … && …` that finds nothing is a non-zero last command and
           # fails the step for passing the check.
-          if ! file "$BIN" | grep -qE "static(-pie)? linked"; then
+          if ! file "$BIN" | grep -qE "static(ally|-pie) linked"; then
             echo "::error::the binary is not statically linked"; exit 1
           fi
           if file "$BIN" | grep -q "dynamically linked"; then
