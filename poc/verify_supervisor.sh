@@ -667,16 +667,28 @@ lines=$("$ZYGO" --json logs chatty -n 3 2>/dev/null | grep -c '"kind":"request"'
 [ "$lines" -eq 3 ] && ok "\`--json\` prints one entry per line" || bad "--json: $lines request lines"
 
 # Follow: a reader already attached sees a request made afterwards.
+#
+# Waited for rather than slept through. The first version gave the follower
+# one second to attach and the request one and a half to arrive, which is
+# generous on a laptop and not on a Raspberry Pi — where it failed twice on a
+# `--follow` that was working, having captured an *earlier* request while the
+# one it was waiting for was still being handled. A check that fails on slow
+# hardware is measuring the hardware.
+: > /tmp/follow.out
 "$ZYGO" logs chatty -f -n 0 >/tmp/follow.out 2>&1 &
 follower=$!
-sleep 1
+sleep 2
 "$ZYGO" exec chatty '{"n": 99}' >/dev/null 2>&1
-sleep 1.5
+waited=0
+while [ "$waited" -lt 200 ] && ! grep -q "stdout line 99" /tmp/follow.out 2>/dev/null; do
+    waited=$((waited + 1))
+    sleep 0.1
+done
 kill $follower 2>/dev/null; wait $follower 2>/dev/null
 if grep -q "stdout line 99" /tmp/follow.out; then
-    ok "\`-f\` shows a request made after it started"
+    ok "\`-f\` shows a request made after it started (after $((waited * 100)) ms)"
 else
-    bad "follow missed the request: $(tr '\n' ' ' </tmp/follow.out | cut -c1-200)"
+    bad "follow did not show the request in 20 s: $(tr '\n' ' ' </tmp/follow.out | cut -c1-200)"
 fi
 
 # The log belongs to the name: a replacement's zygote lands in the same log,
