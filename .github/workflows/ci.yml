@@ -145,11 +145,16 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           . poc/ci_cgroup.sh
+          # `set +e` first: the harness makes several best-effort writes, and
+          # this step runs under `bash -e`, where the first of them that finds
+          # a file already in the wanted state ends the step.
+          set +e
           # Through the harness, like the suites: a bare `zygo` started from
           # this shell's own cgroup cannot build a slice under it, which is
           # what the harness exists to arrange.
           export ZYGO=$PWD/target/release/zygo
           . poc/cgroup_harness.sh
+          echo "harness: $ZYGO_HARNESS at $ZYGO_HARNESS_ROOT"
           zygo pull python:3.12-slim >/dev/null 2>&1 || true
           cat > /tmp/probe.py <<'PYEOF'
           import errno
