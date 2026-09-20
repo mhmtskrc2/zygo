@@ -74,11 +74,17 @@ fn print(style: &Style, entry: &LogEntry) {
             id,
             exit_code,
             wall_ms,
+            timed_out,
             error,
             stderr,
         } => {
+            // A killed request says *why* it was killed. Exit 137 alone
+            // cannot: the deadline and the OOM killer both produce it, and
+            // the two mean opposite things to whoever has to fix it.
             let status = if *exit_code == 0 && error.is_none() {
                 style.green(&format!("exit {exit_code}"))
+            } else if *timed_out {
+                style.red(&format!("exit {exit_code} (deadline)"))
             } else {
                 style.red(&format!("exit {exit_code}"))
             };

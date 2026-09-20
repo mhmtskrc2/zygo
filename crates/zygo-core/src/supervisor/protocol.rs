@@ -399,6 +399,7 @@ mod tests {
                         kind: crate::pool::LogKind::Request {
                             id: "01f3".into(),
                             exit_code: 1,
+                            timed_out: false,
                             wall_ms: 12.5,
                             error: Some("ZeroDivisionError".into()),
                             stderr: "Traceback".into(),

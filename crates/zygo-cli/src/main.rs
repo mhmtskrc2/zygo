@@ -105,7 +105,7 @@ fn run(cli: &Cli) -> anyhow::Result<u8> {
         Command::Stop { name, all } => cmd::supervisor::stop(cli, name.as_deref(), *all),
         Command::Supervisor(command) => cmd::supervisor::supervisor(cli, command),
         Command::Top => pending("zygo top", "3"),
-        Command::Stats { .. } => pending("zygo stats", "3"),
+        Command::Stats { name } => cmd::stats::run(cli, name.as_deref()),
         Command::Api(args) => cmd::api::run(cli, args),
         Command::Up { file, relock } => cmd::supervisor::up(cli, file.path(), *relock),
         Command::Down { file } => cmd::supervisor::down(cli, file.path()),

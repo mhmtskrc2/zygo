@@ -12,6 +12,7 @@ pub mod otlp;
 pub mod run;
 pub mod shell;
 pub mod spec;
+pub mod stats;
 pub mod supervisor;
 
 use zygo_core::Paths;

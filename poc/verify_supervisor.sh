@@ -407,6 +407,17 @@ else
     bad "warm-exec averaged ${per} ms per request through the CLI"
 fi
 
+# And the log has to agree that they took some time. A warm-exec request is a
+# bare process, not an agent reporting on itself, and nothing was measuring
+# it: every entry carried `wall_ms: 0`, so `zygo stats` reported a p50 of
+# `0.0 ms` for a function that was working perfectly.
+logged=$("$ZYGO" --json logs pyexec -n 1 2>/dev/null |
+    sed -n 's/.*"wall_ms":\([0-9.]*\).*/\1/p' | head -1)
+case ${logged:-0} in
+    0 | 0.0 | "") bad "a warm-exec request is logged as ${logged:-nothing} ms; nothing is timing it" ;;
+    *) ok "a warm-exec request's own time reaches the log (${logged} ms)" ;;
+esac
+
 for f in echo pyexec spinexec secretexec; do "$ZYGO" stop "$f" >/dev/null 2>&1; done
 
 say ""
@@ -1350,6 +1361,20 @@ if [ "$elapsed" -ge 1500 ] && [ "$elapsed" -le 5000 ]; then
 else
     bad "the deadline was not the function's: took ${elapsed} ms for a 2 s timeout"
 fi
+# What the *log* says the killed request cost. The agent's `DONE` describes a
+# request that finished, and a killed one did not: its `wall_ms` was zero for
+# something that had just run for two seconds. Every timeout then read as the
+# fastest request there was, and dragged `zygo stats`' percentiles down with
+# it — the slowest counted as the quickest.
+logged=$("$ZYGO" --json logs spin -n 1 2>/dev/null |
+    sed -n 's/.*"wall_ms":\([0-9.]*\).*/\1/p' | head -1)
+logged_ms=$(printf '%s' "${logged:-0}" | awk '{printf "%d", $1}')
+if [ "${logged_ms:-0}" -ge 1500 ]; then
+    ok "and the log records what it actually cost (${logged_ms} ms against a 2 s deadline)"
+else
+    bad "the killed request is logged as ${logged:-nothing} ms; a timeout that logs near zero makes every percentile a lie"
+fi
+
 case "$out" in
     *SIGKILL*) ok "and the caller is told it was killed, not left guessing" ;;
     *) bad "unhelpful timeout message: $(printf '%s' "$out" | head -1)" ;;

@@ -124,6 +124,18 @@ pub enum LogKind {
         id: String,
         exit_code: i32,
         wall_ms: f64,
+        /// The supervisor killed this one for overrunning its deadline.
+        ///
+        /// Carried into the log because the exit code cannot say it: a
+        /// deadline kill and an OOM kill both arrive as 137, and only the
+        /// side that enforced the deadline knows which it was. Without this
+        /// the log can count kills and not explain any of them, which is the
+        /// difference between "your function is too slow" and "your function
+        /// needs more memory".
+        ///
+        /// `default` so a log written by an older supervisor still parses.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        timed_out: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
         #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -999,6 +1011,14 @@ impl WarmFn {
             }
         };
 
+        // A killed request's `DONE` describes a request that *finished*: the
+        // agent's child died, the agent noticed end of file and answered, and
+        // its `wall_ms` is zero for something that ran for its whole
+        // deadline. Recording that makes every timeout the fastest request
+        // there was, and drags the percentiles in `zygo stats` down with it —
+        // the slowest counted as the quickest. The supervisor holds the only
+        // clock that saw the whole of it.
+        let measured = started.elapsed();
         let outcome = match done_reply {
             Message::Done {
                 exit_code,
@@ -1014,7 +1034,14 @@ impl WarmFn {
                 stdout,
                 stderr,
                 error,
-                metrics,
+                metrics: if timed_out {
+                    Metrics {
+                        wall_ms: measured.as_secs_f64() * 1000.0,
+                        ..metrics
+                    }
+                } else {
+                    metrics
+                },
                 timed_out,
             }),
             Message::Error { code, message, .. } => {
@@ -1699,7 +1726,7 @@ impl WarmExec {
         }
         let cleaned = Instant::now();
 
-        let outcome = collected.and_then(|c| into_outcome(c, exit_status));
+        let outcome = collected.and_then(|c| into_outcome(c, exit_status, done - admitted));
         match &outcome {
             Ok(o) => self.record(o.succeeded()),
             Err(_) => self.record(false),
@@ -1837,7 +1864,11 @@ fn read_status(entered: &crate::backend::ns::enter::Entered) -> Option<i32> {
 
 /// Turn what the request left behind into an [`Outcome`].
 #[cfg(target_os = "linux")]
-fn into_outcome(c: Collected, wait_status: Option<i32>) -> Result<Outcome> {
+fn into_outcome(
+    c: Collected,
+    wait_status: Option<i32>,
+    elapsed: std::time::Duration,
+) -> Result<Outcome> {
     if let Some((step, errno)) = c.launch_failure {
         return Err(Error::Primitive {
             operation: step.describe(),
@@ -1895,7 +1926,15 @@ fn into_outcome(c: Collected, wait_status: Option<i32>) -> Result<Outcome> {
         },
         stderr,
         error,
-        metrics: Metrics::default(),
+        metrics: Metrics {
+            // Measured here, because on this path there is nobody else to
+            // measure it: a warm-exec request is a bare process, not an agent
+            // that reports on itself. It was `Metrics::default()` — every
+            // warm-exec request in the log timed at zero, so `zygo stats`
+            // reported a p50 of `0.0 ms` for a function that was working.
+            wall_ms: elapsed.as_secs_f64() * 1000.0,
+            ..Metrics::default()
+        },
         timed_out: c.timed_out,
     })
 }
@@ -2417,6 +2456,7 @@ mod tests {
         LogKind::Request {
             id: "r".into(),
             exit_code,
+            timed_out: false,
             wall_ms: 1.0,
             error: error.map(str::to_string),
             stderr: String::new(),

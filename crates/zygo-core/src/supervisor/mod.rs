@@ -728,6 +728,7 @@ impl Supervisor {
                     id: next_log_request_id(),
                     exit_code: outcome.exit_code,
                     wall_ms: outcome.metrics.wall_ms,
+                    timed_out: outcome.timed_out,
                     error: outcome.error.clone(),
                     stderr: outcome.stderr.clone(),
                 },

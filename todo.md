@@ -38,13 +38,15 @@ live here.
 | Node agent / Go template | **Works** — `examples/agents/node` passes the nine checks; `examples/warm-exec/go` runs for real on alpine |
 | `seccomp = "strict"` | **Works** — all five reference packages, after `clone3` → `ENOSYS` and the socket data calls were kept (3.0g) |
 | `zygo login` | **Works** — verified against the registry before it is stored, `auth.json` at 0600, Docker's file read and never written |
-| `zygo top` / `zygo stats` | Declared; they exit saying which phase brings them |
+| `zygo stats` | **Works** — counters since the warm-up beside latencies over the log window, with the two labelled apart; no `p99` under a hundred samples |
+| `zygo top` | Declared; it exits saying which phase brings it |
 
-Test status: **559 Rust tests on Linux** (466 on macOS) + 34 Python +
-**275 Linux integration / escape / supervisor / backend / example checks** +
-**14 macOS shim checks**
-(36 launcher, 16 escape vectors, 13 syscall-sweep, 19 gvisor, 151 supervisor,
-12 examples, 10 seccomp-matrix cells, 9 Python and 9 Node conformance),
+Test status: **566 Rust tests on Linux** (473 on macOS) + 34 Python +
+**292 Linux integration / escape / supervisor / backend / example / registry
+checks** + **14 macOS shim checks**
+(36 launcher, 16 escape vectors, 13 syscall-sweep, 19 gvisor, 153 supervisor,
+12 examples, 15 registry credentials, 10 seccomp-matrix cells, 9 Python and
+9 Node conformance),
 `clippy -D warnings`.
 
 Run in **two environments**: a privileged container, and a Raspberry Pi
@@ -1063,7 +1065,25 @@ exactly this reason.
       list`, `images`, `ps`, `stop`, `serve`, `exec`, `up`, `down`, `spec
       validate`/`explain`, `pull`, `bench`, `agent test`, `logs`. Not on `api`
       (a server), `shell` (a terminal) or `completion` (a script), where it
-      would mean nothing. `top` and `stats` do not exist
+      would mean nothing. `top` does not exist; `stats` does — see below
+
+- [x] **`zygo stats [name]`.** Counters and latencies are different windows
+      and the table says which is which: `requests`/`failures` are counted
+      since the function was warmed, the percentiles are over the entries
+      still in its log, and a `samples` column joins them. No `p99` below a
+      hundred samples — a percentile over nine of them is a number with a
+      decimal point and no content, so the column says `—` and the footer
+      says why. Killed requests are split into "overran a deadline" and
+      "something else, usually the memory limit", because both arrive as exit
+      137 and only the supervisor knows which.
+
+      Writing it found a measurement bug that made it worth writing. A killed
+      request logged `wall_ms: 0`, because the agent's `DONE` describes a
+      request that *finished* — so every timeout read as the fastest request
+      there was and dragged the percentiles down with it. Warm-exec requests
+      logged `0` too: nothing was timing them at all. Both now record what
+      the supervisor's own clock saw, and two checks in
+      `poc/verify_supervisor.sh` hold them there.
 
 #### 3.0a Two bugs `zygo up` found — the first time functions shared an image
 
