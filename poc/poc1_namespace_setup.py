@@ -108,7 +108,7 @@ def step(name: str) -> None:
     CURRENT_STEP = name
 
 
-def setup_once(rootfs: str, phases: dict[str, float]) -> None:
+def setup_once(rootfs: str, phases: dict[str, float], with_netns: bool = True) -> None:
     """The sequence from design doc §3.3, timed phase by phase."""
     # Capture the identity *before* unsharing. Inside a fresh user namespace
     # with no map yet, getuid() returns the overflow uid (65534), and writing
@@ -122,15 +122,23 @@ def setup_once(rootfs: str, phases: dict[str, float]) -> None:
     #    *children*, so a launcher forks once more after this; that second fork
     #    is measured separately below.
     step("unshare")
-    unshare(
+    flags = (
         CLONE_NEWUSER
         | CLONE_NEWNS
-        | CLONE_NEWNET
         | CLONE_NEWIPC
         | CLONE_NEWUTS
         | CLONE_NEWCGROUP
         | CLONE_NEWPID
     )
+    # Optional, because it is the one that has ever cost anything here: the
+    # first measurement put 94% of the total in `CLONE_NEWNET`, under nested
+    # virtualisation, and creating a network namespace involves RCU
+    # synchronisation that a hypervisor can make disproportionately expensive.
+    # Running the same iteration with and without it, on the same machine, is
+    # the only way to tell the kernel's cost from the platform's.
+    if with_netns:
+        flags |= CLONE_NEWNET
+    unshare(flags)
     t1 = time.perf_counter()
 
     # 2. Identity. `setgroups=deny` is required before gid_map can be written
@@ -210,7 +218,7 @@ def setup_once(rootfs: str, phases: dict[str, float]) -> None:
     phases["total"] = (t4 - t0) * 1000
 
 
-def one_iteration(rootfs: str) -> dict[str, float] | str:
+def one_iteration(rootfs: str, with_netns: bool = True) -> dict[str, float] | str:
     """Run the setup in a child; the namespaces die with it."""
     read_fd, write_fd = os.pipe()
     pid = os.fork()
@@ -219,7 +227,7 @@ def one_iteration(rootfs: str) -> dict[str, float] | str:
         os.close(read_fd)
         phases: dict[str, float] = {}
         try:
-            setup_once(rootfs, phases)
+            setup_once(rootfs, phases, with_netns)
             if "__intermediate__" in phases:
                 # This is the process between the two forks. The grandchild has
                 # already reported; it must stay silent.
@@ -265,25 +273,29 @@ def main() -> int:
     print(f"  iterations  {iterations}")
     print()
 
-    first = one_iteration(rootfs)
-    if isinstance(first, str):
-        print(f"  setup failed: {first}")
-        print()
-        print("  This is the environment refusing a primitive, not a timing result.")
-        return 1
-
-    samples: dict[str, list[float]] = {k: [] for k in first}
-    for _ in range(iterations):
-        result = one_iteration(rootfs)
-        if isinstance(result, str):
-            print(f"  iteration failed: {result}")
-            return 1
-        for k, v in result.items():
-            samples[k].append(v)
-
     def pct(values: list[float], p: float) -> float:
         s = sorted(values)
         return s[min(int(len(s) * p / 100), len(s) - 1)]
+
+    def measure(with_netns: bool) -> dict[str, list[float]] | str:
+        first = one_iteration(rootfs, with_netns)
+        if isinstance(first, str):
+            return first
+        collected: dict[str, list[float]] = {k: [] for k in first}
+        for _ in range(iterations):
+            result = one_iteration(rootfs, with_netns)
+            if isinstance(result, str):
+                return result
+            for k, v in result.items():
+                collected[k].append(v)
+        return collected
+
+    samples = measure(True)
+    if isinstance(samples, str):
+        print(f"  setup failed: {samples}")
+        print()
+        print("  This is the environment refusing a primitive, not a timing result.")
+        return 1
 
     for phase in ("namespaces", "id maps", "pid ns fork", "mounts", "pivot_root", "total"):
         v = samples[phase]
@@ -291,6 +303,24 @@ def main() -> int:
             f"  {phase:<12} p50 {statistics.median(v):6.3f} ms   "
             f"p90 {pct(v, 90):6.3f}   p99 {pct(v, 99):6.3f}   max {max(v):6.3f}"
         )
+
+    # The same sequence again without `CLONE_NEWNET`, so the cost of a network
+    # namespace is a subtraction on this machine rather than a claim carried
+    # over from another one. The first measurement of this attributed 94% of
+    # the total to it — under nested virtualisation, where the RCU
+    # synchronisation a netns needs is exactly what a hypervisor makes
+    # expensive.
+    without = measure(False)
+    print()
+    if isinstance(without, str):
+        print(f"  without CLONE_NEWNET: could not run ({without})")
+    else:
+        with_p50 = statistics.median(samples["total"])
+        without_p50 = statistics.median(without["total"])
+        cost = with_p50 - without_p50
+        share = (cost / with_p50 * 100) if with_p50 > 0 else 0.0
+        print(f"  without CLONE_NEWNET   p50 {without_p50:6.3f} ms")
+        print(f"  the network namespace  p50 {cost:6.3f} ms — {share:.0f}% of the total")
 
     total_p50 = statistics.median(samples["total"])
     print()

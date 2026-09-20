@@ -69,7 +69,7 @@ criteria passed; for the detail and the limits of the measuring environment see
 | 2 — cgroup limits | PASS 4/4 — the host lost 0 MB |
 | 4 — `gc.freeze()` CoW | PASS — 0.81 MB per request (down from 14.96 MB) |
 | 5 — seccomp + 5 packages | PASS 8/8 |
-| 1 — sandbox setup | FAIL — 3.96 ms; 94% of it `CLONE_NEWNET`. Does not touch the warm path |
+| 1 — sandbox setup | FAIL — 4.08 ms on bare metal. The `CLONE_NEWNET` share is **18%**, not the 94% measured under nested virtualisation. Does not touch the warm path |
 | 6 — userns overlayfs | Absent on 5.10; flatten + sidecar whiteout verified instead |
 | 8 — libkrun | No KVM, could not be run → required before phase 2 completes |
 
@@ -295,10 +295,20 @@ equivalent of `docker run`".
       two checks that were right on a machine running nothing else. Plus the
       one that matters most: an escape suite reporting **16 escapes** because
       no sandbox had started. See docs/poc-report.md.
-- [ ] **Re-measure the cost of `CLONE_NEWNET` on bare metal**: 2.5–3.3 ms was
-      measured under nested virtualisation, and netns creation involves RCU
-      synchronisation, so it may be disproportionately expensive there. If the
-      ratio is small, PoC 1's FAIL should be reconsidered too
+- [x] **Re-measured `CLONE_NEWNET` on bare metal**, and the suspicion was
+      right. `poc1_namespace_setup.py` takes a `with_netns` flag now and runs
+      the sequence twice, so the netns cost is a subtraction on one machine
+      rather than a number carried over from another. On a Raspberry Pi 4
+      (kernel 6.5, aarch64, 150 iterations): total p50 **4.08 ms**, without
+      the netns **3.36 ms** — so the network namespace is **0.72 ms, 18%**,
+      against the 94% measured under nested virtualisation.
+
+      Two consequences. PoC 1's FAIL stands at 4.08 ms against 3 ms, but there
+      is no dominant term left to remove — 1.4 ms namespaces, 1.1 ms pid-ns
+      fork, 0.8 ms mounts — so it is four things to speed up rather than one
+      to avoid. And the netns **pool** (PoC 9), which that 94% was the whole
+      argument for, would buy back a fifth of a cost that is already off the
+      warm path. Not worth handing live namespaces between tenants for.
 - [x] Fuzzing: spec parser, resolution, protocol decoding, framing, image
       references and scalar types — 9 tests, ~25k generated inputs, reproducible
       from a seed (`crates/zygo-core/tests/fuzz_parsers.rs`). No panics found

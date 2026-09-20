@@ -528,13 +528,38 @@ sandboxes belonging to that tenant can enter both that userns and a pooled
 netns. Since the phase 2 supervisor will keep the tenant userns alive anyway,
 this may come close to free. Noted in `todo.md` §2.2.
 
-### A caveat about the validity of this measurement
+### A caveat about the validity of this measurement — since answered
 
 The 3.3 ms was measured under nested virtualisation on Apple Silicon (macOS →
 LinuxKit VM → container). Creating a netns involves RCU synchronisation, which
 can be disproportionately expensive when nested. **On bare Linux the "94%" ratio
 is probably not this large.** The phase 1.5 CI matrix should re-measure this on
 bare metal; if the ratio is small, PoC 1's "FAIL" should be reconsidered too.
+
+That guess was right, and by a wide margin. `poc1_namespace_setup.py` takes a
+`with_netns` flag now and runs the whole sequence twice, so the cost of a
+network namespace is a subtraction made on one machine rather than a figure
+carried over from another. On a Raspberry Pi 4 — bare metal, kernel 6.5,
+aarch64 — 150 iterations:
+
+| | total p50 | without `CLONE_NEWNET` | the netns | share |
+|---|---|---|---|---|
+| bare metal (Pi 4, 6.5) | 4.08 ms | 3.36 ms | **0.72 ms** | **18%** |
+| nested (LinuxKit 5.10, same script today) | 6.85 ms | 3.94 ms | 2.91 ms | 42% |
+
+So **the network namespace is 18% of sandbox setup, not 94%**. The figure was
+an artefact of the hypervisor, exactly as suspected, and it was the one number
+in this report that argued for a specific optimisation — a pool of
+pre-created network namespaces (PoC 9). At 0.72 ms that pool would buy back a
+fifth of a cost that is already off the warm path, which is not worth the
+machinery of handing live namespaces between tenants.
+
+PoC 1's **FAIL stands**: 4.08 ms against a 3 ms budget. What changes is the
+shape of it. There is no dominant term to remove any more — 1.4 ms of
+namespaces, 1.1 ms of the pid-namespace fork, 0.8 ms of mounts, 0.5 ms of id
+maps — so getting under 3 ms means being faster at four things rather than
+avoiding one. And as the original note said, none of it touches the warm path,
+which is what the product actually promises.
 
 ### Two mistakes of its own that this PoC found
 
