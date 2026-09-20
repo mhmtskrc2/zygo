@@ -340,6 +340,7 @@ pub const TABLE: &[(&str, u32)] = &[
     ("kexec_load", 246),
     ("keyctl", 250),
     ("kill", 62),
+    ("lchown", 94),
     ("lgetxattr", 192),
     ("link", 86),
     ("linkat", 265),
