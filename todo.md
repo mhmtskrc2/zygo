@@ -39,7 +39,7 @@ live here.
 | `seccomp = "strict"` | **Works** — all five reference packages, after `clone3` → `ENOSYS` and the socket data calls were kept (3.0g) |
 | Other commands | Declared; they exit saying which phase brings them |
 
-Test status: **554 Rust tests on Linux** (466 on macOS) + 34 Python +
+Test status: **559 Rust tests on Linux** (466 on macOS) + 34 Python +
 **275 Linux integration / escape / supervisor / backend / example checks** +
 **14 macOS shim checks**
 (36 launcher, 16 escape vectors, 13 syscall-sweep, 19 gvisor, 151 supervisor,
@@ -265,14 +265,24 @@ equivalent of `docker run`".
       ubuntu-24.04 (6.8) × x86_64/aarch64 × root/rootless; every runner prints
       its own kernel/LSM/cgroup state. It also checks that the syscall tables
       match a fresh generation
-- [ ] Actually run CI and verify it — **it had a bug before ever running**:
-      every verification script hard-coded `/src`, the path `make` mounts the
-      checkout at inside its containers, and CI runs them from the workspace.
-      They take `SRC` now and CI sets it. The matrix and the examples were
-      added to the launcher job while there — the gaps phase 0 could not close have to
-      close there: **the Landlock restriction** (present on ubuntu-24.04),
-      `cgroup.kill`, `memory.peak`, userns-overlayfs, real rootless `newuidmap`.
-      **KVM is still missing** (the `pending-hardware` job reports this)
+- [x] **CI runs, and is green on all twelve jobs.** Four `unit` (x86_64,
+      x86_64 on 5.15, aarch64, macOS), four `launcher` (24.04 rootless and
+      root, 22.04, 24.04 arm), two `static`, the syscall tables and the
+      pending-hardware summary. **Landlock reports ABI v7 there and is
+      enforced for the first time in this project's life**; so are
+      `cgroup.kill`, `memory.peak`, unprivileged overlayfs and a real rootless
+      `newuidmap`. KVM is still missing and the `pending-hardware` job says so.
+
+      The first run failed every Linux job, with six bugs, five of them
+      invisible on the two aarch64 machines this had been measured on: `fork`
+      and `vfork` missing from the allowlist (musl uses `SYS_fork` where the
+      architecture has one), `chmod`/`chown`/`lchown` allowed only under
+      `permissive` while their `*at` forms were in the base list, a Landlock
+      root rule that ignored a build's writable root, a syscall newer than
+      the table answering `EPERM` where a libc fallback needs `ENOSYS`, and
+      two checks that were right on a machine running nothing else. Plus the
+      one that matters most: an escape suite reporting **16 escapes** because
+      no sandbox had started. See docs/poc-report.md.
 - [ ] **Re-measure the cost of `CLONE_NEWNET` on bare metal**: 2.5–3.3 ms was
       measured under nested virtualisation, and netns creation involves RCU
       synchronisation, so it may be disproportionately expensive there. If the

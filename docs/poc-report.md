@@ -2211,9 +2211,87 @@ Rule 1 from the README, in the place it mattered most: the front door.
 
 ---
 
+## CI — the first x86_64, and what it cost to find out
+
+Everything above was measured on two machines: a container on an Apple laptop
+and a Raspberry Pi. Both are aarch64. Both run kernels without an enforcing
+Landlock — 5.10 reports ABI 0, and the Pi's kernel does not compile it in.
+
+The first CI run failed on every Linux job. Not with one bug; with six, and
+five of them were invisible on the only machines this project had ever run
+on. They are listed here in the order they were found, because the order is
+the point: each one hid the next.
+
+**`/bin/sh: can't fork: Operation not permitted`, from every sandbox.** musl's
+`fork()` uses `SYS_fork` where the architecture has one and `clone(SIGCHLD)`
+where it does not. aarch64 has no `fork` syscall, so the allowlist never
+needed an entry and its absence cost nothing. On x86_64 it is syscall 57, it
+is what musl calls, and nothing allowed it. `vfork` (58) was the same, and is
+what `posix_spawn` reaches for.
+
+Found by elimination, and the elimination is worth recording: not the seccomp
+profile (`--seccomp permissive` failed too), not the pids limit, not the
+kernel (the arm runner forks fine on 6.8 and the x86_64 one does not on
+6.17), and not the image alone — a Debian sandbox forked where an alpine one
+in the same harness did not. musl and x86_64 together, which is one line of
+the allowlist.
+
+**`python3 -m venv` died with `[Errno 1] Operation not permitted`.** Same
+shape, one layer down. `chmod`, `chown` and `lchown` were in the *permissive*
+extras while their `*at` forms were in the base allowlist — and they are the
+same calls with the same reach. aarch64 has no `chmod` syscall, so glibc
+reaches for `fchmodat` there on its own and the split was invisible.
+
+Twice in one day, so the rule is a test now: a legacy spelling and its `*at`
+form must get the same answer, whichever answer that is. `mknod`/`mknodat`
+agree by both being refused, which is the boundary the escape suite checks.
+
+**`apt-get` could not lock `/var/lib/apt/lists`.** Zygo derives a system layer
+by running `apt-get install` in a sandbox whose root *is* writable. The mount
+honoured that; the Landlock ruleset did not, writing a read-only rule for `/`
+on the assumption stated in its own test name — "the root is read-only and
+everything writable comes from the mount plan". A build is the exception.
+Unreachable on either development machine, where `build` returns an empty
+ruleset and the mount permission is the only one there is.
+
+**A syscall newer than the table answered `EPERM`.** Not the cause of the
+venv failure in the end, but a real gap found looking for it: a libc that
+probes for a new syscall falls back **on `ENOSYS` only**. That was written
+here for `clone3`, for one syscall, when it is true of every syscall added
+after the table was generated — and there will always be more, because a
+table is generated once and kernels keep going. Above the highest number the
+table knows, the answer is `ENOSYS` now. Numbers the table *does* know and
+the profile refuses keep `EPERM`: refusing what exists is a different
+statement.
+
+**And two checks that were right on one machine and wrong on every other.**
+`no sandbox outlived the supervisor` counted every process on the host called
+`python3` — none but the sandbox's in a container, several on a CI runner. It
+counts processes under a `zygo.slice` now. And `pasta` was matched by an
+exact name, while `passt` ships CPU-tuned builds and `/usr/bin/pasta` is a
+symlink to one: `comm` reads `pasta.avx2` on x86_64. The check reported "found
+0" on a host where four were serving.
+
+The worst of them was none of these. CI's root job reported **1 blocked, 16
+escaped** from the escape suite. Nothing had escaped: every case runs Python
+in a sandbox and reads its output, an empty answer looks exactly like a
+refusal that printed nothing, and no sandbox had started — the data directory
+belonged to root, because one step in that job runs under `sudo` and every
+step after it does not. A suite that cannot start a sandbox now proves one
+runs before it attempts anything, and exits saying so if it cannot. Rule 4,
+in the file that rule is about.
+
+CI is green on all twelve jobs now: four `unit` (x86_64, x86_64 on 5.15,
+aarch64, macOS), four `launcher` (24.04 rootless and root, 22.04, 24.04 arm),
+two `static`, the syscall tables, and the pending-hardware summary. Landlock
+reports **ABI v7** there and is enforced for the first time in this project's
+life.
+
+---
+
 ### An inventory of the bugs found in the tests themselves
 
-Twenty-six times in this project a test looked green because it measured the
+Thirty times in this project a test looked green because it measured the
 wrong thing — or showed the wrong thing red. All of them fall into one of
 a few patterns:
 
@@ -2245,6 +2323,10 @@ a few patterns:
 | 24 | Supervisor suite | a networked function that did not start was Zygo's fault | the section counted `pasta could not configure the sandbox's network` as a failure. `pasta` on that host cannot bring up a namespace for an ordinary user *at all* — `pasta --config-net -- /bin/true` fails there with no Zygo involved — so the suite was reporting a three-year-old package as a runtime bug, and a day went into fixing something that was not broken. A prerequisite that is present but does not work now skips the section, the way a missing one already did |
 | 25 | `zygo doctor` | reading `max_user_namespaces` said whether a sandbox could be built | it says whether one can be *created*. Ubuntu 24.04 permits that and refuses the first mount inside it, so `doctor` reported `ok` and `zygo run` died on `mount --make-rprivate /: Permission denied`. Rule 1, at the front door: the check now makes the namespace, writes the map and attempts the mount |
 | 26 | Supervisor suite | the harness moving processes out of the starting cgroup was test setup | it was **compensating for a missing product behaviour**. The supervisor could not delegate controllers out of a cgroup its own client was sitting in, and the harness had been emptying that cgroup by hand since the first Raspberry Pi run — so 151 checks passed on a build where `zygo serve` failed on any ordinary machine. A fixture that papers over a defect hides it as well as no test at all |
+| 27 | Escape suite | an empty answer from a sandbox meant the escape was refused | it meant no sandbox ran. Every case attempts something and reads the output, and nothing distinguished "refused, printed nothing" from "never started" — so a CI job whose data directory belonged to root reported **1 blocked, 16 escaped**. The suite proves a sandbox runs before it attempts anything now, and exits saying so if it cannot |
+| 28 | Supervisor suite | counting host processes called `python3` counted sandboxes | true on a machine that runs nothing else, which is what a container is. A CI runner has its own, and `no sandbox outlived the supervisor` reported two that were not sandboxes. Counted by cgroup now — under a `zygo.slice` is Zygo's by construction, whatever it is running |
+| 29 | Supervisor suite | `pasta` is called `pasta` | `passt` ships CPU-tuned builds and `/usr/bin/pasta` is a symlink to one, so `comm` reads `pasta.avx2` on x86_64. Matching the name exactly found none and reported "expected a pasta per networked sandbox, found 0" while four were serving |
+| 30 | Syscall sweep | a syscall that kills the process means the filter killed it | `uretprobe` (x86_64 335, kernel 6.11) exists to be called from the kernel's own trampoline and answers a direct call with SIGILL, whatever any filter says. The check subtracts the ones that die under `permissive` too, rather than excusing numbers by name — a list would be another thing to maintain per architecture and wrong the next time the kernel adds one |
 
 Written up as three rules and put in the README:
 

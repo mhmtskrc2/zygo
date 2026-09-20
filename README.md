@@ -329,7 +329,7 @@ Four rules the test suite is built on, all learned the hard way here:
   establishes the positive case first.
 
 Several checks here passed — or failed — for the wrong reason before those rules
-were applied; [docs/poc-report.md](docs/poc-report.md) lists all twenty-six.
+were applied; [docs/poc-report.md](docs/poc-report.md) lists all thirty.
 
 Zygo is Linux-first. The `ns` backend needs Linux **5.3+** — the floor is
 `clone3`, which has no fallback — plus user namespaces and delegated cgroup v2
