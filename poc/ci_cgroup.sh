@@ -33,11 +33,18 @@
 # command here would end the step before the suite it is preparing for ever
 # starts. Every step is therefore guarded and reports rather than exits.
 
+# One per invocation. The first step that used a shared `zygo-ci` left it
+# delegating controllers to its children, and a cgroup that delegates may no
+# longer hold processes — so every *later* step failed to move into it and ran
+# with no cgroup at all, silently. A fresh name each time costs nothing and
+# the kernel reclaims an empty cgroup when it is removed.
+CI_CGROUP=zygo-ci-$$
+
 if [ -w "/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup 2>/dev/null | head -1)" ]; then
     echo "ci_cgroup: the current cgroup is already writable; nothing to do"
 else
-    if sudo -n mkdir -p /sys/fs/cgroup/zygo-ci 2>/dev/null &&
-        sudo -n chown -R "$(id -u):$(id -g)" /sys/fs/cgroup/zygo-ci 2>/dev/null; then
+    if sudo -n mkdir -p /sys/fs/cgroup/$CI_CGROUP 2>/dev/null &&
+        sudo -n chown -R "$(id -u):$(id -g)" /sys/fs/cgroup/$CI_CGROUP 2>/dev/null; then
         # Move first, delegate second — the order is not a preference.
         # cgroup v2 forbids a cgroup from holding processes *and* delegating
         # controllers, and a container's `/sys/fs/cgroup` is its own cgroup
@@ -48,7 +55,7 @@ else
         # Root has to do the move: cgroup v2 only lets an unprivileged process
         # migrate within a subtree it already owns, and this one's ancestor is
         # root's.
-        if ! echo $$ | sudo -n tee /sys/fs/cgroup/zygo-ci/cgroup.procs >/dev/null 2>&1; then
+        if ! echo $$ | sudo -n tee /sys/fs/cgroup/$CI_CGROUP/cgroup.procs >/dev/null 2>&1; then
             echo "ci_cgroup: could not move this shell into zygo-ci"
         fi
         # One controller at a time: the write is atomic, so a kernel that
@@ -60,16 +67,16 @@ else
                 echo "ci_cgroup: this kernel will not delegate \`$c\` from the root"
         done
     else
-        echo "ci_cgroup: could not create /sys/fs/cgroup/zygo-ci"
+        echo "ci_cgroup: could not create /sys/fs/cgroup/$CI_CGROUP"
     fi
 
     now=$(sed -n 's/^0:://p' /proc/self/cgroup 2>/dev/null | head -1)
-    if [ "$now" = /zygo-ci ]; then
+    if [ "$now" = "/$CI_CGROUP" ]; then
         # Say what arrived, not what was asked for. Without the controllers
         # the move is worth nothing: `zygo` gets as far as creating its slice
         # and then finds no `memory.max` there.
-        echo "ci_cgroup: this shell is now in /sys/fs/cgroup/zygo-ci," \
-            "with controllers: [$(cat /sys/fs/cgroup/zygo-ci/cgroup.controllers 2>/dev/null)]"
+        echo "ci_cgroup: this shell is now in /sys/fs/cgroup/$CI_CGROUP," \
+            "with controllers: [$(cat /sys/fs/cgroup/$CI_CGROUP/cgroup.controllers 2>/dev/null)]"
     else
         # Not fatal: the harness says the same thing in its own words, and a
         # suite that runs and reports honestly beats a step that never starts.

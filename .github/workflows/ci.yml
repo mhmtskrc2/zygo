@@ -137,21 +137,6 @@ jobs:
 
       - run: cargo build --release
 
-      # The scripts default to `/src`, which is where `make` mounts the
-      # checkout inside its containers; here the checkout is the workspace.
-      - name: Isolation and limits
-        run: |
-          . poc/ci_cgroup.sh
-          install -m 0755 target/release/zygo poc/zygo-linux
-          if [ "${{ matrix.privilege }}" = root ]; then
-            sudo -E sh poc/verify_launcher.sh
-          else
-            sh poc/verify_launcher.sh
-          fi
-        env:
-          ZYGO_DATA_HOME: /tmp/zygo-ci
-          SRC: ${{ github.workspace }}
-
       # Temporary. The sandbox is confined exactly as intended — seccomp
       # mode 2, one filter, no capabilities, `no_new_privs` — and the fork
       # still fails. `python` as the sandbox's own program needs no fork to
@@ -182,9 +167,25 @@ jobs:
                   os._exit(0)
               print(name, "->", rc, errno.errorcode.get(ctypes.get_errno(), "?"))
           PYEOF
+          echo "this shell is in: $(sed -n 's/^0:://p' /proc/self/cgroup | head -1)"
           $Z run --mount /tmp/forktest.py:/t.py:ro python:3.12-slim python3 /t.py 2>&1 | head -12
         env:
           ZYGO_DATA_HOME: /tmp/zygo-diag
+          SRC: ${{ github.workspace }}
+
+      # The scripts default to `/src`, which is where `make` mounts the
+      # checkout inside its containers; here the checkout is the workspace.
+      - name: Isolation and limits
+        run: |
+          . poc/ci_cgroup.sh
+          install -m 0755 target/release/zygo poc/zygo-linux
+          if [ "${{ matrix.privilege }}" = root ]; then
+            sudo -E sh poc/verify_launcher.sh
+          else
+            sh poc/verify_launcher.sh
+          fi
+        env:
+          ZYGO_DATA_HOME: /tmp/zygo-ci
           SRC: ${{ github.workspace }}
 
       - name: Escape suite
