@@ -2074,10 +2074,113 @@ same mechanism the agent path uses.
 
 ---
 
+## Phase 5 — macOS, and what a third environment found
+
+macOS has no user namespaces, no cgroups, no seccomp and no Landlock, and
+will not grow them. There is no port to write. `zygo` on a Mac forwards: the
+command, its arguments, its working directory and its streams go to a Linux
+`zygo` in a VM, and that command's exit status comes back out. Docker answers
+the same wall the same way.
+
+The provider is **Lima**, not a Virtualization.framework helper. It needs no
+signed binary, `brew install lima` is one line, and everything above the
+provider — what forwards, what a path maps to, what the VM is asked — is
+provider-independent and unit-tested on every platform in the matrix.
+
+What makes forwarding usable is one rule: the VM mounts `$HOME` at the same
+path it has on the host, writable, so `./handler.py` is one file seen from two
+sides and nothing in the command line has to be rewritten. The rule is also
+the limit, and it is enforced rather than hoped for — a command run from
+outside `$HOME` is refused, and the message names both directories, because
+forwarding it would run against a directory that is not the one in front of
+the user.
+
+| | measured |
+|---|---|
+| create and boot the VM, first time | 90 s, image download included |
+| `zygo run python:3.12-slim python -c pass`, VM up | **117 ms** (target: 100 ms) |
+| of which, the `limactl shell` hop | 46 ms |
+| `zygo serve` → warm | 104 ms |
+| warm `zygo exec`, round trip from the Mac | 96 ms |
+
+The 17 ms over target is the ssh hop; vsock is where that goes if it matters.
+`make verify-shim` is 13 checks against a real VM — a Linux kernel answers,
+stdin crosses, an exit status of 7 arrives as 7, a handler in the current
+directory is found, and `ps` lists a function running inside.
+
+CI cannot run it: GitHub's hosted macOS runners are themselves virtual
+machines with no nested virtualization, so Lima cannot boot there. The suite
+skips and says why.
+
+### Two product bugs, and why no suite could see them
+
+Neither is about macOS. Both would stop a first-time user on Linux at the
+first command they type, and both survived because this project had been
+measured in exactly two places: a container it was root in, and a Raspberry
+Pi running the verification suites.
+
+**The client and the supervisor looked for different sockets.** `zygo serve`
+worked its paths out from the XDG environment — data under `~/.local/share`,
+socket under `$XDG_RUNTIME_DIR` — and then started the supervisor with
+`--data-root <data>`, which selects the self-contained layout whose socket is
+`<root>/run/supervisor.sock`. The supervisor came up and listened; the client
+waited ten seconds on a path nothing was bound to and reported that it "did
+not answer". Containers set `ZYGO_DATA_HOME` and have no `XDG_RUNTIME_DIR`,
+so there both halves came from one place and happened to agree.
+
+The layout now travels as both halves or not at all, and the timeout names
+the socket it waited on — the sentence that would have made this a one-minute
+diagnosis instead of an afternoon.
+
+**The supervisor could not delegate out of a cgroup its own client was
+sitting in.** `zygo serve` re-executes into a transient scope and spawns the
+supervisor there. The supervisor steps aside into `zygo.slice/system`, but
+the client is still in the scope, so writing the scope's `subtree_control`
+fails with `EBUSY` and every tenant cgroup arrives with no `memory.max`. The
+error blamed delegation on a host where everything *was* delegated.
+
+This one is worth dwelling on: `poc/cgroup_harness.sh` has been moving
+processes out of the starting cgroup by hand since the first Raspberry Pi
+run. The harness was supplying what the product was missing, which is why 151
+supervisor checks pass either way. A test fixture that compensates for a
+product defect hides it exactly as well as no test at all.
+
+`ensure` now moves Zygo's *own* processes out of the parent first, matched by
+`/proc/<pid>/exe` so nobody else's are touched.
+
+### AppArmor, and a check that read a setting
+
+Ubuntu 24.04 ships `kernel.apparmor_restrict_unprivileged_userns=1`. An
+unprivileged process may still *create* a user namespace; what it may not do
+is mount inside one. So `zygo doctor` said `user namespaces  enabled  ok` —
+it had read `/proc/sys/user/max_user_namespaces` — and the sandbox died four
+calls later on `mount --make-rprivate /: Permission denied`, which names
+neither AppArmor nor user namespaces.
+
+The check attempts it now, in a child, in the order the launcher does: make a
+user and mount namespace, have the parent write the id map, then make the
+mount tree private. Each step is reported separately, because they fail for
+different reasons — and the first version of this check stopped after the id
+map and still said `ok`, since the map is written by the *parent* and that is
+the one part the restriction permits.
+
+```
+restriction on:   user namespaces  the mount tree could not be made private
+                                   inside the namespace                     FAIL
+                  → AppArmor is restricting unprivileged user namespaces on
+                    this host: sudo sysctl -w
+                    kernel.apparmor_restrict_unprivileged_userns=0
+restriction off:  user namespaces  one can be built and mounted in            ok
+```
+
+Rule 1 from the README, in the place it mattered most: the front door.
+
+---
+
 ### An inventory of the bugs found in the tests themselves
 
-Twenty-four times in this project a test looked green because it measured
-the wrong thing — or showed the wrong thing red. All of them fall into one of
+Twenty-six times in this project a test looked green because it measured the
+wrong thing — or showed the wrong thing red. All of them fall into one of
 a few patterns:
 
 | # | Where | What the test thought | The reality |
@@ -2106,6 +2209,8 @@ a few patterns:
 | 22 | Every suite | `ZYGO_HARNESS` being `unusable` would be noticed | the harness set the flag, printed a remedy, and carried on — and nothing read it. A run started outside a delegated scope reported *121 passed, 13 failed* on a build with no bug in it. The harness now steps into a scope of its own the way `zygo` does, and when it still cannot, every summary carries a note saying the number above it is not a verdict |
 | 23 | Supervisor suite | a bandwidth limit could be shown by comparing against an unlimited upload | the assertion was `limited ≥ 3.5 s AND limited > 2 × unlimited`. The first half is arithmetic — 500 KB at 100 KB/s cannot finish sooner — and the second is a control for a slow endpoint. On a busy link the control *inverted*: the unlimited upload took 3.6 s, the ratio failed, and a working limit was reported broken. A control that cannot control for anything has to say so rather than vote |
 | 24 | Supervisor suite | a networked function that did not start was Zygo's fault | the section counted `pasta could not configure the sandbox's network` as a failure. `pasta` on that host cannot bring up a namespace for an ordinary user *at all* — `pasta --config-net -- /bin/true` fails there with no Zygo involved — so the suite was reporting a three-year-old package as a runtime bug, and a day went into fixing something that was not broken. A prerequisite that is present but does not work now skips the section, the way a missing one already did |
+| 25 | `zygo doctor` | reading `max_user_namespaces` said whether a sandbox could be built | it says whether one can be *created*. Ubuntu 24.04 permits that and refuses the first mount inside it, so `doctor` reported `ok` and `zygo run` died on `mount --make-rprivate /: Permission denied`. Rule 1, at the front door: the check now makes the namespace, writes the map and attempts the mount |
+| 26 | Supervisor suite | the harness moving processes out of the starting cgroup was test setup | it was **compensating for a missing product behaviour**. The supervisor could not delegate controllers out of a cgroup its own client was sitting in, and the harness had been emptying that cgroup by hand since the first Raspberry Pi run — so 151 checks passed on a build where `zygo serve` failed on any ordinary machine. A fixture that papers over a defect hides it as well as no test at all |
 
 Written up as three rules and put in the README:
 

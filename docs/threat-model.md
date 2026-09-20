@@ -121,6 +121,20 @@ Said plainly, because `zygo doctor` says it too:
   agent, at the supervisor's request, which means only agents that honour
   `ZYGO_CHILD_SECCOMP` have it. The Python reference agent does; the Node and
   sh examples do not.
+* **On Ubuntu 24.04 and later, Zygo asks you to turn something off.**
+  `kernel.apparmor_restrict_unprivileged_userns=1` stops an unprivileged
+  process mounting inside a user namespace, which is the first thing every
+  sandbox does. `zygo doctor` detects it — by attempting the mount, not by
+  reading the sysctl — and prints `sysctl -w
+  kernel.apparmor_restrict_unprivileged_userns=0` as the remedy. Be clear
+  about what that is: a host-wide protection against a class of local
+  privilege escalation that starts with an unprivileged user namespace, and
+  turning it off removes it for **every** process on the machine, not only
+  Zygo's. It is the right call on a host whose job is running sandboxes, and
+  it is what `shim/lima.yaml` does inside Zygo's own VM. On a shared
+  workstation the narrower answer is an AppArmor profile that permits it for
+  the `zygo` binary alone; Zygo does not ship one yet, and that is a gap.
+
 * **Egress needs `pasta` and `nft`.** If either is missing, a networked sandbox
   refuses to start — it does not start unconfined — but that is a liveness
   failure you should know about before it happens.

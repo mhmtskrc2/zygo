@@ -115,6 +115,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      # Ubuntu 24.04 ships `kernel.apparmor_restrict_unprivileged_userns=1`.
+      # It lets an unprivileged process create a user namespace and then
+      # refuses the first mount inside it, so every sandbox dies on `mount
+      # --make-rprivate /: Permission denied` — which names neither AppArmor
+      # nor user namespaces. `zygo doctor` reports it now; this turns it off,
+      # because this runner exists to run sandboxes and the confinement that
+      # matters is the one Zygo builds inside them.
+      - name: Let unprivileged user namespaces mount
+        run: |
+          before=$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo "not present")
+          echo "apparmor_restrict_unprivileged_userns was: $before"
+          if [ "$before" != "not present" ] && [ "$before" != 0 ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
       - name: Environment
         run: |
           cargo run --release --bin zygo -- doctor || true

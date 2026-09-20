@@ -456,21 +456,166 @@ mod probe {
     fn user_namespaces() -> Check {
         let max =
             read_trimmed("/proc/sys/user/max_user_namespaces").and_then(|s| s.parse::<u64>().ok());
-        match max {
-            Some(0) => Check::failed(
+        if max == Some(0) {
+            return Check::failed(
                 "user namespaces",
                 "disabled",
                 "sudo sysctl -w user.max_user_namespaces=15000",
-            ),
-            Some(_) => Check::ok("user namespaces", "enabled"),
-            None if Path::new("/proc/self/ns/user").exists() => {
-                Check::ok("user namespaces", "enabled")
-            }
-            None => Check::failed(
+            );
+        }
+        if max.is_none() && !Path::new("/proc/self/ns/user").exists() {
+            return Check::failed(
                 "user namespaces",
                 "unavailable",
                 "enable CONFIG_USER_NS, or run Zygo as root",
+            );
+        }
+
+        // Creating the namespace is not the question. Ubuntu 24.04 ships
+        // `kernel.apparmor_restrict_unprivileged_userns=1`, which lets an
+        // ordinary user make a user namespace and then refuses to let them
+        // write its id map — and *every* boundary Zygo builds starts with that
+        // map. The old check read `max_user_namespaces`, reported "enabled",
+        // and the sandbox died four steps later on `mount --make-rprivate /:
+        // Permission denied`, which names none of this.
+        //
+        // So the map is written, in a child, the way the launcher writes it.
+        match try_a_sandbox_primitive() {
+            Ok(()) => Check::ok("user namespaces", "one can be built and mounted in"),
+            Err(reason) if apparmor_restricts_userns() => Check::failed(
+                "user namespaces",
+                reason,
+                "AppArmor is restricting unprivileged user namespaces on this host: \
+                 sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 \
+                 (or ship an AppArmor profile for the `zygo` binary)",
             ),
+            Err(reason) => Check::failed(
+                "user namespaces",
+                reason,
+                "an LSM is refusing what a sandbox does first; check `dmesg` for \
+                 a denial from AppArmor or SELinux",
+            ),
+        }
+    }
+
+    /// Whether Ubuntu's AppArmor restriction on unprivileged user namespaces
+    /// is switched on. Read, not attempted — the attempt is the caller's, and
+    /// this only explains what it found.
+    fn apparmor_restricts_userns() -> bool {
+        read_trimmed("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+            .is_some_and(|v| v.trim() != "0")
+    }
+
+    /// Do what a sandbox does first, in a child, and report what happened.
+    ///
+    /// Three steps, because the interesting failures are at different ones:
+    /// make a user and mount namespace, have the parent write the id map, and
+    /// then make the mount tree private — which is the launcher's very first
+    /// mount and the step Ubuntu 24.04 refuses when AppArmor is restricting
+    /// unprivileged user namespaces.
+    ///
+    /// An earlier version stopped after the id map and reported `ok` on a host
+    /// where `zygo run` died two calls later. The map is written by the
+    /// *parent*, which that restriction permits; it is the mount inside the
+    /// namespace that it denies.
+    ///
+    /// A child, because `unshare` here would change the namespace `zygo
+    /// doctor` itself runs in. It is killed and reaped before this returns.
+    fn try_a_sandbox_primitive() -> std::result::Result<(), String> {
+        use std::ffi::{c_int, c_void};
+
+        let pipe = || -> std::result::Result<(c_int, c_int), String> {
+            let mut fds = [0 as c_int; 2];
+            // SAFETY: `pipe` writes two descriptors into the array and
+            // returns non-zero on failure.
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+                return Err("could not make a pipe".into());
+            }
+            Ok((fds[0], fds[1]))
+        };
+        let (up_read, up_write) = pipe()?;
+        let (down_read, down_write) = pipe()?;
+
+        // SAFETY: the child allocates nothing and takes no lock; every call
+        // below is async-signal-safe.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return Err("could not fork".into());
+        }
+        if pid == 0 {
+            unsafe {
+                libc::close(up_read);
+                libc::close(down_write);
+                let made = libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) == 0;
+                let byte = [u8::from(made)];
+                libc::write(up_write, byte.as_ptr() as *const c_void, 1);
+                if !made {
+                    libc::_exit(0);
+                }
+                // Wait for the map. Without it this process has no valid uid
+                // and the mount below would fail for that reason instead.
+                let mut go = [0u8; 1];
+                if libc::read(down_read, go.as_mut_ptr() as *mut c_void, 1) != 1 || go[0] == 0 {
+                    libc::_exit(0);
+                }
+                let ok = libc::mount(
+                    c"none".as_ptr(),
+                    c"/".as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_REC | libc::MS_PRIVATE,
+                    std::ptr::null(),
+                ) == 0;
+                let answer = [if ok { b'y' } else { b'n' }];
+                libc::write(up_write, answer.as_ptr() as *const c_void, 1);
+                libc::_exit(0);
+            }
+        }
+
+        let close_all = || unsafe {
+            for fd in [up_read, up_write, down_read, down_write] {
+                libc::close(fd);
+            }
+        };
+        let reap = || unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            let mut status = 0;
+            libc::waitpid(pid, &mut status, 0);
+        };
+        let finish = |result: std::result::Result<(), String>| {
+            reap();
+            close_all();
+            result
+        };
+
+        let read_one = |fd: c_int| -> Option<u8> {
+            let mut byte = [0u8; 1];
+            // SAFETY: one byte into a local array.
+            (unsafe { libc::read(fd, byte.as_mut_ptr() as *mut c_void, 1) } == 1).then_some(byte[0])
+        };
+
+        match read_one(up_read) {
+            Some(0) => return finish(Err("unshare(CLONE_NEWUSER) was refused".into())),
+            None => return finish(Err("the child said nothing".into())),
+            Some(_) => {}
+        }
+
+        // SAFETY: no arguments, cannot fail.
+        let uid = unsafe { libc::getuid() };
+        let path = format!("/proc/{pid}/uid_map");
+        let wrote = std::fs::write(&path, format!("0 {uid} 1\n"));
+        let go = [u8::from(wrote.is_ok())];
+        // SAFETY: one byte out of a local array.
+        unsafe { libc::write(down_write, go.as_ptr() as *const c_void, 1) };
+        if let Err(e) = wrote {
+            return finish(Err(format!("the id map was refused ({e})")));
+        }
+
+        match read_one(up_read) {
+            Some(b'y') => finish(Ok(())),
+            Some(_) => finish(Err(
+                "the mount tree could not be made private inside the namespace".into(),
+            )),
+            None => finish(Err("the child died before it could mount".into())),
         }
     }
 
