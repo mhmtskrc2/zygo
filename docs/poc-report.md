@@ -2097,7 +2097,8 @@ the user.
 
 | | measured |
 |---|---|
-| create and boot the VM, first time | 90 s, image download included |
+| no VM at all → output from a Linux sandbox | **51–59 s** (target: 60 s) |
+| the same again, first time ever | + ~40 s for Lima's image download |
 | `zygo run python:3.12-slim python -c pass`, VM up | **117 ms** (target: 100 ms) |
 | of which, the `limactl shell` hop | 46 ms |
 | `zygo serve` → warm | 104 ms |

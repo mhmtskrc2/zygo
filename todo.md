@@ -1661,8 +1661,11 @@ every backend, so the fallback now happens in the bundle.
       install lima` is one line, and everything above the provider is
       provider-independent if that changes. Ubuntu 24.04, kernel 6.8 —
       **Landlock ABI v4 runs here for the first time in this project**.
-      Measured: first create and boot **90 s** (including the image download),
-      a command against a running VM **79 ms**.
+      Measured: **51–59 s** from no VM at all to output from a Linux sandbox
+      — creating the VM, provisioning it, installing the Linux binary and
+      pulling the container image, all of it — against phase 5's 60 s. Add
+      about 40 s the very first time, for Lima to download the Ubuntu image.
+      A command against a running VM is **79 ms**.
 - [x] **virtiofs: `$HOME` at the same path, writable.** That is the whole
       path contract, and it is enforced rather than hoped for — a command run
       from outside `$HOME` is refused and the message names both directories,
@@ -1708,7 +1711,8 @@ every backend, so the fallback now happens in the bundle.
       is absent and says why; the shim's own decisions are unit-tested on
       every platform, including in CI.
 
-**Acceptance:** `zygo run python:3.12-slim python -c pass` on macOS: **117 ms**
+**Acceptance:** first run on a Mac with no VM, **51–59 s** against a 60 s
+target. Second run, `zygo run python:3.12-slim python -c pass`: **117 ms**
 with the VM up, against a target of 100 ms — the ssh hop is 46 ms of it, and
 vsock is where that goes if it matters. `serve` warms in **104 ms** and a warm
 `exec` round-trips in **96 ms**, which is the Linux number plus the hop.

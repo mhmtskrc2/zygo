@@ -22,9 +22,15 @@ images:
 # it.
 vmType: "vz"
 mountType: "virtiofs"
-rosetta:
-  enabled: false
-  binfmt: false
+# Off, and under `vmOpts` because the top-level key is deprecated — Lima warns
+# about it on every start, and a warning a user sees on every command is one
+# they learn to ignore. Zygo's sandboxes are arm64 on an arm64 Mac; x86
+# translation would be a second execution path to reason about for nothing.
+vmOpts:
+  vz:
+    rosetta:
+      enabled: false
+      binfmt: false
 
 # **Writable**, and this is the whole path contract. Lima shares the home
 # directory read-only by default, which would let `zygo serve` read a handler
