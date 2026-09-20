@@ -1762,16 +1762,26 @@ fi
 # No sandbox may outlive the supervisor: that is what PDEATHSIG is for, and the
 # whole reason it cannot simply be dropped.
 sleep 1
+# By cgroup, not by name. Counting every process called `python3` on the host
+# is right on a machine that runs nothing else — a container — and wrong
+# everywhere real: a CI runner has its own, and the check reported two
+# sandboxes that had outlived the supervisor when neither was a sandbox.
+#
+# Anything under a `zygo.slice` is Zygo's by construction, whatever it is
+# running, which is the same rule `poc/cleanup.sh` uses to decide what it may
+# kill.
 leftover=0
+names=
 for d in /proc/[0-9]*; do
-    [ "$(cat "$d/comm" 2>/dev/null)" = "python3" ] || continue
     [ "$(awk '{print $3}' "$d/stat" 2>/dev/null)" = "Z" ] && continue
+    grep -qs 'zygo\.slice' "$d/cgroup" 2>/dev/null || continue
     leftover=$((leftover+1))
+    names="$names $(cat "$d/comm" 2>/dev/null)"
 done
 if [ "$leftover" -eq 0 ]; then
     ok "no sandbox outlived the supervisor"
 else
-    bad "$leftover sandbox process(es) are still running with no supervisor"
+    bad "$leftover sandbox process(es) are still running with no supervisor:$names"
 fi
 
 wait "$SUPERVISOR" 2>/dev/null

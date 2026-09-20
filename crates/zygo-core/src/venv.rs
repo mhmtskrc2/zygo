@@ -234,8 +234,15 @@ fn build_argv() -> Vec<String> {
     vec![
         "sh".to_string(),
         "-c".to_string(),
+        // Three steps rather than one, so a failure says which. `python3 -m
+        // venv` runs `ensurepip` as a subprocess and swallows its output,
+        // reporting only `Command '[...]' returned non-zero exit status 1` —
+        // which is what a CI runner said, and it names nothing anyone can act
+        // on. Splitting it puts `ensurepip`'s own stderr in the sandbox's
+        // output, where the error message already carries it.
         format!(
-            "python3 -m venv {VENV_IN_SANDBOX} && \
+            "python3 -m venv --without-pip {VENV_IN_SANDBOX} && \
+             {VENV_IN_SANDBOX}/bin/python3 -m ensurepip --upgrade --default-pip && \
              {VENV_IN_SANDBOX}/bin/pip install --no-cache-dir --disable-pip-version-check \
              --timeout 60 --retries 5 -r {REQUIREMENTS_IN_SANDBOX}"
         ),
@@ -308,7 +315,9 @@ mod tests {
         assert_eq!(spec.limits.mem, Bytes::from_mib(1024));
         assert!(spec.limits.timeout.get() >= std::time::Duration::from_secs(600));
         assert_eq!(spec.cmd[0], "sh");
-        assert!(spec.cmd[2].contains("python3 -m venv /venv"));
+        // Each step on its own, so a failure names the one that failed.
+        assert!(spec.cmd[2].contains("python3 -m venv --without-pip /venv"));
+        assert!(spec.cmd[2].contains("/venv/bin/python3 -m ensurepip"));
         assert!(spec.cmd[2].contains("pip install"));
     }
 
