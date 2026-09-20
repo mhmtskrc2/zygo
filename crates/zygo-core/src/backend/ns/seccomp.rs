@@ -41,6 +41,7 @@ const BPF_W: u16 = 0x00;
 const BPF_ABS: u16 = 0x20;
 const BPF_JMP: u16 = 0x05;
 const BPF_JEQ: u16 = 0x10;
+const BPF_JGT: u16 = 0x20;
 const BPF_K: u16 = 0x00;
 const BPF_RET: u16 = 0x06;
 const BPF_ALU: u16 = 0x04;
@@ -112,6 +113,11 @@ enum Pending {
         jt: Label,
         jf: Label,
     },
+    JumpGt {
+        k: u32,
+        jt: Label,
+        jf: Label,
+    },
     Goto(Label),
     Ret(u32),
     /// Not an instruction: names the position that follows.
@@ -134,6 +140,9 @@ impl Assembler {
     }
     fn and(&mut self, mask: u32) -> &mut Self {
         self.push(Pending::And(mask))
+    }
+    fn jgt(&mut self, k: u32, jt: Label, jf: Label) -> &mut Self {
+        self.push(Pending::JumpGt { k, jt, jf })
     }
     fn jeq(&mut self, k: u32, jt: Label, jf: Label) -> &mut Self {
         self.push(Pending::JumpEq { k, jt, jf })
@@ -187,6 +196,12 @@ impl Assembler {
                 Pending::Ret(value) => stmt(BPF_RET | BPF_K, value),
                 Pending::JumpEq { k, jt, jf } => SockFilter {
                     code: BPF_JMP | BPF_JEQ | BPF_K,
+                    jt: distance(jt)?,
+                    jf: distance(jf)?,
+                    k,
+                },
+                Pending::JumpGt { k, jt, jf } => SockFilter {
+                    code: BPF_JMP | BPF_JGT | BPF_K,
                     jt: distance(jt)?,
                     jf: distance(jf)?,
                     k,
@@ -732,6 +747,27 @@ pub fn program(profile: SeccompProfile) -> Result<Vec<SockFilter>, SeccompError>
     for nr in &simple {
         asm.jeq(*nr, Label::Allow, Label::Next);
     }
+    // Anything left is refused — but *how* it is refused matters for a number
+    // this build has never heard of.
+    //
+    // A libc probes for a new syscall and falls back to the old way **on
+    // `ENOSYS` only**; on `EPERM` it reports failure. That is already written
+    // down here for `clone3`, where the consequence was "can't start new
+    // thread". It is the same for every syscall added after this table was
+    // generated: `fchmodat2` (6.6) is what glibc uses for `chmod`, it is not
+    // in the table, it was answered `EPERM`, and `python3 -m venv` died with
+    // `[Errno 1] Operation not permitted: '/venv/bin/activate.fish'` on a
+    // 6.17 runner while a 6.8 one was fine.
+    //
+    // So: above the highest number the table knows, answer `ENOSYS`. Syscall
+    // numbers only ever go up, so that is exactly the set this build cannot
+    // have an opinion about — and saying "there is no such syscall here" is
+    // both true and the answer a fallback can act on. Numbers the table *does*
+    // know and this profile does not allow keep `EPERM`: refusing something
+    // that exists is a different statement, and the escape suite asserts it.
+    if let Some(highest) = syscalls::TABLE.iter().map(|(_, nr)| *nr).max() {
+        asm.load(OFF_NR).jgt(highest, Label::NoSys, Label::Deny);
+    }
     asm.goto(Label::Deny);
 
     if clone_nr.is_some() {
@@ -1062,6 +1098,10 @@ mod tests {
                         let taken = acc == insn.k;
                         pc += 1 + usize::from(if taken { insn.jt } else { insn.jf });
                     }
+                    c if c == BPF_JMP | BPF_JGT | BPF_K => {
+                        let taken = acc > insn.k;
+                        pc += 1 + usize::from(if taken { insn.jt } else { insn.jf });
+                    }
                     c if c == BPF_JMP | BPF_JA => {
                         pc += 1 + insn.k as usize;
                     }
@@ -1082,6 +1122,41 @@ mod tests {
             let nr = syscalls::number(name)
                 .unwrap_or_else(|| panic!("{name} has no number on this architecture"));
             evaluate(&prog, syscalls::AUDIT_ARCH, nr, arg0)
+        }
+
+        /// A number newer than this build's table is "no such syscall", not
+        /// "refused" — the distinction a libc fallback turns on.
+        ///
+        /// `clone3` had this written for it by hand. Everything added after
+        /// the table was generated needs it too: `fchmodat2` (kernel 6.6) is
+        /// what glibc uses for `chmod`, it is not in the table, and answering
+        /// it `EPERM` killed `python3 -m venv` on a 6.17 runner with
+        /// `[Errno 1] Operation not permitted: '/venv/bin/activate.fish'`.
+        #[test]
+        fn a_syscall_newer_than_the_table_says_there_is_no_such_syscall() {
+            let highest = syscalls::TABLE
+                .iter()
+                .map(|(_, nr)| *nr)
+                .max()
+                .expect("a supported architecture has a table");
+            let prog = program(SeccompProfile::Default).unwrap();
+            let at = |nr| evaluate(&prog, syscalls::AUDIT_ARCH, nr, 0);
+
+            assert_eq!(
+                at(highest + 1),
+                Verdict::Deny(libc::ENOSYS as u32),
+                "a number this build cannot have an opinion about"
+            );
+            assert_eq!(at(highest + 99), Verdict::Deny(libc::ENOSYS as u32));
+
+            // Something the table knows and this profile refuses keeps
+            // `EPERM`: refusing what exists is a different statement, and the
+            // escape suite asserts it.
+            assert_eq!(
+                verdict(SeccompProfile::Default, "ptrace", 0),
+                Verdict::Deny(libc::EPERM as u32),
+                "`ptrace` exists here and is refused"
+            );
         }
 
         #[test]
