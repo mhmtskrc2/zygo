@@ -232,6 +232,8 @@ pub const BASE_ALLOWLIST: &[&str] = &[
     "capget",
     "capset",
     "chdir",
+    "chmod",
+    "chown",
     "clock_getres",
     "clock_gettime",
     "clock_nanosleep",
@@ -307,6 +309,7 @@ pub const BASE_ALLOWLIST: &[&str] = &[
     "getxattr",
     "ioctl",
     "kill",
+    "lchown",
     "lgetxattr",
     "link",
     "linkat",
@@ -450,11 +453,8 @@ pub const PERMISSIVE_EXTRA: &[&str] = &[
     "syncfs",
     "mknod",
     "mknodat",
-    "chown",
     // `dpkg` changes the ownership of symlinks it unpacks; on x86_64 glibc
     // does that with the legacy syscall (arm64 has only `fchownat`).
-    "lchown",
-    "chmod",
     "chroot",
     "sethostname",
     "setdomainname",
@@ -1157,6 +1157,48 @@ mod tests {
                 Verdict::Deny(libc::EPERM as u32),
                 "`ptrace` exists here and is refused"
             );
+        }
+
+        /// A legacy spelling and its `*at` form get the same answer.
+        ///
+        /// Two bugs came out of them differing, both invisible on aarch64 and
+        /// both fatal on x86_64. `fork` is not a syscall on aarch64, so musl
+        /// reaches for `clone` there and `SYS_fork` here, and nothing allowed
+        /// it: `/bin/sh: can't fork`. `chmod` is not a syscall on aarch64
+        /// either, so glibc reaches for `fchmodat` there and `chmod` here, and
+        /// only the first was allowed: `python3 -m venv` died with `[Errno 1]
+        /// Operation not permitted` partway through its activation scripts.
+        ///
+        /// Denying one spelling while permitting the other is not a boundary —
+        /// it is the same call with the same reach — so the two must agree,
+        /// whichever way. `mknod`/`mknodat` agree by both being refused, which
+        /// is the boundary the escape suite actually checks.
+        #[test]
+        fn a_legacy_spelling_and_its_at_form_agree() {
+            let pairs = [
+                ("chmod", "fchmodat"),
+                ("chown", "fchownat"),
+                ("lchown", "fchownat"),
+                ("mkdir", "mkdirat"),
+                ("mknod", "mknodat"),
+                ("open", "openat"),
+                ("readlink", "readlinkat"),
+                ("rename", "renameat"),
+                ("rmdir", "unlinkat"),
+                ("symlink", "symlinkat"),
+                ("unlink", "unlinkat"),
+            ];
+            for (legacy, modern) in pairs {
+                let (Some(_), Some(_)) = (syscalls::number(legacy), syscalls::number(modern))
+                else {
+                    continue; // one of them does not exist on this architecture
+                };
+                assert_eq!(
+                    verdict(SeccompProfile::Default, legacy, 0),
+                    verdict(SeccompProfile::Default, modern, 0),
+                    "`{legacy}` and `{modern}` are the same call and must get the same answer"
+                );
+            }
         }
 
         #[test]
