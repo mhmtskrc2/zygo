@@ -12,4 +12,5 @@ without mdBook.
 - [The agent protocol](../spec/protocol.md)
 - [Writing an agent](../examples/agents/README.md)
 - [Measurements: the PoC report](poc-report.md)
+- [Using Zygo instead of Docker: a field report](docker-replacement-report.md)
 - [Firecracker snapshots (research)](firecracker-snapshots.md)

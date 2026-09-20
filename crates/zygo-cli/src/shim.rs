@@ -330,21 +330,38 @@ pub fn stops_everything(command: &Command) -> bool {
     matches!(command, Command::Stop { all: true, .. })
 }
 
-/// `limactl stop zygo`, best effort.
+/// `limactl stop zygo`, best effort and quietly.
 ///
 /// Best effort on purpose: the command the user typed has already succeeded
 /// and its exit status is theirs. A VM that will not stop is worth a line in
 /// the log, not a failure on a teardown that worked.
+///
+/// Quiet for the same reason. `limactl stop` writes about thirty lines of its
+/// own progress to stderr, one of them at `level=error` on a shutdown that
+/// worked, and all of it arrives after the user's command has printed its
+/// answer — so the last thing on screen is an error from a VM manager they
+/// never asked about. The output is captured and kept for `-v`, where someone
+/// debugging the shim wants precisely those lines.
 #[cfg(target_os = "macos")]
 fn stop_vm(limactl: &Path) {
     match std::process::Command::new(limactl)
         .args(["stop", INSTANCE])
-        .status()
+        .output()
     {
-        Ok(status) if status.success() => {
-            tracing::debug!("the Linux VM is stopped; the next command starts it again");
+        Ok(out) if out.status.success() => {
+            tracing::debug!(
+                lima = %String::from_utf8_lossy(&out.stderr).trim(),
+                "the Linux VM is stopped; the next command starts it again"
+            );
+            eprintln!("the Linux VM is stopped; the next command starts it again");
         }
-        Ok(status) => tracing::warn!("the Linux VM did not stop ({status})"),
+        // A failure is the one case where Lima's own words are worth showing:
+        // they say what is still holding the VM open, which nothing here can.
+        Ok(out) => tracing::warn!(
+            lima = %String::from_utf8_lossy(&out.stderr).trim(),
+            "the Linux VM did not stop ({})",
+            out.status
+        ),
         Err(e) => tracing::warn!("could not stop the Linux VM: {e}"),
     }
 }
@@ -482,16 +499,45 @@ fn ensure_running(limactl: &Path) -> anyhow::Result<()> {
     }
 
     let template = template_path()?;
-    tracing::info!(status = ?vm, "starting the Linux VM Zygo runs its sandboxes in");
-    let status = std::process::Command::new(limactl)
+
+    // One line of ours, and `limactl`'s thirty kept back unless they are
+    // needed. Booting a virtual machine has a lot to say — a hostagent
+    // socket, an ssh port, six forwarding decisions, three requirements
+    // satisfied — and none of it was asked for by somebody who typed `zygo
+    // run python -c print`. The whole point of this mode is that the VM is
+    // not the user's business.
+    //
+    // Which does not mean silence: a machine that takes a minute to appear
+    // should say it is doing something, and a failure has to arrive with
+    // everything `limactl` said about it.
+    let first_time = vm == Vm::Absent;
+    eprintln!(
+        "starting the Linux VM Zygo runs its sandboxes in{}",
+        if first_time {
+            " (the first time takes about a minute)"
+        } else {
+            ""
+        }
+    );
+    let out = std::process::Command::new(limactl)
         .args(start_args(vm, &template))
-        .status()
+        .output()
         .map_err(|e| anyhow::anyhow!("could not start the VM: {e}"))?;
-    if !status.success() {
+    if !out.status.success() {
         anyhow::bail!(
-            "the Linux VM would not start (limactl exited {})\n  \
+            "the Linux VM would not start (limactl exited {})\n{}\n  \
              → see it for yourself with `limactl start {INSTANCE}`",
-            status.code().unwrap_or(-1)
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .rev()
+                .take(8)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .map(|l| format!("  {l}"))
+                .collect::<Vec<_>>()
+                .join("\n")
         );
     }
     Ok(())

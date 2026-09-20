@@ -1826,12 +1826,105 @@ docs/poc-report.md.
 
 ---
 
+## After test
+
+Source: [docs/docker-replacement-report.md](docs/docker-replacement-report.md),
+the 20 September 2026 session that used Zygo in Docker's place for a day.
+Every item below was checked against the code on 21 September before it was
+written down; the two claims the report gets wrong are the last item rather
+than work of their own.
+
+- [ ] **`zygo bench` never enters a delegated scope.** `needs_a_cgroup`
+      (`crates/zygo-cli/src/scope.rs`) lists `Run`, `Serve`, `Up` and
+      `Supervisor(Run)`; `Bench` is missing, and all three bench modes build a
+      sandbox. On a systemd login `bench` dies with `cannot create the cgroup
+      …/session-N.scope/zygo.slice`, so the command that demonstrates the
+      central claim is the one that fails first. Add `Command::Bench(_)` to the
+      match and to the unit test that pins the list
+- [ ] **Reopen A2 with the field numbers.** `zygo bench warm --no-cgroup`,
+      1500 requests at 200 req/s, both rows minutes apart on the same host:
+
+      | | per-request cgroup | none |
+      |---|---|---|
+      | p50 | 1868 µs | 1223 µs |
+      | p99 | 15608 µs | 1980 µs |
+      | max | 51639 µs | 2819 µs |
+      | `admit` p99 | 11310 µs | 85 µs |
+      | acceptance | p99 **FAIL** | p99 PASS |
+
+      The default configuration misses the project's own p99 criterion and the
+      per-request cgroup is the whole tail; PoC 3's 97 µs was sequential and
+      lightly loaded. Decide between a per-tenant cgroup by default, a pool of
+      request cgroups reused rather than created and destroyed per request, or
+      `--no-cgroup` as a documented production choice with what it gives up
+      spelled out (a runaway request is then billed to the tenant's cgroup
+      instead of killed on its own). Re-measure on bare metal first — the
+      absolute numbers are nested-virtualisation numbers, the ratio is not
+- [ ] **`zygo run <image>` with no command refuses to run.** `--help` promises
+      the image's entrypoint and cmd, and `cmd/run.rs` has the code
+      (`image_config.default_argv()`), but it is never reached:
+      `RunArgs::to_layer` leaves `cmd` unset and `resolve_layer` returns
+      `fn.run: nothing to run` when neither `entry` nor `cmd` is set.
+      `--dry-run` stops at the same place. Let the one-shot resolve accept an
+      empty `cmd` (it is the only caller that fills it in afterwards), keep the
+      "declares no entrypoint or cmd" error for images that really have
+      neither, and add a test: `zygo run --dry-run python:3.12` prints the
+      image's `python3` argv
+- [ ] **`-v host:guest` gets an image-reference error.** `-v` is the global
+      verbose flag, so `zygo run -v $PWD:/src image` parses `$PWD:/src` as the
+      image and fails with `repository has an empty path component` — accurate,
+      and pointing the wrong way. In `cmd/run.rs`, when the reference does not
+      parse and the string is shaped like a path pair (a `/` before the `:`,
+      or a leading `/` or `.`), answer with `--mount host:guest` instead
+- [ ] **`stop --all` prints raw `limactl` output on macOS.** `shim::stop_vm`
+      runs `limactl stop` with inherited stdio, so about thirty lines of Lima's
+      logging, one of them `level=error`, reach the terminal on a teardown that
+      succeeded. Capture both streams, print one line, keep the capture for
+      `-v`, and add a shim check for it
+- [ ] **`--mem 64M` alone is refused.** Scratch defaults to 64M and
+      `resolve_layer` requires `scratch < mem`, so the flag cannot be used by
+      itself. The error says why and not what to do: either scale the scratch
+      default down with `mem` when `scratch` was not set explicitly, or add the
+      hint `pass --scratch <size> smaller than --mem`
+- [ ] **The first traceback frame belongs to Zygo.** `run_request` in
+      `agents/python/zygo_agent.py` reports `traceback.format_exc()`, so a
+      raising handler shows `/zygo/agent.py … in run_request` above the user's
+      own line. Format from the handler's frame down (`tb.tb_next` past the
+      harness frames) so the developer's line comes first; check the Node agent
+      for the same; one unit test with a raising handler
+- [ ] **`image prune` reaches only layers.** `unreferenced_layers` walks
+      `layers/` and removes the matching blob; `flat_cache`, `venv_cache` and
+      `system_cache` are never looked at. Three images with 47 MB of layers left
+      a 230 MB data directory. Extend prune to flattened rootfs caches whose
+      image is gone, venvs no image + requirements pair references, and derived
+      system layers; have `prune --dry-run` report the size per cache
+- [ ] **README: the headline number is not reachable from the macOS CLI.** The
+      README gives the 96 ms round trip but not why: a `zygo exec` from the Mac
+      pays ~100 ms for the command hop through Lima, which is what
+      `docker exec` costs on the same host. Say plainly that on macOS the ~1 ms
+      warm path is visible through the HTTP API or the library, not the CLI, so
+      the first reader to measure it does not conclude the benchmark was
+      optimistic
+- [ ] **Bare-metal re-run of the report's numbers.** Every figure in the report
+      is from nested virtualisation (Lima on Apple Silicon). Re-measure the A2
+      table and the cold/warm comparison on the Raspberry Pi or CI's
+      `ubuntu-24.04` and put both rows in the report
+- [ ] **Correct the report's two stale claims.** `zygo top` is no longer a
+      placeholder — it landed on 21 September (`0690e59`), the day after the
+      session. The "drop-in" qualifier the report wants added to the README is
+      not in the README, whose first line already says "function-shaped code";
+      the phrase is in the design document's one-sentence promise
+      ([ahmed.md](ahmed.md) §1), which is where a qualifier would go if one is
+      wanted
+
+---
+
 ## Open decisions (design document, section 6)
 
 | # | Question | Status |
 |---|---|---|
 | A1 | Should the supervisor be a systemd unit or a user process? | Decided: a user process on first run; a unit via `zygo install-service` |
-| A2 | A cgroup per request, or one per tenant? | Support both; per request by default. **The PoC 3 measurement does not settle it** — the request cgroup was empty when it was taken (2.2b), so the real cost is unmeasured |
+| A2 | A cgroup per request, or one per tenant? | Support both; per request by default. **Reopened**: the field report measured the per-request cgroup at +645 µs p50 and +13.6 ms p99 under sustained load, enough to fail the p99 criterion on its own — see "After test" |
 | A3 | JSON or MessagePack for the protocol? | Start with JSON, measure at 100 KB+ payloads |
 
 ## Open, with evidence

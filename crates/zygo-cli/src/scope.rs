@@ -20,6 +20,11 @@
 //!
 //! Only the commands that build a sandbox are moved. `zygo ps` does not need
 //! a cgroup and should not pay a process spawn for one.
+//!
+//! `zygo bench` is in the list for a reason worth stating: every mode of it
+//! warms a sandbox of its own, so leaving it out made the one command that
+//! demonstrates the warm path the first one to fail on an ordinary systemd
+//! login — with a cgroup error, from a benchmark.
 
 use crate::cli::{Cli, Command, SupervisorCommand};
 
@@ -39,6 +44,7 @@ pub fn needs_a_cgroup(command: &Command) -> bool {
         Command::Run(_)
             | Command::Serve(_)
             | Command::Up { .. }
+            | Command::Bench(_)
             | Command::Supervisor(SupervisorCommand::Run)
     )
 }
@@ -128,6 +134,11 @@ mod tests {
             vec!["zygo", "serve", "h.py", "--name", "x"],
             vec!["zygo", "up"],
             vec!["zygo", "supervisor", "run"],
+            // Every bench mode warms a sandbox, so every one of them needs a
+            // cgroup it can build under.
+            vec!["zygo", "bench", "warm"],
+            vec!["zygo", "bench", "cold"],
+            vec!["zygo", "bench", "load"],
         ] {
             assert!(
                 needs_a_cgroup(&command_of(&args)),

@@ -287,6 +287,74 @@ class ProtocolTests(unittest.TestCase):
         h.wire.send({"type": "PING", "seq": 7})
         self.assertEqual(h.wire.recv(), {"type": "PONG", "seq": 7})
 
+    def test_the_traceback_starts_at_the_handlers_own_frame(self):
+        """The developer's line first, not the agent's.
+
+        A code-first runtime's whole argument is that the developer stays in
+        their own code; opening every failure with a frame from `/zygo/agent.py`
+        undercuts it on the one output that is read when something is wrong.
+        """
+        h = self.harness(
+            """
+            def inner():
+                raise ValueError("boom")
+
+            def handler(event):
+                inner()
+            """
+        )
+        h.ready()
+
+        done = h.call({})
+        self.assertEqual(done["exit_code"], 1)
+        lines = done["error"].splitlines()
+        self.assertEqual(lines[0], "Traceback (most recent call last):")
+        self.assertIn("in handler", lines[1], done["error"])
+        self.assertNotIn("run_request", done["error"], done["error"])
+        self.assertNotIn("zygo_agent.py", done["error"], done["error"])
+        # The handler's own frames are all still there, in order.
+        self.assertIn("in inner", done["error"])
+        self.assertIn("ValueError: boom", done["error"])
+
+    def test_a_chained_cause_survives_the_trim(self):
+        h = self.harness(
+            """
+            def handler(event):
+                try:
+                    raise KeyError("missing")
+                except KeyError as exc:
+                    raise RuntimeError("could not answer") from exc
+            """
+        )
+        h.ready()
+
+        done = h.call({})
+        self.assertEqual(done["exit_code"], 1)
+        self.assertIn("KeyError: 'missing'", done["error"])
+        self.assertIn("direct cause", done["error"])
+        self.assertIn("RuntimeError: could not answer", done["error"])
+        self.assertNotIn("run_request", done["error"], done["error"])
+
+    def test_an_error_raised_by_the_agent_itself_keeps_its_frames(self):
+        """Trimming is for the handler's failures, not the harness's.
+
+        A value that will not serialise is caught after the handler returned,
+        so every frame belongs to the agent. Dropping them all would leave a
+        traceback with no frames at all.
+        """
+        h = self.harness(
+            """
+            def handler(event):
+                return object()
+            """
+        )
+        h.ready()
+
+        done = h.call({})
+        self.assertEqual(done["exit_code"], 1)
+        self.assertIn("not JSON", done["error"])
+        self.assertIn("Traceback", done["error"])
+
     def test_stdout_and_stderr_are_captured_separately(self):
         h = self.harness(
             """

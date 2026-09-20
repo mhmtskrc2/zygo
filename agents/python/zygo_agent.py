@@ -207,6 +207,32 @@ def has_extra_threads() -> bool:
 # --------------------------------------------------------------------------
 
 
+def _handler_traceback(exc: BaseException) -> str:
+    """The traceback as the handler author's own, without Zygo's own frame.
+
+    ``format_exc()`` starts where the exception was caught, which is the
+    ``try:`` in `run_request` — so the first line a developer sees when their
+    handler raises is ``File "/zygo/agent.py", line N, in run_request``, the
+    runtime explaining itself before it explains their bug. That frame is the
+    same for every failure and there is nothing to do about it from a handler,
+    so it is noise on the one output that has to be clear.
+
+    Only the *leading* run of frames in this file is dropped, and only when
+    something is left underneath: a handler that calls back into the agent
+    keeps its frames, and an error raised by the harness itself still prints
+    in full, because there the harness *is* the answer.
+
+    Chained causes are unaffected: `format_exception` walks ``__cause__`` and
+    ``__context__`` from the exception, not from the traceback given here.
+    """
+    tb = exc.__traceback__
+    while tb is not None and tb.tb_frame.f_globals.get("__file__") == __file__:
+        tb = tb.tb_next
+    if tb is None:
+        return traceback.format_exc()
+    return "".join(traceback.format_exception(type(exc), exc, tb))
+
+
 def run_request(
     handler,
     request: dict,
@@ -259,8 +285,8 @@ def run_request(
         except (TypeError, ValueError) as exc:
             raise TypeError(f"handler returned a value that is not JSON: {exc}") from exc
 
-    except BaseException:  # noqa: BLE001 - the child reports everything upwards
-        error = traceback.format_exc()
+    except BaseException as exc:  # noqa: BLE001 - the child reports everything upwards
+        error = _handler_traceback(exc)
         exit_code = 1
         value = None
         if wall_ms == 0.0:

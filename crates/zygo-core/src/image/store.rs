@@ -392,9 +392,55 @@ impl Store {
         // are only half there.
         create_mount_points(&dir, &mount_points)?;
 
+        // The marker carries the layer digests rather than being empty. This
+        // directory is named after a hash of those digests *and* the mount
+        // points, so nothing can invert it, and `zygo image prune` has to be
+        // able to ask whether an image that still exists could have produced
+        // this rootfs. Written last, so a half-built directory has no marker
+        // and makes no claim to be live.
         let done = dir.join(LAYER_DONE);
-        std::fs::write(&done, b"").at(&done)?;
+        let mut record = String::new();
+        for digest in layers {
+            record.push_str(digest);
+            record.push('\n');
+        }
+        std::fs::write(&done, record.as_bytes()).at(&done)?;
         Ok(dir)
+    }
+
+    /// Flattened rootfs directories that no image in the index could produce.
+    ///
+    /// A directory is kept when every layer it records is still referenced.
+    /// One that records nothing — built by a Zygo from before the record, or
+    /// interrupted — cannot be shown to be live, and a cache that cannot be
+    /// shown to be live is what prune is for: dropping it costs one
+    /// re-flatten on the next run and nothing else.
+    pub fn unreferenced_flat(&self) -> Result<Vec<PathBuf>> {
+        let referenced: std::collections::BTreeSet<String> = self
+            .read_index()
+            .into_iter()
+            .flat_map(|e| e.layers)
+            .collect();
+
+        let dir = self.paths.flat_cache();
+        if !dir.is_dir() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(&dir).at(&dir)? {
+            let path = entry.at(&dir)?.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let record = std::fs::read_to_string(path.join(LAYER_DONE)).unwrap_or_default();
+            let mut built_from = record.lines().filter(|l| !l.trim().is_empty()).peekable();
+            let live = built_from.peek().is_some() && built_from.all(|d| referenced.contains(d));
+            if !live {
+                out.push(path);
+            }
+        }
+        out.sort();
+        Ok(out)
     }
 
     // --- index -------------------------------------------------------------

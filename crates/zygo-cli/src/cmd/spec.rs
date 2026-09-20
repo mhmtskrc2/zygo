@@ -71,7 +71,16 @@ fn validate(cli: &Cli, spec: &Spec) -> anyhow::Result<u8> {
 }
 
 fn explain(cli: &Cli, spec: &Spec, name: Option<&str>) -> anyhow::Result<u8> {
-    let resolved = spec.resolve(name, &Layer::default(), &ResolveOptions::default())?;
+    // No name means "what would `zygo run` use", so it has to resolve under
+    // `zygo run`'s own rules — including the one that lets the command come
+    // from the image rather than the spec. Resolving it as a served function
+    // made `zygo spec explain` fail with `nothing to run` on every spec that
+    // does not put a `cmd` in `[defaults]`.
+    let opts = ResolveOptions {
+        one_shot: name.is_none(),
+        ..Default::default()
+    };
+    let resolved = spec.resolve(name, &Layer::default(), &opts)?;
 
     if cli.json {
         output::json(&to_json(&resolved))?;
@@ -105,6 +114,10 @@ fn explain(cli: &Cli, spec: &Spec, name: Option<&str>) -> anyhow::Result<u8> {
     }
     if !resolved.cmd.is_empty() {
         rows.push(row("cmd", &resolved.cmd.join(" ")));
+    } else if resolved.entry.is_none() {
+        // Only `zygo run` reaches this, and only with the image's own default
+        // in hand. Saying where the command comes from beats an absent row.
+        rows.push(row("cmd", "the image's entrypoint and cmd"));
     }
 
     let l = &resolved.limits;

@@ -36,10 +36,26 @@ pub fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<u8> {
     paths.ensure()?;
     let store = Store::new(paths);
 
-    let reference: Reference = resolved
-        .image
-        .parse()
-        .with_context(|| format!("cannot use image `{}`", resolved.image))?;
+    let reference: Reference = match resolved.image.parse() {
+        Ok(r) => r,
+        // `-v` is Zygo's verbose flag, and Docker's volume flag. Someone
+        // carrying a command over types `zygo run -v $PWD:/src image`, clap
+        // takes the pair as the image argument, and the reference parser
+        // reports an empty path component — accurate, and about the wrong
+        // thing entirely. Recognise the shape and name the flag that does it.
+        Err(e) => match mount_pair(&resolved.image) {
+            Some((host, guest)) => anyhow::bail!(
+                "`{}` is a mount, not an image\n  \
+                 → `-v` means verbose in Zygo, not volume; \
+                 use: zygo run --mount {host}:{guest} <image> …",
+                resolved.image
+            ),
+            None => {
+                return Err(anyhow::Error::new(e))
+                    .with_context(|| format!("cannot use image `{}`", resolved.image));
+            }
+        },
+    };
 
     let entry = match store.get(&reference) {
         Some(e) => e,
@@ -209,6 +225,21 @@ fn forward_signals(pid: u32) {
 #[cfg(not(unix))]
 fn forward_signals(_pid: u32) {}
 
+/// `host:guest` read as an image reference, if that is what this looks like.
+///
+/// Deliberately narrow: the guest side has to be absolute, which is what a
+/// bind mount requires anyway, and that is what keeps `alpine:3` and
+/// `localhost:5000/team/app:v2` out of it — in both the text after the first
+/// colon is a tag or a port, and neither starts with `/`.
+fn mount_pair(s: &str) -> Option<(&str, &str)> {
+    let (host, guest) = s.split_once(':')?;
+    let host_is_a_path = host.starts_with('/')
+        || host.starts_with('.')
+        || host.starts_with('~')
+        || host.contains('/');
+    (guest.starts_with('/') && host_is_a_path).then_some((host, guest))
+}
+
 fn print_plan(
     cli: &Cli,
     resolved: &zygo_core::spec::ResolvedFn,
@@ -284,4 +315,44 @@ fn print_plan(
     }
 
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mount_pair;
+
+    /// The shapes a Docker user actually types, and the references they must
+    /// not be confused with.
+    #[test]
+    fn a_volume_pair_is_told_apart_from_an_image_reference() {
+        for s in [
+            "/Users/m/proj:/src",
+            "/Users/m/proj:/src:ro",
+            ".:/app",
+            "./data:/data",
+            "~/proj:/src",
+            "sub/dir:/mnt",
+        ] {
+            assert!(mount_pair(s).is_some(), "`{s}` is a mount");
+        }
+
+        for s in [
+            "alpine:3",
+            "python:3.12-slim",
+            "localhost:5000/team/app",
+            "localhost:5000/team/app:v2",
+            "ghcr.io/o/r@sha256:abc",
+            "alpine",
+        ] {
+            assert!(mount_pair(s).is_none(), "`{s}` is an image");
+        }
+    }
+
+    #[test]
+    fn the_pair_comes_back_split_for_the_suggestion() {
+        assert_eq!(mount_pair("/p:/src"), Some(("/p", "/src")));
+        // Split on the *first* colon, so a mode suffix stays with the guest
+        // and the suggestion round-trips through `--mount`.
+        assert_eq!(mount_pair("/p:/src:ro"), Some(("/p", "/src:ro")));
+    }
 }

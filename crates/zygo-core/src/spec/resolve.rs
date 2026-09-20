@@ -24,7 +24,9 @@ pub fn defaults() -> Layer {
         cpu: Some(Cpu(1.0)),
         pids: Some(64),
         timeout: Some(Duration::from_secs(30)),
-        scratch: Some(Bytes::from_mib(64)),
+        // `scratch` is deliberately absent: its default depends on `mem`, so
+        // it is decided in `resolve_layer` where `mem` is known. See
+        // `default_scratch`.
         nofile: Some(1024),
         connections: Some(256),
         network: Some(Network::None),
@@ -107,6 +109,20 @@ pub struct ResolvedFn {
 /// Smallest memory limit that can start an interpreter. Below this the sandbox
 /// is OOM-killed before it does anything, which reads as a mysterious hang.
 const MIN_MEM: Bytes = Bytes(8 * 1024 * 1024);
+
+/// Writable `/tmp` when nothing asked for a particular size.
+///
+/// 64 MiB is the documented default and what every ordinary sandbox gets, but
+/// it is a ceiling rather than a constant: tmpfs pages are billed to the
+/// memory cgroup, so on a small `mem` a 64 MiB `/tmp` is most of the budget
+/// and, at or below 64 MiB of `mem`, an outright contradiction. Half of `mem`
+/// is the cap, which is also the point at which an explicit `scratch` starts
+/// warning — so the default never warns about itself.
+const DEFAULT_SCRATCH: Bytes = Bytes(64 * 1024 * 1024);
+
+fn default_scratch(mem: Bytes) -> Bytes {
+    Bytes(DEFAULT_SCRATCH.get().min(mem.get() / 2))
+}
 
 /// Default image per built-in runtime, used when the spec names none.
 fn default_image_for(runtime: Option<&Runtime>) -> Option<&'static str> {
@@ -218,7 +234,15 @@ fn resolve_layer(
 
     let cmd = l.cmd.unwrap_or_default();
 
-    if entry.is_none() && cmd.is_empty() {
+    // A served function that says nothing about what to run is a spec bug, and
+    // the earlier it is said the better. A one-shot `zygo run alpine:3` is the
+    // opposite: an empty command means "whatever the image runs by default",
+    // exactly as `docker run alpine:3` does. The image config is not readable
+    // from here — it lives in the store, behind a pull — so the resolver lets
+    // the empty command through and `zygo run` fills it in from the image's
+    // entrypoint and cmd. An image that declares neither still fails there,
+    // with the name of the image that let the user down.
+    if entry.is_none() && cmd.is_empty() && !opts.one_shot {
         return Err(SpecError::invalid_with(
             format!("fn.{name}"),
             "nothing to run",
@@ -267,14 +291,24 @@ fn resolve_layer(
         ));
     }
 
-    let scratch = l.scratch.expect("scratch has a built-in default");
+    // An unset `scratch` follows `mem` down. A flat 64M default meant that
+    // `zygo run --mem 64M` — one flag, nothing else said — was refused for a
+    // conflict the user had not caused and could not see, and the fix was to
+    // pass a second flag they had no reason to know about.
+    let scratch = l.scratch.unwrap_or_else(|| default_scratch(mem));
     // tmpfs pages are billed to the memory cgroup (design doc §3.5), so a
     // scratch area at or above the memory limit is a self-inflicted OOM.
+    // Reachable only when `scratch` was asked for: the derived default is
+    // half of `mem` and cannot collide with it.
     if scratch >= mem {
         return Err(SpecError::invalid_with(
             field("scratch"),
             format!("scratch ({scratch}) must be smaller than mem ({mem})"),
-            "tmpfs pages count against `mem`; filling /tmp would OOM the sandbox",
+            format!(
+                "tmpfs pages count against `mem`; filling /tmp would OOM the sandbox. \
+                 Give scratch less than {mem} (unset, it would be {}), or raise mem",
+                default_scratch(mem)
+            ),
         ));
     }
     if scratch.get() > mem.scaled(0.5).get() {
@@ -725,6 +759,29 @@ mem = "1G"
         assert!(err.to_string().contains("nothing to run"), "{err}");
     }
 
+    /// `zygo run alpine:3` with no command: the image's own entrypoint and cmd
+    /// are the command, and only `zygo run` can read them, so the resolver has
+    /// to hand back an empty one rather than refusing.
+    #[test]
+    fn a_one_shot_run_may_leave_the_command_to_the_image() {
+        let one_shot = ResolveOptions {
+            one_shot: true,
+            ..Default::default()
+        };
+        let flags = Layer {
+            image: Some("alpine:3".into()),
+            ..Default::default()
+        };
+        let r = resolve_standalone("run", &flags, &one_shot).unwrap();
+        assert!(r.cmd.is_empty(), "left for the image config to supply");
+        assert_eq!(r.entry, None);
+        assert_eq!(r.runtime, None, "no agent: this is a plain program");
+
+        // The same layer served rather than run is still a spec bug.
+        let err = resolve_standalone("f", &flags, &opts()).unwrap_err();
+        assert!(err.to_string().contains("nothing to run"), "{err}");
+    }
+
     #[test]
     fn unknown_extension_needs_an_explicit_runtime() {
         let s = spec("[fn.f]\nentry=\"./h.rb\"\nimage=\"ruby\"\n");
@@ -736,6 +793,42 @@ mem = "1G"
         let s = spec("[fn.f]\nentry=\"./h.rb\"\nimage=\"ruby\"\nruntime={agent=\"/a\"}\n");
         let r = s.resolve(Some("f"), &Layer::default(), &opts()).unwrap();
         assert_eq!(r.runtime, Some(Runtime::Agent(PathBuf::from("/a"))));
+    }
+
+    /// `zygo run --mem 64M`, one flag and nothing else. The old flat 64 MiB
+    /// default made that an error about a field the user never mentioned.
+    #[test]
+    fn an_unset_scratch_follows_mem_down() {
+        let s = spec("[fn.f]\nimage=\"a\"\ncmd=[\"x\"]\nmem=\"64M\"\n");
+        let r = s.resolve(Some("f"), &Layer::default(), &opts()).unwrap();
+        assert_eq!(r.limits.scratch, Bytes::from_mib(32), "half of mem");
+        assert!(
+            !r.warnings.iter().any(|w| w.contains("scratch")),
+            "the default must never warn about itself: {:?}",
+            r.warnings
+        );
+
+        // An ordinary sandbox is unaffected: 64 MiB is a ceiling, not a ratio.
+        let s = spec("[fn.f]\nimage=\"a\"\ncmd=[\"x\"]\n");
+        let r = s.resolve(Some("f"), &Layer::default(), &opts()).unwrap();
+        assert_eq!(r.limits.scratch, Bytes::from_mib(64), "256M default mem");
+
+        let s = spec("[fn.f]\nimage=\"a\"\ncmd=[\"x\"]\nmem=\"1G\"\n");
+        let r = s.resolve(Some("f"), &Layer::default(), &opts()).unwrap();
+        assert_eq!(r.limits.scratch, Bytes::from_mib(64), "capped, not scaled");
+    }
+
+    /// The conflict still exists when someone asks for it, and the error now
+    /// says which size would work.
+    #[test]
+    fn an_explicit_scratch_that_cannot_fit_names_a_size_that_does() {
+        let s = spec("[fn.f]\nimage=\"a\"\ncmd=[\"x\"]\nmem=\"64M\"\nscratch=\"64M\"\n");
+        let err = s
+            .resolve(Some("f"), &Layer::default(), &opts())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must be smaller than mem"), "{err}");
+        assert!(err.contains("32M"), "names the size that would work: {err}");
     }
 
     #[test]
