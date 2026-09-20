@@ -118,12 +118,18 @@ zygo run --dry-run --json python:3.12-slim    # the plan, without running it
 Sandboxes need Linux, and on a Mac they get one. Every command except
 `doctor`, `completion` and `agent test` is run by a Linux `zygo` inside a VM
 Zygo starts for itself, with the same arguments, the same working directory
-and the same streams; the exit status comes back out. Install `lima` and the
-lines above work unchanged:
+and the same streams; the exit status comes back out. Two things to have, and
+then the lines above work unchanged:
 
 ```bash
-brew install lima
+brew install lima            # what starts the VM
+make poc/zygo-linux-musl     # the Linux build that runs inside it
 ```
+
+The second is what a release would ship beside the binary; from a checkout it
+is one `make`, and `zygo` says so if it is missing. The VM is built on the
+first command that needs it and takes about a minute; after that a command is
+milliseconds, and `zygo stop --all` puts it away again.
 
 The VM mounts your home directory at *the same path*, writable, so
 `./handler.py` is one file seen from two sides. That is also the limit and it

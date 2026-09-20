@@ -131,6 +131,45 @@ pub fn ensure(store: &Store, image: &ImageEntry, requirements: &Path) -> Result<
     Ok(Venv { dir, built: true })
 }
 
+/// Cached venvs built against an image that is no longer in the store.
+///
+/// The cache key is a hash of the image manifest and the requirements file,
+/// so the directory name says nothing; the done marker already records the
+/// manifest, which is what makes this answerable. A venv with no marker is a
+/// build that did not finish and is never usable, so it goes too.
+///
+/// Nothing here consults the specs that asked for these venvs. A venv is
+/// rebuilt on demand, and one belonging to a function that is merely not
+/// running right now is still keyed on an image that is still present, so it
+/// survives.
+pub fn unreferenced(store: &Store) -> Result<Vec<PathBuf>> {
+    let live: std::collections::BTreeSet<String> =
+        store.list().into_iter().map(|e| e.manifest).collect();
+
+    let dir = store.paths().venv_cache();
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir).at(&dir)? {
+        let path = entry.at(&dir)?.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let marker = std::fs::read_to_string(path.join(DONE_MARKER)).unwrap_or_default();
+        let built_against = marker
+            .lines()
+            .find_map(|l| l.strip_prefix("image "))
+            .map(str::trim);
+        match built_against {
+            Some(manifest) if live.contains(manifest) => {}
+            _ => out.push(path),
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
 /// Run `python3 -m venv` and `pip install` inside a one-shot sandbox.
 fn build(store: &Store, image: &ImageEntry, requirements: &Path, dir: &Path) -> Result<()> {
     let spec = build_spec(&image.reference, requirements, dir);

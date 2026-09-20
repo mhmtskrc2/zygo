@@ -444,6 +444,46 @@ fn write_record(store: &Store, key: &str, base: &ImageEntry, versions: &[String]
     std::fs::write(&path, text).at(&path)
 }
 
+/// Records of derived system layers whose derived image is gone.
+///
+/// The record is only ever read to answer "which versions did `apt` choose",
+/// so it is dead the moment its image leaves the index. The image is the
+/// authority here and the record is the footnote: the layer itself lives in
+/// the image store and is pruned as an ordinary unreferenced layer.
+pub fn unreferenced(store: &Store) -> Result<Vec<PathBuf>> {
+    let live: std::collections::BTreeSet<String> =
+        store.list().into_iter().map(|e| e.reference).collect();
+
+    let dir = store.paths().system_cache();
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir).at(&dir)? {
+        let entry = entry.at(&dir)?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(key) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        // First line of the record: `# <base reference> <base manifest>`.
+        let record = std::fs::read_to_string(path.join(RECORD)).unwrap_or_default();
+        let base = record
+            .lines()
+            .next()
+            .and_then(|l| l.strip_prefix("# "))
+            .and_then(|l| l.split_whitespace().next());
+        match base {
+            Some(base) if live.contains(&derived_reference(base, &key)) => {}
+            _ => out.push(path),
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
 fn read_record(store: &Store, key: &str) -> Vec<String> {
     std::fs::read_to_string(record_path(store, key))
         .unwrap_or_default()
