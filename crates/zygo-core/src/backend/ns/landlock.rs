@@ -216,7 +216,7 @@ impl Ruleset {
 ///
 /// `abi == 0` means the kernel has no Landlock; the result is empty and the
 /// caller skips it.
-pub fn build(abi: u32, plan: &MountPlan, network: NetPolicy) -> Ruleset {
+pub fn build(abi: u32, plan: &MountPlan, network: NetPolicy, writable_root: bool) -> Ruleset {
     if abi == 0 {
         return Ruleset {
             abi: 0,
@@ -227,9 +227,26 @@ pub fn build(abi: u32, plan: &MountPlan, network: NetPolicy) -> Ruleset {
         };
     }
 
+    // The root is read-only *unless the mount plan says otherwise*. It almost
+    // always does not — a tenant's root is read-only by design and everything
+    // writable is a mount underneath it. The exception is a build: `zygo`
+    // derives a system layer by running `apt-get install` in a sandbox whose
+    // root **is** writable, and a root rule that ignored that left `apt`
+    // with `Could not open lock file /var/lib/apt/lists/lock: Permission
+    // denied` — a mount it was allowed to write and a Landlock rule that said
+    // no.
+    //
+    // Invisible until CI. Landlock is compiled out of the Raspberry Pi's
+    // kernel and reports ABI 0 on the container's 5.10, so on both machines
+    // this whole function returns an empty ruleset and the mount permission
+    // is the only one there is.
     let mut rules = vec![PathRule {
         path: CString::new("/").expect("`/` has no interior NUL"),
-        rights: read_only_rights(abi),
+        rights: if writable_root {
+            read_write_rights(abi)
+        } else {
+            read_only_rights(abi)
+        },
     }];
 
     for target in plan.writable_targets() {
@@ -237,7 +254,7 @@ pub fn build(abi: u32, plan: &MountPlan, network: NetPolicy) -> Ruleset {
         // absolute paths, which is what will be opened after `pivot_root`.
         let inside = inside_path(&plan.newroot, target);
         if inside == Path::new("/") {
-            continue; // the root rule already covers it
+            continue; // the root rule above carries it
         }
         if let Ok(path) = CString::new(inside.to_string_lossy().as_bytes()) {
             rules.push(PathRule {
@@ -488,7 +505,7 @@ mod tests {
 
     #[test]
     fn an_unavailable_abi_produces_nothing_to_apply() {
-        let r = build(0, &plan(&[]), NetPolicy::Sealed);
+        let r = build(0, &plan(&[]), NetPolicy::Sealed, false);
         assert!(r.is_empty());
         assert!(r.rules.is_empty());
         assert_eq!(r.handled_fs, 0);
@@ -500,7 +517,7 @@ mod tests {
             "/host/ro:/ro".parse::<Mount>().unwrap(),
             "/host/rw:/rw:rw".parse::<Mount>().unwrap(),
         ];
-        let r = build(1, &plan(&mounts), NetPolicy::Sealed);
+        let r = build(1, &plan(&mounts), NetPolicy::Sealed, false);
 
         let rights = |p: &str| {
             r.rules
@@ -533,7 +550,7 @@ mod tests {
 
     #[test]
     fn writable_paths_are_named_as_the_sandbox_sees_them() {
-        let r = build(1, &plan(&[]), NetPolicy::Sealed);
+        let r = build(1, &plan(&[]), NetPolicy::Sealed, false);
         for rule in &r.rules {
             let path = rule.path.to_str().unwrap();
             assert!(path.starts_with('/'), "{path} is not absolute");
@@ -544,9 +561,37 @@ mod tests {
         }
     }
 
+    /// A build's root is writable, and Landlock has to agree with the mount.
+    ///
+    /// `zygo` derives a system layer by running `apt-get install` in a
+    /// sandbox whose root *is* writable. The mount honoured that and the
+    /// ruleset did not, so `apt` met `Could not open lock file
+    /// /var/lib/apt/lists/lock: Permission denied` — a filesystem it was
+    /// allowed to write and a Landlock rule that said no.
+    ///
+    /// Only reachable where Landlock is enforced, which is nowhere this
+    /// project ran before CI: the Raspberry Pi's kernel does not compile it
+    /// in and the container's 5.10 reports ABI 0.
+    #[test]
+    fn a_writable_root_is_writable_to_landlock_too() {
+        let ro = build(1, &plan(&[]), NetPolicy::Sealed, false);
+        let rw = build(1, &plan(&[]), NetPolicy::Sealed, true);
+
+        let root = |r: &Ruleset| {
+            r.rules
+                .iter()
+                .find(|rule| rule.path.to_str().unwrap() == "/")
+                .map(|rule| rule.rights)
+                .expect("there is always a rule for `/`")
+        };
+        assert_eq!(root(&ro), read_only_rights(1), "a tenant's root is not");
+        assert_eq!(root(&rw), read_write_rights(1), "a build's root is");
+        assert_ne!(read_only_rights(1), read_write_rights(1));
+    }
+
     #[test]
     fn rules_are_sorted_and_unique() {
-        let r = build(1, &plan(&[]), NetPolicy::Sealed);
+        let r = build(1, &plan(&[]), NetPolicy::Sealed, false);
         let mut sorted = r.rules.clone();
         sorted.sort_by(|a, b| a.path.cmp(&b.path));
         assert_eq!(r.rules, sorted);
@@ -606,7 +651,7 @@ mod tests {
     /// the allowlist names ports, and granted on exactly those.
     #[test]
     fn a_sealed_sandbox_can_neither_bind_nor_connect() {
-        let none = build(4, &plan(&[]), NetPolicy::Sealed);
+        let none = build(4, &plan(&[]), NetPolicy::Sealed, false);
         assert_eq!(
             none.handled_net,
             ACCESS_NET_BIND_TCP | ACCESS_NET_CONNECT_TCP
@@ -623,7 +668,7 @@ mod tests {
             NetPolicy::Egress(vec![443]),
             NetPolicy::Egress(vec![]),
         ] {
-            let r = build(4, &plan(&[]), policy.clone());
+            let r = build(4, &plan(&[]), policy.clone(), false);
             assert_ne!(r.handled_net & ACCESS_NET_BIND_TCP, 0, "{policy:?}");
             assert!(
                 r.net_rules
@@ -632,7 +677,7 @@ mod tests {
                 "{policy:?} granted bind"
             );
         }
-        let host = build(4, &plan(&[]), NetPolicy::Unrestricted);
+        let host = build(4, &plan(&[]), NetPolicy::Unrestricted, false);
         assert_eq!(
             host.handled_net, 0,
             "the host's namespace is not ours to police"
@@ -641,7 +686,7 @@ mod tests {
 
     #[test]
     fn egress_grants_connect_on_exactly_the_listed_ports() {
-        let r = build(4, &plan(&[]), NetPolicy::Egress(vec![53, 443, 5432]));
+        let r = build(4, &plan(&[]), NetPolicy::Egress(vec![53, 443, 5432]), false);
         assert_ne!(r.handled_net & ACCESS_NET_CONNECT_TCP, 0);
         let ports: Vec<u16> = r.net_rules.iter().map(|n| n.port).collect();
         assert_eq!(ports, [53, 443, 5432]);
@@ -657,7 +702,7 @@ mod tests {
         // Landlock cannot say "any port to this host", so handling `connect`
         // with a port list would refuse what the allowlist permits. It steps
         // aside on `connect` and keeps only the `bind` denial.
-        let r = build(4, &plan(&[]), NetPolicy::Egress(vec![]));
+        let r = build(4, &plan(&[]), NetPolicy::Egress(vec![]), false);
         assert_eq!(r.handled_net, ACCESS_NET_BIND_TCP);
         assert!(r.net_rules.is_empty());
     }
@@ -691,7 +736,7 @@ mod tests {
     fn before_abi_v4_the_network_policy_is_silently_nothing() {
         // A v1–v3 kernel is given an 8-byte attr and must not be asked to
         // handle rights it has never heard of.
-        let r = build(3, &plan(&[]), NetPolicy::Egress(vec![443]));
+        let r = build(3, &plan(&[]), NetPolicy::Egress(vec![443]), false);
         assert_eq!(r.handled_net, 0);
         assert!(r.net_rules.is_empty());
     }
@@ -762,7 +807,7 @@ mod tests {
     #[test]
     fn building_against_this_hosts_real_abi_is_consistent() {
         let abi = abi_version();
-        let r = build(abi, &plan(&[]), NetPolicy::Sealed);
+        let r = build(abi, &plan(&[]), NetPolicy::Sealed, false);
         assert_eq!(r.abi, abi);
         if abi == 0 {
             assert!(r.is_empty(), "no ABI means nothing may be claimed");
