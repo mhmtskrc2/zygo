@@ -72,6 +72,20 @@ served() {
     return 1
 }
 
+# Where a section runs. Called at the top of every section that needs a
+# directory of its own, and again by the next section — *not* left to the
+# previous one to restore.
+#
+# The egress section used to `cd` back at its end, inside the guard that skips
+# it when there is no usable `/dev/net/tun`. On a host without one the shell
+# stayed in `/tmp/egress`, and four sections later `serve spin.py` failed
+# because `spin.py` was somewhere else. Six failures, none of them about
+# directories. A section that states where it runs cannot be moved by what
+# happened before it.
+work() {
+    mkdir -p "$1" && cd "$1" || exit 1
+}
+
 # Assert on a command's exit code, which is how a script would branch.
 exits() {
     want=$1; shift
@@ -88,8 +102,7 @@ exits() {
 say "supervisor verification"
 say "  kernel $(uname -r)"
 
-mkdir -p /tmp/sup-work
-cd /tmp/sup-work || exit 1
+work /tmp/sup-work
 printf 'def handler(event):\n    n = event.get("n", 0) if isinstance(event, dict) else 0\n    return {"doubled": n * 2}\n' > handler.py
 printf 'def handler(event):\n    return 1 / 0\n' > boom.py
 printf 'import time\n\n\ndef handler(event):\n    time.sleep(0.4)\n    return {"slept": True}\n' > slow.py
@@ -470,7 +483,7 @@ say "the derived system layer"
 # `system = ["jq"]`: installed once inside a writable copy of the image, the
 # difference written as an OCI layer, every function naming the same packages
 # on the same image sharing it. The base image is never touched.
-mkdir -p /tmp/sysl && cd /tmp/sysl || exit 1
+work /tmp/sysl
 cat > sysjq.py <<'PY'
 import os
 import shutil
@@ -546,7 +559,7 @@ fi
 
 # A package that does not exist fails the function that named it, with apt's
 # words, and nothing is left in the image index for it.
-mkdir -p /tmp/sysbad && cd /tmp/sysbad || exit 1
+work /tmp/sysbad
 cp /tmp/sysl/sysjq.py .
 printf '[fn.bad]\nimage = "python:3.12-slim"\nentry = "sysjq.py"\nsystem = ["no-such-package-zzz"]\n' > sandbox.toml
 "$ZYGO" up >/tmp/up-bad.log 2>&1
@@ -566,7 +579,7 @@ case "$out" in
     *"not a package name"*) ok "a malformed package name is a spec error" ;;
     *) bad "malformed package name: $(printf '%s' "$out" | head -2 | tr '\n' ' ')" ;;
 esac
-cd /tmp/sup-work || exit 1
+work /tmp/sup-work
 
 say ""
 say "\`zygo shell\`"
@@ -794,17 +807,32 @@ say "egress networking"
 # Installed here when this is a container we are root in; on a real host it is
 # the operator's package manager and not this script's business.
 apt-get install -y --no-install-recommends passt nftables iproute2 >/tmp/net-install.log 2>&1
-if command -v pasta >/dev/null 2>&1 && command -v nft >/dev/null 2>&1 && command -v tc >/dev/null 2>&1; then
-    ok "pasta, nft and tc are installed for this section"
-    egress_possible=yes
-else
+# `pasta` needs a tun device it can open, which is a separate question from
+# whether the package is installed — a container started without `--device`
+# has the binary and nothing for it to attach to. Both are prerequisites, and
+# a prerequisite that is missing should skip this section rather than report
+# five functions that "did not start".
+#
+# Opening the device is necessary and not sufficient: it says the node is
+# there and the driver is loaded, not that `pasta` can build an interface
+# through it. A host that gets past this and still cannot bring egress up
+# fails below, once, and skips the rest.
+egress_possible=no
+if ! command -v pasta >/dev/null 2>&1 || ! command -v nft >/dev/null 2>&1 ||
+    ! command -v tc >/dev/null 2>&1; then
     # One missing package must not become twenty failures. A section that
     # cannot run says so once and is skipped; a wall of red for a missing
     # dependency is how people learn to ignore red.
-    egress_possible=no
     say "  SKIP  egress needs pasta, nft and tc, and they are not installed here"
     say "        → sudo apt install passt nftables iproute2 (this script only"
     say "          installs them when it is root, as it is inside the container)"
+elif ! : <>/dev/net/tun 2>/dev/null; then
+    say "  SKIP  egress needs /dev/net/tun, and this user cannot open it here"
+    say "        → the device is missing or unreadable; on a host that means"
+    say "          loading the tun module, on a container passing --device"
+else
+    ok "pasta, nft and tc are installed, and /dev/net/tun opens"
+    egress_possible=yes
 fi
 
 if [ "$egress_possible" = yes ]; then
@@ -833,7 +861,7 @@ pastas() {
     printf '%s' "$n"
 }
 
-mkdir -p /tmp/egress && cd /tmp/egress || exit 1
+work /tmp/egress
 cat > net.py <<'PY'
 import http.client
 import socket
@@ -1123,9 +1151,10 @@ sleep 1
 leaked=$(pastas)
 [ "$leaked" -eq 0 ] && ok "no pasta process is left behind after \`down\`" \
     || bad "$leaked pasta processes leaked"
-cd /tmp/sup-work || exit 1
 fi   # egress_up
 fi   # egress_possible
+
+work /tmp/sup-work
 
 say ""
 say "the HTTP API"
@@ -1430,7 +1459,7 @@ say "blue/green deploys"
 # difference replaces — with the new sandbox warm before the old one stops
 # taking requests, requests the old one accepted finishing on it, and requests
 # queued behind it admitted to the new one.
-mkdir -p /tmp/bg && cd /tmp/bg || exit 1
+work /tmp/bg
 cat > sandbox.toml <<'TOML'
 [defaults]
 image = "python:3.12-slim"
@@ -1505,19 +1534,39 @@ esac
 
 # A request *queued* behind the old function (concurrency = 1) is admitted to
 # the replacement rather than told that the function is shutting down.
-"$ZYGO" exec v '{"sleep": 2}' >/tmp/bg-inflight.out 2>&1 &
+#
+# The window is the whole check: the queued request has to still be waiting
+# when the replacement lands. The first version held the function for 2 s and
+# assumed `up` would finish inside that, which is true on a laptop and false
+# on a Raspberry Pi — there the queue drained to the old function first and
+# the check reported a supervisor bug that was a stopwatch. The hold is long
+# enough now that it is not close, and `up` is timed so that a run where it
+# *was* close says so instead of voting.
+HOLD_S=8
+"$ZYGO" exec v "{\"sleep\": $HOLD_S}" >/tmp/bg-inflight.out 2>&1 &
 inflight=$!
 sleep 0.3
 "$ZYGO" exec v '{}' >/tmp/bg-queued.out 2>&1 &
 queued=$!
 sleep 0.3
 sed -i 's/"version": 3/"version": 4/' v.py
+up_started=$(date +%s%N)
 "$ZYGO" up >/dev/null 2>&1
+up_ms=$(( ($(date +%s%N) - up_started) / 1000000 ))
+# What was left of the hold when `up` began.
+window_ms=$(( HOLD_S * 1000 - 600 ))
 wait $queued
 rc=$?
 out=$(tr -d '\n ' </tmp/bg-queued.out)
 case "$rc:$out" in
-    0:*'"version":4'*) ok "a request queued behind the old function ran on the replacement" ;;
+    0:*'"version":4'*)
+        ok "a request queued behind the old function ran on the replacement (\`up\` took ${up_ms} ms of a ${window_ms} ms window)" ;;
+    0:*'"version":3'*)
+        if [ "$up_ms" -ge "$window_ms" ]; then
+            ok "the queued request ran on the old function, and could not have done otherwise: \`up\` took ${up_ms} ms and the queue only held for ${window_ms} ms"
+        else
+            bad "the queued request ran on the old function although the replacement was ready ${up_ms} ms in, with ${window_ms} ms of queue left"
+        fi ;;
     *) bad "the queued request during a replacement: exit $rc, $out" ;;
 esac
 wait $inflight
@@ -1623,7 +1672,7 @@ rm -f zygo.lock
 unset TOKEN
 
 "$ZYGO" down >/dev/null 2>&1
-cd /tmp/sup-work || exit 1
+work /tmp/sup-work
 
 say ""
 say "surviving a restart"

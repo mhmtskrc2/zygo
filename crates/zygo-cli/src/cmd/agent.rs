@@ -35,10 +35,17 @@ use crate::output::{self, Style};
 
 /// How long any single message may take to arrive.
 ///
-/// Generous: an agent's warm-up is the slow part and a cold interpreter on a
-/// loaded CI runner can take a while. Everything after `READY` is fast, and a
-/// hung agent fails the check rather than hanging the suite.
-const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+/// This is a conformance check, not a benchmark: nothing here is measuring
+/// how fast an agent answers, only that it does. So the number should be
+/// large enough that slow hardware never enters into it, and small enough
+/// that a hung agent fails instead of hanging the suite.
+///
+/// It was ten seconds, which was chosen for a cold interpreter on a loaded CI
+/// runner and turned out to be a measurement after all: the `sh` reference
+/// agent, which shells out to `jq` for every frame, exceeded it on a
+/// Raspberry Pi whenever the rest of the suite was running — reporting a
+/// conformance failure against an agent that conforms.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long to wait, after `FORKED`, for a `DONE` that must *not* arrive.
 ///
