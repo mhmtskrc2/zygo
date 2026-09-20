@@ -1751,6 +1751,35 @@ docs/poc-report.md.
 | A2 | A cgroup per request, or one per tenant? | Support both; per request by default. **The PoC 3 measurement does not settle it** — the request cgroup was empty when it was taken (2.2b), so the real cost is unmeasured |
 | A3 | JSON or MessagePack for the protocol? | Start with JSON, measure at 100 KB+ payloads |
 
+## Open, with evidence
+
+**A request queued behind a function being replaced ran on the old one.**
+Seen once, on the Raspberry Pi, by the check written to tell that apart from
+a slow host:
+
+```
+FAIL  the queued request ran on the old function although the replacement
+      was ready 402 ms in, with 7400 ms of queue left
+```
+
+`Supervisor::serve` documents the opposite — "requests the old one accepted
+finish on it, and requests that were queued behind it are admitted to the new
+one" — and the code reads as though it holds. `retire` closes the old gate
+immediately after the registry swap; `Gate::close` sets `closed` and
+`notify_all`; a waiter's predicate is `!closed && in_flight >= limit`, so it
+wakes, sees `closed`, and the caller's loop looks the name up again and gets
+the replacement. Every ordering I can trace ends on the new function.
+
+The premises check out: `concurrency = 1`, the handler really does
+`time.sleep(event["sleep"])`, and the default timeout is 30 s, so the 8 s
+in-flight request was not killed early and did hold the only slot. The
+container passes this check every time.
+
+What is missing is a reproduction tight enough to instrument, and each attempt
+on that machine is a thirty-five minute run. Left open rather than guessed at.
+The check stays as it is: it asserts the documented behaviour, it distinguishes
+that from `up` being slow, and it will say so again.
+
 ## Risks (tracked)
 
 `R1` fork+thread deadlock · `R2` no cgroup delegation · `R3` old-kernel
