@@ -365,11 +365,21 @@ pub fn forward(_cli: &Cli) -> anyhow::Result<Option<u8>> {
 #[cfg(target_os = "macos")]
 fn ensure_guest_binary(limactl: &Path) -> anyhow::Result<()> {
     let Some(source) = linux_binary() else {
-        // Nothing to install. The guest may already have one — from a
-        // previous release, or put there by hand — so this is not fatal here;
-        // the forwarded command fails with `zygo: not found` if it is really
-        // missing, which names the thing that is missing.
-        return Ok(());
+        // Nothing to install. The guest may already have one — from an
+        // earlier release, or put there by hand — so ask before refusing.
+        // The round trip is affordable because this path is rare: an install
+        // ships the Linux build beside the binary, and a checkout has it
+        // after one `make`.
+        if guest_has_zygo(limactl) {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "the VM has no Linux build of Zygo to run, and there is none on \
+             this Mac to put there\n  \
+             → in a checkout: make poc/zygo-linux-musl\n  \
+             → otherwise: set ZYGO_LINUX_BIN to a Linux `zygo` for this \
+             machine's architecture"
+        );
     };
     let Ok(meta) = std::fs::metadata(&source) else {
         return Ok(());
@@ -405,6 +415,23 @@ fn ensure_guest_binary(limactl: &Path) -> anyhow::Result<()> {
     }
     let _ = std::fs::write(&stamp, &want);
     Ok(())
+}
+
+/// Whether the VM already has something to run.
+///
+/// Asked only when there is nothing on this side to install, so the answer
+/// decides between carrying on with whatever is in there and refusing with a
+/// sentence that names what to build. Without it the forwarded command comes
+/// back as exit 127 and the words `zygo: not found`, which reads like the
+/// user's `PATH` is wrong.
+#[cfg(target_os = "macos")]
+fn guest_has_zygo(limactl: &Path) -> bool {
+    std::process::Command::new(limactl)
+        .args(["shell", INSTANCE, "test", "-x", GUEST_BIN])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 /// The Linux build that belongs in the VM.
