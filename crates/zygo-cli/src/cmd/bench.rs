@@ -948,8 +948,8 @@ fn print_cgroup_note(phases: &[zygo_core::pool::CallTiming], report: &Report, st
         "{}",
         style.yellow(&format!(
             "  {:.0}% of the p99 above is `admit` and `release` — creating this request's\n  \
-             own cgroup and removing it, not running the handler. That cost is open\n  \
-             question A2 in todo.md, not a property of the warm path.",
+             own cgroup and removing it, not running the handler. That is the cost of\n  \
+             per-request containment, not a property of the warm path.",
             share * 100.0
         ))
     );

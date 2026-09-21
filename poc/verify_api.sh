@@ -14,7 +14,7 @@
 set -u
 
 SRC=${SRC:-/src}
-ZYGO=${ZYGO:-$SRC/poc/zygo-linux}
+ZYGO=${ZYGO:-$SRC/poc/zygo-linux-musl}
 IMAGE=${IMAGE:-python:3.12-slim}
 
 ZYGO_DATA_HOME=${ZYGO_DATA_HOME:-/tmp/zdata-api}

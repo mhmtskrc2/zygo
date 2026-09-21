@@ -1,5 +1,5 @@
 #!/bin/sh
-# Escape suite for the `ns` backend (todo.md, phase 1.5; design doc §3.10).
+# Escape suite for the `ns` backend (design doc §3.10).
 #
 # Each case is an actual attempt to get out, not an inspection of settings: a
 # test that only reads a flag passes on a kernel that ignores the flag.
@@ -16,7 +16,7 @@ set -u
 # workspace in CI. Everything below is relative to it.
 SRC=${SRC:-/src}
 
-ZYGO=${ZYGO:-$SRC/poc/zygo-linux}
+ZYGO=${ZYGO:-$SRC/poc/zygo-linux-musl}
 IMAGE=python:3.12-slim
 PASS=0
 FAIL=0
@@ -369,7 +369,7 @@ print(','.join(reachable) if reachable else 'none')")
 # A warm-exec request is forked inside the held sandbox and its helper
 # renumbers thirteen descriptors — seven namespace descriptors among them —
 # before `execve`. `F_DUPFD` and `dup2` both *clear* close-on-exec, so until
-# the 2026-09-21 review (B-03) every one of them was inherited by the tenant
+# the code review (B-03) every one of them was inherited by the tenant
 # program: the namespace descriptors it would need to `setns` back out, and a
 # second copy of the helper's error pipe.
 #

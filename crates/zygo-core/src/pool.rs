@@ -74,7 +74,7 @@ pub struct PoolConfig {
     ///
     /// So `false` is a flag for measuring what this costs, not a production
     /// choice: it saves a quarter of a millisecond and gives up per-request
-    /// containment. See `todo.md`, "After test".
+    /// containment.
     pub per_request_cgroup: bool,
 }
 
@@ -357,7 +357,7 @@ impl Pool {
             return Err(Error::BackendUnavailable {
                 backend: "nix",
                 reason: "`nix = [...]` layers are not implemented yet".into(),
-                remedy: "use `system = [...]` (apt) for now; track phase 3 in todo.md".into(),
+                remedy: "use `system = [...]` (apt) for now".into(),
             });
         }
         let entry = if f.system.is_empty() {
@@ -406,8 +406,7 @@ impl Pool {
                             .map(|r| r.to_string())
                             .unwrap_or_else(|| "a function with neither runtime nor cmd".into())
                     ),
-                    remedy: "only the Python agent and warm-exec (`cmd`) are wired up so far \
-                             (todo.md, phase 3)"
+                    remedy: "only the Python agent and warm-exec (`cmd`) are wired up so far"
                         .into(),
                 });
             }
@@ -1434,7 +1433,7 @@ fn write_secrets(secrets: &mut Secrets, at: SecretsAt<'_>) -> Result<()> {
 
     // The directory is recorded **before** the files are written, so a write
     // that fails half way leaves something `unlink_all` can clean. It was set
-    // afterwards until the 2026-09-21 review (B-01): the second of three
+    // afterwards until the code review (B-01): the second of three
     // writes failing left the first file on the tmpfs at mode 0400, `dir` was
     // `None` so nothing removed it, and every later request on that function
     // failed with EACCES trying to create a file that was already there.
@@ -3089,7 +3088,7 @@ mod tests {
     #[test]
     fn per_request_cgroups_are_on_by_default() {
         // Measured at 97 µs of a 1.9 ms request; the design's open question A2
-        // resolves in favour of keeping them (docs/poc-report.md).
+        // resolves in favour of keeping them.
         assert!(PoolConfig::new(Paths::rooted("/x")).per_request_cgroup);
     }
 

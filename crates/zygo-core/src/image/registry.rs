@@ -231,7 +231,7 @@ impl RegistryClient {
         // What was actually served. Computed every time, and then compared
         // against everything that claimed to know it.
         //
-        // Until the 2026-09-21 review (B-05) the header was taken as the
+        // Until the code review (B-05) the header was taken as the
         // answer when present and the body hashed only when it was absent —
         // and neither was ever compared with `reference.digest`. So
         // `zygo pull python@sha256:<X>` accepted any self-consistent manifest

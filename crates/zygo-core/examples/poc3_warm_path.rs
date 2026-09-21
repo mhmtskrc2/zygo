@@ -1,4 +1,4 @@
-//! PoC 3 — warm request overhead (todo.md, phase 0.2).
+//! PoC 3 — warm request overhead.
 //!
 //! **The gate for the whole architecture.** If a request cannot be served in
 //! under 2 ms at p50, the zygote model does not buy enough over `docker exec`

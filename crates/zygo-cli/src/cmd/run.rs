@@ -108,7 +108,7 @@ pub fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<u8> {
     // The same cache, keyed the same way, so a `zygo run --requirements` and a
     // `zygo serve --requirements` on the same image and the same file share
     // one venv. `examples/ci-job` documented this flag before it existed
-    // (2026-09-21 use-case pass), and the workaround it forced — installing
+    // (the use-case pass), and the workaround it forced — installing
     // packages into a directory and bind-mounting it — rebuilt them per job.
     let mut resolved = resolved;
     let venv = match &resolved.requirements {
@@ -148,14 +148,19 @@ pub fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<u8> {
     // Overlay needs a kernel that permits it inside a user namespace; the store
     // falls back to a flattened rootfs when it does not.
     //
-    // `gvisor` always takes the flattened one: an OCI bundle's `root.path` is a
-    // single directory, so there is nowhere for a stack of lowerdirs to go.
-    // gVisor's Sentry keeps an overlay of its own above it in any case.
-    let overlay_supported = resolved.isolation != zygo_core::spec::Isolation::Gvisor
-        && zygo_core::doctor::run()
-            .checks
-            .iter()
-            .any(|c| c.name == "overlayfs (userns)" && c.status == zygo_core::doctor::Status::Ok);
+    // `gvisor` and `vm` always take the flattened one, for the same reason
+    // written two ways: an OCI bundle's `root.path` is a single directory, and
+    // `krun_set_root` takes a single directory. There is nowhere for a stack
+    // of lowerdirs to go. gVisor's Sentry keeps an overlay of its own above it,
+    // and a guest kernel can build one inside itself if M3 needs the layers
+    // back.
+    let overlay_supported = !matches!(
+        resolved.isolation,
+        zygo_core::spec::Isolation::Gvisor | zygo_core::spec::Isolation::Vm
+    ) && zygo_core::doctor::run()
+        .checks
+        .iter()
+        .any(|c| c.name == "overlayfs (userns)" && c.status == zygo_core::doctor::Status::Ok);
 
     // The sandbox root is read-only, so every path the launcher mounts over has
     // to exist before it is assembled; the store fills in what the image lacks.
@@ -267,7 +272,7 @@ pub fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<u8> {
     //
     // A deadline kill and an out-of-memory kill are both exit 137, and a judge
     // — or any caller deciding between "too slow" and "too big" — cannot tell
-    // them apart from that alone (2026-09-21 use-case pass, UC6). The launcher
+    // them apart from that alone (the use-case pass). The launcher
     // knows the first; the kernel's `memory.events` records the second. Both
     // are written to the file `--outcome` names, out of band, because standard
     // output belongs to the program.

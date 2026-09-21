@@ -471,7 +471,7 @@ pub fn down(cli: &Cli, file: Option<&std::path::Path>) -> anyhow::Result<u8> {
 pub fn exec(cli: &Cli, args: &ExecArgs) -> anyhow::Result<u8> {
     anyhow::ensure!(
         !args.batch,
-        "`--batch` needs the supervisor's request queue (todo.md, phase 2.2)"
+        "`--batch` is not implemented yet: it needs the supervisor's request queue"
     );
 
     let event = read_event(args)?;

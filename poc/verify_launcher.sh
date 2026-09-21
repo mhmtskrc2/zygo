@@ -1,5 +1,5 @@
 #!/bin/sh
-# Integration check for the `ns` launcher (todo.md, phase 1.5).
+# Integration check for the `ns` launcher.
 #
 # Running the program is the easy half. This asserts the boundary is actually
 # there: that the sandbox cannot see the host's processes, cannot write to its
@@ -13,7 +13,7 @@ set -u
 # workspace in CI. Everything below is relative to it.
 SRC=${SRC:-/src}
 
-ZYGO=${ZYGO:-$SRC/poc/zygo-linux}
+ZYGO=${ZYGO:-$SRC/poc/zygo-linux-musl}
 IMAGE=alpine:3
 # Checks that need an allocator or an interpreter use this one.
 PYIMAGE=python:3.12-slim

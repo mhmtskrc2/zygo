@@ -96,9 +96,10 @@ one depends on the device; both warn when absent.
 
 Every claim in the README is either measured or marked. The test suites
 attempt the thing rather than reading a setting; a negative check first proves
-the thing ran; a latency number says whether it hit a limit. The
-[PoC report](poc-report.md) records what was measured, on what, and the
-twelve times a test passed for the wrong reason before those rules existed.
+the thing ran; a latency number says whether it hit a limit.
+[What Zygo costs](performance.md) records what was measured and on what
+hardware; several checks passed — or failed — for the wrong reason before
+those rules existed.
 
 **Cost.** The status paragraph is long, and it says "not built" more often
 than a launch page would.

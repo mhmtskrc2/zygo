@@ -138,6 +138,17 @@ impl Paths {
     pub fn tenant_data(&self, name: &str) -> PathBuf {
         self.data.join("tenants").join(name)
     }
+    /// Where the `vm` backend's guest kernel lives, as the layout above
+    /// reserves.
+    ///
+    /// A downloaded artefact rather than a linked one: the kernel is GPL and
+    /// this binary is Apache-2.0, and it is ten to twenty megabytes against a
+    /// fifteen megabyte budget. `zygo backend install vm` writes it here and
+    /// verifies a pinned digest, the way `install gvisor` verifies `runsc`.
+    pub fn krun(&self) -> PathBuf {
+        self.backends().join("krun")
+    }
+
     pub fn backends(&self) -> PathBuf {
         self.data.join("backends")
     }

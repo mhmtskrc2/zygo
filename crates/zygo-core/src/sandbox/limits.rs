@@ -172,11 +172,16 @@ pub enum RlimitKind {
     NProc,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn limits() -> Limits {
+/// An ordinary set of limits, for tests.
+///
+/// One definition rather than the same literal in five modules: every one of
+/// them was a copy, and a field added to `Limits` had to be added to all five
+/// before anything compiled again (T-07 in the code review). It is
+/// `cfg(test)`-free on purpose so the backends' own test modules can reach it
+/// across crate-internal boundaries.
+#[doc(hidden)]
+impl Limits {
+    pub fn for_tests() -> Limits {
         Limits {
             mem: Bytes::from_mib(256),
             mem_high: Bytes::from_mib(256).scaled(0.9),
@@ -194,6 +199,15 @@ mod tests {
             nofile: 1024,
             fsize: Bytes::from_mib(64),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn limits() -> Limits {
+        Limits::for_tests()
     }
 
     #[test]
@@ -213,7 +227,7 @@ mod tests {
 
     /// Without swap there is nothing to reclaim, so `memory.high` would
     /// throttle a runaway allocation into a livelock instead of letting
-    /// `memory.max` kill it. Measured on a real kernel; see docs/poc-report.md.
+    /// `memory.max` kill it. Measured on a real kernel.
     #[test]
     fn memory_high_is_only_set_when_swap_can_absorb_the_reclaim() {
         let no_swap = limits();

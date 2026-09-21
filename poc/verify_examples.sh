@@ -13,7 +13,7 @@ set -u
 # workspace in CI. Everything below is relative to it.
 SRC=${SRC:-/src}
 
-ZYGO=${ZYGO:-$SRC/poc/zygo-linux}
+ZYGO=${ZYGO:-$SRC/poc/zygo-linux-musl}
 PASS=0
 FAIL=0
 ZYGO_DATA_HOME=/tmp/zdata-ex

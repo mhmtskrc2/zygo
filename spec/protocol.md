@@ -219,7 +219,7 @@ Python.
   the reference agent, a deferred `import inspect` (~10 ms) and `import random`
   (~2 ms) in the child put p50 at 11.8 ms against a 2 ms budget. Hoisting them
   to the agent halved it, and the measured p50 on Linux is now 1.9 ms. See
-  [the phase 0 report](../docs/poc-report.md#poc-3--warm-request-overhead-the-acceptance-gate).
+  [what Zygo costs](../docs/performance.md).
 - **Reseed the RNG in the child.** A forked child inherits the parent's seeded
   random state; without a reseed, every request produces identical "random"
   values — tokens, temporary names, jitter.

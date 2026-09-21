@@ -27,7 +27,7 @@ for. Three trust classes, from the design:
 | T2 | Authenticated, contracted customers | `ns` + strict seccomp + Landlock + a network allowlist | A kernel local-privilege-escalation CVE — historically a few critical ones a year |
 | T3 | Anonymous, hostile | `vm` | A VMM or KVM CVE, which are much rarer |
 
-**The `vm` backend is not built yet** ([todo.md](../todo.md), 2.5 — it needs a
+**The `vm` backend cannot be relied on yet** (it builds and links; no host available to this project can boot a guest on it, so it needs a
 machine with KVM). Until it is, T3 workloads do not have the boundary the
 design assigns them, and the honest answer for anonymous code today is a
 separate machine.
@@ -146,7 +146,7 @@ Said plainly, because `zygo doctor` says it too:
 ## What has not been reviewed
 
 **No external security audit has been done.** That is the largest gap in this
-document and it is the first item of [phase 4](../todo.md); it needs an
+document; it needs an
 auditor, not a commit. The other two hardening items of that phase are built:
 the syscall sweep described above, and the kernel-age warning in `zygo
 doctor`.

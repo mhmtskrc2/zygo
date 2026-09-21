@@ -102,6 +102,44 @@ pub struct SandboxConfig {
     pub pasta_pid_file: Option<PathBuf>,
 }
 
+impl SandboxConfig {
+    /// An ordinary one-shot sandbox, for tests.
+    ///
+    /// The same literal was written out in several test modules; a field added
+    /// to `SandboxConfig` had to be added to every one of them before anything
+    /// compiled (T-07 in the code review). Here it is written once, and
+    /// a test that cares about one field changes that field.
+    #[doc(hidden)]
+    pub fn for_tests() -> SandboxConfig {
+        let limits = Limits::for_tests();
+        let view = crate::sandbox::RootfsView::Flat {
+            dir: "/store/flat/for-tests".into(),
+        };
+        let mounts = crate::sandbox::mount::plan("/tmp/newroot", &view, &limits, &[]);
+        SandboxConfig {
+            id: SandboxId::new("for-tests"),
+            isolation: Isolation::Ns,
+            seccomp: SeccompProfile::Default,
+            network: Network::None,
+            limits,
+            mounts,
+            argv: vec!["/bin/true".into()],
+            env: Vec::new(),
+            workdir: "/".into(),
+            uid: 1000,
+            gid: 1000,
+            stdio: None,
+            agent_fd: None,
+            hold: false,
+            writable_root: false,
+            allow: Vec::new(),
+            allow_resolved: Default::default(),
+            allow_private_net: false,
+            pasta_pid_file: None,
+        }
+    }
+}
+
 /// `PATH` inside a sandbox whose image sets none.
 ///
 /// What a stock Debian or Alpine image exports, so `python3` and `sh` resolve

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Integration check for the supervisor (todo.md, phase 2.2).
+# Integration check for the supervisor.
 #
 # The unit tests cover the control protocol, the registry and the admission
 # gate; none of them can catch what this does. The supervisor is the first part
@@ -19,7 +19,7 @@ set -u
 # workspace in CI. Everything below is relative to it.
 SRC=${SRC:-/src}
 
-ZYGO=${ZYGO:-$SRC/poc/zygo-linux}
+ZYGO=${ZYGO:-$SRC/poc/zygo-linux-musl}
 IMAGE=python:3.12-slim
 PASS=0
 FAIL=0
@@ -63,7 +63,7 @@ bad() { FAIL=$((FAIL+1)); say "  FAIL  $*"; }
 # no cause. `serve spin.py` failing on a Raspberry Pi produced ten red lines,
 # every one of them "no function named `spin`", and the reason was in output
 # that had been sent to /dev/null. Third time this project has learned it:
-# see the inventory in docs/poc-report.md.
+# see the four test rules at the top of this file.
 served() {
     name=$1
     shift
@@ -247,28 +247,73 @@ case $out in
     *) bad "the first frame does not explain the missing rate: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-160)" ;;
 esac
 
-# A rate from two real samples. Forty requests inside a two-second interval
-# is twenty a second, and the check allows a wide band because the client
-# start-up is inside the window.
+# A rate from two real samples.
+#
+# The load runs *continuously* in the background rather than as a burst before
+# the frames, and the assertion is about what actually happened rather than a
+# constant. The first version launched forty `zygo exec` processes in a loop
+# and required at least 5 req/s from the second frame, which is a number
+# calibrated on a laptop: on a loaded Raspberry Pi a `zygo exec` takes a few
+# hundred milliseconds to start and connect, so fewer than ten of them finish
+# inside a two-second interval and the check reported `top` as broken when the
+# machine was merely slow.
+#
+# So: keep requests flowing across every frame, count what the function really
+# served over the window, and compare the reported rate against *that*.
+requests_of() {
+    "$ZYGO" --json ps 2>/dev/null | tr -d '\n ' |
+        grep -o "\"name\":\"$1\",\"requests\":[0-9]*" | grep -o '[0-9]*$'
+}
+
+before=$(requests_of double)
+: > /tmp/top-load.on
+(
+    while [ -f /tmp/top-load.on ]; do
+        "$ZYGO" exec double '{"n": 1}' >/dev/null 2>&1
+    done
+) &
+loader=$!
+
+window_started=$(date +%s%N)
 "$ZYGO" top --interval 2 >/tmp/top-frames.txt 2>&1 &
 topper=$!
-sleep 1
-n=0
-while [ "$n" -lt 40 ]; do
-    "$ZYGO" exec double '{"n": 1}' >/dev/null 2>&1
-    n=$((n + 1))
-done
-sleep 3
+# Long enough for at least three frames at a two-second interval, so the
+# second one is not the last and is bracketed by load on both sides.
+sleep 7
 kill "$topper" 2>/dev/null
-# The field after `MB`, not a column number: the RSS value contains a space,
-# so counting fields read `MB` as the rate and reported it as a failure.
-rate=$(grep -E '^double ' /tmp/top-frames.txt | sed -n '2p' |
-    awk '{ for (i = 1; i <= NF; i++) if ($i == "MB") { print $(i + 1); exit } }')
-rate_int=$(printf '%s' "${rate:-0}" | awk '{printf "%d", $1}')
-if [ "${rate_int:-0}" -ge 5 ]; then
-    ok "a second frame reports a real rate (${rate} req/s for 40 requests in 2 s)"
+rm -f /tmp/top-load.on
+wait "$loader" 2>/dev/null
+window_ms=$(( ($(date +%s%N) - window_started) / 1000000 ))
+after=$(requests_of double)
+served=$(( ${after:-0} - ${before:-0} ))
+
+# The positive control, first. "The rate was wrong" and "nothing ran" look
+# identical in the rate column, and only one of them is about `top`.
+if [ "$served" -le 0 ]; then
+    bad "no request reached \`double\` during the ${window_ms} ms window, so the rate column says nothing about \`top\`"
 else
-    bad "the rate column read ${rate:-nothing}; two samples should have produced one"
+    ok "the load reached the function: $served requests in ${window_ms} ms"
+
+    # The field after `MB`, not a column number: the RSS value contains a
+    # space, so counting fields read `MB` as the rate.
+    rate=$(grep -E '^double ' /tmp/top-frames.txt | sed -n '2p' |
+        awk '{ for (i = 1; i <= NF; i++) if ($i == "MB") { print $(i + 1); exit } }')
+    # The average over the whole window, as a hundredth, so this stays in
+    # integer arithmetic that `sh` can do.
+    average_c=$(( served * 100000 / window_ms ))
+    rate_c=$(printf '%s' "${rate:-0}" | awk '{printf "%d", $1 * 100}')
+
+    if [ "${rate_c:-0}" -le 0 ]; then
+        bad "the rate column read ${rate:-nothing} while $served requests were served; two samples should have produced a rate"
+    elif [ "$(( rate_c * 5 ))" -lt "$average_c" ] || [ "$rate_c" -gt "$(( average_c * 5 ))" ]; then
+        # A generous band: load varies between frames and this is not a
+        # benchmark. What it catches is a rate off by a factor — dividing by
+        # the interval that was asked for rather than the one that elapsed,
+        # or by the wrong unit entirely.
+        bad "the rate column read ${rate} req/s where the window averaged $(( average_c / 100 )).$(( average_c % 100 )) req/s; that is off by more than a factor of five"
+    else
+        ok "a second frame reports a rate consistent with the load (${rate} req/s against an average of $(( average_c / 100 )).$(( average_c % 100 )))"
+    fi
 fi
 
 say ""
@@ -1128,7 +1173,7 @@ else
     # the passt Ubuntu shipped in June 2023, which cannot bring up a namespace
     # for an ordinary user at all — `pasta --config-net -- /bin/true` fails
     # there with no Zygo in the picture. Counting that as a Zygo failure sent
-    # a day into a fix for a bug that did not exist; see docs/poc-report.md.
+    # a day into a fix for a bug that did not exist.
     case $why in
         *"pasta could not configure"*)
             say "  SKIP  \`pasta\` on this host cannot configure a sandbox's network:"
@@ -1714,8 +1759,8 @@ inflight=$!
 # than that to connect: the second request then won the race to the only slot,
 # ran on the function that was current at the time, and this check reported a
 # supervisor bug that was a stopwatch. That single failure was the whole of
-# todo.md's "Open, with evidence" entry, and `poc/repro_blue_green.sh` could
-# not reproduce it once the ordering was made certain.
+# the evidence for it, and `poc/repro_blue_green.sh` could not reproduce it
+# once the ordering was made certain.
 i=0
 while [ $i -lt 400 ]; do
     [ -f /tmp/bg-marker/started ] && break

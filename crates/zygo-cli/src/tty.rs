@@ -111,7 +111,7 @@ impl Drop for RawMode {
 /// `Drop` alone is not enough. The release profile is `panic = "abort"`
 /// (`Cargo.toml`), so a panic runs no destructors at all — the guard's `Drop`
 /// and the `catch_unwind` test both worked only because the *test* profile
-/// unwinds (B-08, 2026-09-21 review). A panic hook runs before the abort, in
+/// unwinds (B-08, the code review). A panic hook runs before the abort, in
 /// ordinary Rust context, which is where this can safely take a lock.
 static SAVED: std::sync::Mutex<Vec<(RawFd, libc::termios)>> = std::sync::Mutex::new(Vec::new());
 static HOOK: std::sync::Once = std::sync::Once::new();

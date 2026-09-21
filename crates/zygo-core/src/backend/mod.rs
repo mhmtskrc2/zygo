@@ -12,6 +12,7 @@ use crate::spec::Isolation;
 pub mod gvisor;
 #[cfg(target_os = "linux")]
 pub mod ns;
+pub mod vm;
 
 /// What the kernel had to say about a sandbox, after it ended.
 ///
@@ -186,13 +187,11 @@ pub fn for_isolation(isolation: Isolation) -> Result<Box<dyn Backend>> {
                 "namespaces are a Linux feature; this host runs {}",
                 std::env::consts::OS
             ),
-            remedy: "run Zygo inside a Linux VM or container (macOS shim is phase 5)".into(),
+            remedy: "run Zygo inside a Linux VM or container; on macOS the `zygo` \
+                     binary normally forwards into one it manages"
+                .into(),
         }),
-        Isolation::Vm => Box::new(Unimplemented {
-            name: "vm",
-            reason: "the libkrun backend is not built into this binary yet".into(),
-            remedy: "track phase 2 in todo.md; use --isolation ns meanwhile".into(),
-        }),
+        Isolation::Vm => Box::new(vm::VmBackend::new()),
         Isolation::Gvisor => Box::new(gvisor::GvisorBackend::new()),
     };
 
@@ -202,15 +201,18 @@ pub fn for_isolation(isolation: Isolation) -> Result<Box<dyn Backend>> {
     }
 }
 
-/// Placeholder for a backend that exists in the design but not yet in the
-/// binary. It reports *why* rather than being silently missing, so
-/// `--isolation vm` gives a straight answer instead of an unknown-flag error.
+/// Placeholder for a backend that exists in the design but cannot exist in
+/// this binary — a Linux-only backend compiled for something else. It reports
+/// *why* rather than being silently missing, so the flag gives a straight
+/// answer instead of an unknown-backend error.
+#[cfg(not(target_os = "linux"))]
 struct Unimplemented {
     name: &'static str,
     reason: String,
     remedy: String,
 }
 
+#[cfg(not(target_os = "linux"))]
 impl Backend for Unimplemented {
     fn name(&self) -> &'static str {
         self.name
@@ -266,9 +268,32 @@ mod tests {
     }
 
     #[test]
-    fn vm_says_it_is_pending_rather_than_unknown() {
-        let err = expect_error(Isolation::Vm);
-        assert!(err.to_string().contains("libkrun"), "{err}");
+    /// The `vm` backend says *which* of its preconditions is missing, and what
+    /// to do about it.
+    ///
+    /// There are three, and they fail in a deliberate order: a binary built
+    /// without the feature has no monitor at all, a host without a usable KVM
+    /// cannot run one, and a host with both still needs a guest kernel. A
+    /// single "not available" would send somebody to the wrong one — which is
+    /// what the placeholder this replaced did, by naming libkrun on a host
+    /// that had no KVM either.
+    fn vm_says_which_of_its_preconditions_is_missing() {
+        let err = expect_error(Isolation::Vm).to_string();
+        let expected = if cfg!(not(feature = "vm")) {
+            "without the `vm` feature"
+        } else if cfg!(not(target_os = "linux")) {
+            "KVM is a Linux feature"
+        } else {
+            // On a Linux host with the feature the answer depends on the
+            // machine, so what is asserted is that it named one of them.
+            for candidate in ["/dev/kvm", "guest kernel"] {
+                if err.contains(candidate) {
+                    return;
+                }
+            }
+            panic!("the vm backend refused without naming a precondition: {err}");
+        };
+        assert!(err.contains(expected), "{err}");
     }
 
     #[test]

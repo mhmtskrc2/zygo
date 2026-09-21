@@ -42,7 +42,7 @@ sees `RuntimeError: can't start new thread`. `pip` starts a thread for its
 progress bar on any download over a few megabytes, which is how the venv build
 of this very matrix failed at `numpy`'s 13.6 MB wheel — and `numpy` itself
 starts several on import. The profile had been "validated" against these
-packages in phase 0, but with a JSON profile applied by a different tool, not
+packages earlier, but with a JSON profile applied by a different tool, not
 with the filter that ships.
 
 `clone3` cannot simply be allowed: it takes its flags in a struct the filter

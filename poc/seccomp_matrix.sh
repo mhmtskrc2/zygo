@@ -1,5 +1,5 @@
 #!/bin/sh
-# The `strict` seccomp profile against real packages (todo.md, phase 3).
+# The `strict` seccomp profile against real packages.
 #
 # `strict` removes the socket family, `ptrace` and `mount` from the default
 # allowlist, and the agent's forked child additionally loses `execve` and
@@ -18,7 +18,7 @@ set -u
 # workspace in CI. Everything below is relative to it.
 SRC=${SRC:-/src}
 
-ZYGO=${ZYGO:-$SRC/poc/zygo-linux}
+ZYGO=${ZYGO:-$SRC/poc/zygo-linux-musl}
 ZYGO_DATA_HOME=/tmp/zdata-matrix
 export ZYGO_DATA_HOME
 

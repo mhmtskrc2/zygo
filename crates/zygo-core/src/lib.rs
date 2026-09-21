@@ -28,6 +28,21 @@
 //! Everything except [`backend`]'s Linux implementations is platform
 //! independent and unit tested on any host.
 
+// Linked for its symbols, never named in Rust.
+//
+// libkrun exports a C ABI from a Rust crate: `backend::vm` declares the
+// functions in an `extern "C"` block and the linker resolves them against this
+// rlib. Nothing here *calls* a Rust item from it, so without this line the
+// crate is dropped and every `krun_*` symbol is undefined. It has to be at the
+// crate root — the same line inside a nested module is a different resolution
+// and fails with "can't find crate".
+//
+// The crate is `krun`; the *package* is `libkrun`. `[lib] name = "krun"` in
+// its manifest, which is why `extern crate libkrun` fails with exactly the
+// same message as a missing dependency.
+#[cfg(feature = "vm")]
+extern crate krun;
+
 pub mod backend;
 pub mod cgroup;
 pub mod derive;

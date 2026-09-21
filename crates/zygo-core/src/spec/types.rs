@@ -230,7 +230,7 @@ impl Cpu {
     /// while total time spent throttled rose from 2.3 s to 9.0 s. Below
     /// saturation the 100 ms period costs nothing (p99 1.9 ms), so the trade
     /// would make the ordinary case worse to improve a case that means the
-    /// tenant needs a larger quota. See docs/poc-report.md, phase 2.
+    /// tenant needs a larger quota.
     pub const PERIOD_US: u64 = 100_000;
 
     pub fn cores(self) -> f64 {

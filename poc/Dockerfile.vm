@@ -1,4 +1,4 @@
-# Build environment for the `vm` backend (docs/vm_implementation.md, M0.1).
+# Build environment for the `vm` backend .
 #
 # The question this image exists to answer is **V1**: does libkrun build and
 # link against musl? Everything about the plan's distribution story hangs on
@@ -20,10 +20,22 @@ FROM rust:1-alpine
 # `clang-dev` and `llvm-dev` are not optional: libkrun's dependency tree
 # reaches `bindgen` through `clang-sys`, which needs a real `libclang` at
 # build time. The first run of this probe discovered that by failing on it.
+# Two sets of dependencies, for two different builds.
+#
+# libkrun's: a C toolchain, `make`, `patch`, and `clang-dev`/`llvm-dev`,
+# because its dependency tree reaches `bindgen` through `clang-sys` and that
+# needs a real `libclang` at build time.
+#
+# The guest kernel's: `xz`, `tar`, `cpio`, `rsync`, `perl`, `bc`, `elfutils`
+# and `openssl` headers. A kernel build without `xz` fails in
+# `kernel/kheaders_data.tar.xz` with exit 127 — "command not found", four
+# hundred lines into an otherwise healthy compile.
 RUN apk add --no-cache \
         musl-dev gcc make patch bash git curl file pkgconfig \
         linux-headers python3 flex bison \
         clang-dev llvm-dev clang-static \
+        xz tar cpio rsync perl bc diffutils findutils \
+        elfutils-dev openssl-dev zstd py3-elftools \
     && rustup component add rust-src
 
 WORKDIR /build
@@ -38,6 +50,10 @@ ARG LIBKRUNFW_REF=v4.5.1
 # failing with a wall of compiler output: a `RUN` that exits non-zero loses
 # the thing being measured.
 COPY vm_build_probe.sh /build/vm_build_probe.sh
-RUN chmod +x /build/vm_build_probe.sh
+COPY vm_kernel.sh /build/vm_kernel.sh
+RUN chmod +x /build/vm_build_probe.sh /build/vm_kernel.sh
 
-ENTRYPOINT ["/build/vm_build_probe.sh"]
+# No entrypoint: this image is used two ways — `make vm-build` runs a cargo
+# build in it, and `make vm-probe` runs the script above. An entrypoint would
+# make the first awkward and the second no clearer.
+

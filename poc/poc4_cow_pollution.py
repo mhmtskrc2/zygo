@@ -11,7 +11,7 @@ walk.
 Measures the child's private (copied) memory from ``/proc/self/smaps_rollup``,
 which is the only place the kernel reports it honestly.
 
-Acceptance (todo.md): under 2 MB copied per request.
+Acceptance: under 2 MB copied per request.
 
 Run:  docker run --rm -v "$PWD/poc:/poc" python:3.12-slim python3 /poc/poc4_cow_pollution.py
 """

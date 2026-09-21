@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PoC 1 — how long does it take to build a sandbox? (todo.md, phase 0.2)
+"""PoC 1 — how long does it take to build a sandbox?
 
 The design claims a namespace set, a mount plan and a `pivot_root` cost 1–3 ms,
 and that the expensive parts of `docker run` are orchestration rather than

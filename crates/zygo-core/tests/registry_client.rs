@@ -2,7 +2,7 @@
 //!
 //! Everything below the network was already covered by unit tests; what was
 //! not covered at all was the client's behaviour when a registry answers
-//! *differently from what was asked* — and that is where the 2026-09-21 review
+//! *differently from what was asked* — and that is where the code review
 //! found B-05: a pinned digest was never compared with what arrived, so
 //! `zygo pull python@sha256:<X>` accepted any self-consistent manifest a
 //! registry chose to serve.

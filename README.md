@@ -13,64 +13,61 @@ zygo serve ./handler.py --name resize   # a warm zygote comes up
 zygo exec resize '{"url": "..."}'       # ~1 ms of overhead
 ```
 
-Design document: [ahmed.md](ahmed.md). Plan and status: [todo.md](todo.md).
+**Docs:** the [quickstart](docs/quickstart.md) gets you to three warm
+functions; the [guide](docs/guide.md) is everything else. Also:
+[concepts](docs/concepts.md) ·
+[`sandbox.toml` reference](docs/spec-reference.md) ·
+[what it costs](docs/performance.md) ·
+[threat model](docs/threat-model.md) ·
+[seccomp profiles](docs/seccomp-profiles.md) ·
+[comparison](docs/comparison.md) ·
+[the SDKs](docs/sdk.md) ·
+[the MCP server](docs/mcp.md) ·
+[troubleshooting](docs/troubleshooting.md) ·
+[examples](examples/) ·
+[writing an agent](docs/agents.md) ·
+[the wire protocol](spec/protocol.md)
 
-> **Status: phase 1 complete, phase 2 underway.** `zygo run` works: a real
-> sandbox with namespaces, cgroup limits, `pivot_root`, capability dropping, a
-> seccomp allowlist and Landlock. The warm pool works too: `zygo serve`,
-> `exec`, `ps` and `stop` run against a supervisor in the user's own session,
-> with per-tenant concurrency limits, backpressure, request deadlines enforced
-> against the whole process tree, automatic rewarming after a crash, and idle
-> functions that pause and wake in single-digit milliseconds.
->
-> What is verified rather than asserted: the warm path measures **p50 1.70 ms,
-> p99 2.81 ms** through the shipping code at 250 requests/s, against budgets of
-> 2 ms and 10 ms, and sustains **981 requests/s** at a concurrency of 4
-> ([docs/poc-report.md](docs/poc-report.md)). Drive the same
-> tenant past its own CPU quota and the p99 becomes 47 ms — that is the quota
-> being enforced, and `zygo bench warm` says so rather than reporting it as
-> Zygo's cost. A cold `zygo run` with the image cached measures **p50 18.4 ms**
-> against a 50 ms budget. The launcher is checked by 52 scenarios against a real
-> kernel, 16 of them actual escape attempts, and the supervisor by 139 end-to-end
-> ones. Every syscall number the architecture has is swept against all three
-> seccomp profiles, and the `gvisor` backend is checked against a real `runsc`
-> by 19 more.
->
-> Those suites now run in two places, which turned out to matter: a privileged
-> container, and a Raspberry Pi as an ordinary user with a systemd session.
-> Everything until then had been measured as root in one container, and the
-> second environment found five bugs in a day — including secrets that could
-> never be delivered to a warm-exec function without privilege, and a
-> supervisor that stopped for ever rather than failing.
->
-> Phase 2 is complete except for the `vm` backend, which needs KVM: warm-exec
-> (a held sandbox, a fresh process per request — p50 2.2 ms), secrets delivered
-> as files the agent never sees, a venv cache built inside the image, and an
-> HTTP API with bearer auth. Phase 3 has started: `zygo up` and `zygo down`
-> bring a whole `sandbox.toml` up and down, `up` is a deploy rather than a
-> restart — it replaces only what changed, blue/green — `system = [...]`
-> installs apt packages once, as a layer of their own, without a Dockerfile,
-> and `network = "egress"` gives a sandbox an allowlist enforced by nftables
-> inside its own namespace, with no privilege anywhere. `zygo agent test` makes
-> the "language independent protocol" claim checkable — there is a complete
-> agent in POSIX sh that passes it — and `zygo shell` gets you inside a warm
-> sandbox without disturbing it.
->
-> Phase 4 has started: the **`gvisor` backend runs**. `zygo backend install
-> gvisor` fetches and verifies the runtime, and `zygo run --isolation gvisor`
-> gives the same answers as `ns` while `uname -r` inside reports a different
-> kernel — the boundary really moved. One-shot only: warm functions and
-> networked sandboxes on it are refused with a reason rather than weakened.
-> Every syscall number is also swept against all three seccomp profiles.
-> See [todo.md](todo.md) for exactly what is built, what is measured, and what
-> is still unverified.
+## What works
 
-**Docs:** [quickstart](docs/quickstart.md) ·
-[concepts](docs/concepts.md) · [`sandbox.toml` reference](docs/spec-reference.md) ·
-[seccomp profiles](docs/seccomp-profiles.md) · [threat model](docs/threat-model.md) ·
-[comparison](docs/comparison.md) · [examples](examples/) ·
-[writing an agent](examples/agents/README.md) · [the protocol](spec/protocol.md) ·
-[the SDKs](docs/sdk.md) · [the MCP server](docs/mcp.md)
+`zygo run` builds a real sandbox: namespaces, cgroup limits, `pivot_root`,
+every capability dropped, a seccomp allowlist and Landlock where the kernel
+has it. `zygo serve`, `exec`, `ps` and `stop` run a warm pool in your own
+session, with per-function concurrency limits, backpressure, request deadlines
+enforced against the whole process tree, automatic rewarming after a crash, and
+idle functions that pause and wake in single-digit milliseconds.
+
+`zygo up` brings a whole `sandbox.toml` up and down. It is a deploy rather than
+a restart: it replaces only what changed, blue/green. `system = [...]` installs
+apt packages once as a layer of their own, with no Dockerfile.
+`network = "egress"` gives a sandbox an allowlist enforced by nftables inside
+its own network namespace, with no privilege anywhere.
+
+There is an [HTTP API](docs/sdk.md) with bearer auth, [Python and Node
+clients](docs/sdk.md) with no dependencies, and an [MCP server](docs/mcp.md)
+that gives an agent host a code interpreter whose limits live in a file
+somebody reviewed.
+
+**What is measured rather than asserted.** The warm path is a median of
+**1.70 ms** and a 99th percentile of **2.81 ms** through the shipping code at
+250 requests a second, and it sustains **981 requests a second** at a
+concurrency of four. A cold `zygo run` with the image cached is a median of
+**18.4 ms**. [What Zygo costs](docs/performance.md) has the rest, including
+what is *not* measured and why.
+
+The suites run in three places, which turned out to matter: a privileged
+container, a Raspberry Pi as an ordinary user with a systemd session, and a
+Mac. The launcher is checked against a real kernel, including actual escape
+attempts; every syscall number the architecture has is swept against all three
+seccomp profiles; and fifty scenarios shaped by use case rather than by
+mechanism run on two of the three.
+
+**What is not ready.** The `vm` backend builds and links libkrun, and no host
+available to this project can boot a guest on it, so nothing about it is
+claimed. `gvisor` runs one-shot sandboxes only; warm functions and networked
+sandboxes on it are refused with a reason rather than weakened. Zygo scales to
+one machine, and answers `429` past its capacity. No external audit has been
+done.
 
 ---
 
@@ -93,7 +90,7 @@ interpreter start is amortised by a warm zygote that forks per request.
 
 ## How
 
-Three ideas, in full in [ahmed.md](ahmed.md):
+Three ideas:
 
 1. **A sandbox is a constrained process, not a container.** Namespaces, cgroups,
    seccomp and Landlock, set up in one process with no RPC.
@@ -396,7 +393,7 @@ Four rules the test suite is built on, all learned the hard way here:
   establishes the positive case first.
 
 Several checks here passed — or failed — for the wrong reason before those rules
-were applied; [docs/poc-report.md](docs/poc-report.md) lists all thirty-two.
+were applied.
 
 Zygo is Linux-first. The `ns` backend needs Linux **5.3+** — the floor is
 `clone3`, which has no fallback — plus user namespaces and delegated cgroup v2
@@ -411,7 +408,17 @@ VM says about itself and exits with its answer. A warm `exec` from the Mac
 round-trips in 96 ms, nearly all of it the hop into the VM rather than the
 request; `make verify-shim` is 14 checks against a real VM.
 
-One thing to know before running Zygo on Ubuntu 24.04 or later:
+Two things to know before running Zygo on Ubuntu or Debian. Both are the same
+shape: a distribution's AppArmor policy, not a Zygo setting, and `zygo doctor`
+or the error message names the fix.
+
+A **networked** sandbox needs `pasta`, and Ubuntu ships an AppArmor profile
+that confines it. Where that profile is enforcing, `pasta` is denied
+`/proc/<pid>/ns/user` and `network = "egress"` or `"full"` cannot start — on a
+host where `/dev/net/tun` is present and working. The error says so and names
+`aa-complain`; `network = "none"`, the default, needs no `pasta` at all.
+
+And:
 `kernel.apparmor_restrict_unprivileged_userns=1` lets an unprivileged process
 create a user namespace and then refuses the first mount inside it, which is
 the first thing every sandbox does. `zygo doctor` detects it by attempting
@@ -434,7 +441,7 @@ syscall profiles and the compatibility matrix — five reference packages
 exercised under `default` and `strict`, every cell an attempt — including the
 two bugs the first run of that matrix found in the profile itself.
 
-No external audit has been done yet; that is phase 4.
+No external audit has been done.
 
 ## Licence
 

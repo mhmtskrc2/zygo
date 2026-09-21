@@ -1284,7 +1284,7 @@ fn reject_foreign_peer(stream: &UnixStream) -> Option<Response> {
 /// be read at all, and the honest reading of that is "this connection's owner
 /// is unknown" — which, for a check whose failure mode is arbitrary code
 /// execution as this user, has to be a refusal. It read as `None` meaning
-/// *allowed* until the 2026-09-21 review (B-02), because the syscall and the
+/// *allowed* until the code review (B-02), because the syscall and the
 /// policy shared one `?`.
 fn peer_verdict(ours: u32, peer: Option<u32>) -> Option<Response> {
     match peer {

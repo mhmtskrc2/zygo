@@ -29,7 +29,7 @@ prefer otherwise. If we disagree that it is a vulnerability we will say why, in
 writing, rather than closing it silently.
 
 Zygo is pre-1.0 and has not had an external audit; that audit is
-[phase 4](todo.md). **There is no bug bounty**: reports are answered, fixed and
+planned. **There is no bug bounty**: reports are answered, fixed and
 credited, not paid for.
 
 ## Supported versions

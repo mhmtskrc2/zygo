@@ -489,7 +489,7 @@ class Agent:
 
     Requests are served one at a time. The ``concurrency`` field in the spec is
     enforced by the supervisor, which is what owns the queue and the
-    backpressure (todo.md, phase 2.2); an agent that also multiplexed would
+    backpressure; an agent that also multiplexed would
     have to duplicate that logic and could not apply per-request limits without
     the supervisor's cooperation anyway.
     """

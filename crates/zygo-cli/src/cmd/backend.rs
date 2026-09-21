@@ -54,9 +54,7 @@ fn list(cli: &Cli) -> anyhow::Result<u8> {
 fn install(cli: &Cli, name: &str) -> anyhow::Result<u8> {
     match name {
         "gvisor" => install_gvisor(cli),
-        "vm" => anyhow::bail!(
-            "the vm backend is linked into the binary, not downloaded (todo.md, phase 2.5)"
-        ),
+        "vm" => install_vm(cli),
         other => anyhow::bail!("unknown backend `{other}`\n  → known backends: gvisor, vm"),
     }
 }
@@ -128,6 +126,54 @@ fn sha512_of(bytes: &[u8]) -> String {
 /// Verification is not optional and there is no flag to skip it: this
 /// downloads a binary that will be handed other people's code to run, over a
 /// link whose only guarantee is TLS to a bucket.
+/// The guest kernel, pinned by digest.
+///
+/// libkrun itself is linked into this binary, so there is nothing to download
+/// for it. The *kernel* is a different matter and deliberately so: it is GPL
+/// where this binary is Apache-2.0, and it is twenty-five megabytes against a
+/// fifteen megabyte budget. `krun_set_kernel` is what lets it be a file, and
+/// this is what puts the file there.
+fn install_vm(cli: &Cli) -> anyhow::Result<u8> {
+    anyhow::ensure!(
+        cfg!(target_os = "linux"),
+        "a guest kernel is only useful on Linux; this host runs {}\n  \
+         → run Zygo inside a Linux VM or container",
+        std::env::consts::OS
+    );
+    anyhow::ensure!(
+        zygo_core::backend::vm::COMPILED_IN,
+        "this binary has no virtual machine monitor linked into it, so a guest \
+         kernel would have nothing to boot it\n  \
+         → build with `--features vm`, or `make vm-build`"
+    );
+
+    let paths = super::paths(cli);
+    let destination = paths.krun().join(zygo_core::backend::vm::KERNEL_FILE);
+    if destination.is_file() {
+        eprintln!(
+            "{} {}",
+            Style::stderr().dim("already installed"),
+            destination.display()
+        );
+        return Ok(0);
+    }
+
+    // Deliberately not a download, yet. There is no published artefact to
+    // point at: libkrunfw ships source that builds a kernel, and the `Image`
+    // this wants is what `make vm-kernel` extracts from that build. Saying so
+    // is better than inventing a URL that would rot, and better than a silent
+    // "not implemented" — the file is one `make` away and the message says
+    // which one.
+    anyhow::bail!(
+        "there is no published guest kernel to download: libkrunfw ships source, \
+         not an image\n  \
+         → build one with `make vm-kernel`, then copy it in:\n     \
+         install -Dm644 poc/vm-out/Image {}\n  \
+         → `zygo doctor` reports it once it is there",
+        destination.display()
+    )
+}
+
 fn install_gvisor(cli: &Cli) -> anyhow::Result<u8> {
     anyhow::ensure!(
         cfg!(target_os = "linux"),

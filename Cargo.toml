@@ -47,6 +47,14 @@ rustix = { version = "1", features = ["fs", "process", "thread", "mount", "pipe"
 libc = "0.2"
 tempfile = "3"
 
+# The `vm` backend's virtual machine monitor, linked *into* the binary rather
+# than loaded as a shared object: libkrun exports a C ABI from a Rust crate, so
+# a cargo dependency and an rlib are the whole mechanism. Optional and off by
+# default — it is a large tree, and a host without KVM has no use for it.
+#
+# Pinned to a tag, and to one whose musl build was measured: see `make vm-build`.
+libkrun = { git = "https://github.com/containers/libkrun.git", tag = "v1.19.4" }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

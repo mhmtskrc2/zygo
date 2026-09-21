@@ -4,18 +4,26 @@ An mdBook table of contents; every page is plain Markdown and reads fine
 without mdBook.
 
 - [Quickstart](quickstart.md)
+- [The guide](guide.md)
 - [Concepts](concepts.md)
-- [`sandbox.toml` reference](spec-reference.md)
-- [Networking and seccomp](seccomp-profiles.md)
+
+# Reference
+
+- [`sandbox.toml`](spec-reference.md)
+- [What Zygo costs](performance.md)
+- [Troubleshooting](troubleshooting.md)
+
+# Security
+
 - [Threat model](threat-model.md)
-- [Comparison](comparison.md)
+- [Seccomp profiles](seccomp-profiles.md)
+
+# Embedding it
+
 - [The Python and Node SDKs](sdk.md)
 - [The MCP server](mcp.md)
-- [The agent protocol](../spec/protocol.md)
-- [Writing an agent](../examples/agents/README.md)
-- [Measurements: the PoC report](poc-report.md)
-- [Using Zygo instead of Docker: a field report](docker-replacement-report.md)
-- [Second pass: what is still open](second_test.md)
-- [Use-case test instructions](use_case_test_instructions.md)
-- [The `vm` backend: implementation roadmap](vm_implementation.md)
-- [Firecracker snapshots (research)](firecracker-snapshots.md)
+- [Writing an agent](agents.md)
+
+# Around it
+
+- [Comparison with Docker, gVisor, Firecracker and Lambda](comparison.md)

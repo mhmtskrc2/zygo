@@ -2,8 +2,7 @@
 
 The tests drive the agent from the other side of the wire — they are a
 miniature supervisor — so what is verified is the *protocol*, not the internals.
-The same harness is what `zygo agent test` will run against third-party agents
-(todo.md, phase 2.1).
+The same harness is what `zygo agent test` will run against third-party agents.
 
 Run with:  python3 -m unittest discover agents/python
 """

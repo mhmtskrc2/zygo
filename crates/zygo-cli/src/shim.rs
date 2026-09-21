@@ -20,8 +20,8 @@
 //! the user is looking at.
 //!
 //! The provider is [`Lima`], driven through `limactl`. The design allows for a
-//! Virtualization.framework helper instead (ADR notes in `ahmed.md`, §3.11);
-//! Lima is what a `brew install` can rely on today, it gives virtiofs mounts
+//! Virtualization.framework helper instead; Lima is what a `brew install` can
+//! rely on today, it gives virtiofs mounts
 //! and a working init without a signed helper binary, and everything above
 //! this line is provider-independent.
 //!

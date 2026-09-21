@@ -627,13 +627,11 @@ pub(crate) mod linux {
             .map_err(|e| Error::primitive("start pasta", "could not run `pasta`", e))?;
 
         if !output.status.success() {
+            let said = last_line(&output.stderr);
             return Err(Error::BackendUnavailable {
                 backend: "network",
-                reason: format!(
-                    "pasta could not configure the sandbox's network: {}",
-                    last_line(&output.stderr)
-                ),
-                remedy: "check that /dev/net/tun exists and is usable by this user".into(),
+                reason: format!("pasta could not configure the sandbox's network: {said}"),
+                remedy: pasta_remedy(&said),
             });
         }
         Ok(())
@@ -1007,7 +1005,7 @@ pub(crate) mod linux {
             // close-on-exec from the moment it exists. Without it the
             // sandbox's `/run/secrets` directory descriptor was inherited by
             // every later `Command` the supervisor spawned — `pasta`, `nft`,
-            // `newuidmap`, a re-exec of itself (S-04, 2026-09-21 review). The
+            // `newuidmap`, a re-exec of itself (S-04, the code review). The
             // flag has to be set here rather than afterwards: between
             // `recvmsg` and an `fcntl` there is a window in which another
             // thread can fork.
@@ -1117,6 +1115,37 @@ pub(crate) mod linux {
             Err(std::io::Error::other(last_line(&output.stderr)))
         }
     }
+}
+
+/// What to try, given what `pasta` said.
+///
+/// One remedy for every failure sent people to `/dev/net/tun` for a problem
+/// that had nothing to do with it. The one below was found by the use-case
+/// sweep on a Raspberry Pi running Ubuntu: `pasta` is confined by an AppArmor
+/// profile that denies it `/proc/<pid>/ns/user`, so a networked sandbox cannot
+/// start and the message pointed at a device that was present and working.
+// Compiled and tested on every host, called on one. Which remedy answers
+// which failure is a decision, and a decision is worth checking wherever the
+// tests run — `shim.rs` and `scope.rs` are kept the same way.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn pasta_remedy(said: &str) -> String {
+    let lower = said.to_ascii_lowercase();
+    if lower.contains("user namespace") && lower.contains("permission denied") {
+        return "`pasta` was refused access to the sandbox's user namespace. On Ubuntu \
+            and Debian that is usually AppArmor: a profile confines `pasta` and \
+            denies it `/proc/<pid>/ns/user`.\n  \
+            → check `sudo aa-status | grep -i passt` and, if it is enforcing, \
+            `sudo aa-complain /usr/bin/pasta`\n  \
+            → or run the sandbox with `network = \"none\"`, which needs no `pasta` \
+            at all"
+            .to_string();
+    }
+    if lower.contains("tun") || lower.contains("no such device") {
+        return "check that /dev/net/tun exists and is usable by this user".to_string();
+    }
+    "`zygo doctor` reports what `network = \"egress\"` and `\"full\"` need; \
+ `network = \"none\"` needs none of it"
+        .to_string()
 }
 
 #[cfg(test)]
@@ -1373,5 +1402,32 @@ mod tests {
         assert_eq!(e.exit_code(), 125);
         let e = missing("tc", "iproute2");
         assert!(e.to_string().contains("iproute2"));
+    }
+
+    /// The remedy has to match the failure.
+    ///
+    /// One remedy for every `pasta` failure sent people to `/dev/net/tun` for
+    /// an AppArmor confinement — a device that was present, working, and
+    /// nothing to do with it. Found by the use-case sweep on a Raspberry Pi
+    /// running Ubuntu, where `network = "full"` could not start at all.
+    #[test]
+    fn a_pasta_failure_is_answered_with_the_remedy_for_that_failure() {
+        let confined =
+            pasta_remedy("Couldn't open user namespace /proc/124388/ns/user: Permission denied");
+        assert!(confined.contains("AppArmor"), "{confined}");
+        assert!(confined.contains("aa-complain"), "{confined}");
+        assert!(
+            !confined.contains("/dev/net/tun"),
+            "the old catch-all remedy is still being given: {confined}"
+        );
+
+        let no_device = pasta_remedy("Couldn't open /dev/net/tun: No such device");
+        assert!(no_device.contains("/dev/net/tun"), "{no_device}");
+
+        // Anything else gets something true rather than something specific and
+        // wrong.
+        let unknown = pasta_remedy("something nobody has seen before");
+        assert!(unknown.contains("doctor"), "{unknown}");
+        assert!(!unknown.contains("AppArmor"), "{unknown}");
     }
 }

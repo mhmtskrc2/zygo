@@ -1,5 +1,5 @@
 #!/bin/sh
-# PoC 2 — cgroup v2 limits actually contain a hostile tenant (todo.md, phase 0.2).
+# PoC 2 — cgroup v2 limits actually contain a hostile tenant.
 #
 # Acceptance: a fork bomb and a runaway allocation inside the cgroup must not
 # affect the host. This is requirement N4 — if limits are not enforced, nothing

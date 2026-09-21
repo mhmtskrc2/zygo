@@ -135,7 +135,7 @@ pub fn response(query: &Query, rcode: Rcode, addrs: &[IpAddr]) -> Vec<u8> {
     // packet limit, so a name with enough addresses produced a header
     // promising records that were not there — a malformed answer that a
     // resolver reports as a failed lookup rather than a short one
-    // (B-16, 2026-09-21 review).
+    // (B-16, the code review).
     //
     // The truncation bit is deliberately *not* set. It tells a client to retry
     // over TCP, and this resolver listens on UDP only (see `serve`), so a

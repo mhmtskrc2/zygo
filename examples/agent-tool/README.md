@@ -38,6 +38,6 @@ mistakes survivable.
 
 For code you did not write and cannot read, the design's answer is
 `isolation = "vm"`, a hardware boundary. That backend needs a machine with KVM
-and is not built yet ([todo.md](../../todo.md), 2.5); until it is, this runs
+is not ready yet; until it is, this runs
 on `ns` with the tightest profile it has, and the [threat model](../../docs/threat-model.md)
 says plainly what that does and does not hold against.

@@ -1,5 +1,4 @@
-//! Property and fuzz-style tests for everything that parses untrusted input
-//! (todo.md, phase 1.5).
+//! Property and fuzz-style tests for everything that parses untrusted input.
 //!
 //! The spec file comes from a user and the wire protocol comes from inside a
 //! sandbox, so neither may panic, hang or allocate unboundedly on malformed
@@ -12,7 +11,7 @@
 
 // Gated because `image::auth` is: a build without the registry client has no
 // credential store to sweep, and `cargo test --no-default-features` failed to
-// compile here until the 2026-09-21 review (T-04) — so the feature-off build
+// compile here until the code review (T-04) — so the feature-off build
 // was never tested at all.
 #[cfg(feature = "registry")]
 use zygo_core::image::auth::CredentialStore;

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """PoC 5 — do real packages survive the `default` seccomp allowlist?
 
-Acceptance (todo.md): `requests`, `pydantic`, `numpy`, `pandas` and `Pillow`
+Acceptance: `requests`, `pydantic`, `numpy`, `pandas` and `Pillow`
 all work. A profile that is tight but breaks numpy is not a shippable default,
 and the deliverable of this PoC is the list of syscalls that had to be let back
 in.

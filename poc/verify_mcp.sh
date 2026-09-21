@@ -15,7 +15,7 @@
 set -u
 
 SRC=${SRC:-/src}
-ZYGO=${ZYGO:-$SRC/poc/zygo-linux}
+ZYGO=${ZYGO:-$SRC/poc/zygo-linux-musl}
 
 ZYGO_DATA_HOME=${ZYGO_DATA_HOME:-/tmp/zdata-mcp}
 export ZYGO_DATA_HOME

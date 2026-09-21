@@ -14,6 +14,10 @@ default = ["registry"]
 # store, which keeps the dependency surface (TLS, HTTP) out of embedders that
 # pull images by other means.
 registry = ["dep:reqwest", "dep:futures-util", "dep:tokio"]
+# The `vm` backend. Off by default: it links a virtual machine monitor, and a
+# host without KVM cannot use one. `make vm-build` is the build that turns it
+# on, and `zygo doctor` says what is missing when it is not compiled in.
+vm = ["dep:libkrun"]
 
 [dependencies]
 serde.workspace = true
@@ -29,6 +33,7 @@ flate2.workspace = true
 ruzstd.workspace = true
 
 reqwest = { workspace = true, optional = true }
+libkrun = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 

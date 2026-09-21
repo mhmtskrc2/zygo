@@ -20,7 +20,7 @@
 set -u
 
 SRC=${SRC:-/src}
-ZYGO=${ZYGO:-$SRC/poc/zygo-linux}
+ZYGO=${ZYGO:-$SRC/poc/zygo-linux-musl}
 ROUNDS=${1:-5}
 
 # How long the in-flight request holds the only slot. The queued request has to

@@ -5,7 +5,7 @@
 #
 # For code you did not write and cannot read, `isolation = "vm"` — a hardware
 # boundary rather than the kernel's — is the setting the design intends. It
-# is not built yet (todo.md, 2.5), so this runs on `ns` with the tightest
+# is not ready yet, so this runs on `ns` with the tightest
 # profile it has.
 
 [fn.calc]

@@ -1,6 +1,6 @@
 #!/bin/sh
 # PoC 6 — is overlayfs usable inside a user namespace on this kernel?
-# (todo.md, phase 0.2; risk R3)
+#
 #
 # Unprivileged overlayfs landed in Linux 5.11. Below that, a rootless sandbox
 # cannot present image layers as an overlay and has to fall back to a flattened

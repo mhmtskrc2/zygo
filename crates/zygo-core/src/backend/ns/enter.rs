@@ -257,7 +257,7 @@ unsafe fn helper_main(plan: &PreparedLaunch, ns: &NamespaceFds, ends: Ends) -> !
         // namespace descriptors, second copies of its own stdio, and the
         // helper's error pipe. `setns` is denied by the seccomp filter, so it
         // was a leak rather than an escape, but the comment at the top of this
-        // function promised the opposite (B-03, 2026-09-21 review).
+        // function promised the opposite (B-03, the code review).
         //
         // SAFETY: `fcntl` with F_DUPFD_CLOEXEC on a descriptor we hold.
         parked[i] = unsafe { libc::fcntl(*fd, libc::F_DUPFD_CLOEXEC, PARKED) };

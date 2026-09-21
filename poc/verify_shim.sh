@@ -1,5 +1,5 @@
 #!/bin/sh
-# The macOS shim (todo.md, phase 5), end to end.
+# The macOS shim, end to end.
 #
 # Runs **on macOS**, against a real Lima VM. Nothing here inspects the shim's
 # decisions — those are unit tests in `crates/zygo-cli/src/shim.rs` and they

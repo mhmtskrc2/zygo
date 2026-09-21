@@ -1,6 +1,6 @@
 #!/bin/bash
 # A sweep of the whole syscall space against each seccomp profile
-# (todo.md, phase 4 — the fuzz-based extension of the escape suite).
+# — the fuzz-based extension of the escape suite.
 #
 # The escape suite attempts the vectors somebody thought of. This attempts
 # *every* syscall number the architecture has, which is the only way to catch
@@ -30,7 +30,7 @@
 set -u
 
 SRC=${SRC:-/src}
-ZYGO=${ZYGO:-$SRC/poc/zygo-linux}
+ZYGO=${ZYGO:-$SRC/poc/zygo-linux-musl}
 IMAGE=python:3.12-slim
 PASS=0
 FAIL=0

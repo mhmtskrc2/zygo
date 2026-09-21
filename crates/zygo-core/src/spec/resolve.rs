@@ -213,7 +213,7 @@ fn resolve_layer(
     // the cgroup hierarchy goes through it: `Paths::tenant_data`,
     // `Paths::agent_sock` and the pasta pid file all join the name raw, and
     // `[fn."../x"]` is legal TOML while `--name` is free text (B-07,
-    // 2026-09-21 review). One check here covers every entry point, because
+    // the code review). One check here covers every entry point, because
     // every one of them resolves before it builds a path.
     if !is_fn_name(name) {
         return Err(SpecError::invalid_with(

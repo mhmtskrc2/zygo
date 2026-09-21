@@ -107,7 +107,7 @@ impl Store {
         // Lower case only. `write_blob` compares against a freshly computed
         // digest, which `digest_of` renders in lower case, so an upper-case
         // reference named a blob that could be written and never verified
-        // (E-11, 2026-09-21 review). Refusing it here says so once, where the
+        // (E-11, the code review). Refusing it here says so once, where the
         // reference was written.
         if hex.chars().any(|c| c.is_ascii_uppercase()) {
             return Err(ImageError::digest(
@@ -832,7 +832,7 @@ pub(crate) fn is_internal_entry(name: &std::ffi::OsStr) -> bool {
 /// not a refinement: the unpack path was hardened against hostile tars
 /// (`safe_join`, `ensure_real_directory`) and this one was not, so a lower
 /// layer could plant `etc` as a symlink to `/etc` and an upper layer's
-/// `etc/passwd` would be created **on the host** (B-04, 2026-09-21 review).
+/// `etc/passwd` would be created **on the host** (B-04, the code review).
 /// `create_dir_all` follows a symlink, and `Path::exists` is false for a
 /// dangling one — so both branches wrote through it.
 fn copy_tree(src: &Path, dst: &Path) -> Result<()> {

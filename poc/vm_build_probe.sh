@@ -2,7 +2,7 @@
 # V1, asked of a real build: does libkrun link against musl?
 #
 # Everything about the `vm` backend's distribution story rests on this
-# (docs/vm_implementation.md, D8 and M0.1). `dist-linux` ships one static
+# . `dist-linux` ships one static
 # binary under 15 MB; if libkrun needs glibc, the vm-capable build is a
 # separate target and the README says so. Either answer is the deliverable, so
 # this script reports rather than fails: a `RUN` that exits non-zero loses the
@@ -147,7 +147,7 @@ say "  builds under musl:        $VERDICT_MUSL"
 say "  staticlib target present: $VERDICT_STATIC"
 say "$NOTES"
 say ""
-say "Record this in docs/vm_implementation.md under V1 and in todo.md's M0,"
+say "Record the answer: it decides whether the vm-capable build can be the"
 say "whichever way it went. A negative answer is a decision, not a blocker:"
 say "the fallback is a glibc \`dist-linux-vm\` target and a sentence in the"
 say "README saying why there are two binaries."

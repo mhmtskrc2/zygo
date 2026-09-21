@@ -324,8 +324,8 @@ jobs:
           git diff --exit-code crates/zygo-core/src/backend/ns/syscalls.rs \
             || { echo "::error::run 'make syscall-tables' and commit the result"; exit 1; }
 
-  # Known gaps from the phase 0 report that need hardware CI does not always
-  # have. Informational until a suitable runner exists — see docs/poc-report.md.
+  # Known gaps that need hardware CI does not always have. Informational until
+  # a suitable runner exists.
   pending-hardware:
     runs-on: ubuntu-24.04
     steps:
@@ -342,4 +342,5 @@ jobs:
           echo "Raspberry Pi's kernel does not compile it in — so this runner is"
           echo "where those rules run for the first time."
           echo
-          echo "KVM is the one with no home yet; see todo.md, phase 2.5."
+          echo "KVM is the one with no home yet: the vm backend needs a runner"
+          echo "that exposes /dev/kvm, and no hosted one does."

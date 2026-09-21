@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PoC 9 — is a pre-created network namespace reusable? (todo.md, phase 1.3)
+"""PoC 9 — is a pre-created network namespace reusable?
 
 PoC 1 measured `CLONE_NEWNET` at 2.47 ms, 94% of the whole sandbox setup cost.
 The obvious fix is a pool: `network = "none"` namespaces are all identical, so

@@ -329,6 +329,7 @@ mod probe {
             seccomp(),
             subuid(),
             kvm(),
+            guest_kernel(),
             runsc(),
             egress(),
         ]
@@ -817,7 +818,7 @@ mod probe {
         // hypervisor hands out `/dev/kvm` and then refuses `KVM_CREATE_VM`,
         // and this check used to call that host ready — which would have sent
         // the `vm` backend to a machine that cannot start a virtual machine
-        // (V10 in docs/vm_implementation.md). So it creates one and closes it,
+        // So it creates one and closes it,
         // which is the same probe that confirmed the Raspberry Pi.
         match create_vm(&fd) {
             Ok(()) => Check::ok("kvm", "/dev/kvm"),
@@ -861,6 +862,30 @@ mod probe {
         // There is no `/dev/kvm` to have opened, so this is unreachable; it
         // exists so the check above compiles and is reviewed everywhere.
         Ok(())
+    }
+
+    /// The `vm` backend's guest kernel, which is a file and not a link.
+    ///
+    /// A line of its own rather than folded into `kvm`, because the two fail
+    /// for opposite reasons and have opposite remedies: a host without KVM
+    /// cannot run the backend at all, and a host with KVM and no kernel is one
+    /// command away. Folding them together sent people to the wrong one (D8).
+    fn guest_kernel() -> Check {
+        let paths = crate::Paths::from_env();
+        let image = paths.krun().join(crate::backend::vm::KERNEL_FILE);
+        if image.is_file() {
+            let size = std::fs::metadata(&image).map(|m| m.len()).unwrap_or(0);
+            Check::ok(
+                "guest kernel",
+                format!("{} ({} MB)", image.display(), size / (1024 * 1024)),
+            )
+        } else {
+            Check::absent(
+                "guest kernel",
+                "not installed",
+                "zygo backend install vm — the `vm` backend has nothing to boot without it",
+            )
+        }
     }
 
     fn runsc() -> Check {

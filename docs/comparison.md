@@ -2,7 +2,7 @@
 
 Where Zygo sits, and where it does not. Numbers for Zygo are the project's
 own measurements (kernel 5.10, aarch64, Docker Desktop's VM — see the
-[PoC report](poc-report.md)); numbers for the others are their documented
+[what Zygo costs](performance.md)); numbers for the others are their documented
 or commonly measured figures and are marked as such.
 
 ## The request path
@@ -33,16 +33,15 @@ entirely and amortises the interpreter with a warm zygote.
   `zygo run --isolation gvisor`); warm functions still need `ns`.
 * **Lambda and its relatives** are managed platforms. Zygo is a local runtime
   with a similar shape — a function, a warm instance, a request — and no
-  platform: no billing, no scaling across machines (phase 3's scope ends at
-  one host), no ingress.
+  platform: no billing, no scaling across machines, no ingress.
 * **Windmill, Temporal, and other workflow platforms** run user scripts and
   are exactly the embedder Zygo is designed for: a worker calls `zygo serve`
   or the library, and each script run is a `fork()` instead of a container.
 
 ## What Zygo does not do
 
-* Run on macOS or Windows natively. Sandboxes are Linux; phase 5 is a hidden
-  VM.
+* Run on macOS or Windows natively. Sandboxes are Linux; on a Mac, Zygo
+  manages a Linux VM for you.
 * Provide ingress. No mode accepts connections; a function is called through
   the CLI, the library or Zygo's own HTTP API.
 * Scale past one machine. Capacity is a per-host budget and `429` past it.

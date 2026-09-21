@@ -16,7 +16,7 @@
 set -u
 
 SRC=${SRC:-/src}
-ZYGO=${ZYGO:-$SRC/poc/zygo-linux}
+ZYGO=${ZYGO:-$SRC/poc/zygo-linux-musl}
 REGISTRY=${REGISTRY:-127.0.0.1:5000}
 USER_NAME=${USER_NAME:-zygotest}
 PASSWORD=${PASSWORD:-s3cret}

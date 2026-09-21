@@ -8,8 +8,7 @@
 //! build the mount plan.
 //!
 //! `clone3(CLONE_NEWPID)` makes the *child* pid 1 in the new namespace
-//! directly, so the mount plan can proceed immediately. See
-//! `docs/poc-report.md`, PoC 1.
+//! directly, so the mount plan can proceed immediately.
 
 use std::io;
 

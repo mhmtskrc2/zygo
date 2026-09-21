@@ -3,7 +3,8 @@
 Ten minutes from a checkout to three warm functions — Python, Go and one
 with apt packages — called from a webhook. Linux only; on macOS the code
 builds and the platform-independent layers are tested, but sandboxes need a
-Linux kernel (a VM or a container is fine, and phase 5 brings a hidden one).
+Linux kernel. A VM or a container is fine, and on a Mac Zygo manages one for
+you.
 
 ## 1. Build and check the host
 
@@ -125,8 +126,14 @@ zygo run --dry-run --json python:3.12-slim   # the mount plan without running it
 
 ## Where next
 
+* [The guide](guide.md) — the same ground at working depth: warm functions,
+  limits, networking, deployment, the HTTP API, and what to do when a
+  request is slow.
 * [Concepts](concepts.md) — the eight principles, and what each one costs.
 * [Spec reference](spec-reference.md) — every field of `sandbox.toml`.
+* [What Zygo costs](performance.md) — measured latency and memory, and the
+  hosts the numbers came from.
+* [Troubleshooting](troubleshooting.md) — the errors people actually hit.
 * [Security](../SECURITY.md) and the [threat model](threat-model.md).
 * [Comparison](comparison.md) — against Docker, gVisor, Firecracker and
   the function platforms.

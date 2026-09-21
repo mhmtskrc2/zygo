@@ -135,14 +135,14 @@ impl Backend for GvisorBackend {
             return Err(unsupported(
                 "the gvisor backend cannot hold a warm sandbox yet: entering a running \
                  one is `runsc exec`, not `setns`",
-                "use --isolation ns for warm functions; see todo.md, phase 4",
+                "use --isolation ns for warm functions",
             ));
         }
         if config.agent_fd.is_some() {
             return Err(unsupported(
                 "the runtime agent is handed its control socket as an inherited \
                  descriptor, and an OCI runtime closes everything but stdio",
-                "use --isolation ns for agent runtimes; see todo.md, phase 4",
+                "use --isolation ns for agent runtimes",
             ));
         }
         if config.network != Network::None {
@@ -152,7 +152,7 @@ impl Backend for GvisorBackend {
                      for `{}`, which needs pasta attached to gVisor's own netstack",
                     config.network
                 ),
-                "use --isolation ns for a networked sandbox; see todo.md, phase 4",
+                "use --isolation ns for a networked sandbox",
             ));
         }
         let rootfs = flat_rootfs(config).ok_or_else(|| {
@@ -167,7 +167,7 @@ impl Backend for GvisorBackend {
         // enforced is worse than one that was never promised.
         tracing::warn!(
             "the gvisor backend is experimental: a rootless runsc cannot write cgroups, \
-             so mem, cpu and pids limits are advisory here (todo.md, phase 4)"
+             so mem, cpu and pids limits are advisory here"
         );
 
         let bundle = bundle_dir(config);

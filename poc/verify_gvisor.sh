@@ -1,5 +1,5 @@
 #!/bin/sh
-# The `gvisor` backend against a real `runsc` (todo.md, phase 4).
+# The `gvisor` backend against a real `runsc`.
 #
 # Requirement N8 is that the same spec means the same thing on every backend.
 # The only way to check that is to run the same command on two of them and
@@ -14,7 +14,7 @@
 set -u
 
 SRC=${SRC:-/src}
-ZYGO=${ZYGO:-$SRC/poc/zygo-linux}
+ZYGO=${ZYGO:-$SRC/poc/zygo-linux-musl}
 IMAGE=alpine:3
 PASS=0
 FAIL=0
@@ -70,7 +70,7 @@ fi
 # status. Matching `"backend":"gvisor","status":"available"` as one string
 # would be asserting serde's key order, which is alphabetical and puts
 # `detail` between them — the mistake this suite has now made three times
-# (docs/poc-report.md, the inventory of bugs found in the tests themselves).
+# (one of the bugs the tests found in themselves).
 available=$(zygo --json backend list 2>/dev/null | tr -d '\n ' | tr '{' '\n' \
     | grep '"backend":"gvisor"' | grep -o '"status":"available"')
 if [ -n "$available" ]; then

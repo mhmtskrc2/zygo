@@ -1,9 +1,8 @@
 #!/bin/sh
 # What a host needs before the `vm` backend can be worked on, as a script.
 #
-# Section 2 of docs/vm_implementation.md is a table somebody produced by
-# sshing around by hand. This prints the same table, so the next person does
-# not — and so a host that has quietly changed says so before a milestone is
+# The table of what each test host provides is something somebody produced by
+# sshing around by hand. This prints it instead, so the next person does not — and so a host that has quietly changed says so before a milestone is
 # blamed for it.
 #
 # It also refuses to let a run start on top of somebody else's: another
@@ -134,8 +133,14 @@ say "room"
 free_kb=$(df -Pk / | awk 'NR==2 {print $4}')
 free_gb=$(( free_kb / 1048576 ))
 note "$(df -h / | awk 'NR==2 {print $4" free of "$2}') on /"
-if [ "$free_gb" -lt 4 ]; then
-    no "under 4 GB free: a guest kernel, a flattened rootfs and the image store will not fit comfortably"
+# Two thresholds, because "comfortable" and "possible" are different
+# questions and only the second should stop a run. Blocking at 4 GB refused
+# to run a suite on a host that had the kernel installed already and needed a
+# few hundred megabytes more.
+if [ "$free_gb" -lt 1 ]; then
+    no "under 1 GB free: a flattened rootfs will not fit, so nothing can run"
+elif [ "$free_gb" -lt 4 ]; then
+    ok "${free_gb} GB free — enough to run, tight for a second image or a kernel rebuild"
 else
     ok "${free_gb} GB free"
 fi

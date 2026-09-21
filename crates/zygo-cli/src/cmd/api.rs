@@ -1505,7 +1505,7 @@ mod tests {
 
     /// The ceilings that stop one caller from spending the host's resources.
     ///
-    /// Each is a number that was absent until the 2026-09-21 review, and each
+    /// Each is a number that was absent until the code review, and each
     /// absence had the same shape: a request that costs the *server* more the
     /// larger the caller makes it.
     #[test]

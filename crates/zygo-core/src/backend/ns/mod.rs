@@ -477,7 +477,7 @@ pub fn launch(config: &SandboxConfig, hierarchy: Option<&cgroup::Hierarchy>) -> 
     // spawns of `newuidmap`, `nft` and the long-lived `pasta` below, and a
     // `pasta` holding the write end means the parent never sees end of file
     // on it — quite apart from handing an unrelated process a descriptor into
-    // this launch (S-03, 2026-09-21 review). The child gets its copy through
+    // this launch (S-03, the code review). The child gets its copy through
     // `clone`, which does not exec, so the flag costs it nothing.
     let (ready_read, ready_write) = pipe_cloexec()?;
     let (err_read, err_write) = pipe_cloexec()?;
