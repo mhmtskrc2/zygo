@@ -101,7 +101,8 @@ impl Backend for GvisorBackend {
                     "gVisor runs on Linux; this host runs {}",
                     std::env::consts::OS
                 ),
-                "run Zygo inside a Linux VM or container (macOS shim is phase 5)",
+                "run Zygo inside a Linux VM or container; on macOS the `zygo` binary \
+                 normally forwards into one it manages",
             );
         }
         match &self.runsc {

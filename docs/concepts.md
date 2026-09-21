@@ -36,9 +36,9 @@ it after `cold_after`; the next request then pays the warm-up again.
 the backend decides where the boundary is drawn. `ns` is the kernel; `vm` is
 KVM with a guest kernel; `gvisor` is a userspace kernel.
 
-**Cost.** `ns` and `gvisor` are built; `vm` builds and links, and no host
-available to this project has booted a guest on it, so it is not yet a choice
-you can make. `zygo backend install gvisor` downloads the runtime, and the same
+**Cost.** `ns` and `gvisor` are built; `vm` boots a guest and runs one-shot
+sandboxes, at about ten times `ns`'s setup cost and without scratch, network
+or warm functions. `zygo backend install gvisor` downloads the runtime, and the same
 command run on both backends gives the same answer while `uname -r` inside
 reports `4.19.0-gvisor` rather than the host's kernel — which is the point.
 

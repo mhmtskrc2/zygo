@@ -220,7 +220,7 @@ fn build(store: &Store, image: &ImageEntry, requirements: &Path, dir: &Path) -> 
     let spec = build_spec(&image.reference, requirements, dir);
 
     let mount_points = crate::sandbox::mount::required_mount_points(&spec.mounts);
-    let overlay = crate::doctor::run()
+    let overlay = crate::doctor::run(store.paths())
         .checks
         .iter()
         .any(|c| c.name == "overlayfs (userns)" && c.status == crate::doctor::Status::Ok);
@@ -241,7 +241,7 @@ fn build(store: &Store, image: &ImageEntry, requirements: &Path, dir: &Path) -> 
         "building a venv inside the image (host networking, once)"
     );
     let started = std::time::Instant::now();
-    let outcome = run_captured(&mut config);
+    let outcome = run_captured(&mut config, store.paths());
     let _ = std::fs::remove_dir_all(&newroot);
 
     match outcome {
@@ -249,8 +249,8 @@ fn build(store: &Store, image: &ImageEntry, requirements: &Path, dir: &Path) -> 
             tracing::info!(elapsed_s = started.elapsed().as_secs(), "venv built");
             Ok(())
         }
-        Ok((code, output)) => Err(Error::BackendUnavailable {
-            backend: "venv",
+        Ok((code, output)) => Err(Error::Build {
+            what: "the venv build",
             reason: format!(
                 "pip exited {code} building {}:\n{}",
                 requirements.display(),

@@ -304,10 +304,15 @@ pub fn landlock_features(abi: u32) -> &'static str {
     }
 }
 
-/// Run every check for this host.
-pub fn run() -> Report {
+/// Run every check for this host, against the data directory in use.
+///
+/// The directory is an argument because one check reads it: the guest kernel
+/// lives under it, and a `doctor` that looked it up with `Paths::from_env()`
+/// reported the default directory's kernel while the command it is advising
+/// was pointed at another by `--data-root`.
+pub fn run(paths: &crate::Paths) -> Report {
     Report {
-        checks: probe::all(),
+        checks: probe::all(paths),
     }
 }
 
@@ -318,7 +323,7 @@ mod probe {
     use super::*;
     use crate::cgroup;
 
-    pub fn all() -> Vec<Check> {
+    pub fn all(paths: &crate::Paths) -> Vec<Check> {
         vec![
             kernel(),
             kernel_age_check(),
@@ -329,7 +334,7 @@ mod probe {
             seccomp(),
             subuid(),
             kvm(),
-            guest_kernel(),
+            guest_kernel(paths),
             runsc(),
             egress(),
         ]
@@ -870,8 +875,7 @@ mod probe {
     /// for opposite reasons and have opposite remedies: a host without KVM
     /// cannot run the backend at all, and a host with KVM and no kernel is one
     /// command away. Folding them together sent people to the wrong one (D8).
-    fn guest_kernel() -> Check {
-        let paths = crate::Paths::from_env();
+    fn guest_kernel(paths: &crate::Paths) -> Check {
         let image = paths.krun().join(crate::backend::vm::KERNEL_FILE);
         if image.is_file() {
             let size = std::fs::metadata(&image).map(|m| m.len()).unwrap_or(0);
@@ -923,7 +927,7 @@ mod probe {
     /// On macOS that somewhere is a Linux VM, and the answer a user actually
     /// wants is *its* — which the CLI appends, because knowing how to reach
     /// the VM is the shim's business and not this library's.
-    pub fn all() -> Vec<Check> {
+    pub fn all(_paths: &crate::Paths) -> Vec<Check> {
         vec![Check::failed(
             "platform",
             format!(
@@ -1188,7 +1192,7 @@ mod tests {
         let with_kvm = report(vec![("kvm", Status::Ok)]);
         assert!(with_kvm.supports(Isolation::Vm), "the host has KVM");
         assert!(
-            crate::backend::for_isolation(Isolation::Vm).is_err(),
+            crate::backend::for_isolation(Isolation::Vm, &crate::Paths::from_env()).is_err(),
             "and the vm backend is not built, which is the other half"
         );
 
@@ -1216,11 +1220,52 @@ mod tests {
         assert_eq!(r.exit_code(), 0, "degraded is not a failure");
     }
 
+    /// `doctor` answers about the data directory it was given.
+    ///
+    /// The guest-kernel line used to come from `Paths::from_env()` however
+    /// `doctor` was invoked, so `zygo --data-root /tmp/x doctor` reported the
+    /// kernel in the *default* directory — "ok" about a file the command it
+    /// was advising would never open.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_guest_kernel_line_is_about_the_data_root_it_was_given() {
+        let root = tempfile::tempdir().expect("a temp dir");
+        let paths = crate::Paths::rooted(root.path());
+
+        let absent = run(&paths);
+        let line = absent
+            .checks
+            .iter()
+            .find(|c| c.name == "guest kernel")
+            .expect("doctor reports a guest kernel line on Linux");
+        assert_eq!(
+            line.status,
+            Status::Absent,
+            "a data root with no kernel must not report one: {line:?}"
+        );
+
+        std::fs::create_dir_all(paths.krun()).expect("the krun directory");
+        std::fs::write(paths.krun().join(crate::backend::vm::KERNEL_FILE), b"file")
+            .expect("the kernel file");
+
+        let present = run(&paths);
+        let line = present
+            .checks
+            .iter()
+            .find(|c| c.name == "guest kernel")
+            .expect("doctor reports a guest kernel line on Linux");
+        assert_eq!(line.status, Status::Ok, "the installed kernel is reported");
+        assert!(
+            line.detail.contains(&root.path().display().to_string()),
+            "the line names the given data root, not another: {line:?}"
+        );
+    }
+
     #[test]
     fn a_report_can_always_be_produced_on_this_host() {
         // Whatever platform the tests run on, `doctor` must not panic — it is
         // the command users reach for when nothing else works.
-        let r = run();
+        let r = run(&crate::Paths::from_env());
         assert!(!r.checks.is_empty());
     }
 }

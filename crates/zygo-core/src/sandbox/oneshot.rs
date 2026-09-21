@@ -14,7 +14,7 @@ use crate::sandbox::SandboxConfig;
 /// wrote to stdout and stderr.
 ///
 /// `config.stdio` is replaced by the pipe; whatever it held is ignored.
-pub fn run_captured(config: &mut SandboxConfig) -> Result<(i32, Vec<u8>)> {
+pub fn run_captured(config: &mut SandboxConfig, paths: &crate::Paths) -> Result<(i32, Vec<u8>)> {
     let (read_end, write_end) = rustix::pipe::pipe()
         .map_err(|e| Error::primitive("pipe", "internal build error", e.into()))?;
     let drain = {
@@ -27,7 +27,7 @@ pub fn run_captured(config: &mut SandboxConfig) -> Result<(i32, Vec<u8>)> {
     };
     config.stdio = Some(write_end.as_raw_fd());
 
-    let backend = crate::backend::for_isolation(config.isolation)?;
+    let backend = crate::backend::for_isolation(config.isolation, paths)?;
     let outcome = backend.start(config).and_then(|mut sandbox| sandbox.wait());
     // Ours is the last write end once the sandbox has exited; closing it is
     // what lets the drain thread see end of file.

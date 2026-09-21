@@ -24,7 +24,8 @@ struct JsonReport {
 }
 
 pub fn run(cli: &Cli) -> anyhow::Result<u8> {
-    let report = doctor::run();
+    let paths = super::paths(cli);
+    let report = doctor::run(&paths);
 
     // Two questions, and the answer is the *and* of them: does the host have
     // what the backend needs, and does this binary implement it? Reporting
@@ -34,7 +35,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<u8> {
     // availability check consults this report and the pair would recurse.
     let usable: Vec<&'static str> = Isolation::ALL
         .iter()
-        .filter(|i| report.supports(**i) && zygo_core::backend::for_isolation(**i).is_ok())
+        .filter(|i| report.supports(**i) && zygo_core::backend::for_isolation(**i, &paths).is_ok())
         .map(|i| i.as_str())
         .collect();
 

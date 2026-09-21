@@ -78,7 +78,18 @@ impl Launcher {
             .name("zygo-launcher".into())
             .spawn(move || {
                 for job in inbox {
-                    job();
+                    // A job that panics must not take the thread with it.
+                    //
+                    // There is one launcher thread for the supervisor's whole
+                    // life, and every warm-up and every `ns` request runs on
+                    // it. A panic in one of them used to end the loop, after
+                    // which every later job sat in the channel unanswered and
+                    // the supervisor looked hung rather than broken (E-01).
+                    //
+                    // The panic is still a bug and still prints; `run`'s
+                    // caller sees the dropped result channel and reports it.
+                    // What changes is that the *next* job gets to run.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
                 }
             })
             .map_err(|e| Error::primitive("spawn", "launcher thread", e))?;
@@ -117,8 +128,10 @@ impl Drop for Launcher {
 fn launcher_gone() -> Error {
     Error::BackendUnavailable {
         backend: "supervisor",
-        reason: "the launcher thread is gone; a previous sandbox start panicked".into(),
-        remedy: "restart the supervisor: `zygo stop --all`, then serve again".into(),
+        reason: "the launcher never answered: the job panicked, or the thread is gone".into(),
+        remedy: "the supervisor's log has the panic; a single panicking job no longer \
+                 stops the ones after it"
+            .into(),
     }
 }
 
@@ -288,6 +301,19 @@ pub struct Supervisor {
     cold: Mutex<BTreeMap<String, Cold>>,
     /// Rewarm history per name. See [`Backoff`] for why it is not in `Entry`.
     rewarms: Mutex<BTreeMap<String, Backoff>>,
+    /// One lock per function name, held for the length of a rewarm.
+    ///
+    /// Without it, N requests that all find the same crashed function all
+    /// rewarm it: N sandboxes built, N of them registered in turn, and N−1
+    /// thrown away — on a function that crashes under load, which is when the
+    /// host can least afford it (B-10). The first request through builds the
+    /// replacement; the rest wait on this and then find it already in the
+    /// registry.
+    ///
+    /// A lock per name rather than one lock: two different functions crashing
+    /// at once are unrelated, and serialising them would make a slow warm-up
+    /// of one into a stall of the other.
+    warming: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
     /// Recent log per name. Kept here rather than in `Entry` so it survives
     /// a replacement and a cold spell: a `zygo logs -f` across a deploy
     /// should show the new zygote coming up, not go quiet.
@@ -322,6 +348,7 @@ impl Supervisor {
             functions: Mutex::new(BTreeMap::new()),
             cold: Mutex::new(BTreeMap::new()),
             rewarms: Mutex::new(BTreeMap::new()),
+            warming: Mutex::new(BTreeMap::new()),
             logs: Mutex::new(BTreeMap::new()),
             started: Instant::now(),
             stopping: AtomicBool::new(false),
@@ -535,6 +562,32 @@ impl Supervisor {
     /// at all — a handler that segfaults on import — from becoming a rewarm loop
     /// that costs more than the function ever would.
     fn rewarm(&self, name: &str, broken: &Arc<Entry>) -> std::result::Result<Arc<Entry>, Response> {
+        // One rewarm at a time per function (B-10). Everything below — the
+        // backoff, the warm-up, the registration — runs under this, so the
+        // second request to arrive waits here rather than building a second
+        // sandbox for the same crash.
+        let gate = {
+            let mut warming = self.warming.lock().expect("warming");
+            Arc::clone(
+                warming
+                    .entry(name.to_string())
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+        let _warming = gate.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Now that we hold it, somebody else may have done the work. A
+        // registry entry that is no longer the broken one, and is healthy, is
+        // that somebody's replacement — take it and charge this request
+        // nothing. Checked *after* the lock, because before it the answer is
+        // a guess.
+        if let Ok(current) = self.lookup(name)
+            && !Arc::ptr_eq(&current, broken)
+            && current.function.is_healthy()
+        {
+            return Ok(current);
+        }
+
         let now = Instant::now();
         {
             let mut rewarms = self.rewarms.lock().expect("rewarms");
@@ -669,13 +722,6 @@ impl Supervisor {
                 entry = self.rewarm(name, &entry)?;
             }
 
-            // Thawing is one write, so a paused function answers at warm speed
-            // plus that. This is the whole reason pausing is a tier of its own
-            // rather than going straight to cold.
-            if let Err(e) = entry.function.resume() {
-                return Err(Response::error(ControlError::CallFailed, e));
-            }
-
             event = match self.attempt(&entry, name, event, timeout) {
                 Attempt::Done(response) => return response,
                 Attempt::Closed(event) => event,
@@ -712,6 +758,22 @@ impl Supervisor {
                 }));
             }
         };
+
+        // Thawing is one write, so a paused function answers at warm speed
+        // plus that. This is the whole reason pausing is a tier of its own
+        // rather than going straight to cold.
+        //
+        // **After** the permit, and that ordering is the fix for B-11. It used
+        // to happen before, in the caller, where `in_flight` was still zero —
+        // so `tier_idle` could read the gate, see nothing in flight, and
+        // freeze the function in the window between the thaw and the permit.
+        // The request then ran against a frozen sandbox. Holding the permit
+        // first makes the function visibly busy to `tier_idle`, which skips
+        // anything with a request in flight.
+        if let Err(e) = entry.function.resume() {
+            drop(permit);
+            return Attempt::Done(Err(Response::error(ControlError::CallFailed, e)));
+        }
 
         let outcome = entry
             .function

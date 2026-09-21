@@ -110,16 +110,39 @@ function spawnWorker() {
       worker.result = msg;
     }
   });
-  child.on('exit', (code, signal) => {
+  // `close`, not `exit`, for the request's answer.
+  //
+  // `exit` fires when the process ends; the worker's stdout and stderr can
+  // still have buffered data that arrives after it. Finishing there meant a
+  // handler whose last line of output raced the exit had that line dropped
+  // from the result — intermittently, and more often the more it wrote
+  // (B-26). `close` fires once every stdio stream is done, which is what
+  // makes `Buffer.concat(worker.stdout)` the whole of it.
+  child.on('close', (code, signal) => {
     if (!worker.request) return; // a spare that died: replaced below
     finish(worker, code, signal);
   });
+  // The replacement is started on `exit`, which is as soon as the slot is
+  // free: there is no reason to wait for the dead worker's pipes to drain
+  // before warming its successor.
   child.on('exit', () => {
     const at = idle.indexOf(worker);
     if (at >= 0) idle.splice(at, 1);
     if (!shuttingDown) spawnWorker();
   });
   return worker;
+}
+
+// A signal's number, for the shell's `128 + n`.
+//
+// Node reports the *name* — `SIGTERM` — and this used to assume `SIGKILL`
+// and answer 137 whatever had happened, so a handler killed by SIGSEGV and
+// one killed by its deadline were indistinguishable (B-26). `os.constants`
+// has the real numbers for this platform; 9 stays as the fallback for a
+// name Node reports that the table does not have.
+function signalNumber(signal) {
+  const table = require('os').constants.signals;
+  return (signal && table[signal]) || 9;
 }
 
 function finish(worker, code, signal) {
@@ -131,7 +154,7 @@ function finish(worker, code, signal) {
   const done = {
     type: 'DONE',
     id,
-    exit_code: code === null ? 128 + 9 : code,
+    exit_code: code === null ? 128 + signalNumber(signal) : code,
     result: r && r.ok ? r.result : null,
     stdout,
     stderr,

@@ -4,16 +4,16 @@
 # Shaped like `verify_gvisor.sh`: the `ns` baseline first, then the same probes
 # on `vm`, then the things that must differ, then every refusal by name.
 #
-# It is written to be honest on a host that cannot boot a guest, which is where
-# this project stands. A Raspberry Pi 5 has a GIC-400 — GICv2 — and under
-# libkrun's GICv2 fallback the guest receives no timer interrupts, spins, and
-# prints nothing. That is V11 in docs/vm_implementation.md, and it is a
-# property of the machine rather than of Zygo. So the suite checks everything
-# it can without a guest, tries one, and *says which* when it cannot: a run
-# that reports "0 failed" because nothing was attempted is the failure mode the
-# fourth rule in the README exists to stop.
+# It is written to be honest on a host where the guest does not boot, which is
+# where this project stands. A Raspberry Pi 5 has a GIC-400 — GICv2 — and under
+# libkrun's GICv2 fallback the guest spins and prints nothing. That is *not* the
+# machine's fault: QEMU boots a KVM guest on the same Pi with vGICv2, so the
+# fault is somewhere in libkrun's GICv2 support. See V11. So the suite checks
+# everything it can without a guest, tries one, and *says which* when it cannot:
+# a run that reports "0 failed" because nothing was attempted is the failure
+# mode the fourth rule in the README exists to stop.
 #
-# Run:  make verify-vm-linux    (on a host whose KVM offers GICv3)
+# Run:  make verify-vm-linux
 set -u
 
 SRC=${SRC:-/src}
@@ -69,20 +69,26 @@ else
     exit 1
 fi
 
-# The interrupt controller decides whether a guest can run at all, and it is
-# the one thing that cannot be worked around from here.
+# The interrupt controller decides which of libkrun's two paths is taken, and
+# only one of them is known to work.
 gic=$(grep -oE 'GICv[23]' /proc/interrupts 2>/dev/null | head -1)
 case "$gic" in
-    GICv3) ok "the host has $gic, which libkrun's guests need" ;;
-    GICv2) say "  note  the host has $gic; libkrun falls back to it and a guest gets no
-        timer interrupts on at least one such machine (V11). If the guest
-        below spins, that is why, and it is the host rather than Zygo." ;;
+    GICv3) ok "the host has $gic" ;;
+    GICv2) say "  note  the host has $gic, so libkrun logs a GICv3 failure and falls back.
+        That line is noise, not a diagnosis: a guest boots on GICv2. It is
+        recorded here because it was once read as the reason one would not,
+        and the real reason was the kernel image being an ELF." ;;
     *)     say "  note  the interrupt controller could not be read from /proc/interrupts" ;;
 esac
 
+# `unavailable` contains `available`, so the unavailable case has to be
+# matched first. Written the other way round this reported "vm available" for
+# a host with no guest kernel, and then failed four checks that were about
+# something else entirely.
 case "$(zygo backend list 2>/dev/null | grep '^vm ')" in
-    *available*) ok "\`backend list\` reports vm available" ;;
-    *) bad "vm is not available: $(zygo backend list 2>&1 | grep '^vm ' | tr -s ' ')"; exit 1 ;;
+    *unavailable*) bad "vm is not available: $(zygo backend list 2>&1 | grep '^vm ' | tr -s ' ')"; exit 1 ;;
+    *available*)   ok "\`backend list\` reports vm available" ;;
+    *)             bad "backend list has no vm row"; exit 1 ;;
 esac
 
 say ""
@@ -112,19 +118,26 @@ say ""
 
 say "what vm refuses, by name"
 
+# What is asserted is the remedy and the subject, not a milestone number.
+# This used to look for "M4" and "M5" — names from a roadmap, useless to
+# whoever typed the command, and stale the moment the roadmap moved.
 refuses() {
     what=$1
-    milestone=$2
+    subject=$2
     shift 2
     out=$(zygo run --quiet --isolation vm "$@" 2>&1)
     case "$out" in
-        *"$milestone"*) ok "$what is refused, and the message names $milestone" ;;
+        *"$subject"*)
+            case "$out" in
+                *"→"*) ok "$what is refused, names $subject, and says what to do instead" ;;
+                *) bad "$what is refused for the right reason and offers no remedy" ;;
+            esac ;;
         *) bad "$what: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-140)" ;;
     esac
 }
 
-refuses "a networked sandbox" "M4" --net full "$IMAGE" /bin/true
-refuses "a terminal" "M5" --tty "$IMAGE" /bin/true
+refuses "a networked sandbox" "network" --net full "$IMAGE" /bin/true
+refuses "a terminal" "terminal" --tty "$IMAGE" /bin/true
 
 say ""
 
@@ -132,12 +145,23 @@ say ""
 
 say "a guest"
 
+# The guest's console and the program's stdout are the *same* channel: a
+# sandbox's output arrives over the virtio-console port, and
+# `ZYGO_KRUN_CONSOLE` diverts that port to a file. Exporting it for the
+# measured run therefore takes away the thing being measured — this reported
+# "no guest ran" while the console file beside it held the answer the run was
+# looking for. So the measured run has no console, and the console is only
+# attached for a second, diagnostic run when the first produced nothing.
 console=$(mktemp)
-ZYGO_KRUN_CONSOLE=$console
-export ZYGO_KRUN_CONSOLE
+unset ZYGO_KRUN_CONSOLE
 started=$(date +%s)
 vm_uname=$(zygo run --quiet --isolation vm --timeout "${BOOT_S}s" "$IMAGE" /bin/uname -r 2>/dev/null | tr -d '\n')
 elapsed=$(( $(date +%s) - started ))
+
+if [ -z "$vm_uname" ]; then
+    ZYGO_KRUN_CONSOLE=$console zygo run --quiet --isolation vm \
+        --timeout "${BOOT_S}s" "$IMAGE" /bin/true >/dev/null 2>&1
+fi
 
 if [ -n "$vm_uname" ]; then
     ok "a guest booted and ran a program in ${elapsed}s"
@@ -149,12 +173,28 @@ if [ -n "$vm_uname" ]; then
         bad "the guest reports the host's own kernel ($vm_uname); that is not a virtual machine"
     fi
 
+    # The root must be read-only, and the reason is not tidiness. The directory
+    # libkrun shares as the root is the store's flattened rootfs for an image
+    # digest — one directory, shared by every sandbox that runs that image. It
+    # was writable once, and `echo x > /pwned` in a guest left
+    # `cache/flat/<digest>/pwned` on the host for the next tenant to find.
     out=$(zygo run --quiet --isolation vm --timeout "${BOOT_S}s" "$IMAGE" \
-        /bin/sh -c 'echo x > /tmp/w && echo tmp-ok; echo y > /rootfs-probe 2>/dev/null && echo ROOT-WRITABLE || echo root-ro' 2>/dev/null)
+        /bin/sh -c 'echo y > /rootfs-probe 2>/dev/null && echo ROOT-WRITABLE || echo root-ro; echo x > /tmp/w 2>/dev/null && echo tmp-writable || echo tmp-ro' 2>/dev/null)
     case "$out" in
-        *tmp-ok*root-ro*) ok "/tmp is writable inside the guest and / is not" ;;
-        *ROOT-WRITABLE*) bad "the guest's root filesystem is writable" ;;
-        *) bad "the guest's filesystem probes said: $(printf '%s' "$out" | tr '\n' ' ')" ;;
+        *ROOT-WRITABLE*) bad "the guest's root filesystem is writable — a tenant can edit the shared image cache" ;;
+        *root-ro*)       ok "the guest's root filesystem is read-only, enforced by the VMM" ;;
+        *) bad "the guest's filesystem probe said: $(printf '%s' "$out" | tr '\n' ' ')" ;;
+    esac
+
+    # And the gap that read-only root leaves, named rather than left to be
+    # discovered: the guest has no writable scratch at all. libkrun's init
+    # mounts /dev/shm and not /tmp, and mounting one needs guest-side code —
+    # `zygo guest-init`, which is also where the guest's own cgroups, seccomp
+    # and Landlock go. Until then a vm sandbox can read and compute but not
+    # write, which is a real limit and not a bug in this check.
+    case "$out" in
+        *tmp-writable*) ok "/tmp is writable inside the guest" ;;
+        *tmp-ro*) skip "/tmp is not writable in a guest: no scratch until guest-init mounts one" ;;
     esac
 
     # The claim from §2 of the plan: a guest can offer controls the host lacks.
@@ -168,9 +208,11 @@ else
         say "        the guest said:"
         head -12 "$console" | sed 's/^/          /'
     else
-        say "        the guest printed nothing at all, which on a GICv2 host is V11:"
-        say "        no timer interrupts, so the kernel spins before it can register"
-        say "        a console. Everything above this line still passed."
+        say "        the guest printed nothing at all. console=hvc0 is virtio-console,"
+        say "        so a kernel that stops before that driver is up is silent either"
+        say "        way — build with KRUN_DEBUG_EARLYCON to get a PL011 earlycon,"
+        say "        which prints from the first lines of start_kernel."
+        say "        Everything above this line still passed."
     fi
     skip "the guest's kernel, filesystem and limits could not be checked"
 fi

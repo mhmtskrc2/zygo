@@ -27,7 +27,7 @@ an error, not a warning.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `isolation` | `ns` \| `vm` \| `gvisor` | `ns` | Where the boundary is. `ns` is built; `gvisor` runs one-shot sandboxes after `zygo backend install gvisor`, and refuses warm and networked ones; `vm` builds and links but no host available to this project has booted a guest on it, so it is not yet usable. |
+| `isolation` | `ns` \| `vm` \| `gvisor` | `ns` | Where the boundary is. `ns` is built; `gvisor` runs one-shot sandboxes after `zygo backend install gvisor`, and refuses warm and networked ones; `vm` boots a guest and runs one-shot sandboxes, with a read-only root and no writable scratch, no network and no warm functions. |
 | `seccomp` | `default` \| `strict` \| `permissive` | `default` | The syscall allowlist. See [seccomp profiles](seccomp-profiles.md). |
 
 ## Limits

@@ -270,25 +270,11 @@ pub fn answer(
     response(query, Rcode::NoError, &admitted)
 }
 
-/// The same ranges the ruleset rejects (`PRIVATE_V4`/`PRIVATE_V6` in the
-/// parent module), decided per address.
+/// The same ranges the ruleset rejects and the spec's validator refuses.
+///
+/// One definition, in `spec::types`, because three copies disagreed (B-18).
 pub fn is_private(addr: IpAddr) -> bool {
-    match addr {
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            v4.is_private()
-                || v4.is_loopback()
-                || v4.is_link_local()
-                || (o[0] == 100 && (o[1] & 0xC0) == 64) // 100.64.0.0/10
-                || v4.is_unspecified()
-        }
-        IpAddr::V6(v6) => {
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || (v6.segments()[0] & 0xffc0) == 0xfe80
-                || (v6.segments()[0] & 0xfe00) == 0xfc00
-        }
-    }
+    crate::spec::types::is_private_addr(addr)
 }
 
 /// Serve on `socket` until `stop` is set. Blocks; run it on its own thread.

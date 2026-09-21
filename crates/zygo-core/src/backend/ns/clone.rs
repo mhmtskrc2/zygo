@@ -1,6 +1,6 @@
 //! `clone3` (design doc §3.3 step 1).
 //!
-//! `clone3` rather than `unshare` for a reason the phase 0 measurement made
+//! `clone3` rather than `unshare` for a reason the first measurements made
 //! concrete: `unshare(CLONE_NEWPID)` does *not* move the caller into the new
 //! pid namespace, it only makes the caller's future children its first members.
 //! A process that has merely unshared cannot mount a fresh `proc` — it gets

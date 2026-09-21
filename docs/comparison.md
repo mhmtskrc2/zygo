@@ -14,7 +14,7 @@ measured figures and are marked as such.
 | Clean state per request | yes | no | yes | yes | no | **yes** | **yes** (a fresh process) |
 | Daemon | yes | yes | yes (a VMM per VM) | yes (`runsc` + shim) | n/a | **no** | **no** |
 | Root | daemon runs as root | same | needs `/dev/kvm` | no | n/a | **no** | **no** |
-| Boundary | kernel | kernel | hardware | userspace kernel | hardware | kernel (`ns`); userspace kernel (`gvisor`) | kernel (`ns`); hardware (`vm`, not yet usable) |
+| Boundary | kernel | kernel | hardware | userspace kernel | hardware | kernel (`ns`); userspace kernel (`gvisor`) | kernel (`ns`); hardware (`vm`, one-shot only) |
 
 The first row is the whole argument. A container's cost is orchestration and
 cold interpreter start; Zygo takes the orchestration off the request path
@@ -147,7 +147,9 @@ and shared by everything that names the same thing.
   containers or restart policies, you need Docker.
 * **Firecracker / Cloud Hypervisor** are microVMs: the strongest boundary,
   at a boot cost per VM. Zygo's `vm` backend is built on libkrun for the same
-  purpose — anonymous code, not your own — and is not yet usable.
+  purpose — anonymous code, not your own. It boots a guest and runs one-shot
+  sandboxes today; warm functions, networking and writable scratch inside the
+  guest are not built.
 * **gVisor** is a userspace kernel: a smaller attack surface than the host
   kernel without KVM, at a syscall cost. Zygo's `gvisor` backend is built for
   one-shot runs (`zygo backend install gvisor`, then

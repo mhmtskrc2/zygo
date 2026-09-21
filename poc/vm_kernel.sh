@@ -1,5 +1,5 @@
 #!/bin/sh
-# The guest kernel, as a file (docs/vm_implementation.md, M0.2 and D8).
+# The guest kernel, as a file.
 #
 # libkrun can boot a kernel from a path — `krun_set_kernel` — and that is what
 # keeps the GPL kernel out of an Apache-2.0 binary and a ten-to-twenty megabyte
@@ -42,17 +42,64 @@ make -j"$(nproc)" >/build/kernel.log 2>&1 || {
 }
 
 # The image, wherever this version put it.
-image=$(find /build/libkrunfw -name 'Image' -o -name 'vmlinux' -o -name 'bzImage' 2>/dev/null |
-        grep -v '/tools/' | head -1)
+#
+# The *boot* image, specifically, and the distinction is the whole of this
+# block. A kernel build leaves both `vmlinux` — an ELF, for debuggers — and
+# `arch/<arch>/boot/Image`, the thing a bootloader can actually jump to. This
+# used to be one `find` with three `-name`s and a `head -1`, which took
+# whichever the directory walk reached first: `vmlinux`. libkrun then loaded
+# the ELF headers as if they were a kernel, the vCPU executed them, and the
+# guest spun at 100% and printed nothing — for which the interrupt controller
+# was blamed for a long time.
+#
+# So: the boot image by its real path, and never `vmlinux`.
+arch=$(uname -m)
+case "$arch" in
+    aarch64) want='arch/arm64/boot/Image' ;;
+    x86_64)  want='arch/x86/boot/bzImage' ;;
+    *)       want='' ;;
+esac
+
+image=""
+if [ -n "$want" ]; then
+    image=$(find /build/libkrunfw -path "*/$want" 2>/dev/null | grep -v '/tools/' | head -1)
+fi
 if [ -z "$image" ]; then
-    echo "no kernel image came out of the build:"
-    find /build/libkrunfw -maxdepth 2 -name '*.so*' -o -maxdepth 2 -name 'Image*' | head -10
+    image=$(find /build/libkrunfw \( -name 'Image' -o -name 'bzImage' \) 2>/dev/null |
+            grep -v '/tools/' | head -1)
+fi
+if [ -z "$image" ]; then
+    echo "no bootable kernel image came out of the build (looked for $want):"
+    find /build/libkrunfw -name 'Image' -o -name 'bzImage' -o -name 'vmlinux' | head -10
     exit 1
 fi
 
 cp "$image" "$OUT/Image"
+
+# And then check it, rather than trusting the path it came from. libkrun
+# decides what to do with this file from its first bytes, and the formats it
+# accepts on aarch64 are raw Image, gzip and the compressed variants — not
+# ELF. A build that produces something else should fail here, loudly, and not
+# three weeks later as a guest that will not boot.
+magic=$(od -An -tx1 -N4 "$OUT/Image" | tr -d ' \n')
+arm64=$(od -An -tx1 -j56 -N4 "$OUT/Image" | tr -d ' \n')
+case "$magic" in
+    7f454c46)
+        echo "REFUSED: $image is an ELF (vmlinux), which libkrun cannot load on aarch64."
+        echo "         The bootable image is arch/arm64/boot/Image."
+        rm -f "$OUT/Image"
+        exit 1 ;;
+esac
+if [ "$arch" = aarch64 ] && [ "$arm64" != "41524d64" ] && [ "${magic%????}" != "1f8b" ]; then
+    echo "REFUSED: $image has no arm64 Image header (ARM\\x64 at offset 56) and is not gzip."
+    echo "         first bytes: $magic, offset 56: $arm64"
+    rm -f "$OUT/Image"
+    exit 1
+fi
+
 sha=$(sha256sum "$OUT/Image" | cut -d' ' -f1)
 echo ""
+echo "  from $image"
 echo "  $OUT/Image  $(stat -c %s "$OUT/Image") bytes"
 echo "  sha256:$sha"
 

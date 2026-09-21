@@ -1150,6 +1150,53 @@ fn pasta_remedy(said: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// The ruleset's blocks and the one `is_private_addr` answers for are the
+    /// same set, checked address by address rather than by reading both lists.
+    ///
+    /// They were not (B-18): the spec's validator had no carrier-grade NAT
+    /// range, so `allow = ["100.64.0.1:443"]` was accepted, said nothing, and
+    /// was then dropped by nftables. A rule that looks accepted and is dead is
+    /// worse than one that is refused.
+    #[test]
+    fn what_nftables_drops_is_what_the_validator_refuses() {
+        use crate::spec::types::is_private_addr;
+
+        // One address from inside every block the ruleset installs.
+        let inside = [
+            "10.1.2.3",
+            "172.16.5.6",
+            "192.168.1.1",
+            "169.254.169.254",
+            "127.0.0.1",
+            "100.64.0.1",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+        ];
+        for a in inside {
+            let addr: std::net::IpAddr = a.parse().expect("an address");
+            assert!(
+                is_private_addr(addr),
+                "{a} is dropped by the ruleset and accepted by the validator"
+            );
+        }
+
+        // And addresses outside every one of them, so the check is not
+        // satisfied by a function that always says true.
+        for a in ["8.8.8.8", "1.1.1.1", "93.184.216.34", "2606:2800:220:1::1"] {
+            let addr: std::net::IpAddr = a.parse().expect("an address");
+            assert!(!is_private_addr(addr), "{a} is public and was refused");
+        }
+
+        // Every block named in the ruleset has a representative above; a new
+        // one without a case here fails this rather than passing quietly.
+        assert_eq!(
+            PRIVATE_V4.len() + PRIVATE_V6.len(),
+            inside.len(),
+            "a block was added to the ruleset without an address in this test"
+        );
+    }
     use super::*;
 
     fn rules(list: &[&str]) -> Vec<AllowRule> {

@@ -11,7 +11,7 @@ are below; every millisecond in this documentation came from one of them.
 | Hardware | 4× Cortex-A76, 8 GiB, aarch64 | 5 vCPU, 8 GiB, of an Apple M1 Max | 2 vCPU, 4 GiB, of the same Mac |
 | OS and kernel | Ubuntu 23.10, Linux 6.5 | LinuxKit, Linux 5.10 | Ubuntu 24.04, Linux 6.8 |
 | How Zygo ran | an ordinary user, under a systemd session — the way a real host runs it | a privileged container, as root | forwarded from the Mac shell, as an ordinary user |
-| What was measured here | the fifty use-case scenarios, the supervisor and MCP suites, warm-up, and the `vm` backend's attempt to boot | the warm path, the cold start, throughput, the escape suite, the seccomp sweep and matrix | the shim's own overhead, and the same suites through the hop |
+| What was measured here | the fifty use-case scenarios, the supervisor and MCP suites, warm-up, and the `vm` backend end to end | the warm path, the cold start, throughput, the escape suite, the seccomp sweep and matrix | the shim's own overhead, and the same suites through the hop |
 
 Two things follow. **Unless a section says otherwise, a number below is from
 Docker Desktop's VM**, which is the slowest of the three for this work: a
@@ -83,6 +83,24 @@ of an image also pulls it, and the first run on a kernel without unprivileged
 overlayfs also flattens the image's layers — `zygo bench cold` says which of
 those happened, because a number that hides them is misleading.
 
+## A sandbox with a hardware boundary
+
+The `vm` backend boots a guest kernel under KVM and runs the program inside it.
+
+| | |
+|---|---|
+| One-shot run, image already in the store | ~400 ms |
+| The same run on `ns`, same host | ~40 ms |
+| Measured on | the Raspberry Pi 5 |
+
+Ten times the setup cost of `ns`, for a kernel the tenant cannot share with
+the host. The first run of an image is several seconds longer because the
+store flattens it.
+
+That is the whole of what is measured: the `vm` backend has no warm path, no
+networking and no writable scratch inside the guest, so there is nothing else
+to time yet.
+
 ## Dependencies
 
 A `requirements` file is built into a virtual environment once and shared by
@@ -111,8 +129,8 @@ round-trips in 96 ms, nearly all of it the hop.
 
 ## What is not measured
 
-- The `vm` backend. It builds and links, and no host available to this project
-  can boot a guest on it, so there are no numbers and none are claimed.
+- The `vm` backend beyond the one-shot cost above. There is no warm path to
+  measure on it, and no network.
 - Anything across more than one machine. Zygo's capacity is a per-host budget
   and a `429` past it.
 - Receive-side bandwidth shaping, which needs an `ifb` device the test hosts do

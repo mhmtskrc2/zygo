@@ -65,9 +65,18 @@ fn main() -> std::process::ExitCode {
         Err(e) => {
             output::error(&e);
             // Preserve the library's exit-code convention where there is one:
-            // 2 for a spec problem, 125 when the host cannot run sandboxes.
+            // 2 for a spec problem, 125 when the host cannot run sandboxes,
+            // 137 for a deadline.
+            //
+            // Searched through the whole chain, not just the outermost error
+            // (B-29). `downcast_ref` looks only at the top, so any
+            // `.context("…")` on the way up — and the CLI adds them freely —
+            // turned a spec error into a bare 1. A script checking for 2 saw
+            // it only when nobody had added context, which is the worst kind
+            // of contract: one that holds until someone improves a message.
             let code = e
-                .downcast_ref::<zygo_core::Error>()
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<zygo_core::Error>())
                 .map(|e| e.exit_code())
                 .unwrap_or(1);
             std::process::ExitCode::from(code as u8)
@@ -138,5 +147,50 @@ fn init_tracing(verbose: u8, json: bool) {
         builder.json().init();
     } else {
         builder.without_time().with_target(false).init();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The library's exit code survives a `.context()` on the way up.
+    ///
+    /// B-29: the mapping used `downcast_ref` on the outermost error, so any
+    /// context added between the library and `main` replaced 2 or 125 with a
+    /// bare 1 — and the CLI adds context on most paths.
+    #[test]
+    fn a_wrapped_library_error_keeps_its_exit_code() {
+        let spec = zygo_core::Error::Spec(zygo_core::spec::SpecError::Invalid {
+            field: "fn.x.mem".into(),
+            message: "too small".into(),
+            remedy: String::new(),
+        });
+        let bare_code = spec.exit_code();
+        assert_eq!(bare_code, 2, "a spec error is exit 2");
+
+        let wrapped: anyhow::Error =
+            anyhow::Error::from(spec).context("while resolving the spec file");
+        let found = wrapped
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<zygo_core::Error>())
+            .map(|e| e.exit_code())
+            .unwrap_or(1);
+        assert_eq!(found, 2, "the context hid the spec error's exit code");
+
+        // Two layers, because one is the easy case.
+        let deeper = anyhow::Error::from(zygo_core::Error::Spec(
+            zygo_core::spec::SpecError::Invalid {
+                field: "fn.x.mem".into(),
+                message: "too small".into(),
+                remedy: String::new(),
+            },
+        ))
+        .context("one")
+        .context("two");
+        let found = deeper
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<zygo_core::Error>())
+            .map(|e| e.exit_code())
+            .unwrap_or(1);
+        assert_eq!(found, 2);
     }
 }

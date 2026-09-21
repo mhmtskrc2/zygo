@@ -42,6 +42,25 @@ pub enum Error {
         remedy: String,
     },
 
+    /// A dependency build ran and failed: `pip` could not resolve a
+    /// requirement, `apt` could not find a package.
+    ///
+    /// Its own variant because of the exit code (E-02). These used to be
+    /// `BackendUnavailable`, which is exit **125** — "this host cannot run
+    /// sandboxes". A CI job reading that code is told to try another machine,
+    /// when what actually happened is that a line in `requirements.txt` names
+    /// a package that does not exist. The host is fine; the input is wrong,
+    /// and wrong input is exit 1.
+    ///
+    /// A build that could not *start* is still `BackendUnavailable`: that one
+    /// really is about the host.
+    #[error("{what} failed: {reason}\n  → {remedy}")]
+    Build {
+        what: &'static str,
+        reason: String,
+        remedy: String,
+    },
+
     #[error("i/o error on {path}: {source}")]
     Io {
         path: PathBuf,
@@ -49,8 +68,16 @@ pub enum Error {
         source: std::io::Error,
     },
 
+    /// An I/O failure with no path attached.
+    ///
+    /// Deliberately **not** `#[from]` (E-03). With the conversion derived, a
+    /// bare `?` on any `io::Result` compiled and produced "No such file or
+    /// directory" with nothing to say which file — in a mount plan with
+    /// thirty entries, that is not a diagnosis. Without it the compiler asks
+    /// for [`IoContext::at`], which carries the path, and the few places that
+    /// genuinely have no path say so by naming this variant.
     #[error(transparent)]
-    Bare(#[from] std::io::Error),
+    Bare(std::io::Error),
 }
 
 impl Error {
@@ -108,6 +135,9 @@ impl Error {
                 128 + libc::SIGKILL
             }
             Error::BackendUnavailable { .. } | Error::Primitive { .. } => 125,
+            // A build that ran and failed is the caller's input, not the
+            // host: exit 1, like any other "what you asked for is wrong".
+            Error::Build { .. } => 1,
             _ => 1,
         }
     }

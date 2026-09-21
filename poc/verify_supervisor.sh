@@ -905,10 +905,29 @@ say "protocol conformance"
 # what its smallest implementation proves, so the suite runs against the
 # reference Python agent *and* against a complete agent written in POSIX sh —
 # which shares no code with Zygo at all.
-# The first `apt` of the run: the image ships no package lists, and the venv
-# and system-layer sections above install inside sandboxes, not out here.
-apt-get update >/tmp/jq-install.log 2>&1
-apt-get install -y --no-install-recommends jq >>/tmp/jq-install.log 2>&1
+# `jq` is needed by the sh agent below and by nothing else here. Installing it
+# is conditional three ways, and every one of those conditions was learned by
+# this line stopping a whole run:
+#
+#   * only if it is missing — the container image ships no package lists, the
+#     Pi has jq already, and `apt-get update` on the Pi is pure cost;
+#   * only as root — as an ordinary user `apt-get update` does not fail, it
+#     **blocks**, and the suite sat at this line for the rest of its life. A
+#     139-check run that never reaches check 104 reports nothing at all;
+#   * under a timeout either way, because an apt mirror is a network service
+#     and this suite's job is not to wait on one.
+#
+# If it is still missing afterwards the sh agent case says so and fails, which
+# is the honest outcome: not checked is not the same as passed.
+if ! command -v jq >/dev/null 2>&1; then
+    if [ "$(id -u)" = 0 ]; then
+        timeout 120 apt-get update >/tmp/jq-install.log 2>&1
+        timeout 120 apt-get install -y --no-install-recommends jq >>/tmp/jq-install.log 2>&1
+    else
+        say "  note  jq is missing and this is not root, so it will not be installed"
+    fi
+fi
+
 out=$("$ZYGO" agent test python3 -- $SRC/agents/python/zygo_agent.py --fd 3 \
     $SRC/examples/agents/conformance/handler.py 2>&1)
 case "$out" in
@@ -968,8 +987,13 @@ say "egress networking"
 # started reads as "the destination was refused", which is the shape of
 # check that passes for the wrong reason.
 # Installed here when this is a container we are root in; on a real host it is
-# the operator's package manager and not this script's business.
-apt-get install -y --no-install-recommends passt nftables iproute2 >/tmp/net-install.log 2>&1
+# the operator's package manager and not this script's business. The condition
+# is now checked rather than described: as an ordinary user `apt-get` blocks
+# instead of failing, and a suite that stops here reports none of what follows.
+if [ "$(id -u)" = 0 ] && ! command -v pasta >/dev/null 2>&1; then
+    timeout 180 apt-get install -y --no-install-recommends passt nftables iproute2 \
+        >/tmp/net-install.log 2>&1
+fi
 # `pasta` needs a tun device it can open, which is a separate question from
 # whether the package is installed — a container started without `--device`
 # has the binary and nothing for it to attach to. Both are prerequisites, and
@@ -1555,7 +1579,7 @@ fi   # spin_up
 
 say ""
 say "the request cgroup"
-# The check that would have caught a bug that hid for the whole of phase 2: the
+# The check that would have caught a bug that hid for months: the
 # agent is pid 1 in its own namespace, so the pid it reports means nothing to
 # the supervisor. Writing it into `cgroup.procs` silently moved *nothing*, and
 # the per-request cgroup was an empty directory being created and removed.
@@ -1878,9 +1902,20 @@ case "$out" in
 esac
 # The other functions in the same project still come up: one stale entry is
 # not a reason to leave the project down.
+# `failed` carries a reason per function, not just a name: `up --json` used to
+# print one document per failure *and* a summary, and two of its failure paths
+# printed nothing at all in JSON mode, so the reason was lost (E-14). One
+# document now, and the entry says why.
 out=$("$ZYGO" --json up 2>/dev/null | tr -d '\n ')
 case "$out" in
-    *'"failed":["v"]'*) ok "only the function whose image moved is refused" ;;
+    *'"name":"v"'*'"reason":'*)
+        # And exactly one document, which is the other half of that fix: a
+        # concatenation of two would not parse.
+        if printf '%s' "$out" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+            ok "only the function whose image moved is refused, with its reason, in one JSON document"
+        else
+            bad "up --json emitted something that is not one JSON document: $out"
+        fi ;;
     *) bad "up with one stale entry: $out" ;;
 esac
 

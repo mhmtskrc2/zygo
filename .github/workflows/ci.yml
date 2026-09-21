@@ -1,6 +1,7 @@
 name: ci
 
-# The matrix exists because phase 0 could not test several things: the
+# The matrix exists because the development machines cannot test several
+# things: the
 # measurement environment was kernel 5.10 without KVM, so Landlock, cgroup.kill,
 # memory.peak, unprivileged overlayfs and the `vm` backend were never exercised.
 # Each of those has a job here that will exercise it, and the kernel each runner
@@ -18,6 +19,19 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+
+# Least privilege by default (S-13). Without this the token is whatever the
+# repository's default is, which for many repositories is write — handed to
+# every third-party action in every job. A job that needs more asks for it.
+permissions:
+  contents: read
+
+# One run per ref. A push that supersedes another cancels it rather than
+# queueing behind it, which on a repository with long Linux jobs is the
+# difference between minutes and an hour.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   # Everything platform independent: spec, protocol, image store, mount plan.
@@ -37,13 +51,14 @@ jobs:
           - os: macos-14
             label: macos/aarch64
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     name: unit (${{ matrix.label }})
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: Report what this runner actually is
         run: |
@@ -109,11 +124,12 @@ jobs:
           - os: ubuntu-24.04-arm
             privilege: rootless
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     name: launcher (${{ matrix.os }}, ${{ matrix.privilege }})
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       # Ubuntu 24.04 ships `kernel.apparmor_restrict_unprivileged_userns=1`.
       # It lets an unprivileged process create a user namespace and then
@@ -269,13 +285,14 @@ jobs:
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     name: static (${{ matrix.target }})
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - run: cargo build --release --target ${{ matrix.target }}
@@ -304,7 +321,7 @@ jobs:
           [ "$SIZE" -lt 15728640 ] \
             || { echo "::error::binary is $((SIZE / 1048576)) MB, over the 15 MB budget"; exit 1; }
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: zygo-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/zygo
@@ -315,9 +332,10 @@ jobs:
   # fresh generation.
   syscall-tables:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-qemu-action@v3    # for the non-native architecture
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3    # for the non-native architecture
       - run: python3 poc/gen_syscall_tables.py
       - name: The committed tables must match
         run: |
@@ -328,8 +346,9 @@ jobs:
   # a suitable runner exists.
   pending-hardware:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: What is still unverified
         run: |
           echo "KVM (the vm backend, PoC 8): $([ -e /dev/kvm ] && echo present || echo ABSENT)"

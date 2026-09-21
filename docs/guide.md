@@ -580,8 +580,11 @@ zygo backend install gvisor
 zygo run --isolation gvisor python:3.12-slim python3 -c 'import platform; print(platform.release())'
 ```
 
-**`vm`** is a hardware boundary. It builds and links, and no host available to
-this project can boot a guest on it, so nothing about it is claimed yet.
+**`vm`** is a hardware boundary: libkrun and KVM, with a guest kernel of its
+own. It runs one-shot sandboxes — `zygo backend install vm` puts the kernel in
+place and `zygo doctor` reports it — at about 400 ms a run against `ns`'s
+40 ms on the same host. What it does not do yet: a writable `/tmp` inside the
+guest, any networking, or warm functions. Those are refused by name.
 
 ```bash
 zygo backend list        # what this host can actually use

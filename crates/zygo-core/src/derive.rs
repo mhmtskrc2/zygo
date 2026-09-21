@@ -1,4 +1,4 @@
-//! Derived system layers (design doc §3.7, todo phase 3).
+//! Derived system layers: apt packages as an OCI layer of their own.
 //!
 //! `system = ["libpq5", "jq"]` in a function's spec → those packages installed
 //! once, on top of the image, as a new OCI layer in the content-addressed
@@ -239,7 +239,13 @@ fn build(
         "installing system packages inside the image (host networking, once)"
     );
     let started = Instant::now();
-    if let Err(e) = install(&base.reference, packages, &root, &work.join("newroot")) {
+    if let Err(e) = install(
+        &base.reference,
+        packages,
+        &root,
+        &work.join("newroot"),
+        store.paths(),
+    ) {
         let _ = std::fs::remove_dir_all(&work);
         return Err(e);
     }
@@ -291,7 +297,13 @@ fn build(
 }
 
 /// Run `apt-get install` in a sandbox whose root is `root`, writable.
-fn install(image: &str, packages: &[String], root: &Path, newroot: &Path) -> Result<()> {
+fn install(
+    image: &str,
+    packages: &[String],
+    root: &Path,
+    newroot: &Path,
+    paths: &crate::Paths,
+) -> Result<()> {
     let spec = build_spec(image, packages);
     std::fs::create_dir_all(newroot).at(newroot)?;
     let view = RootfsView::Flat {
@@ -301,12 +313,12 @@ fn install(image: &str, packages: &[String], root: &Path, newroot: &Path) -> Res
         SandboxConfig::from_resolved(&spec, &view, newroot, spec.cmd.clone(), &build_env());
     config.writable_root = true;
 
-    let result = run_captured(&mut config);
+    let result = run_captured(&mut config, paths);
     let _ = std::fs::remove_dir_all(newroot);
     match result {
         Ok((0, _)) => Ok(()),
-        Ok((code, output)) => Err(Error::BackendUnavailable {
-            backend: "system",
+        Ok((code, output)) => Err(Error::Build {
+            what: "the system layer build",
             reason: format!(
                 "apt-get exited {code} installing {}:\n{}",
                 packages.join(" "),

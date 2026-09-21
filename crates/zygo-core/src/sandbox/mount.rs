@@ -135,6 +135,17 @@ pub struct MountPoint {
 ///
 /// A read-only root cannot have anything created inside it, so these have to
 /// exist before the root is assembled — the image store fills in whatever the
+/// The paths the launcher mounts itself, which a spec may therefore not.
+///
+/// Exported because the spec's validator has to refuse the same set: it used
+/// to carry its own shorter list — `/`, `/proc`, `/sys`, `/dev` — so a mount
+/// onto `/tmp` or `/run` was accepted by the validator and then silently
+/// mounted over by the launcher (B-19). One list, in the module that does the
+/// mounting.
+pub const MANAGED_TARGETS: &[&str] = &[
+    "/proc", "/sys", "/dev", "/dev/pts", "/dev/shm", "/tmp", "/run",
+];
+
 /// image itself lacks. Derived from the same list the plan uses, so the two
 /// cannot drift apart.
 ///
@@ -143,15 +154,13 @@ pub struct MountPoint {
 /// that does not exist yet is taken to be a directory, which is what
 /// `docker run -v` does with one.
 pub fn required_mount_points(mounts: &[Mount]) -> Vec<MountPoint> {
-    let mut points: Vec<MountPoint> = [
-        "/proc", "/sys", "/dev", "/dev/pts", "/dev/shm", "/tmp", "/run",
-    ]
-    .iter()
-    .map(|p| MountPoint {
-        path: PathBuf::from(p),
-        kind: MountPointKind::Directory,
-    })
-    .collect();
+    let mut points: Vec<MountPoint> = MANAGED_TARGETS
+        .iter()
+        .map(|p| MountPoint {
+            path: PathBuf::from(p),
+            kind: MountPointKind::Directory,
+        })
+        .collect();
 
     points.extend(mounts.iter().map(|m| MountPoint {
         path: m.target.clone(),

@@ -436,7 +436,7 @@ impl Pool {
         };
 
         let mount_points = mount::required_mount_points(&warm.mounts);
-        let overlay = crate::doctor::run()
+        let overlay = crate::doctor::run(&self.config.paths)
             .checks
             .iter()
             .any(|c| c.name == "overlayfs (userns)" && c.status == crate::doctor::Status::Ok);
@@ -477,7 +477,7 @@ impl Pool {
         let tenant_cgroup = crate::cgroup::Hierarchy::discover()
             .ok()
             .map(|h| h.tenant(&f.name));
-        let backend = crate::backend::for_isolation(f.isolation)?;
+        let backend = crate::backend::for_isolation(f.isolation, &self.config.paths)?;
 
         match mode {
             Mode::Exec => self.serve_exec(f, config, backend.as_ref(), tenant_cgroup),
@@ -646,7 +646,9 @@ impl Pool {
         Err(Error::BackendUnavailable {
             backend: "pool",
             reason: "warm-exec enters Linux namespaces".into(),
-            remedy: "run Zygo inside a Linux VM or container (macOS shim is phase 5)".into(),
+            remedy: "run Zygo inside a Linux VM or container; on macOS the `zygo` \
+                 binary normally forwards into one it manages"
+                .into(),
         })
     }
 
@@ -987,13 +989,49 @@ impl WarmFn {
         // The window the handshake exists for: the child is alive but has run
         // no tenant code, so this is the only moment its limits can be set —
         // and the only moment its secrets can be put where it will find them.
-        let request_cgroup = self.admit(&id, pid);
+        // The host pid is what makes the deadline enforceable, and it is
+        // resolved *here*, once, for both of the things that need it: moving
+        // the child into its own cgroup, and signalling it if there is no
+        // cgroup to kill.
+        //
+        // B-12: this used to be resolved inside `admit`, which returned `None`
+        // when the translation failed — and `None` is also what it returns
+        // when per-request cgroups are simply off. The two were
+        // indistinguishable, so a child whose pid could not be translated got
+        // no cgroup, was never signalled, and **ran past its deadline
+        // untouched**. Resolving it again at kill time does not help: by then
+        // it can fail for a second reason.
+        //
+        // A child this supervisor just forked, parked waiting for `GO`, must
+        // be in the agent's `children`. If it is not, something is wrong with
+        // the sandbox rather than with this request, so the sandbox goes —
+        // which is also the only way left to be rid of the parked child.
+        let host_pid = match self.host_pid_of(pid) {
+            Some(host) => host,
+            None => {
+                return self.broken(Error::BackendUnavailable {
+                    backend: "pool",
+                    reason: format!(
+                        "`{}` forked a child this supervisor cannot find on the host \
+                         (agent-local pid {pid}), so its deadline could not be enforced",
+                        self.name
+                    ),
+                    remedy: "the function will be rewarmed; the request was not run".into(),
+                });
+            }
+        };
+        let request_cgroup = admit(
+            self.generation_cgroup.as_deref(),
+            self.per_request_cgroup,
+            &id,
+            host_pid,
+        );
         let _secrets = match self.place_secrets() {
             Ok(lease) => lease,
             Err(e) => {
                 // The child is waiting for `GO` that will never come; kill it
                 // rather than leave it parked in the agent's fork table.
-                self.enforce_deadline(request_cgroup.as_deref(), pid);
+                self.enforce_deadline(request_cgroup.as_deref(), host_pid);
                 self.record(false);
                 return Err(e);
             }
@@ -1020,7 +1058,7 @@ impl WarmFn {
             Err(ReplyError::Gone(reason)) => return self.broken(agent_gone(&self.name, &reason)),
             Err(ReplyError::TimedOut) => {
                 timed_out = true;
-                self.enforce_deadline(request_cgroup.as_deref(), pid);
+                self.enforce_deadline(request_cgroup.as_deref(), host_pid);
                 // The child is dead, so the agent sees end of file on the
                 // result pipe and sends `DONE` by itself. Waiting for it is
                 // what keeps this request's reply from arriving later with
@@ -1169,34 +1207,15 @@ impl WarmFn {
     /// kernel below 5.14 — all we have is the pid the agent reported, which
     /// misses grandchildren. That is a reason to keep per-request cgroups on,
     /// not a reason to skip the kill.
-    fn enforce_deadline(&self, request_cgroup: Option<&std::path::Path>, ns_pid: u32) {
-        // The pid has to be translated first, or a fallback signal goes to
-        // whatever host process happens to hold the agent's namespace-local
-        // number. A pid that cannot be translated is not signalled at all;
-        // the cgroup path, when there is one, does not need it.
-        match self.host_pid_of(ns_pid) {
-            Some(host) => kill_request(request_cgroup, host),
-            None => {
-                if let Some(dir) = request_cgroup {
-                    let _ = crate::cgroup::kill(dir);
-                }
-            }
-        }
-    }
-
-    /// Put the forked child in its own cgroup. Returns the directory to remove
-    /// afterwards, if one was created.
-    fn admit(&self, id: &str, pid: u32) -> Option<PathBuf> {
-        // The pid the agent reported is namespace-local; translate it first.
-        // A pid that cannot be translated still gets its cgroup directory, so
-        // `cgroup.kill` has somewhere to aim, even if nothing was moved.
-        let host = self.host_pid_of(pid)?;
-        admit(
-            self.generation_cgroup.as_deref(),
-            self.per_request_cgroup,
-            id,
-            host,
-        )
+    /// Kill a request that overran, given the host pid resolved at admission.
+    ///
+    /// The pid is passed in rather than translated again. Translating it here
+    /// can fail for reasons that have nothing to do with this request — the
+    /// child may have exited and been reaped between the deadline firing and
+    /// this call — and the old code answered that failure by signalling
+    /// nothing at all.
+    fn enforce_deadline(&self, request_cgroup: Option<&std::path::Path>, host_pid: u32) {
+        kill_request(request_cgroup, host_pid);
     }
 
     /// Translate a pid the agent reported into the pid this process must use.
@@ -1779,7 +1798,7 @@ impl WarmExec {
             kill_request(request_cgroup.as_deref(), entered.pid)
         });
 
-        let exit_status = read_status(&entered);
+        let exit_status = read_status(&entered, STATUS_GRACE);
         let _ = entered.reap_helper();
         let done = Instant::now();
 
@@ -1915,15 +1934,71 @@ fn collect_request(
 }
 
 /// The request's wait status from the helper, or `None` if the helper never
-/// reported one.
+/// reported one *within `grace`*.
+///
+/// The bound is the whole point (B-13). This read used to block for ever, and
+/// it runs immediately after `collect_request` has already given up waiting
+/// for the request — so the one case it is reached in is the case where
+/// something is wrong, and it answered that by hanging the caller instead of
+/// the request. A deadline that is enforced up to the last step and then
+/// abandoned at it is not a deadline.
+///
+/// The descriptor is put in non-blocking mode and polled, because there is no
+/// timed `read` for a pipe. Four bytes arrive in one write or not at all.
 #[cfg(target_os = "linux")]
-fn read_status(entered: &crate::backend::ns::enter::Entered) -> Option<i32> {
+fn read_status(
+    entered: &crate::backend::ns::enter::Entered,
+    grace: std::time::Duration,
+) -> Option<i32> {
     use std::io::Read as _;
-    let mut file = std::fs::File::from(entered.status.try_clone().ok()?);
+    use std::os::fd::AsRawFd as _;
+
+    let fd = entered.status.try_clone().ok()?;
+    let raw = fd.as_raw_fd();
+    let deadline = Instant::now() + grace;
+    let mut file = std::fs::File::from(fd);
     let mut bytes = [0u8; 4];
-    file.read_exact(&mut bytes).ok()?;
-    Some(i32::from_ne_bytes(bytes))
+    let mut have = 0;
+
+    loop {
+        // SAFETY: `raw` is an open descriptor this process owns.
+        let ready = unsafe {
+            let mut pfd = libc::pollfd {
+                fd: raw,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            let ms = left.as_millis().min(i32::MAX as u128) as libc::c_int;
+            libc::poll(&mut pfd, 1, ms)
+        };
+        if ready <= 0 {
+            return None;
+        }
+        match file.read(&mut bytes[have..]) {
+            Ok(0) => return None, // the helper closed without reporting
+            Ok(n) => {
+                have += n;
+                if have == 4 {
+                    return Some(i32::from_ne_bytes(bytes));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
 }
+
+/// How long `read_status` waits for the helper's four bytes.
+///
+/// Generous against the thing it bounds: the helper writes them immediately
+/// after `waitpid` returns, so a second is several orders of magnitude more
+/// than the good case needs, and any amount of waiting is better than none.
+#[cfg(target_os = "linux")]
+const STATUS_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Turn what the request left behind into an [`Outcome`].
 #[cfg(target_os = "linux")]

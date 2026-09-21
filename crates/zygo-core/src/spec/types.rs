@@ -576,15 +576,40 @@ impl Cidr {
     }
 
     /// Blocks that stay denied even when listed, unless `--allow-private-net`
-    /// is given (design doc §3.10: "network access to the host").
+    /// is given: "network access to the host".
     pub fn is_private_or_link_local(&self) -> bool {
-        match self.addr {
-            IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
-            IpAddr::V6(v6) => {
-                v6.is_loopback()
-                    || (v6.segments()[0] & 0xffc0) == 0xfe80
-                    || (v6.segments()[0] & 0xfe00) == 0xfc00
-            }
+        is_private_addr(self.addr)
+    }
+}
+
+/// The addresses that stay denied in every namespaced network mode.
+///
+/// One definition, because there were three and they disagreed (B-18). The
+/// spec's validator had no carrier-grade NAT range and no unspecified
+/// address; the resolver had both; the nftables set had CGNAT. So
+/// `allow = ["100.64.0.1:443"]` passed validation, told the user nothing, and
+/// was then dropped by the ruleset — a rule that looks accepted and is dead.
+///
+/// These are the same blocks `PRIVATE_V4` and `PRIVATE_V6` install, and the
+/// test below holds the two lists to each other rather than to a comment.
+pub fn is_private_addr(addr: IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                // 100.64.0.0/10, carrier-grade NAT: the range a cloud provider
+                // puts its own services on.
+                || (o[0] == 100 && (o[1] & 0xC0) == 64)
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                // fe80::/10 link-local, fc00::/7 unique-local.
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
         }
     }
 }
@@ -629,19 +654,54 @@ impl FromStr for AllowRule {
             return Err(ParseError::new("allow rule", s, "empty"));
         }
 
-        // Split host from port on the last colon, but only when what follows is
-        // numeric — otherwise a bare IPv6 address would lose its tail.
-        let (host_part, port) = match t.rsplit_once(':') {
-            Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
-                let port: u16 = p
-                    .parse()
-                    .map_err(|_| ParseError::new("allow rule", s, "port must be 1–65535"))?;
-                if port == 0 {
-                    return Err(ParseError::new("allow rule", s, "port must be 1–65535"));
-                }
-                (h, Some(port))
+        let parse_port = |p: &str| -> Result<u16, ParseError> {
+            let port: u16 = p
+                .parse()
+                .map_err(|_| ParseError::new("allow rule", s, "port must be 1–65535"))?;
+            if port == 0 {
+                return Err(ParseError::new("allow rule", s, "port must be 1–65535"));
             }
-            _ => (t, None),
+            Ok(port)
+        };
+
+        // Host and port, which an IPv6 address makes less obvious than it
+        // looks: the address is full of colons, so "split on the last one"
+        // turns `2001:db8::1` into the host `2001:db8:` on **port 1** — a rule
+        // that parses, reports nothing, and permits something nobody asked
+        // for (B-17). Brackets are the standard way to say which colons belong
+        // to the address, and a bare literal is recognised as one.
+        let (host_part, port) = if let Some(rest) = t.strip_prefix('[') {
+            let (inside, after) = rest.split_once(']').ok_or_else(|| {
+                ParseError::new(
+                    "allow rule",
+                    s,
+                    "a `[` needs a matching `]`: `[2001:db8::1]:443`",
+                )
+            })?;
+            let port = match after {
+                "" => None,
+                other => match other.strip_prefix(':') {
+                    Some(p) => Some(parse_port(p)?),
+                    None => {
+                        return Err(ParseError::new(
+                            "allow rule",
+                            s,
+                            "after `]` only `:port` may follow",
+                        ));
+                    }
+                },
+            };
+            (inside, port)
+        } else if t.parse::<std::net::Ipv6Addr>().is_ok() {
+            // A bare IPv6 literal: every colon belongs to the address.
+            (t, None)
+        } else {
+            match t.rsplit_once(':') {
+                Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
+                    (h, Some(parse_port(p)?))
+                }
+                _ => (t, None),
+            }
         };
 
         let host = if host_part.contains('/') {
@@ -805,6 +865,50 @@ impl Serialize for Cpu {
 
 #[cfg(test)]
 mod tests {
+
+    /// An IPv6 address in `allow` is an address, not a host and a port.
+    ///
+    /// `2001:db8::1` used to parse as the host `2001:db8:` on port 1: it
+    /// looked accepted, matched nothing anyone meant, and opened port 1 on a
+    /// prefix instead (B-17).
+    #[test]
+    fn an_ipv6_literal_in_allow_keeps_all_of_its_colons() {
+        let bare: AllowRule = "2001:db8::1".parse().expect("a bare v6 literal");
+        assert_eq!(bare.port, None, "a bare literal names no port");
+        match &bare.host {
+            HostPattern::Exact(h) => assert_eq!(h, "2001:db8::1"),
+            other => panic!("expected an exact host, got {other:?}"),
+        }
+
+        let with_port: AllowRule = "[2001:db8::1]:443".parse().expect("a bracketed v6");
+        assert_eq!(with_port.port, Some(443));
+        match &with_port.host {
+            HostPattern::Exact(h) => assert_eq!(h, "2001:db8::1"),
+            other => panic!("expected an exact host, got {other:?}"),
+        }
+
+        let bracketed_bare: AllowRule = "[::1]".parse().expect("brackets without a port");
+        assert_eq!(bracketed_bare.port, None);
+
+        // And the ordinary cases still split where they always did.
+        let v4: AllowRule = "10.0.0.1:5432".parse().expect("a v4 host and port");
+        assert_eq!(v4.port, Some(5432));
+        let name: AllowRule = "api.example.com:443".parse().expect("a name and port");
+        assert_eq!(name.port, Some(443));
+        let no_port: AllowRule = "api.example.com".parse().expect("a name alone");
+        assert_eq!(no_port.port, None);
+
+        // Malformed brackets are refused rather than guessed at.
+        assert!(
+            "[2001:db8::1".parse::<AllowRule>().is_err(),
+            "unclosed bracket"
+        );
+        assert!(
+            "[2001:db8::1]x".parse::<AllowRule>().is_err(),
+            "junk after `]`"
+        );
+        assert!("[2001:db8::1]:0".parse::<AllowRule>().is_err(), "port zero");
+    }
     use super::*;
 
     #[test]

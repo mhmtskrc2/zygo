@@ -1,6 +1,6 @@
 //! `zygo run` — a one-shot sandbox.
 //!
-//! The launcher itself is phase 1.3; what works today is everything up to it:
+//! What this command owns is everything up to the launcher:
 //! resolve the spec and flags, make sure the image is in the store, build the
 //! rootfs view and the mount plan. `--dry-run` prints exactly that, which is
 //! also how the plan gets reviewed without a Linux host.
@@ -157,7 +157,7 @@ pub fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<u8> {
     let overlay_supported = !matches!(
         resolved.isolation,
         zygo_core::spec::Isolation::Gvisor | zygo_core::spec::Isolation::Vm
-    ) && zygo_core::doctor::run()
+    ) && zygo_core::doctor::run(store.paths())
         .checks
         .iter()
         .any(|c| c.name == "overlayfs (userns)" && c.status == zygo_core::doctor::Status::Ok);
@@ -241,7 +241,7 @@ pub fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<u8> {
         terminal = Some(pty);
     }
 
-    let backend = backend::for_isolation(resolved.isolation)?;
+    let backend = backend::for_isolation(resolved.isolation, store.paths())?;
     let mut sandbox = backend.start(&config)?;
 
     // The slave belongs to the sandbox now; holding it open here would keep the

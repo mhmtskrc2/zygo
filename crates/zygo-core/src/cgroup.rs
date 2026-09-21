@@ -96,7 +96,9 @@ impl Hierarchy {
         Err(Error::BackendUnavailable {
             backend: "ns",
             reason: "cgroup v2 only exists on Linux".into(),
-            remedy: "run inside a Linux VM or container; macOS support is phase 5".into(),
+            remedy: "run inside a Linux VM or container; on macOS the `zygo` binary \
+                     normally forwards into one it manages"
+                .into(),
         })
     }
 
@@ -125,7 +127,7 @@ impl Hierarchy {
     /// function shared the tenant cgroup, and on a kernel with `cgroup.kill`
     /// (5.14+) retiring the old one killed its replacement — and then every
     /// rewarm after it, each retiring the one before. Found on 6.5; invisible
-    /// on the 5.10 phase 0 measured on, where the fallback signalled one pid.
+    /// on the 5.10 this was measured on, where the fallback signalled one pid.
     ///
     /// The name is unique per supervisor lifetime: the pid keeps it apart from
     /// a dead supervisor's leftovers, the counter from this supervisor's own

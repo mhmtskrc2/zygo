@@ -3,7 +3,7 @@
 #
 # The Pi is the test target and not the build host: it has no toolchain and
 # little disk, so the binary and the guest kernel are built here and copied
-# over. That is the arrangement §2 of docs/vm_implementation.md settled on, and
+# over. That is the arrangement the VM plan settled on, and
 # this is it written down instead of remembered.
 #
 # It refuses to run on top of somebody else's session (V9): the data directory,

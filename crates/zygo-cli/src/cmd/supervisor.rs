@@ -236,7 +236,20 @@ pub fn up(cli: &Cli, file: Option<&std::path::Path>, relock: bool) -> anyhow::Re
     let mut brought_up = Vec::new();
     let mut replaced = Vec::new();
     let mut unchanged = Vec::new();
-    let mut failed = Vec::new();
+    // Name *and* reason, and collected rather than printed as they happen.
+    //
+    // `up --json` used to write one document per failure from inside this
+    // loop and then a summary document at the end, so its output was several
+    // JSON values concatenated — which `json.load` rejects and `jq` only
+    // accepts with `-s` (E-14). Two of the failure branches printed nothing
+    // at all in JSON mode, so the reason was simply lost. One document, with
+    // every failure and why, is what a caller can actually read.
+    let mut failed: Vec<serde_json::Value> = Vec::new();
+    let mut failed_names: Vec<String> = Vec::new();
+    let mut note_failure = |name: &str, reason: String| {
+        failed.push(serde_json::json!({ "name": name, "reason": reason }));
+        failed_names.push(name.to_string());
+    };
 
     for name in &names {
         let resolved = spec
@@ -284,7 +297,7 @@ pub fn up(cli: &Cli, file: Option<&std::path::Path>, relock: bool) -> anyhow::Re
                         )
                     );
                 }
-                failed.push(name.clone());
+                note_failure(name, drift.to_string());
                 continue;
             }
         }
@@ -295,7 +308,7 @@ pub fn up(cli: &Cli, file: Option<&std::path::Path>, relock: bool) -> anyhow::Re
                 if !cli.json {
                     println!("{} {name} — {e:#}", style.red("✗"));
                 }
-                failed.push(name.clone());
+                note_failure(name, format!("{e:#}"));
                 continue;
             }
         };
@@ -379,11 +392,18 @@ pub fn up(cli: &Cli, file: Option<&std::path::Path>, relock: bool) -> anyhow::Re
             other => {
                 // Keep going: one function that cannot start is not a reason to
                 // leave the rest of the project down.
-                if !cli.json {
+                //
+                // `report_failure` is for a command whose *whole* answer is one
+                // failure; here it would be one JSON document per function on
+                // top of the summary. In JSON mode the reason is collected
+                // instead, and printed once, below.
+                if cli.json {
+                    note_failure(name, failure_reason(&other));
+                } else {
                     print!("{} {name} — ", style.red("✗"));
+                    report_failure(cli, &other)?;
+                    note_failure(name, failure_reason(&other));
                 }
-                report_failure(cli, &other)?;
-                failed.push(name.clone());
             }
         }
     }
@@ -404,7 +424,7 @@ pub fn up(cli: &Cli, file: Option<&std::path::Path>, relock: bool) -> anyhow::Re
             "failed": failed,
             "locked": locked_now,
         }))?;
-    } else if !failed.is_empty() {
+    } else if !failed_names.is_empty() {
         println!();
         println!(
             "{}",
@@ -412,11 +432,11 @@ pub fn up(cli: &Cli, file: Option<&std::path::Path>, relock: bool) -> anyhow::Re
                 "  {} of {} functions are up; {} did not start",
                 brought_up.len(),
                 names.len(),
-                failed.len()
+                failed_names.len()
             ))
         );
     }
-    Ok(u8::from(!failed.is_empty()))
+    Ok(u8::from(!failed_names.is_empty()))
 }
 
 /// `zygo down` — stop every function the spec file declares.
@@ -664,6 +684,21 @@ pub fn stop(cli: &Cli, name: Option<&str>, all: bool) -> anyhow::Result<u8> {
 /// `BUSY` is not an error: it is the answer to "can you take this right now",
 /// and it gets its own exit code so a shell loop can tell it from a failure and
 /// retry rather than give up.
+/// A one-line reason from a failure response, for collecting rather than
+/// printing. See `up`'s `note_failure`.
+fn failure_reason(response: &Response) -> String {
+    match response {
+        Response::Busy {
+            in_flight,
+            queued,
+            limit,
+            ..
+        } => format!("busy: {in_flight} of {limit} in flight, {queued} queued"),
+        Response::Error { code, message } => format!("{}: {message}", code.as_str()),
+        other => format!("unexpected response: {other:?}"),
+    }
+}
+
 pub(super) fn report_failure(cli: &Cli, response: &Response) -> anyhow::Result<u8> {
     match response {
         Response::Busy {

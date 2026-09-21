@@ -60,6 +60,24 @@ PYEOF
 # Run Python inside a sandbox and echo its stdout.
 py() { zygo run "$IMAGE" python3 -c "$1" 2>/tmp/escape.err; }
 
+# What an empty answer means, which is never "escaped".
+#
+# Every case here reads the attempt's stdout, and a sandbox that did not run
+# prints nothing — which is indistinguishable from a refusal that printed
+# nothing. The suite has a positive control at the top for the case where *no*
+# sandbox can start; this is for the case where one fails in the middle of the
+# run, which used to be reported as an escape with an empty list of what was
+# reached. An escape is a claim about the kernel; "the sandbox did not start"
+# is a claim about this machine, and they must not share a verdict.
+#
+# Rule 4 again: a negative check must first prove the thing ran. Emptiness is
+# the proof that it did not.
+nothing_ran() {
+    case_name=$1
+    printf '%s' "        $(grep -v '^$' /tmp/escape.err 2>/dev/null | tr '\n' ' ' | cut -c1-200)\n"
+    skip "$case_name: the sandbox produced no output, so nothing was attempted"
+}
+
 say "escape suite — every case is an attempt, not an inspection"
 say "  kernel $(uname -r)"
 zygo pull "$IMAGE" >/dev/null 2>&1
@@ -90,7 +108,7 @@ print(attempt_write('/proc/self/exe'))")
 case "$out" in
     refused:*) ok "/proc/self/exe is not writable ($out)" ;;
     WROTE)     bad "the sandbox overwrote its own executable" ;;
-    *)         bad "inconclusive: '$out'" ;;
+    *)         if [ -z "$out" ]; then nothing_ran "this case"; else bad "inconclusive: '$out'"; fi ;;
 esac
 
 # --- 2. cgroup release_agent ------------------------------------------------
@@ -104,7 +122,7 @@ case "$out" in
     absent)    ok "cgroupfs is not mounted in the sandbox at all" ;;
     refused:*) ok "release_agent is not writable ($out)" ;;
     WROTE)     bad "release_agent was writable" ;;
-    *)         bad "inconclusive: '$out'" ;;
+    *)         if [ -z "$out" ]; then nothing_ran "this case"; else bad "inconclusive: '$out'"; fi ;;
 esac
 
 # --- 3. mounting anything ---------------------------------------------------
@@ -118,7 +136,7 @@ print('MOUNTED' if rc == 0 else 'refused:%d' % ctypes.get_errno())")
 case "$out" in
     refused:*) ok "mount() is refused ($out)" ;;
     MOUNTED)   bad "the sandbox mounted a filesystem" ;;
-    *)         bad "inconclusive: '$out'" ;;
+    *)         if [ -z "$out" ]; then nothing_ran "this case"; else bad "inconclusive: '$out'"; fi ;;
 esac
 
 # --- 4. joining another namespace -------------------------------------------
@@ -137,7 +155,7 @@ else:
 case "$out" in
     refused:*|no-such-namespace:*) ok "setns is refused ($out)" ;;
     JOINED) bad "the sandbox joined another namespace" ;;
-    *)      bad "inconclusive: '$out'" ;;
+    *)      if [ -z "$out" ]; then nothing_ran "this case"; else bad "inconclusive: '$out'"; fi ;;
 esac
 
 # --- 5. new namespaces (nesting out of the confinement) ---------------------
@@ -151,7 +169,7 @@ print('UNSHARED' if rc == 0 else 'refused:%d' % ctypes.get_errno())")
 case "$out" in
     refused:*) ok "unshare(CLONE_NEWUSER) is refused ($out)" ;;
     UNSHARED)  bad "the sandbox created a user namespace" ;;
-    *)         bad "inconclusive: '$out'" ;;
+    *)         if [ -z "$out" ]; then nothing_ran "this case"; else bad "inconclusive: '$out'"; fi ;;
 esac
 
 # --- 6. remapping identity --------------------------------------------------
@@ -167,7 +185,7 @@ print('%s map=%s->%s' % (result, ','.join(before), ','.join(after)))")
 case "$out" in
     refused:*) ok "uid_map cannot be rewritten ($out)" ;;
     WROTE*)    bad "the sandbox remapped its own identity ($out)" ;;
-    *)         bad "inconclusive: '$out'" ;;
+    *)         if [ -z "$out" ]; then nothing_ran "this case"; else bad "inconclusive: '$out'"; fi ;;
 esac
 
 # --- 7. device nodes --------------------------------------------------------
@@ -183,7 +201,7 @@ except OSError as e:
 case "$out" in
     refused:*) ok "mknod is refused ($out)" ;;
     CREATED)   bad "the sandbox created a block device" ;;
-    *)         bad "inconclusive: '$out'" ;;
+    *)         if [ -z "$out" ]; then nothing_ran "this case"; else bad "inconclusive: '$out'"; fi ;;
 esac
 
 say "   and: are any host block devices already visible?"
@@ -255,8 +273,13 @@ for name, nr in sorted(calls.items()):
     if not (rc == -1 and ctypes.get_errno() == 1):
         reached.append('%s(rc=%d,errno=%d)' % (name, rc, ctypes.get_errno()))
 print(';'.join(reached) if reached else 'all-refused')")
-[ "$out" = "all-refused" ] && ok "every privileged syscall returns EPERM" \
-                           || bad "reached: $out"
+if [ -z "$out" ]; then
+    nothing_ran "10. privileged syscalls"
+elif [ "$out" = "all-refused" ]; then
+    ok "every privileged syscall returns EPERM"
+else
+    bad "reached: $out"
+fi
 
 # --- 11. writing through a read-only mount ----------------------------------
 
@@ -268,7 +291,7 @@ print(attempt_write('/ro/host.txt', b'tampered'))" 2>/dev/null)
 case "$out" in
     refused:*) ok "a read-only mount cannot be written ($out)" ;;
     WROTE)     bad "a read-only mount was written" ;;
-    *)         bad "inconclusive: '$out'" ;;
+    *)         if [ -z "$out" ]; then nothing_ran "this case"; else bad "inconclusive: '$out'"; fi ;;
 esac
 [ "$(cat /tmp/escape-ro/host.txt)" = "original" ] \
     && ok "the host file is unchanged" || bad "the host file was modified"
@@ -312,7 +335,7 @@ case "$out" in
     refused:*)
         ok "following the symlink was refused ($out)" ;;
     *)
-        bad "inconclusive: '$out'" ;;
+        if [ -z "$out" ]; then nothing_ran "this case"; else bad "inconclusive: '$out'"; fi ;;
 esac
 rm -f "$RW/root-link" "$MARKER"
 

@@ -59,6 +59,16 @@ Three causes, in order of likelihood:
   `workdir` defaults to `/app` and falls back to `/` when the image lacks it;
   `zygo run --workdir /where …` sets it.
 
+### A dependency build failed (exit 1)
+
+`pip` could not resolve a requirement, or `apt` could not find a package. The
+message carries the last forty lines of the build's own output, which is where
+the reason is.
+
+The exit code is **1**, not 125: the host is fine, the input is wrong, and a
+CI job that retries on another machine would fail there too. 125 is reserved
+for a build that could not *start*.
+
 ### "this host cannot run sandboxes" (exit 125)
 
 `zygo doctor` will say which of the preconditions is missing. The common ones
@@ -221,6 +231,33 @@ Without flags it removes only what nothing can reach: layers of images that
 were removed, and caches whose image is gone. `--blobs` drops the compressed
 copy of every unpacked layer, which roughly halves the store and costs a
 download if a layer directory is ever lost.
+
+## The `vm` backend
+
+### "the guest kernel is not installed"
+
+```bash
+zygo backend install vm
+```
+
+It is a separate file because it is GPL where this binary is Apache-2.0, and
+because it is twenty megabytes against a fifteen megabyte budget. From a
+checkout, `make vm-kernel` builds it and `zygo doctor` reports it once it is
+in place.
+
+### A `vm` sandbox cannot write anywhere
+
+That is correct today, and it is the backend's largest gap. The guest's root
+is read-only — enforced by the VMM, because the directory behind it is the
+image cache every sandbox on that image shares — and nothing mounts a
+writable `/tmp` inside the guest yet. Use `--isolation ns` for anything that
+writes.
+
+### `KVM GICv3 creation failed, falling back to KVM GICv2`
+
+Noise, not an error. On a host whose interrupt controller is GICv2 — a
+Raspberry Pi, for instance — libkrun tries the newer one first and falls back.
+Guests boot either way.
 
 ## On a Mac
 

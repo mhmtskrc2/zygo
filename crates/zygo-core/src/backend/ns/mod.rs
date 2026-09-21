@@ -120,18 +120,31 @@ pub struct NsBackend {
     /// Where per-tenant cgroups are created. `None` means limits are not
     /// applied — only reachable when the caller explicitly accepted that.
     hierarchy: Option<cgroup::Hierarchy>,
+    paths: crate::Paths,
 }
 
 impl NsBackend {
     pub fn new() -> Self {
+        Self::with_paths(&crate::Paths::from_env())
+    }
+
+    /// The backend, against a given data directory.
+    ///
+    /// `ns` does not read that directory itself; it is here because
+    /// `availability` gathers a `doctor` report, and one line of that report —
+    /// the guest kernel — is about a data directory. Passing the caller's
+    /// keeps every backend answering about the same one.
+    pub fn with_paths(paths: &crate::Paths) -> Self {
         Self {
             hierarchy: cgroup::Hierarchy::discover().ok(),
+            paths: paths.clone(),
         }
     }
 
     /// Use a specific cgroup hierarchy instead of discovering one. For tests.
     pub fn with_hierarchy(hierarchy: cgroup::Hierarchy) -> Self {
         Self {
+            paths: crate::Paths::from_env(),
             hierarchy: Some(hierarchy),
         }
     }
@@ -150,7 +163,7 @@ impl Backend for NsBackend {
             );
         }
 
-        let report = doctor::run();
+        let report = doctor::run(&self.paths);
         if report.supports(Isolation::Ns) {
             return Availability::Available;
         }
@@ -294,6 +307,32 @@ impl NsSandbox {
         Ok(())
     }
 
+    /// Wait for a sandbox that is *running*, with no deadline of its own.
+    ///
+    /// This is `--timeout 0` — "as long as it takes" — and it is a separate
+    /// method because the bounded wait below is for a sandbox that has already
+    /// been killed. `wait()` used to route the no-timeout case through that
+    /// one, which waits ten seconds, **sends a SIGKILL halfway through**, and
+    /// then gives up: a healthy program asked to run without a limit was
+    /// killed after five seconds (B-14). Nothing else read `--allow-unlimited`
+    /// and then imposed a limit.
+    fn reap_until_it_exits(&mut self) -> Result<i32> {
+        if let Some(code) = self.exit_code {
+            return Ok(code);
+        }
+        let mut status: libc::c_int = 0;
+        // SAFETY: `status` is a live local; the pid is our own child.
+        let rc = unsafe { libc::waitpid(self.pid as libc::pid_t, &mut status, 0) };
+        if rc < 0 {
+            return Err(Error::primitive(
+                "waitpid",
+                "the sandbox process could not be reaped",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        Ok(self.record_exit(status))
+    }
+
     fn reap(&mut self, block: bool) -> Result<Option<i32>> {
         if let Some(code) = self.exit_code {
             return Ok(Some(code));
@@ -318,6 +357,15 @@ impl NsSandbox {
             ));
         }
 
+        Ok(Some(self.record_exit(status)))
+    }
+
+    /// Everything that happens once, when the sandbox is known to have ended.
+    ///
+    /// Shared by both waits so that the teardown cannot belong to one of them:
+    /// the cgroup's account of *why* it ended is readable only here, and a
+    /// path that skipped this left `pasta` running and a cgroup behind.
+    fn record_exit(&mut self, status: libc::c_int) -> i32 {
         let code = exit_code_of(status);
         self.exit_code = Some(code);
         self.state = SandboxState::Cold;
@@ -347,7 +395,7 @@ impl NsSandbox {
                 let _ = std::fs::remove_dir(tenant);
             }
         }
-        Ok(Some(code))
+        code
     }
 }
 
@@ -387,11 +435,11 @@ impl Sandbox for NsSandbox {
 
     fn wait(&mut self) -> Result<i32> {
         if self.timeout.is_zero() {
-            return self.reap(true).map(|c| c.unwrap_or(0));
+            return self.reap_until_it_exits();
         }
 
         // Poll rather than block, so the wall-clock limit can be enforced.
-        // The supervisor will replace this with a timerfd in phase 2; for a
+        // The supervisor replaces this with a timerfd of its own; for a
         // one-shot `run` the polling cost is irrelevant next to the program.
         let deadline = Instant::now() + self.timeout;
         let mut backoff = Duration::from_micros(200);
@@ -604,16 +652,24 @@ pub fn launch(config: &SandboxConfig, hierarchy: Option<&cgroup::Hierarchy>) -> 
             // queued behind it for ever. That is what a wedged supervisor on
             // a Raspberry Pi turned out to be — this thread parked in
             // `pipe_read` with no end in sight.
+            // Both of these paths are failures with the child still alive:
+            // one is "it never reported and never execed", the other is "it
+            // reported why it could not start". `reap` only *waits* for it,
+            // so a child that is wedged — which is exactly the first case —
+            // was waited on rather than killed, and on the second the child
+            // was mid-failure and might still be running (B-15). `kill` ends
+            // the process tree and then reaps, which is what a failed start
+            // owes the host.
             let payload = match read_to_end_within(err_read, START_TIMEOUT) {
                 Ok(payload) => payload,
                 Err(e) => {
-                    let _ = sandbox.reap(true);
+                    let _ = sandbox.kill();
                     return Err(e);
                 }
             };
 
             if !payload.is_empty() {
-                let _ = sandbox.reap(true);
+                let _ = sandbox.kill();
                 return Err(launch_failure(&payload));
             }
 
@@ -626,7 +682,10 @@ pub fn launch(config: &SandboxConfig, hierarchy: Option<&cgroup::Hierarchy>) -> 
                 match crate::net::linux::recv_fd(sock.as_raw_fd()) {
                     Ok(dir) => sandbox.secrets_dir = Some(dir),
                     Err(e) => {
-                        let _ = sandbox.reap(true);
+                        // Same as the two above: the sandbox is up and has
+                        // hardened, so waiting for it to end on its own is
+                        // waiting for something that will not happen.
+                        let _ = sandbox.kill();
                         return Err(Error::primitive(
                             "recvmsg",
                             "the sandbox did not hand back /run/secrets; \

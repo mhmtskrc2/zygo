@@ -176,10 +176,19 @@ impl Availability {
 }
 
 /// Pick the backend for an isolation level on this host.
-pub fn for_isolation(isolation: Isolation) -> Result<Box<dyn Backend>> {
+///
+/// `paths` is passed rather than re-derived, and that is the whole point of
+/// the argument. `VmBackend` looks up its guest kernel under the data
+/// directory, and when it called `Paths::from_env()` for itself a caller that
+/// had been given `--data-root` got a backend pointing at the *default* data
+/// directory: `zygo --data-root /tmp/x run --isolation vm` found a kernel that
+/// was not in `/tmp/x`, and `doctor` reported one that was not there either.
+/// Same failure as `Paths::with_runtime` guards against, one layer down — two
+/// halves of a layout derived independently agree until the day they do not.
+pub fn for_isolation(isolation: Isolation, paths: &crate::Paths) -> Result<Box<dyn Backend>> {
     let backend: Box<dyn Backend> = match isolation {
         #[cfg(target_os = "linux")]
-        Isolation::Ns => Box::new(ns::NsBackend::new()),
+        Isolation::Ns => Box::new(ns::NsBackend::with_paths(paths)),
         #[cfg(not(target_os = "linux"))]
         Isolation::Ns => Box::new(Unimplemented {
             name: "ns",
@@ -191,7 +200,7 @@ pub fn for_isolation(isolation: Isolation) -> Result<Box<dyn Backend>> {
                      binary normally forwards into one it manages"
                 .into(),
         }),
-        Isolation::Vm => Box::new(vm::VmBackend::new()),
+        Isolation::Vm => Box::new(vm::VmBackend::with_paths(paths)),
         Isolation::Gvisor => Box::new(gvisor::GvisorBackend::new()),
     };
 
@@ -237,7 +246,7 @@ mod tests {
 
     /// `Box<dyn Backend>` is not `Debug`, so `unwrap_err` is unavailable.
     fn expect_error(isolation: Isolation) -> Error {
-        match for_isolation(isolation) {
+        match for_isolation(isolation, &crate::Paths::from_env()) {
             Ok(_) => panic!("{isolation} unexpectedly available"),
             Err(e) => e,
         }
@@ -249,7 +258,7 @@ mod tests {
     /// answers. A backend that is merely absent must never read as a bug.
     #[test]
     fn gvisor_is_unavailable_only_for_a_reason_the_user_can_act_on() {
-        match for_isolation(Isolation::Gvisor) {
+        match for_isolation(Isolation::Gvisor, &crate::Paths::from_env()) {
             // A host with runsc on its PATH: nothing to assert but that it
             // resolved to the real backend rather than a placeholder.
             Ok(backend) => assert_eq!(backend.name(), "gvisor"),

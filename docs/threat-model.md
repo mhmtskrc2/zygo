@@ -27,8 +27,12 @@ for. Three trust classes, from the design:
 | T2 | Authenticated, contracted customers | `ns` + strict seccomp + Landlock + a network allowlist | A kernel local-privilege-escalation CVE — historically a few critical ones a year |
 | T3 | Anonymous, hostile | `vm` | A VMM or KVM CVE, which are much rarer |
 
-**The `vm` backend cannot be relied on yet.** It builds and links, and no host
-available to this project has booted a guest on it. Until it can, T3 workloads do not have the boundary the
+**The `vm` backend runs one-shot sandboxes.** A guest boots, the program runs
+under a kernel of its own, and the root filesystem is read-only at the device
+rather than by a mount option the guest could change. What it does not have
+yet: any writable scratch inside the guest, networking, warm functions, and
+its own in-guest cgroups, seccomp and Landlock — so a tenant's limits are the
+VMM's host-side cgroup and nothing finer. Until those land, T3 workloads do not have the boundary the
 design assigns them, and the honest answer for anonymous code today is a
 separate machine.
 

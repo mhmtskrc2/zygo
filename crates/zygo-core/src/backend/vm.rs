@@ -4,7 +4,7 @@
 //! It exports a C ABI from a Rust crate, so a cargo dependency and an rlib are
 //! the whole mechanism: no `.so`, no `dlopen`, no C static library. That is
 //! what keeps `dist-linux`'s one static musl binary intact, and it is the
-//! route measured in `make vm-build` (V1 in `docs/vm_implementation.md`).
+//! route measured in `make vm-build`.
 //!
 //! # The shape
 //!
@@ -45,6 +45,63 @@ use crate::spec::Network;
 /// D8; `krun_set_kernel` is what makes it possible, and it is present in the
 /// pinned libkrun.
 pub const KERNEL_FILE: &str = "Image";
+
+/// Which of libkrun's kernel formats this file is, read from the file.
+///
+/// This was `KRUN_KERNEL_FORMAT_RAW`, unconditionally, and the guest kernel
+/// that `make vm-kernel` produces is an **ELF**. libkrun then copied the ELF
+/// headers to the guest's load address and jumped into them, so the vCPU
+/// executed whatever those bytes decoded to: it spun at 100%, printed nothing,
+/// and was killed by its deadline.
+///
+/// That failure was read as an interrupt-controller problem for a long time,
+/// because the host is GICv2 and libkrun logs a GICv3 fallback on the way past.
+/// It was not: with `earlycon=pl011` on the command line — which prints from
+/// the first lines of `start_kernel`, long before any interrupt is wanted —
+/// the guest still produced nothing, which places the failure *before* the
+/// kernel began, not in what it did afterwards.
+///
+/// So the format is read from the file rather than assumed. The magic numbers
+/// are the ones the loader itself keys on: `\x7fELF`, gzip's `\x1f\x8b`, and
+/// the arm64 Image header's `ARM\x64` at offset 56 (`arch/arm64/kernel/image.h`).
+/// A file that is none of them is a refusal that names what was found, because
+/// the alternative is this bug again with different bytes.
+#[cfg(all(feature = "vm", target_os = "linux"))]
+fn kernel_format(kernel: &Path) -> std::result::Result<u32, String> {
+    use std::io::Read as _;
+
+    let mut head = [0u8; 64];
+    let mut file = std::fs::File::open(kernel).map_err(|e| format!("{}: {e}", kernel.display()))?;
+    let read = file
+        .read(&mut head)
+        .map_err(|e| format!("{}: {e}", kernel.display()))?;
+    if read < 64 {
+        return Err(format!(
+            "{} is {read} bytes, too small to be a kernel",
+            kernel.display()
+        ));
+    }
+
+    if &head[..4] == b"\x7fELF" {
+        return Ok(ffi::KRUN_KERNEL_FORMAT_ELF);
+    }
+    if head[..2] == [0x1f, 0x8b] {
+        return Ok(ffi::KRUN_KERNEL_FORMAT_IMAGE_GZ);
+    }
+    // The arm64 Image header carries `ARM\x64` at offset 56; x86's bzImage
+    // carries `HdrS` at 514, and either way an uncompressed image is what
+    // libkrun calls "raw".
+    if &head[56..60] == b"ARM\x64" {
+        return Ok(ffi::KRUN_KERNEL_FORMAT_RAW);
+    }
+
+    Err(format!(
+        "{} is not a kernel libkrun can load: it is neither an ELF, nor gzip, \
+         nor an arm64 Image (first bytes {:02x?})",
+        kernel.display(),
+        &head[..8]
+    ))
+}
 
 /// How much RAM the guest gets beyond what the spec asked for.
 ///
@@ -191,7 +248,7 @@ pub fn refuse_what_v1_cannot_do(config: &SandboxConfig) -> Result<()> {
             "the vm backend cannot hold a warm sandbox yet: a request enters a guest \
              over vsock, not through `setns`"
                 .into(),
-            "use --isolation ns for warm functions; see todo.md, phase 2.5 M3",
+            "use --isolation ns for warm functions",
         ));
     }
     if config.agent_fd.is_some() {
@@ -199,7 +256,7 @@ pub fn refuse_what_v1_cannot_do(config: &SandboxConfig) -> Result<()> {
             "the runtime agent is handed its control socket as an inherited descriptor, \
              and a guest inherits nothing from the host"
                 .into(),
-            "use --isolation ns for agent runtimes; see todo.md, phase 2.5 M3",
+            "use --isolation ns for agent runtimes",
         ));
     }
     if config.network != Network::None {
@@ -209,13 +266,13 @@ pub fn refuse_what_v1_cannot_do(config: &SandboxConfig) -> Result<()> {
                  `{}`, which needs the VMM inside Zygo's own network namespace",
                 config.network
             ),
-            "use --isolation ns for a networked sandbox; see todo.md, phase 2.5 M4",
+            "use --isolation ns for a networked sandbox",
         ));
     }
     if config.stdio.is_some() {
         return Err(unsupported(
             "a terminal inside a guest is virtio-console, which is not wired up".into(),
-            "drop --tty, or use --isolation ns; see todo.md, phase 2.5 M5",
+            "drop --tty, or use --isolation ns",
         ));
     }
     Ok(())
@@ -234,7 +291,17 @@ pub fn refuse_what_v1_cannot_do(config: &SandboxConfig) -> Result<()> {
 mod ffi {
     use std::os::raw::{c_char, c_int};
 
+    /// The tag libkrun gives the root filesystem. `krun_set_root` uses it
+    /// internally; naming it is what lets the root be configured instead.
+    pub const KRUN_FS_ROOT_TAG: &str = "/dev/root";
+
+    /// The DAX window `krun_set_root` picks for the root, matched here so that
+    /// asking for a read-only root changes the permission and nothing else.
+    pub const ROOT_SHM_SIZE: u64 = 1 << 29;
+
     pub const KRUN_KERNEL_FORMAT_RAW: u32 = 0;
+    pub const KRUN_KERNEL_FORMAT_ELF: u32 = 1;
+    pub const KRUN_KERNEL_FORMAT_IMAGE_GZ: u32 = 4;
 
     // Declared ahead of the milestone that uses each, because the signatures
     // are the thing that has to be right and reading them all from one header
@@ -246,6 +313,15 @@ mod ffi {
         pub fn krun_create_ctx() -> i32;
         pub fn krun_set_vm_config(ctx: u32, vcpus: u8, ram_mib: u32) -> i32;
         pub fn krun_set_root(ctx: u32, root_path: *const c_char) -> i32;
+        /// The root filesystem with its own parameters, the one that matters
+        /// being `read_only`. `krun_set_root` is this call with the flag off.
+        pub fn krun_add_virtiofs3(
+            ctx: u32,
+            tag: *const c_char,
+            path: *const c_char,
+            shm_size: u64,
+            read_only: bool,
+        ) -> i32;
         pub fn krun_set_kernel(
             ctx: u32,
             kernel_path: *const c_char,
@@ -370,6 +446,31 @@ fn start_vm(config: &SandboxConfig, kernel: &Path) -> Result<Box<dyn Sandbox>> {
             remedy: "run `zygo doctor` and check `make vm-kernel` produced a usable Image".into(),
         });
     }
+
+    // End of file on that pipe is ambiguous. The child closes `err_write`
+    // deliberately, just before `krun_start_enter` — and the kernel closes it
+    // for the child too, when the child dies. Both arrive here as EOF with
+    // nothing read, so EOF alone cannot mean "the monitor is up".
+    //
+    // `wait` catches a monitor that dies later, because it reaps in its poll
+    // loop; nothing caught one that died here, and `serve` never calls `wait`,
+    // so a warm function could be declared warm against a process that was
+    // already gone. This closes that: it cannot catch a death that happens
+    // after the close and before this line, but the answer it does give is
+    // never wrong.
+    #[cfg(target_os = "linux")]
+    if let Ok(Some(code)) = sandbox.reap(false) {
+        return Err(Error::BackendUnavailable {
+            backend: "vm",
+            reason: format!(
+                "the monitor exited with status {code} before the guest was up, and said nothing"
+            ),
+            remedy: "run with ZYGO_KRUN_CONSOLE=/path to capture the guest's console, \
+                     which is the only channel a kernel that has not reached its init has"
+                .into(),
+        });
+    }
+
     sandbox.state = SandboxState::Warm;
     let _ = std::io::stderr().as_raw_fd();
     Ok(Box::new(sandbox))
@@ -457,19 +558,48 @@ fn child_becomes_the_vmm(
         );
 
         let kernel_c = cstr(&kernel.to_string_lossy());
+        let format = match kernel_format(kernel) {
+            Ok(f) => f,
+            Err(why) => fail(&why),
+        };
         check(
             ffi::krun_set_kernel(
                 ctx,
                 kernel_c.as_ptr(),
-                ffi::KRUN_KERNEL_FORMAT_RAW,
+                format,
                 std::ptr::null(),
                 std::ptr::null(),
             ),
             "krun_set_kernel",
         );
 
+        // The root goes in **read-only**, and that is a correctness fix rather
+        // than a hardening nicety.
+        //
+        // `krun_set_root` is `krun_add_virtiofs3` with `read_only: false`, and
+        // the directory it shares is the store's flattened rootfs for an image
+        // digest — one directory, shared by every sandbox that ever runs that
+        // image. With the share writable, `echo x > /pwned` inside a guest
+        // created `cache/flat/<digest>/pwned` **on the host**, where the next
+        // tenant on the same image would find it. The `ns` backend has always
+        // mounted this read-only; the `vm` backend, whose whole claim is a
+        // stronger boundary, had the weaker one.
+        //
+        // Read-only on the *host* side, at the device, not a `ro` mount option
+        // in the guest: a guest kernel is the tenant's to subvert, and a
+        // remount is one syscall. The VMM refusing the write is not.
         let root_c = cstr(&rootfs.to_string_lossy());
-        check(ffi::krun_set_root(ctx, root_c.as_ptr()), "krun_set_root");
+        let root_tag_c = cstr(ffi::KRUN_FS_ROOT_TAG);
+        check(
+            ffi::krun_add_virtiofs3(
+                ctx,
+                root_tag_c.as_ptr(),
+                root_c.as_ptr(),
+                ffi::ROOT_SHM_SIZE,
+                true,
+            ),
+            "krun_add_virtiofs3(root, read-only)",
+        );
 
         let workdir_c = cstr(&config.workdir.to_string_lossy());
         check(
@@ -700,6 +830,42 @@ mod tests {
         config
     }
 
+    /// The guest kernel is looked for under the paths the caller handed in,
+    /// and nowhere else.
+    ///
+    /// `VmBackend::new` derives them from the environment, which is right for
+    /// a caller that has none. The bug this pins is the *other* caller: with
+    /// `--data-root /tmp/x`, `for_isolation` used to build a `VmBackend` that
+    /// had gone back to the environment for its own answer, so the backend
+    /// found a kernel in the default data directory while everything else in
+    /// that command — the image store, the run directory — was under
+    /// `/tmp/x`. `doctor` reported the same phantom.
+    ///
+    /// Both directions are checked, because a test that only proves "absent
+    /// when absent" also passes for a backend that always says absent.
+    #[test]
+    fn the_guest_kernel_is_found_under_the_paths_the_caller_gave() {
+        let root = tempfile::tempdir().expect("a temp dir");
+        let paths = crate::Paths::rooted(root.path());
+
+        let empty = VmBackend::with_paths(&paths);
+        assert!(
+            empty.kernel.is_none(),
+            "a data root with no kernel must not produce one"
+        );
+
+        std::fs::create_dir_all(paths.krun()).expect("the krun directory");
+        let installed = paths.krun().join(KERNEL_FILE);
+        std::fs::write(&installed, b"not a kernel, but a file").expect("the kernel file");
+
+        let found = VmBackend::with_paths(&paths);
+        assert_eq!(
+            found.kernel.as_deref(),
+            Some(installed.as_path()),
+            "the kernel under the given data root is the one the backend uses"
+        );
+    }
+
     /// Every refusal names what it will not do and where that is tracked.
     ///
     /// A backend that silently does less than it was asked for is the failure
@@ -713,34 +879,43 @@ mod tests {
             "an ordinary one-shot sandbox must not be refused"
         );
 
-        /// One refusal: what is asked for, how to ask for it, and the
-        /// milestone whose name the message has to carry.
+        /// One refusal: what is asked for, how to ask for it, and a word the
+        /// message has to carry so that it is about *this* request.
+        ///
+        /// What is asserted is the remedy, not a roadmap. An earlier version
+        /// required each message to name the milestone that would implement
+        /// the feature — "M3", "M4" — which is a fact about this project's
+        /// plan and no use at all to the person who just typed the command.
+        /// A refusal owes them two things: which of their choices was the
+        /// problem, and what to do instead.
         struct Case {
             what: &'static str,
             ask: fn(&mut SandboxConfig),
-            milestone: &'static str,
+            /// A word from the request itself, so the message cannot be a
+            /// generic "unsupported" that fits every case equally.
+            names: &'static str,
         }
 
         let cases = [
             Case {
                 what: "a held sandbox",
                 ask: |c| c.hold = true,
-                milestone: "M3",
+                names: "warm",
             },
             Case {
                 what: "an agent runtime",
                 ask: |c| c.agent_fd = Some(3),
-                milestone: "M3",
+                names: "agent",
             },
             Case {
                 what: "a networked sandbox",
                 ask: |c| c.network = Network::Egress,
-                milestone: "M4",
+                names: "network",
             },
             Case {
                 what: "a terminal",
                 ask: |c| c.stdio = Some(0),
-                milestone: "M5",
+                names: "terminal",
             },
         ];
 
@@ -751,8 +926,13 @@ mod tests {
                 .expect_err(&format!("{} should be refused", case.what));
             let text = format!("{err}");
             assert!(
-                text.contains(case.milestone),
-                "the refusal for {} should name the milestone that will do it: {text}",
+                text.contains(case.names),
+                "the refusal for {} should say which choice it is about: {text}",
+                case.what
+            );
+            assert!(
+                text.contains("--isolation ns") || text.contains("--tty"),
+                "the refusal for {} should say what to do instead: {text}",
                 case.what
             );
         }

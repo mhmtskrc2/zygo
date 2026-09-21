@@ -1,7 +1,7 @@
 //! `zygo bench` — measure the warm path against the real pool.
 //!
 //! PoC 3 measured p50 1887 µs against a 2000 µs budget: **6% of headroom**. The
-//! supervisor's queue, timers and metrics all land on this path in phase 2, so
+//! supervisor's queue, timers and metrics all land on this path, so
 //! a number that is only ever measured by hand will be spent without anyone
 //! noticing. This runs the same measurement against `zygo_core::pool`, which is
 //! the code that ships.
@@ -19,7 +19,7 @@ use crate::output::{self, Style};
 const WARM_P50_BUDGET_US: f64 = 2_000.0;
 const WARM_P99_BUDGET_US: f64 = 10_000.0;
 
-/// The phase 2 acceptance criterion for warm-exec: "a Go binary under 3 ms".
+/// The acceptance criterion for warm-exec: "a Go binary under 3 ms".
 ///
 /// A different budget because it is a different thing: an agent request is a
 /// `fork()` of a warm interpreter, a warm-exec request is a fresh process
@@ -211,7 +211,7 @@ fn warm(
 /// Requirement N2: a cold `run` with the image already in the store.
 const COLD_BUDGET_MS: f64 = 50.0;
 
-/// The design document's phase 2 acceptance criterion for throughput.
+/// The acceptance criterion for throughput.
 const LOAD_TARGET_PER_SECOND: f64 = 600.0;
 
 /// `zygo bench cold` — build a sandbox, run a program, tear it down.
@@ -254,13 +254,13 @@ fn cold(cli: &Cli, n: u32, image: &str, command: Option<&[String]>) -> anyhow::R
         },
     )?;
 
-    let overlay = zygo_core::doctor::run()
+    let overlay = zygo_core::doctor::run(&paths)
         .checks
         .iter()
         .any(|c| c.name == "overlayfs (userns)" && c.status == zygo_core::doctor::Status::Ok);
     let mount_points = zygo_core::sandbox::mount::required_mount_points(&resolved.mounts);
     let view = store.rootfs_view(&entry.layers, overlay, &mount_points)?;
-    let backend = zygo_core::backend::for_isolation(resolved.isolation)?;
+    let backend = zygo_core::backend::for_isolation(resolved.isolation, &paths)?;
 
     let style = Style::stdout();
     eprintln!(
@@ -345,7 +345,7 @@ fn cold(cli: &Cli, n: u32, image: &str, command: Option<&[String]>) -> anyhow::R
 
 /// `zygo bench load` — sustained throughput through one warm function.
 ///
-/// The design document's phase 2 acceptance criterion is ≥ 600 requests/s at a
+/// The acceptance criterion is ≥ 600 requests/s at a
 /// concurrency of 4. Measuring it needs concurrent callers, and the interesting
 /// number is not just the total: [`CallTiming::lock`] says how much of each
 /// request was spent waiting for the connection, which is the difference
@@ -646,7 +646,7 @@ impl Report {
         self.p50 < self.p50_budget && (!self.p99_is_meaningful() || self.p99 < WARM_P99_BUDGET_US)
     }
 
-    /// How much of the budget is left. The number worth watching: phase 0
+    /// How much of the budget is left. The number worth watching: the first
     /// measured 6%, and the supervisor's own work still has to fit in it.
     fn headroom_percent(&self) -> f64 {
         (self.p50_budget - self.p50) / self.p50_budget * 100.0

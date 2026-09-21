@@ -181,25 +181,30 @@ fn rm(cli: &Cli, references: &[String]) -> anyhow::Result<u8> {
         removed.extend(gone);
     }
 
+    let opts = PruneOptions {
+        dry_run: false,
+        unused_for: None,
+        blobs: false,
+    };
+
     if cli.json {
+        // One document: what was removed, and what the prune that follows
+        // reclaimed. Two `output::json` calls on one stdout is not JSON.
+        let mut pruned = serde_json::Value::Null;
+        // What only those images kept alive is unreferenced now.
+        let code = prune_with(cli, &opts, Some(&mut pruned))?;
         output::json(&serde_json::json!({
             "removed": removed.iter().map(|e| e.reference.clone()).collect::<Vec<_>>(),
+            "pruned": pruned,
         }))?;
-    } else {
-        for entry in &removed {
-            println!("{} {}", style.dim("removed"), entry.reference);
-        }
+        return Ok(code);
     }
 
+    for entry in &removed {
+        println!("{} {}", style.dim("removed"), entry.reference);
+    }
     // What only those images kept alive is unreferenced now.
-    prune(
-        cli,
-        &PruneOptions {
-            dry_run: false,
-            unused_for: None,
-            blobs: false,
-        },
-    )
+    prune(cli, &opts)
 }
 
 /// What one `prune` was asked to consider.
@@ -238,6 +243,20 @@ struct Reclaimable {
 /// Every cache Zygo writes is reachable from here, and each is reported on its
 /// own line so the size that matters is the one the user can see.
 fn prune(cli: &Cli, opts: &PruneOptions) -> anyhow::Result<u8> {
+    prune_with(cli, opts, None)
+}
+
+/// `prune`, with somewhere for its JSON to go other than stdout.
+///
+/// `image rm` prunes what the removed images kept alive, and in JSON mode it
+/// used to print its own `{"removed": …}` document and then let `prune` print
+/// a second one — two JSON values on one stream, which `json.load` rejects
+/// (E-14). Passing a slot here lets the caller fold both into one document.
+fn prune_with(
+    cli: &Cli,
+    opts: &PruneOptions,
+    into: Option<&mut serde_json::Value>,
+) -> anyhow::Result<u8> {
     let dry_run = opts.dry_run;
     let paths = super::paths(cli);
     let store = Store::new(paths.clone());
@@ -333,7 +352,7 @@ fn prune(cli: &Cli, opts: &PruneOptions) -> anyhow::Result<u8> {
     let count: usize = categories.iter().map(|c| c.items.len()).sum();
 
     if cli.json {
-        output::json(&serde_json::json!({
+        let report = serde_json::json!({
             "dry_run": dry_run,
             "bytes": total,
             "items": count,
@@ -343,7 +362,11 @@ fn prune(cli: &Cli, opts: &PruneOptions) -> anyhow::Result<u8> {
                 "bytes": c.items.iter().map(|i| i.bytes).sum::<u64>(),
                 "items": c.items.iter().map(|i| i.label.clone()).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
-        }))?;
+        });
+        match into {
+            Some(slot) => *slot = report,
+            None => output::json(&report)?,
+        }
         if !dry_run {
             remove(&categories);
         }

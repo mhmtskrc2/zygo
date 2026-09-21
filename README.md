@@ -38,6 +38,59 @@ Zygo's two numbers are medians with the image cached, on the machines named in
 VMs on an Apple-silicon Mac, all aarch64; Docker's are its commonly measured
 range. The program's own start-up is on top of every column.
 
+The same four columns as lifecycles. On the left, what every request walks
+through; on the right, what is left when it is done.
+
+```text
+ONE-SHOT ── one request, one fresh sandbox
+════════════════════════════════════════════════════════════════════
+
+  docker run                          zygo run
+  ──────────                          ────────
+  docker CLI                          zygo
+     │                                   │  clone3 · mounts · cgroup
+     ▼                                   │  seccomp · Landlock · execve
+  dockerd                                ▼
+     │                                your program
+     ▼                                   │
+  containerd                             ▼ exit
+     │                                nothing left behind
+     ▼
+  shim
+     │
+     ▼
+  runc
+     │
+     ▼
+  your program
+     │
+     ▼ exit
+  container object stays → docker rm
+
+  300–1000 ms                         ~18 ms
+
+
+WARM ── pay once, then request after request
+═══════════════════════════════════════════════════════════════════════════
+
+  docker run -d ──▶ one container, shared state
+                       │
+                       ├─ docker exec ▶ dockerd ▶ containerd ▶ shim ▶ runc ▶ process
+                       ├─ docker exec ▶ dockerd ▶ containerd ▶ shim ▶ runc ▶ process
+                       │                                   same state, every time
+                       ▼
+                    docker rm                                50–100 ms per exec
+
+
+  zygo serve ──▶ warm zygote: interpreter up, imports done, waiting
+                       │
+                       ├─ zygo exec ▶ fork() ▶ process
+                       ├─ zygo exec ▶ fork() ▶ process
+                       │               clean copy, every time
+                       ▼
+                    zygo down                                ~1.7 ms per exec
+```
+
 ## Try it
 
 ```bash
@@ -179,11 +232,14 @@ scenarios shaped by use case rather than by mechanism run on two of the three.
 [What Zygo costs](docs/performance.md) has the numbers, the hosts, and what is
 *not* measured.
 
-**Not ready.** The `vm` backend builds and links libkrun, and no host available
-to this project has booted a guest on it, so nothing about it is claimed.
-`gvisor` runs one-shot sandboxes only; warm functions and networked sandboxes
-on it are refused with a reason rather than weakened. Zygo scales to one
-machine, and answers `429` past its capacity. No external audit has been done.
+**Not ready.** The `vm` backend boots a guest and runs one-shot sandboxes —
+about 400 ms against `ns`'s 40 ms on the same host, for a kernel of the
+guest's own — but it has no writable scratch, no network and no warm
+functions yet, so it is a hardware boundary for code that reads and computes
+and not much else. `gvisor` runs one-shot sandboxes only; warm functions and
+networked sandboxes on it are refused with a reason rather than weakened.
+Zygo scales to one machine, and answers `429` past its capacity. No external
+audit has been done.
 
 ## Documentation
 

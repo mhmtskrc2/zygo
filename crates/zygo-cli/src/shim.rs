@@ -219,8 +219,40 @@ pub fn install_args() -> Vec<OsString> {
 /// forwarded command, and reading six megabytes to discover that nothing
 /// changed would cost more than the command. The two together move whenever
 /// the binary is rebuilt or reinstalled, which is the only case that matters.
-pub fn build_stamp(len: u64, modified_secs: u64) -> String {
-    format!("{len}-{modified_secs}")
+///
+/// `instance` is what makes the stamp about *this* VM. The stamp lives on the
+/// host, so `limactl delete zygo` used to leave it behind: the VM was gone,
+/// its copy of the binary with it, and the next command read the stale stamp,
+/// concluded the binary was installed and failed inside the new VM with
+/// "zygo: not found" (B-27). Mixing in something that changes when the
+/// instance is recreated makes a deleted VM look exactly like a changed
+/// binary, which is a case this already handles.
+pub fn build_stamp(len: u64, modified_secs: u64, instance: u64) -> String {
+    format!("{len}-{modified_secs}-{instance}")
+}
+
+/// A number that changes when the Lima instance is recreated.
+///
+/// Its configuration file's modification time: Lima writes one when the
+/// instance is created, so a `delete` and a fresh `start` give a different
+/// value. Zero when it cannot be read — which is the safe direction, because
+/// it will not match a stamp written when it could, and the binary is
+/// reinstalled.
+#[cfg(target_os = "macos")]
+fn instance_generation() -> u64 {
+    let Some(home) = std::env::var_os("HOME") else {
+        return 0;
+    };
+    let config = PathBuf::from(home)
+        .join(".lima")
+        .join(INSTANCE)
+        .join("lima.yaml");
+    std::fs::metadata(config)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// `limactl start --tty=false zygo`, or the same with a template the first
@@ -246,7 +278,33 @@ pub fn start_args(vm: Vm, template: &Path) -> Vec<OsString> {
 /// makes a relative path in `args` mean the same file on both sides; without
 /// it `limactl` lands in the user's home directory and `serve handler.py`
 /// resolves somewhere else entirely.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn forward_args<I, S>(workdir: &Path, args: I) -> Vec<OsString>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<OsString>,
+{
+    forward_args_with_env(workdir, args, &[])
+}
+
+/// The same, with variables to set inside the VM.
+///
+/// `limactl shell` runs the command with the *guest's* environment, so
+/// everything the caller's shell had was dropped at the boundary (B-28):
+/// `ZYGO_API_TOKEN` never reached `zygo api`, `ZYGO_LOG=debug` turned nothing
+/// on, and a secret named by `secrets = [...]` — which is read from the shell
+/// that runs `up` — arrived empty, so the command failed on a Mac and worked
+/// on Linux.
+///
+/// They are passed to `env` inside the VM rather than set on `limactl`, which
+/// would only change `limactl`'s own environment. A name is refused rather
+/// than quoted if it is not a plain identifier, because it is going through a
+/// shell on the other side.
+pub fn forward_args_with_env<I, S>(
+    workdir: &Path,
+    args: I,
+    env: &[(OsString, OsString)],
+) -> Vec<OsString>
 where
     I: IntoIterator<Item = S>,
     S: Into<OsString>,
@@ -256,10 +314,26 @@ where
         "--workdir".into(),
         workdir.into(),
         INSTANCE.into(),
-        "zygo".into(),
     ];
+    if !env.is_empty() {
+        out.push("env".into());
+        for (k, v) in env {
+            let mut pair = k.clone();
+            pair.push("=");
+            pair.push(v);
+            out.push(pair);
+        }
+    }
+    out.push("zygo".into());
     out.extend(args.into_iter().map(Into::into));
     out
+}
+
+/// Whether a name is safe to hand to `env` on the other side of a shell.
+pub fn is_forwardable_env_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// What `zygo doctor` can say about the VM without starting it.
@@ -373,10 +447,30 @@ pub fn forward(cli: &Cli) -> anyhow::Result<Option<u8>> {
     ensure_running(&limactl, &paths)?;
     ensure_guest_binary(&limactl, &paths)?;
 
-    let status = std::process::Command::new(&limactl)
-        .args(forward_args(&workdir, std::env::args_os().skip(1)))
-        .status()
+    let env = environment_to_forward(cli);
+    let mut child = std::process::Command::new(&limactl)
+        .args(forward_args_with_env(
+            &workdir,
+            std::env::args_os().skip(1),
+            &env,
+        ))
+        .spawn()
         .with_context(|| format!("could not run {}", limactl.display()))?;
+
+    // Relay the signals the user can send to *this* process.
+    //
+    // Ctrl-C reaches `limactl` anyway, because it goes to the whole foreground
+    // process group. A `kill` by pid does not: it arrives here, this process
+    // ends, and `limactl` — and the sandbox behind it — carries on with
+    // nobody left to wait for it (B-28). So the pid is published and the two
+    // signals a person actually sends are forwarded.
+    FORWARDED_CHILD.store(child.id() as i32, std::sync::atomic::Ordering::SeqCst);
+    install_signal_relay();
+
+    let status = child
+        .wait()
+        .with_context(|| format!("could not wait for {}", limactl.display()))?;
+    FORWARDED_CHILD.store(0, std::sync::atomic::Ordering::SeqCst);
 
     // "Stop everything" includes the machine Zygo started to do it in. A VM
     // holding no warm functions is four gigabytes of a laptop doing nothing,
@@ -394,6 +488,91 @@ pub fn forward(cli: &Cli) -> anyhow::Result<Option<u8>> {
     // it can; where the child died on a signal there is none to relay, and
     // 128 + n is what every shell reports.
     Ok(Some(exit_status(&status)))
+}
+
+/// The `limactl` child's pid while one is running, for the signal relay.
+///
+/// An `AtomicI32` because a signal handler may only touch things that are
+/// async-signal-safe, and a lock is not one of them.
+#[cfg(target_os = "macos")]
+static FORWARDED_CHILD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+#[cfg(target_os = "macos")]
+extern "C" fn relay_signal(signum: libc::c_int) {
+    let pid = FORWARDED_CHILD.load(std::sync::atomic::Ordering::SeqCst);
+    if pid > 0 {
+        // SAFETY: `kill` is async-signal-safe; `pid` is a child of ours or
+        // already gone, in which case this fails harmlessly.
+        unsafe { libc::kill(pid, signum) };
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn install_signal_relay() {
+    for signum in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        let handler: extern "C" fn(libc::c_int) = relay_signal;
+        // SAFETY: installing a handler that only calls `kill` and reads an
+        // atomic, both of which are safe from a signal context.
+        unsafe { libc::signal(signum, handler as *const () as libc::sighandler_t) };
+    }
+}
+
+/// Which of this shell's variables the command inside the VM should see.
+///
+/// Everything would be wrong — `PATH`, `HOME` and `SHELL` describe the Mac and
+/// would mislead the guest. What is forwarded is what Zygo itself reads, plus
+/// the secrets the command is about to look for:
+///
+/// * every `ZYGO_*` variable: the API token, the log level, the data root;
+/// * for `serve`, the names given with `--secret`;
+/// * for `up` and `serve`, the names a spec's `secrets = [...]` lists, because
+///   those are read from the shell that runs the command and that shell is on
+///   this side of the boundary.
+///
+/// A secret's *value* crosses as an argument to `env` inside the VM, which is
+/// visible in the guest's process list for the length of the command. That is
+/// the same exposure `zygo up` has on Linux, where the value is in this
+/// process's environment, and it is why secrets reach the sandbox as files
+/// rather than as environment variables once they are across.
+#[cfg(target_os = "macos")]
+fn environment_to_forward(cli: &Cli) -> Vec<(OsString, OsString)> {
+    let mut wanted: Vec<String> = Vec::new();
+
+    for (key, _) in std::env::vars_os() {
+        if let Some(name) = key.to_str()
+            && name.starts_with("ZYGO_")
+        {
+            wanted.push(name.to_string());
+        }
+    }
+
+    match &cli.command {
+        crate::cli::Command::Serve(args) => wanted.extend(args.secrets.iter().cloned()),
+        crate::cli::Command::Up { .. } => {}
+        _ => {}
+    }
+    if matches!(
+        cli.command,
+        crate::cli::Command::Up { .. } | crate::cli::Command::Serve(_)
+    ) && let Ok(Some(spec)) = zygo_core::spec::Spec::discover(None)
+    {
+        for f in spec.functions.values() {
+            if let Some(names) = &f.secrets {
+                wanted.extend(names.iter().cloned());
+            }
+        }
+        if let Some(names) = &spec.defaults.secrets {
+            wanted.extend(names.iter().cloned());
+        }
+    }
+
+    wanted.sort();
+    wanted.dedup();
+    wanted
+        .into_iter()
+        .filter(|name| is_forwardable_env_name(name))
+        .filter_map(|name| std::env::var_os(&name).map(|value| (OsString::from(name), value)))
+        .collect()
 }
 
 /// Whether this command has nothing left to do once the VM is already down.
@@ -500,7 +679,7 @@ fn ensure_guest_binary(limactl: &Path, paths: &zygo_core::paths::Paths) -> anyho
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let want = build_stamp(meta.len(), modified);
+    let want = build_stamp(meta.len(), modified, instance_generation());
 
     let stamp = stamp_path();
     if std::fs::read_to_string(&stamp).is_ok_and(|have| have.trim() == want) {
@@ -985,18 +1164,93 @@ mod tests {
 
     #[test]
     fn a_rebuild_changes_the_stamp_and_an_unchanged_file_does_not() {
+        const VM: u64 = 1_700_000_500;
         assert_eq!(
-            build_stamp(6_364_736, 1_700_000_000),
-            build_stamp(6_364_736, 1_700_000_000)
+            build_stamp(6_364_736, 1_700_000_000, VM),
+            build_stamp(6_364_736, 1_700_000_000, VM)
         );
         assert_ne!(
-            build_stamp(6_364_736, 1_700_000_000),
-            build_stamp(6_364_800, 1_700_000_000)
+            build_stamp(6_364_736, 1_700_000_000, VM),
+            build_stamp(6_364_800, 1_700_000_000, VM)
         );
         assert_ne!(
-            build_stamp(6_364_736, 1_700_000_000),
-            build_stamp(6_364_736, 1_700_000_001)
+            build_stamp(6_364_736, 1_700_000_000, VM),
+            build_stamp(6_364_736, 1_700_000_001, VM)
         );
+    }
+
+    /// A VM that was deleted and recreated needs the binary put back, even
+    /// though the binary on the host has not moved.
+    ///
+    /// B-27: the stamp lived on the host and described only the file, so
+    /// `limactl delete zygo` left it behind claiming an installation that had
+    /// gone with the VM. The next command forwarded into a VM with no `zygo`
+    /// in it.
+    #[test]
+    fn recreating_the_vm_changes_the_stamp_even_when_the_binary_has_not() {
+        let same_binary = (6_364_736, 1_700_000_000);
+        assert_ne!(
+            build_stamp(same_binary.0, same_binary.1, 1_700_000_500),
+            build_stamp(same_binary.0, same_binary.1, 1_700_009_999),
+            "a recreated VM must not match the stamp written for the old one"
+        );
+    }
+
+    /// The environment the caller had is carried into the VM.
+    ///
+    /// B-28: `limactl shell` runs with the *guest's* environment, so a secret
+    /// or a token from the user's shell arrived empty and the command failed
+    /// on a Mac while working on Linux.
+    #[test]
+    fn variables_are_carried_into_the_vm_as_an_env_prefix() {
+        let env = vec![
+            (OsString::from("ZYGO_API_TOKEN"), OsString::from("t0ken")),
+            (OsString::from("STRIPE_KEY"), OsString::from("sk_live_x")),
+        ];
+        let args = forward_args_with_env(Path::new("/Users/m/p"), ["exec", "fetch"], &env);
+        let words: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+
+        // The *last* `zygo` is the binary inside the VM; the first is the
+        // Lima instance, which is also called zygo.
+        let env_at = words
+            .iter()
+            .position(|w| w == "env")
+            .expect("an env prefix");
+        let binary_at = words
+            .iter()
+            .rposition(|w| w == "zygo")
+            .expect("the inner binary");
+        assert!(
+            env_at < binary_at,
+            "env must come before the command it sets up: {words:?}"
+        );
+        assert!(words.contains(&"ZYGO_API_TOKEN=t0ken".to_string()));
+        assert!(words.contains(&"STRIPE_KEY=sk_live_x".to_string()));
+        assert_eq!(words.last().map(String::as_str), Some("fetch"));
+
+        // And with nothing to carry there is no `env` in the way.
+        let plain = forward_args_with_env(Path::new("/Users/m/p"), ["ps"], &[]);
+        assert!(!plain.iter().any(|a| a == "env"));
+    }
+
+    /// A name that is not a plain identifier does not go through a shell.
+    #[test]
+    fn only_ordinary_variable_names_are_forwarded() {
+        for good in ["ZYGO_API_TOKEN", "STRIPE_KEY", "_x", "A1"] {
+            assert!(
+                is_forwardable_env_name(good),
+                "{good} should be forwardable"
+            );
+        }
+        for bad in ["", "1ABC", "A B", "A;rm -rf /", "A=B", "A$X"] {
+            assert!(
+                !is_forwardable_env_name(bad),
+                "{bad:?} should not be forwarded"
+            );
+        }
     }
 
     #[test]

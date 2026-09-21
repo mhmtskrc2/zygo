@@ -140,10 +140,23 @@ impl Store {
 
         std::fs::create_dir_all(self.paths.blobs()).at(self.paths.blobs())?;
         std::fs::create_dir_all(self.paths.tmp()).at(self.paths.tmp())?;
+        // Unique per *attempt*, not per process. The name used to be
+        // `blob-{hex}-{pid}`, which two threads of one process pulling the
+        // same blob share — so they wrote into the same file, and whichever
+        // renamed second published a mixture of the two (B-20). A counter
+        // makes every attempt its own file at no cost.
+        static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let attempt = ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp_path = self
             .paths
             .tmp()
-            .join(format!("blob-{hex}-{}", std::process::id()));
+            .join(format!("blob-{hex}-{}-{attempt}", std::process::id()));
+
+        // And the file is removed on every way out but the successful one.
+        // Before, only the digest-mismatch branch cleaned up, so a read error,
+        // a full disk or a dropped connection each left a part-written blob in
+        // `tmp/` for ever (B-21).
+        let _cleanup = TempFile(&tmp_path);
 
         let mut hasher = Sha256::new();
         let mut written = 0u64;
@@ -164,7 +177,6 @@ impl Store {
 
         let got = hex::encode(hasher.finalize());
         if got != hex {
-            let _ = std::fs::remove_file(&tmp_path);
             return Err(ImageError::DigestMismatch {
                 expected: digest.to_string(),
                 got: format!("sha256:{got}"),
@@ -173,6 +185,8 @@ impl Store {
         }
 
         std::fs::rename(&tmp_path, &final_path).at(&final_path)?;
+        // Renamed, so there is nothing left to remove.
+        _cleanup.keep();
         Ok(written)
     }
 
@@ -457,11 +471,50 @@ impl Store {
 
     // --- index -------------------------------------------------------------
 
+    /// The index, or an empty one — but never an empty one because the file
+    /// was *unreadable*.
+    ///
+    /// "No file yet" and "the file is corrupt" both used to answer with an
+    /// empty list, and the next `put` then wrote that empty list back: one bad
+    /// parse and the store forgot every image it had, silently (B-22). They
+    /// are different situations and only the first is ordinary.
+    ///
+    /// A corrupt index is moved aside rather than deleted, so it can be looked
+    /// at, and the loss is announced. The images themselves are still on disk;
+    /// what is lost is the record of their references, which a `pull` rebuilds.
     fn read_index(&self) -> Vec<ImageEntry> {
-        std::fs::read(self.paths.image_index())
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+        let path = self.paths.image_index();
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            // Nothing written yet: the ordinary first-run case.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(e) => {
+                tracing::error!(
+                    path = %path.display(),
+                    error = %e,
+                    "the image index could not be read; continuing with an empty one, \
+                     and it will be overwritten by the next change"
+                );
+                return Vec::new();
+            }
+        };
+        match serde_json::from_slice(&bytes) {
+            Ok(entries) => entries,
+            Err(e) => {
+                let aside = path.with_extension("json.corrupt");
+                let moved = std::fs::rename(&path, &aside).is_ok();
+                tracing::error!(
+                    path = %path.display(),
+                    error = %e,
+                    kept = moved,
+                    "the image index is not valid JSON; it has been set aside and the \
+                     store will rebuild it. Pulled images are still on disk; their \
+                     references are not, so `zygo images` will look empty until they \
+                     are pulled again"
+                );
+                Vec::new()
+            }
+        }
     }
 
     fn write_index(&self, entries: &[ImageEntry]) -> Result<()> {
@@ -891,6 +944,27 @@ fn remove_whatever_is_there(path: &Path) -> Result<()> {
         std::fs::remove_dir_all(path).at(path)
     } else {
         std::fs::remove_file(path).at(path)
+    }
+}
+
+/// Removes a temporary file unless it was published.
+///
+/// A `?` is an early return, and an early return between "create the temp
+/// file" and "rename it" used to leave that file behind. There were four such
+/// returns and one of them cleaned up (B-21). A guard cannot miss a path the
+/// way a list of cleanup calls can.
+struct TempFile<'a>(&'a std::path::Path);
+
+impl TempFile<'_> {
+    /// The file reached its final name; there is nothing to remove.
+    fn keep(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for TempFile<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.0);
     }
 }
 

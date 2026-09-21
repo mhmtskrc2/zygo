@@ -233,6 +233,16 @@ def _handler_traceback(exc: BaseException) -> str:
     return "".join(traceback.format_exception(type(exc), exc, tb))
 
 
+# A child that could not run the request, by reason. Distinct from any exit
+# code a handler can produce, so the supervisor's log says which happened.
+_EXIT_NO_GO = 121
+"""The supervisor closed the GO pipe without sending GO."""
+
+_EXIT_CHILD_ESCAPED = 122
+"""`run_request` returned instead of exiting; the child left rather than
+unwind into the parent's serve loop."""
+
+
 def run_request(
     handler,
     request: dict,
@@ -252,7 +262,14 @@ def run_request(
         # Wait for the supervisor to place this pid in its own cgroup. Until
         # `GO` arrives the child has the *zygote's* limits, so a runaway
         # allocation here would be billed to the wrong place.
-        os.read(go_fd, 1)
+        #
+        # End of file is not `GO`. A zero-length read means the supervisor
+        # closed the pipe without sending anything — it gave up, or it died —
+        # and running the handler then is running it with the zygote's limits,
+        # which is the one thing this barrier exists to prevent. The child
+        # leaves instead, and the supervisor sees the result pipe close.
+        if len(os.read(go_fd, 1)) != 1:
+            os._exit(_EXIT_NO_GO)
         os.close(go_fd)
 
         # The supervisor's tightening for this child, before any handler code:
@@ -657,8 +674,44 @@ class Agent:
             self._unreaped.append(request.pid)
 
         result["type"] = "DONE"
-        self._wire.send(result)
+        self._send_result(result)
         self._reap_finished()
+
+    def _send_result(self, result: dict) -> None:
+        """Send a `DONE`, or a `DONE` saying why the real one could not go.
+
+        A handler that returns more than the frame limit allows used to raise
+        out of the serve loop and take the agent with it: one oversize return
+        value, and every later request to that function failed until it was
+        rewarmed (B-24). The request is the thing that failed, not the agent,
+        so it is reported as a failed request and the loop carries on.
+
+        The replacement is built from scratch rather than by trimming the
+        original, because whatever made it oversize is in there.
+        """
+        try:
+            self._wire.send(result)
+            return
+        except ValueError as exc:
+            reason = str(exc)
+
+        self._wire.send(
+            {
+                "type": "DONE",
+                "id": result.get("id"),
+                "exit_code": 1,
+                "error": (
+                    f"the handler's result does not fit in one frame ({reason}); "
+                    "return a reference to it — a path in a writable mount, an "
+                    "object key — rather than the bytes"
+                ),
+                "stdout": "",
+                "stderr": "",
+                "peak_rss_kb": result.get("peak_rss_kb", 0),
+                "wall_ms": result.get("wall_ms", 0.0),
+                "cpu_ms": result.get("cpu_ms", 0.0),
+            }
+        )
 
     def _open_fds(self) -> list[int]:
         """Descriptors a newly forked child must not inherit.
@@ -719,8 +772,17 @@ class Agent:
                     os.close(fd)
                 except OSError:
                     pass
-            run_request(self._handler, request, result_w, go_r, self._child_filter)
-            return  # unreachable: run_request calls os._exit
+            # `os._exit` in a `finally`, because the child returning here is
+            # the worst outcome available: it would unwind into the parent's
+            # `serve()` loop and there would be two agents on one socket,
+            # answering each other's requests. `run_request` exits on every
+            # path it knows about; this covers the ones it does not — an
+            # exception before its own try block, a `SystemExit` from handler
+            # code, a bug in this file.
+            try:
+                run_request(self._handler, request, result_w, go_r, self._child_filter)
+            finally:
+                os._exit(_EXIT_CHILD_ESCAPED)
 
         os.close(result_w)
         os.close(go_r)

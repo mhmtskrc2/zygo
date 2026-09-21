@@ -3,7 +3,7 @@
         verify-linux verify-supervisor-linux escape-linux dist-linux \
         fuzz-linux gvisor-linux verify-login-linux verify-shim \
         repro-blue-green-linux verify-api-linux vm-build vm-probe vm-kernel \
-        verify-vm-pi use-cases-linux \
+        verify-vm-pi use-cases-linux vm-use-cases-linux \
         syscall-tables conformance conformance-node examples-go-linux \
         seccomp-matrix-linux fmt lint clean
 
@@ -17,6 +17,7 @@ help:
 	@echo "vm-kernel    build the guest kernel and check its config"
 	@echo "vm-probe     ask whether libkrun links against musl (the vm plan V1)"
 	@echo "verify-vm-pi the vm backend on the Pi, compared with ns"
+	@echo "vm-use-cases-linux  twenty vm cases that need no booted guest"
 	@echo "use-cases-linux  fifty scenarios, by use case rather than by mechanism"
 	@echo "check        type-check the workspace"
 	@echo "conformance  run the agent protocol suite against both reference agents"
@@ -246,11 +247,17 @@ vm-probe: poc/vm-builder
 	@echo ""
 	@echo "the log is in poc/vm-out/v1-probe.log"
 
-# The `vm` backend on a real KVM, compared with `ns`. Needs a host whose KVM
-# offers GICv3 — see V11 — and says so rather than reporting a pass on a host
-# where no guest ran.
+# The `vm` backend on a real KVM, compared with `ns`. Says so rather than
+# reporting a pass on a host where no guest ran — see V11.
 verify-vm-pi: poc/zygo-linux-musl-vm
 	@sh poc/vm_pi.sh
+
+# Twenty use cases for the `vm` backend that do not need the guest to boot:
+# what it refuses, what it resolves, what `doctor` says, and what is left
+# behind when a guest never comes up. `verify_vm.sh` is the other half — the
+# one that needs a working guest — and this is the half that runs today.
+vm-use-cases-linux: poc/zygo-linux-musl-vm poc/zygo-linux-musl
+	@sh poc/vm_use_cases.sh
 
 # Fifty scenarios organised by who is asking rather than by mechanism: an
 # agent tool runner, a platform embedder, multi-tenant functions, untrusted

@@ -470,15 +470,26 @@ fn resolve_layer(
                 "/, /proc, /sys and /dev are set up by the launcher and cannot be overridden",
             ));
         }
-        if seen_targets.insert(m.target.clone(), ()).is_some() {
+        // Duplicates are duplicates of a *place*: `/app/cfg` and `/app//cfg`
+        // are one target written two ways, and letting both through leaves
+        // the launcher to apply them in whatever order it happens to.
+        let target = normalise(&m.target);
+        if !target.is_absolute() {
+            return Err(SpecError::invalid_with(
+                field("mounts"),
+                format!("`{}` is not an absolute path", m.target.display()),
+                "a mount target is a path inside the sandbox, so it starts with `/`",
+            ));
+        }
+        if seen_targets.insert(target.clone(), ()).is_some() {
             return Err(SpecError::invalid(
                 field("mounts"),
-                format!("duplicate mount target `{}`", m.target.display()),
+                format!("duplicate mount target `{}`", target.display()),
             ));
         }
         mounts.push(Mount {
             source: absolutise(base_dir, &m.source),
-            target: m.target,
+            target,
             mode: m.mode,
         });
     }
@@ -576,11 +587,25 @@ fn normalise(p: &Path) -> PathBuf {
     out
 }
 
+/// Whether the launcher already owns this target.
+///
+/// The path is compared after [`normalise`], because the check is about a
+/// place and not about a spelling: `/proc/`, `//proc` and `/proc/../proc` all
+/// name the directory the launcher mounts, and a check on the raw string
+/// waved each of them through (B-19).
+///
+/// The set is the launcher's own [`MANAGED_TARGETS`] plus the root. It used to
+/// be a shorter list written out here, missing `/tmp` and `/run` — both of
+/// which the launcher mounts — so a spec could name one, be told nothing, and
+/// have it quietly replaced.
 fn is_reserved_mount_target(target: &Path) -> bool {
-    matches!(
-        target.to_str(),
-        Some("/") | Some("/proc") | Some("/sys") | Some("/dev")
-    )
+    let normalised = normalise(target);
+    if normalised == Path::new("/") {
+        return true;
+    }
+    crate::sandbox::mount::MANAGED_TARGETS
+        .iter()
+        .any(|m| normalised == Path::new(m))
 }
 
 /// Whether a function name is safe to join into a path.
@@ -608,6 +633,58 @@ fn is_env_name(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// A mount target is refused for the place it names, not the way it is
+    /// spelled — and the set of refused places is the launcher's own.
+    ///
+    /// Both halves were wrong (B-19): the check ran on the raw string, so
+    /// `/proc/` and `/proc/../proc` passed it, and the list left out `/tmp`
+    /// and `/run`, which the launcher mounts over. A spec naming either was
+    /// accepted and then quietly overridden.
+    #[test]
+    fn a_mount_cannot_take_a_path_the_launcher_manages() {
+        for spelling in [
+            "/proc",
+            "/proc/",
+            "//proc",
+            "/proc/../proc",
+            "/./proc",
+            "/tmp",
+            "/tmp/",
+            "/run",
+            "/dev",
+            "/dev/shm",
+            "/dev/pts",
+            "/sys",
+            "/",
+        ] {
+            assert!(
+                is_reserved_mount_target(std::path::Path::new(spelling)),
+                "`{spelling}` names a path the launcher mounts and was allowed"
+            );
+        }
+
+        // And ordinary targets are still allowed, so the check is not
+        // satisfied by refusing everything.
+        for ok in ["/app", "/cache", "/data/in", "/proc-notes", "/tmpfiles"] {
+            assert!(
+                !is_reserved_mount_target(std::path::Path::new(ok)),
+                "`{ok}` is an ordinary target and was refused"
+            );
+        }
+    }
+
+    /// Every path the launcher mounts is one the validator refuses, checked
+    /// against the launcher's list rather than a copy of it.
+    #[test]
+    fn the_validator_refuses_everything_the_launcher_mounts() {
+        for m in crate::sandbox::mount::MANAGED_TARGETS {
+            assert!(
+                is_reserved_mount_target(std::path::Path::new(m)),
+                "the launcher mounts `{m}` and the validator accepts it"
+            );
+        }
+    }
     use super::*;
 
     fn spec(text: &str) -> Spec {

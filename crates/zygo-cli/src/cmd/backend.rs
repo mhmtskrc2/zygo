@@ -15,11 +15,12 @@ pub fn run(cli: &Cli, command: &BackendCommand) -> anyhow::Result<u8> {
 
 fn list(cli: &Cli) -> anyhow::Result<u8> {
     let style = Style::stdout();
+    let paths = super::paths(cli);
     let mut rows = Vec::new();
     let mut json_rows = Vec::new();
 
     for isolation in Isolation::ALL {
-        let (status, detail) = match backend::for_isolation(*isolation) {
+        let (status, detail) = match backend::for_isolation(*isolation, &paths) {
             Ok(_) => ("available".to_string(), String::new()),
             Err(zygo_core::Error::BackendUnavailable { reason, .. }) => {
                 ("unavailable".to_string(), reason)
