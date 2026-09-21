@@ -364,6 +364,7 @@ mod tests {
             Response::Functions {
                 functions: vec![Status {
                     name: "resize".into(),
+                    image: String::new(),
                     state: crate::sandbox::SandboxState::Warm,
                     runtime: "python3.12".into(),
                     rss_kb: 15_000,

@@ -293,6 +293,7 @@ mod tests {
             api_errors: 1,
             functions: vec![Status {
                 name: "resize".into(),
+                image: String::new(),
                 state: SandboxState::Warm,
                 runtime: "python/3.12".into(),
                 rss_kb: 15_000,

@@ -888,6 +888,7 @@ mod tests {
         // Guards the column order, which is the part a script would parse.
         let f = Status {
             name: "resize".into(),
+            image: String::new(),
             state: SandboxState::Warm,
             runtime: "python3.12".into(),
             rss_kb: 15_360,

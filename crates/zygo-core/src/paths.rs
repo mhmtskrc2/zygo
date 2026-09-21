@@ -152,6 +152,57 @@ impl Paths {
         self.runtime.join("tenants").join(name).join("agent.sock")
     }
 
+    /// Take an exclusive, cross-process lock named `key`.
+    ///
+    /// Advisory `flock` on a file under `tmp/`, released when the returned
+    /// guard drops — including when the process dies, which is what makes it
+    /// safe to hold across something slow. Two Zygo processes that would
+    /// otherwise build the same thing twice take the same key and one waits.
+    ///
+    /// It **blocks**. Every caller is in the position of having found work
+    /// that somebody else may be part-way through, and waiting for their
+    /// answer beats racing them to a half-built result.
+    pub fn lock(&self, key: &str) -> Result<Lock> {
+        let dir = self.tmp();
+        std::fs::create_dir_all(&dir).at(&dir)?;
+        let path = dir.join(format!(
+            "{}.lock",
+            key.chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '_'
+                })
+                .collect::<String>()
+        ));
+        let file = std::fs::File::create(&path).at(&path)?;
+        lock_exclusive(&file).at(&path)?;
+        Ok(Lock { _file: file })
+    }
+
+    /// Whether `key` is locked by somebody else right now.
+    ///
+    /// Only ever used to decide whether to *say* something before blocking on
+    /// [`Paths::lock`] — "another command is already doing this" is worth a
+    /// line when the wait is a minute long. Racy by nature, which is why it
+    /// decides nothing else.
+    pub fn is_locked(&self, key: &str) -> bool {
+        let path = self.tmp().join(format!(
+            "{}.lock",
+            key.chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '_'
+                })
+                .collect::<String>()
+        ));
+        let Ok(file) = std::fs::File::open(&path) else {
+            return false;
+        };
+        try_lock_exclusive(&file).is_err()
+    }
+
     /// Create the directories needed before anything is written. Cheap enough
     /// to call on every command; `create_dir_all` on an existing tree is a
     /// handful of `stat`s.
@@ -268,4 +319,69 @@ mod tests {
         assert!(p.layers().is_dir());
         assert!(p.runtime().is_dir());
     }
+    /// The guard that stops two `zygo` commands from starting the Linux VM at
+    /// once. Creating the instance takes about a minute, and a second
+    /// `limactl start` inside that minute fails against the half-made
+    /// directory rather than waiting for it.
+    #[test]
+    fn a_lock_is_exclusive_and_released_on_drop() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let paths = Paths::rooted(tmp.path());
+        paths.ensure().expect("ensure");
+
+        assert!(!paths.is_locked("vm-start"), "nothing holds it yet");
+
+        let held = paths.lock("vm-start").expect("lock");
+        assert!(paths.is_locked("vm-start"), "held now");
+        // A different job is not blocked by this one.
+        assert!(!paths.is_locked("vm-guest-binary"));
+
+        drop(held);
+        assert!(!paths.is_locked("vm-start"), "released on drop");
+    }
+
+    /// The key becomes a filename, so it must not be able to leave `tmp/`.
+    #[test]
+    fn a_lock_key_cannot_escape_the_data_directory() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let paths = Paths::rooted(tmp.path());
+        paths.ensure().expect("ensure");
+
+        let _held = paths.lock("../../etc/passwd").expect("lock");
+        let files: Vec<String> = std::fs::read_dir(paths.tmp())
+            .expect("read")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(files, ["______etc_passwd.lock"], "every separator replaced");
+    }
+}
+
+/// Held for as long as the caller needs exclusivity; released on drop.
+#[derive(Debug)]
+pub struct Lock {
+    _file: std::fs::File,
+}
+
+#[cfg(unix)]
+fn lock_exclusive(file: &std::fs::File) -> std::io::Result<()> {
+    rustix::fs::flock(file, rustix::fs::FlockOperation::LockExclusive)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn lock_exclusive(_file: &std::fs::File) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn try_lock_exclusive(file: &std::fs::File) -> std::io::Result<()> {
+    rustix::fs::flock(file, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
+    // Taken and immediately given back: the question was whether it was free.
+    let _ = rustix::fs::flock(file, rustix::fs::FlockOperation::Unlock);
+    Ok(())
+}
+#[cfg(not(unix))]
+fn try_lock_exclusive(_file: &std::fs::File) -> std::io::Result<()> {
+    Ok(())
 }

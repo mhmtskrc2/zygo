@@ -150,9 +150,6 @@ protocol does not promise otherwise, so this is not a violation — but showing
 the developer their own line first is the argument a code-first runtime makes
 against every alternative, and trimming the harness frame in the child is small.
 
-**`zygo top` is still a placeholder.** It appears in `--help` and exits saying
-which phase brings it.
-
 **Disk.** Three small images totalling 47 MB of layers left a 230 MB data
 directory once flatten caches and venvs were counted. Worth confirming that
 `image prune` reaches both.
@@ -171,9 +168,11 @@ on a Mac measures the shim and concludes the benchmark was optimistic.
 
 Port publishing, detach, `build` and `cp` have no equivalent, all of them
 declared out of scope in §1.4 and §1.6 of the design document. The code is
-consistent with the document. The README is not quite: "drop-in muadili" needs
-its qualifier — the function-shaped slice of Docker — somewhere a skimmer will
-see it.
+consistent with the document, and so is the README, whose first line says
+"function-shaped code". The unqualified promise is in the design document's
+own one-sentence summary (§1), which calls Zygo a drop-in equivalent of
+`docker run` without saying for what — the only place a reader meets the claim
+bare.
 
 ## Suggested order
 
@@ -183,4 +182,19 @@ see it.
 3. Default `zygo run` to the image's entrypoint and cmd, which are already in
    hand, and add the `-v` hint. Both are first-five-minutes friction.
 4. Quiet the `limactl` output, trim the harness traceback frame, and qualify
-   the README's drop-in claim.
+   the design document's drop-in claim.
+
+## Since this was written
+
+The session above is a dated record and the findings are left as they were
+found. What has happened to them since lives in
+[todo.md](../todo.md) under "After test", which was written by checking every
+claim here against the code. Two of those claims did not survive the check:
+
+* **`zygo top` was reported as a placeholder.** It landed the next morning,
+  the rate columns and all. The finding was true when it was written and was
+  stale by the time it was read, which is the ordinary fate of a report
+  against a moving tree.
+* **The README was reported as needing a qualifier on "drop-in".** It does not
+  contain the phrase. The design document does, and that is where the
+  qualifier belongs; the paragraph above is corrected.

@@ -123,6 +123,15 @@ pub fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<u8> {
         .tmp()
         .join(format!("root-{}", std::process::id()));
     std::fs::create_dir_all(&newroot)?;
+    // Removed however this function leaves, not only when it succeeds. The
+    // cleanup used to be one line before the `Ok`, so a run that failed after
+    // the directory was made — a bad mount, a missing image, a kernel that
+    // refused — left it behind, and only a failing run ever did. Found by the
+    // embedder's script driver: its tests fail on purpose, and the tmp
+    // directory filled up with empty `root-<pid>` directories while successful
+    // runs left none.
+    let newroot = Scratch(newroot);
+    let newroot = &newroot.0;
 
     // The image's own config supplies the default command and, just as
     // importantly, `PATH` — without which a bare `python3` cannot be resolved.
@@ -148,7 +157,7 @@ pub fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<u8> {
     };
 
     let mut config =
-        SandboxConfig::from_resolved(&resolved, &view, &newroot, argv, &image_config.env_pairs());
+        SandboxConfig::from_resolved(&resolved, &view, newroot, argv, &image_config.env_pairs());
     config.allow_resolved = net.allowed;
     config.pasta_pid_file = net.pid_file;
 
@@ -193,8 +202,22 @@ pub fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<u8> {
     }
     drop(raw_mode);
 
-    let _ = std::fs::remove_dir(&newroot);
     Ok(code.clamp(0, 255) as u8)
+}
+
+/// A directory that belongs to one run, removed when that run is over.
+///
+/// `remove_dir` rather than `remove_dir_all`: this is a `pivot_root` target
+/// and it is empty once the sandbox is gone. If it is not — a mount that
+/// outlived its namespace — the removal fails and the directory stays, which
+/// is the right way round. Deleting a tree through a live mount point would
+/// reach whatever is mounted there.
+struct Scratch(std::path::PathBuf);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.0);
+    }
 }
 
 /// Relay `SIGINT` and `SIGTERM` to the sandbox's init process.

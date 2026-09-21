@@ -33,6 +33,8 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use zygo_core::spec::Mount;
+
 use crate::cli::{AgentCommand, Cli, Command};
 
 /// The Lima instance Zygo keeps for itself.
@@ -96,6 +98,50 @@ pub fn workdir(cwd: &Path, home: &Path) -> Result<PathBuf, Unmapped> {
             cwd: cwd.to_path_buf(),
             home: home.to_path_buf(),
         })
+    }
+}
+
+/// Mount sources this VM has no counterpart for.
+///
+/// The same rule as [`workdir`], applied to the other half of what a command
+/// brings with it. `workdir` has always refused a command run from outside
+/// `$HOME`, on the stated grounds that forwarding it would silently run
+/// against a directory that is not the one the user is looking at — and a
+/// `--mount` is exactly that, with the silence replaced by a worse noise:
+/// the guest reports `applying a bind mount from the spec failed: No such
+/// file or directory` about a path that plainly exists on the host, and
+/// points at `zygo doctor`, which has nothing to say about it.
+///
+/// Found by running an embedder's script driver against Zygo: it puts its
+/// scratch directory in the system temporary directory, which on macOS is
+/// `/var/folders/…`, and every one of its tests failed on this line.
+///
+/// Relative paths are resolved against `cwd` first, because they mean a
+/// place on this side and the VM never sees them as written.
+pub fn unmapped_mounts<'a>(
+    mounts: impl IntoIterator<Item = &'a Mount>,
+    cwd: &Path,
+    home: &Path,
+) -> Vec<PathBuf> {
+    mounts
+        .into_iter()
+        .map(|m| {
+            if m.source.is_absolute() {
+                m.source.clone()
+            } else {
+                cwd.join(&m.source)
+            }
+        })
+        .filter(|source| !source.starts_with(home))
+        .collect()
+}
+
+/// Every mount the command carries, whichever command it is.
+pub fn mounts_of(command: &Command) -> &[Mount] {
+    match command {
+        Command::Run(args) => &args.sandbox.mounts,
+        Command::Serve(args) => &args.sandbox.mounts,
+        _ => &[],
     }
 }
 
@@ -293,8 +339,39 @@ pub fn forward(cli: &Cli) -> anyhow::Result<Option<u8>> {
     let workdir = workdir(&cwd, &home)
         .map_err(|e| anyhow::anyhow!("{e}\n  → run it from somewhere under {}", home.display()))?;
 
-    ensure_running(&limactl)?;
-    ensure_guest_binary(&limactl)?;
+    // The same rule, for what the command brings with it. Refused here so the
+    // reader is told about a path on the host they are looking at, rather than
+    // by the guest about a path it has never had.
+    let unmapped = unmapped_mounts(mounts_of(&cli.command), &cwd, &home);
+    if let Some(first) = unmapped.first() {
+        anyhow::bail!(
+            "on macOS Zygo runs in a Linux VM, and only {} is shared with it — \
+             but this command mounts {}{}\n  \
+             → move it under {}, or set TMPDIR there if it is a temporary directory",
+            home.display(),
+            first.display(),
+            match unmapped.len() {
+                1 => String::new(),
+                n => format!(" (and {} other{})", n - 1, if n == 2 { "" } else { "s" }),
+            },
+            home.display()
+        );
+    }
+
+    let paths = crate::cmd::paths(cli);
+    paths.ensure()?;
+    // Before anything is started: a stop has nothing to do here.
+    if needs_nothing_when_the_vm_is_down(&cli.command) && !is_running(&limactl)? {
+        if cli.json {
+            crate::output::json(&serde_json::json!({ "stopped": [] }))?;
+        } else {
+            println!("nothing is running; the Linux VM is stopped");
+        }
+        return Ok(Some(0));
+    }
+
+    ensure_running(&limactl, &paths)?;
+    ensure_guest_binary(&limactl, &paths)?;
 
     let status = std::process::Command::new(&limactl)
         .args(forward_args(&workdir, std::env::args_os().skip(1)))
@@ -317,6 +394,22 @@ pub fn forward(cli: &Cli) -> anyhow::Result<Option<u8>> {
     // it can; where the child died on a signal there is none to relay, and
     // 128 + n is what every shell reports.
     Ok(Some(exit_status(&status)))
+}
+
+/// Whether this command has nothing left to do once the VM is already down.
+///
+/// Stopping is the one job a stopped machine has finished. Without this,
+/// `zygo stop --all` on a stopped VM took the ordinary forwarding path:
+/// `ensure_running` booted the machine — sixteen seconds, or fifty-five from
+/// nothing — so that a supervisor which does not exist could be told to stop
+/// functions that do not exist, and then [`stops_everything`] stopped it
+/// again. The narration gave it away, announcing a start from a command whose
+/// entire purpose is the opposite.
+///
+/// `down` and a named `stop` are here for the same reason: they cannot find
+/// anything to stop in a machine that is not running.
+pub fn needs_nothing_when_the_vm_is_down(command: &Command) -> bool {
+    matches!(command, Command::Stop { .. } | Command::Down { .. })
 }
 
 /// Whether this command means the user is finished with the VM.
@@ -380,7 +473,7 @@ pub fn forward(_cli: &Cli) -> anyhow::Result<Option<u8>> {
 /// command, so it compares a stamp kept on the host rather than asking the
 /// guest.
 #[cfg(target_os = "macos")]
-fn ensure_guest_binary(limactl: &Path) -> anyhow::Result<()> {
+fn ensure_guest_binary(limactl: &Path, paths: &zygo_core::paths::Paths) -> anyhow::Result<()> {
     let Some(source) = linux_binary() else {
         // Nothing to install. The guest may already have one — from an
         // earlier release, or put there by hand — so ask before refusing.
@@ -410,6 +503,15 @@ fn ensure_guest_binary(limactl: &Path) -> anyhow::Result<()> {
     let want = build_stamp(meta.len(), modified);
 
     let stamp = stamp_path();
+    if std::fs::read_to_string(&stamp).is_ok_and(|have| have.trim() == want) {
+        return Ok(());
+    }
+
+    // Two commands starting together would otherwise both copy to the same
+    // staging path and both `install` from it — one writing the file while
+    // the other reads it. Serialised, and the stamp is read again inside, so
+    // the second one finds the work already done.
+    let _guard = paths.lock(GUEST_BIN_LOCK)?;
     if std::fs::read_to_string(&stamp).is_ok_and(|have| have.trim() == want) {
         return Ok(());
     }
@@ -486,9 +588,47 @@ fn stamp_path() -> PathBuf {
     base.join("zygo").join(format!("vm-{INSTANCE}.stamp"))
 }
 
+/// Lock key for "somebody is starting the VM".
+///
+/// Creating the instance takes about a minute, and for that whole minute the
+/// directory exists while the hostagent does not. A second `limactl start`
+/// arriving in that window does not queue behind the first: it finds the
+/// half-made instance, fails to connect to a `ha.sock` that has not been
+/// created yet, and exits `fatal` — leaving the user with an error about a
+/// socket for a command that was `zygo run python -c print`. Typing two
+/// commands in the first minute was enough to see it.
+pub const VM_START_LOCK: &str = "vm-start";
+
+/// Lock key for "somebody is putting the Linux binary into the VM".
+///
+/// Separate from [`VM_START_LOCK`] because it is a different job with a
+/// different fast path: the stamp check costs one `stat` and is the answer
+/// almost every time, so the lock is only reached on the command after a
+/// rebuild.
+pub const GUEST_BIN_LOCK: &str = "vm-guest-binary";
+
 /// Start the instance if it is not already up.
+///
+/// Serialised across processes, because `limactl start` on one instance is
+/// not safe to run twice at once. The status is read again after the lock is
+/// held: the common case for the second command is that the first one has by
+/// then finished starting the VM, and there is nothing left to do.
 #[cfg(target_os = "macos")]
-fn ensure_running(limactl: &Path) -> anyhow::Result<()> {
+fn ensure_running(limactl: &Path, paths: &zygo_core::paths::Paths) -> anyhow::Result<()> {
+    if is_running(limactl)? {
+        return Ok(());
+    }
+
+    // Only to decide whether to say something: the wait below is up to a
+    // minute, and a command that appears to have hung is worse than a slow
+    // one that says what it is waiting for.
+    if paths.is_locked(VM_START_LOCK) {
+        eprintln!("waiting for the Linux VM another zygo command is starting");
+    }
+    let _guard = paths.lock(VM_START_LOCK)?;
+
+    // Held now. Whoever we waited for has finished, and usually finished the
+    // job — so ask again rather than starting a VM that is already up.
     let out = std::process::Command::new(limactl)
         .args(status_args())
         .output()
@@ -526,7 +666,10 @@ fn ensure_running(limactl: &Path) -> anyhow::Result<()> {
     if !out.status.success() {
         anyhow::bail!(
             "the Linux VM would not start (limactl exited {})\n{}\n  \
-             → see it for yourself with `limactl start {INSTANCE}`",
+             → see it for yourself with `limactl start {INSTANCE}`\n  \
+             → an instance left half-created reports a missing `ha.sock`; \
+             `limactl delete {INSTANCE}` discards it and the next command \
+             builds a fresh one",
             out.status.code().unwrap_or(-1),
             String::from_utf8_lossy(&out.stderr)
                 .lines()
@@ -541,6 +684,16 @@ fn ensure_running(limactl: &Path) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Whether `limactl` says the instance is up right now.
+#[cfg(target_os = "macos")]
+fn is_running(limactl: &Path) -> anyhow::Result<bool> {
+    let out = std::process::Command::new(limactl)
+        .args(status_args())
+        .output()
+        .map_err(|e| anyhow::anyhow!("could not ask limactl about the VM: {e}"))?;
+    Ok(Vm::parse(&String::from_utf8_lossy(&out.stdout)) == Vm::Running)
 }
 
 /// Where the VM's template lives.
@@ -726,6 +879,99 @@ mod tests {
         let target = install.iter().position(|a| a == GUEST_BIN).unwrap();
         assert!(stage < target, "{install:?}");
         assert!(install.contains(&"0755".to_string()));
+    }
+
+    /// A stop against a stopped machine must not start one to do it.
+    #[test]
+    fn stopping_needs_nothing_from_a_stopped_machine() {
+        for args in [
+            vec!["zygo", "stop", "--all"],
+            vec!["zygo", "stop", "f"],
+            vec!["zygo", "down"],
+        ] {
+            assert!(
+                needs_nothing_when_the_vm_is_down(&command_of(&args)),
+                "{args:?} has nothing to stop in a machine that is not running"
+            );
+        }
+
+        // Everything else needs the VM, including the ones that only read:
+        // the answer lives in there.
+        for args in [
+            vec!["zygo", "ps"],
+            vec!["zygo", "run", "alpine:3", "true"],
+            vec!["zygo", "logs", "f"],
+            vec!["zygo", "images"],
+            vec!["zygo", "up"],
+        ] {
+            assert!(
+                !needs_nothing_when_the_vm_is_down(&command_of(&args)),
+                "{args:?} has to reach the VM"
+            );
+        }
+    }
+
+    /// The other half of the path rule. Found by a real consumer: an embedder
+    /// mounts a scratch directory from the system temporary directory, which
+    /// on macOS is outside `$HOME`, and every one of its tests failed with
+    /// the guest complaining about a path the host has.
+    #[test]
+    fn a_mount_the_vm_cannot_see_is_refused_here() {
+        let home = Path::new("/Users/m");
+        let cwd = Path::new("/Users/m/projects/app");
+        let mount = |s: &str| s.parse::<Mount>().expect("mount");
+
+        // Under `$HOME`: the VM has it at the same path.
+        assert!(
+            unmapped_mounts(&[mount("/Users/m/data:/data")], cwd, home).is_empty(),
+            "an absolute path under home is shared"
+        );
+        // Relative: resolved against the caller's directory, which is itself
+        // already known to be under home.
+        assert!(
+            unmapped_mounts(&[mount("./cache:/cache:rw")], cwd, home).is_empty(),
+            "a relative path means a place on this side"
+        );
+
+        // The case that failed: macOS puts temporary directories here.
+        assert_eq!(
+            unmapped_mounts(&[mount("/var/folders/ab/T/run:/data:rw")], cwd, home),
+            [PathBuf::from("/var/folders/ab/T/run")]
+        );
+        // And every one of them is collected, so the message can count them.
+        assert_eq!(
+            unmapped_mounts(
+                &[
+                    mount("/Users/m/ok:/ok"),
+                    mount("/tmp/one:/one"),
+                    mount("/etc/two:/two"),
+                ],
+                cwd,
+                home
+            )
+            .len(),
+            2
+        );
+    }
+
+    /// Only the commands that can carry one are asked.
+    #[test]
+    fn mounts_are_read_from_whichever_command_has_them() {
+        let with_mount = command_of(&["zygo", "run", "--mount", "/tmp/x:/x", "alpine:3", "true"]);
+        assert_eq!(mounts_of(&with_mount).len(), 1);
+
+        let served = command_of(&[
+            "zygo",
+            "serve",
+            "h.py",
+            "--name",
+            "f",
+            "--mount",
+            "/tmp/x:/x:rw",
+        ]);
+        assert_eq!(mounts_of(&served).len(), 1);
+
+        assert!(mounts_of(&command_of(&["zygo", "ps"])).is_empty());
     }
 
     #[test]

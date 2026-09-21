@@ -1362,6 +1362,7 @@ mod tests {
 
         let status = Status {
             name: "resize".into(),
+            image: String::new(),
             state: crate::sandbox::SandboxState::Cold,
             runtime: "python/3.12".into(),
             rss_kb: 0,
@@ -1510,6 +1511,7 @@ mod tests {
     fn cold_status(name: &str) -> Status {
         Status {
             name: name.into(),
+            image: String::new(),
             state: crate::sandbox::SandboxState::Cold,
             runtime: "python/3.12".into(),
             rss_kb: 0,

@@ -256,6 +256,7 @@ mod tests {
     fn status() -> Status {
         Status {
             name: "f".into(),
+            image: String::new(),
             state: SandboxState::Warm,
             runtime: "python/3.12".into(),
             rss_kb: 1000,

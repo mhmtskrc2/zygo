@@ -164,6 +164,7 @@ mod tests {
     fn status(name: &str, requests: u64, failures: u64) -> Status {
         Status {
             name: name.into(),
+            image: String::new(),
             state: SandboxState::Warm,
             runtime: "python/3.12".into(),
             rss_kb: 2048,

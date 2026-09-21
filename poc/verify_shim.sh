@@ -207,6 +207,23 @@ else
     ok "\`stop --all\` stops the VM too — it is $state"
 fi
 
+# A second `stop --all` has nothing to do, and must not build a machine to do
+# it in. Before the short-circuit this booted the VM — sixteen seconds, or
+# fifty-five from nothing — to tell a supervisor that does not exist to stop
+# functions that do not exist, and then stopped it again. Timed rather than
+# read, because the output was already plausible while the behaviour was not.
+started=$(now_ms)
+again=$("$ZYGO" stop --all 2>&1)
+took=$(($(now_ms) - started))
+state=$(limactl list --format '{{.Status}}' zygo 2>/dev/null | head -1)
+if [ "$state" = Running ]; then
+    bad "a second \`stop --all\` started the VM it was asked to stop"
+elif [ "$took" -gt 3000 ]; then
+    bad "a second \`stop --all\` took ${took}ms; it has nothing to do"
+else
+    ok "a second \`stop --all\` does nothing, in ${took}ms: $again"
+fi
+
 # And now the strong version of "nothing survived": the next command brings
 # the VM back from a full stop, and the function must not be in it.
 started=$(now_ms)

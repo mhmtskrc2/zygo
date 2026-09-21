@@ -41,9 +41,10 @@ live here.
 | `zygo stats` | **Works** — counters since the warm-up beside latencies over the log window, with the two labelled apart; no `p99` under a hundred samples |
 | `zygo top` | **Works** — `ps` on a timer plus the rate columns one sample cannot have; the first frame says `—` rather than inventing a zero |
 
-Test status: **574 Rust tests on Linux** (481 on macOS) + 34 Python +
+Test status: **591 Rust tests on Linux** (498 on macOS, run; the Linux figure
+adds the unchanged 93 Linux-only tests and wants CI to confirm it) + 37 Python +
 **296 Linux integration / escape / supervisor / backend / example / registry
-checks** + **14 macOS shim checks**
+checks** + **15 macOS shim checks**
 (36 launcher, 16 escape vectors, 13 syscall-sweep, 19 gvisor, 157 supervisor,
 12 examples, 15 registry credentials, 10 seccomp-matrix cells, 9 Python and
 9 Node conformance),
@@ -1830,92 +1831,306 @@ docs/poc-report.md.
 
 Source: [docs/docker-replacement-report.md](docs/docker-replacement-report.md),
 the 20 September 2026 session that used Zygo in Docker's place for a day.
-Every item below was checked against the code on 21 September before it was
-written down; the two claims the report gets wrong are the last item rather
-than work of their own.
+Every item was checked against the code before it was written down; the two
+claims the report gets wrong are recorded at the end of the report itself
+rather than as work.
 
-- [ ] **`zygo bench` never enters a delegated scope.** `needs_a_cgroup`
-      (`crates/zygo-cli/src/scope.rs`) lists `Run`, `Serve`, `Up` and
-      `Supervisor(Run)`; `Bench` is missing, and all three bench modes build a
-      sandbox. On a systemd login `bench` dies with `cannot create the cgroup
-      …/session-N.scope/zygo.slice`, so the command that demonstrates the
-      central claim is the one that fails first. Add `Command::Bench(_)` to the
-      match and to the unit test that pins the list
-- [ ] **Reopen A2 with the field numbers.** `zygo bench warm --no-cgroup`,
-      1500 requests at 200 req/s, both rows minutes apart on the same host:
+- [x] **`zygo bench` never entered a delegated scope.** `needs_a_cgroup`
+      (`crates/zygo-cli/src/scope.rs`) listed `Run`, `Serve`, `Up` and
+      `Supervisor(Run)` but not `Bench`, and every bench mode warms a sandbox
+      of its own — so on an ordinary systemd login the command that
+      demonstrates the warm path was the first one to fail, with
+      `cannot create the cgroup …/session-N.scope/zygo.slice`. `Command::Bench(_)`
+      is in the list, and all three modes are in the test that pins it
+- [x] **`zygo run <image>` with no command refused to run.** `--help` promised
+      the image's entrypoint and cmd, `cmd/run.rs` had the code to use them,
+      and the resolver never let it get there: with neither `entry` nor `cmd`
+      it returned `fn.run: nothing to run`. A one-shot resolve now carries an
+      empty command and `zygo run` fills it in from the image config, which is
+      the only place that can read it; an image declaring neither still fails,
+      naming itself. `zygo spec explain` with no function name had the same
+      bug for the same reason and is fixed with it
+- [x] **`-v host:guest` got an image-reference error.** `-v` is the global
+      verbose flag, so `zygo run -v $PWD:/src image` handed the pair to the
+      image argument and got `repository has an empty path component` —
+      accurate, and pointing at the wrong thing. A reference that fails to
+      parse and is shaped like a mount now answers with `--mount` instead.
+      Told apart by an absolute guest path, which is what keeps `alpine:3` and
+      `localhost:5000/team/app:v2` out of it
+- [x] **`stop --all` printed raw `limactl` output on macOS.** `shim::stop_vm`
+      inherited stdio, so a teardown that worked ended in thirty lines of
+      Lima's logging with a `level=error` among them. Captured, replaced with
+      one line, and kept for `-v`, where the person debugging the shim wants
+      exactly those lines. A failure still shows Lima's own words: they say
+      what is holding the VM open and nothing else can
+- [x] **`--mem 64M` alone was refused.** Scratch defaulted to a flat 64M and
+      must be smaller than mem, so one flag with nothing else said was an
+      error about a field the user never mentioned. An unset `scratch` now
+      follows `mem` down — `min(64M, mem/2)` — so 64M is a ceiling rather than
+      a constant and the derived default can never collide with `mem` or warn
+      about itself. An explicit `scratch` that will not fit is still an error,
+      and now names a size that would work
+- [x] **The first traceback frame belonged to Zygo.** `format_exc()` in
+      `agents/python/zygo_agent.py` started at the `try:` in `run_request`, so
+      a raising handler opened with `/zygo/agent.py … in run_request` — the
+      runtime explaining itself before it explained the bug, on the one output
+      read when something is wrong. The leading frames from the agent's own
+      file are dropped, chained causes survive, and an error raised by the
+      harness itself still prints in full, because there the harness is the
+      answer
+- [x] **`image prune` reached only layers.** Three images with 47 MB of layers
+      left a 230 MB data directory: the flattened rootfs, venv and derived
+      system caches were never collected, and each is larger than the layers
+      it comes from. All four are reachable now and each is reported on its
+      own line. The venv marker and the system record already named what they
+      were built against; a flattened rootfs did not, so its completion marker
+      carries the layer digests — a directory that records none cannot be
+      shown to be live and costs one re-flatten to drop
+- [x] **README: the headline number is not reachable from the macOS CLI.** The
+      96 ms round trip was given without saying that ~100 ms of it is the hop
+      into the VM, which is also what `docker exec` costs there. The README
+      now says plainly that on a Mac the ~1 ms warm path is reachable through
+      the HTTP API or the library and not the CLI, and that this is the shim
+      working rather than failing
+- [x] **A2: settled on bare metal. The default stays.** Measured on the
+      Raspberry Pi — Ubuntu 23.10, kernel 6.5, aarch64, four cores, a real
+      `session-370.scope` login — at a rate below the host's own capacity, so
+      neither row is a CPU quota in disguise (0.49 of 1.00 cores, zero
+      throttled periods). 1000 requests at 100 req/s, back to back:
 
-      | | per-request cgroup | none |
-      |---|---|---|
-      | p50 | 1868 µs | 1223 µs |
-      | p99 | 15608 µs | 1980 µs |
-      | max | 51639 µs | 2819 µs |
-      | `admit` p99 | 11310 µs | 85 µs |
-      | acceptance | p99 **FAIL** | p99 PASS |
+      | | per-request cgroup | none | cost |
+      |---|---|---|---|
+      | p50 | 3166 µs | 2928 µs | +238 µs |
+      | p99 | 3426 µs | 3066 µs | +360 µs |
+      | max | 3673 µs | 3126 µs | +547 µs |
+      | `admit` p99 | 758 µs | 176 µs | +582 µs |
+      | acceptance | p99 **PASS** | p99 PASS | — |
 
-      The default configuration misses the project's own p99 criterion and the
-      per-request cgroup is the whole tail; PoC 3's 97 µs was sequential and
-      lightly loaded. Decide between a per-tenant cgroup by default, a pool of
-      request cgroups reused rather than created and destroyed per request, or
-      `--no-cgroup` as a documented production choice with what it gives up
-      spelled out (a runaway request is then billed to the tenant's cgroup
-      instead of killed on its own). Re-measure on bare metal first — the
-      absolute numbers are nested-virtualisation numbers, the ratio is not
-- [ ] **`zygo run <image>` with no command refuses to run.** `--help` promises
-      the image's entrypoint and cmd, and `cmd/run.rs` has the code
-      (`image_config.default_argv()`), but it is never reached:
-      `RunArgs::to_layer` leaves `cmd` unset and `resolve_layer` returns
-      `fn.run: nothing to run` when neither `entry` nor `cmd` is set.
-      `--dry-run` stops at the same place. Let the one-shot resolve accept an
-      empty `cmd` (it is the only caller that fills it in afterwards), keep the
-      "declares no entrypoint or cmd" error for images that really have
-      neither, and add a test: `zygo run --dry-run python:3.12` prints the
-      image's `python3` argv
-- [ ] **`-v host:guest` gets an image-reference error.** `-v` is the global
-      verbose flag, so `zygo run -v $PWD:/src image` parses `$PWD:/src` as the
-      image and fails with `repository has an empty path component` — accurate,
-      and pointing the wrong way. In `cmd/run.rs`, when the reference does not
-      parse and the string is shaped like a path pair (a `/` before the `:`,
-      or a leading `/` or `.`), answer with `--mount host:guest` instead
-- [ ] **`stop --all` prints raw `limactl` output on macOS.** `shim::stop_vm`
-      runs `limactl stop` with inherited stdio, so about thirty lines of Lima's
-      logging, one of them `level=error`, reach the terminal on a teardown that
-      succeeded. Capture both streams, print one line, keep the capture for
-      `-v`, and add a shim check for it
-- [ ] **`--mem 64M` alone is refused.** Scratch defaults to 64M and
-      `resolve_layer` requires `scratch < mem`, so the flag cannot be used by
-      itself. The error says why and not what to do: either scale the scratch
-      default down with `mem` when `scratch` was not set explicitly, or add the
-      hint `pass --scratch <size> smaller than --mem`
-- [ ] **The first traceback frame belongs to Zygo.** `run_request` in
-      `agents/python/zygo_agent.py` reports `traceback.format_exc()`, so a
-      raising handler shows `/zygo/agent.py … in run_request` above the user's
-      own line. Format from the handler's frame down (`tb.tb_next` past the
-      harness frames) so the developer's line comes first; check the Node agent
-      for the same; one unit test with a raising handler
-- [ ] **`image prune` reaches only layers.** `unreferenced_layers` walks
-      `layers/` and removes the matching blob; `flat_cache`, `venv_cache` and
-      `system_cache` are never looked at. Three images with 47 MB of layers left
-      a 230 MB data directory. Extend prune to flattened rootfs caches whose
-      image is gone, venvs no image + requirements pair references, and derived
-      system layers; have `prune --dry-run` report the size per cache
-- [ ] **README: the headline number is not reachable from the macOS CLI.** The
-      README gives the 96 ms round trip but not why: a `zygo exec` from the Mac
-      pays ~100 ms for the command hop through Lima, which is what
-      `docker exec` costs on the same host. Say plainly that on macOS the ~1 ms
-      warm path is visible through the HTTP API or the library, not the CLI, so
-      the first reader to measure it does not conclude the benchmark was
-      optimistic
-- [ ] **Bare-metal re-run of the report's numbers.** Every figure in the report
-      is from nested virtualisation (Lima on Apple Silicon). Re-measure the A2
-      table and the cold/warm comparison on the Raspberry Pi or CI's
-      `ubuntu-24.04` and put both rows in the report
-- [ ] **Correct the report's two stale claims.** `zygo top` is no longer a
-      placeholder — it landed on 21 September (`0690e59`), the day after the
-      session. The "drop-in" qualifier the report wants added to the README is
-      not in the README, whose first line already says "function-shaped code";
-      the phrase is in the design document's one-sentence promise
-      ([ahmed.md](ahmed.md) §1), which is where a qualifier would go if one is
-      wanted
+      **The tail is not there.** On this host the per-request cgroup costs
+      about 240 µs at p50 and 360 µs at p99, both configurations pass the p99
+      budget, and `admit` never exceeds 838 µs. The field report's 13.6 ms and
+      its `p99 FAIL` were an artefact of nested virtualisation: under Lima on
+      Apple Silicon the same phase measures 11–12 ms at p99, fifteen times
+      what real hardware does, because that is where a cgroup `mkdir` and
+      `rmdir` per request actually costs something.
+
+      So the roadmap's own caution was right and its guess was wrong: the
+      absolute numbers did not survive bare metal, and neither did the ratio.
+      Nothing to change — per-request stays the default, and it keeps
+      `cgroup.kill`, which is one write to tear down a timed-out request's
+      whole tree. The three options the reopening proposed are all answers to
+      a problem this host does not have.
+
+      Two things follow. `--no-cgroup` remains a measurement flag rather than
+      a production one, since what it buys is 240 µs and what it gives up is
+      per-request containment. And the p99 note added to `bench warm` earns
+      its keep in exactly one place — a nested-virtualisation host, where it
+      now explains a failure that is about the environment; on the Pi it
+      correctly stays silent, because there is no tail to explain
+      (`p50 FAIL` there is the board's own fork floor of 310 µs against the
+      VM's 97 µs, not the cgroup)
+- [ ] **Bare-metal re-run of the report's other numbers.**- [ ] **Bare-metal re-run of the report's other numbers.** The cold and warm
+      comparisons against Docker have the same problem as the A2 table: both
+      runtimes paid for a VM. Re-measure where neither does, and put both rows
+      in the report
+
+---
+
+## Second test
+
+Source: [docs/second_test.md](docs/second_test.md), a re-test of every
+"After test" item against the tree of 21 September 2026 with the fixes in.
+Seven of eight closed under re-test and are not repeated here.
+
+- [x] **Nothing a user decided they were finished with could ever be
+      collected.** `prune` walked four categories and found nothing, and the
+      cause was upstream of the walk: there was no `zygo image rm`, and
+      `Store` had no way to drop an entry, so an image could not be
+      un-referenced by intent. Its layers were therefore never unreferenced,
+      and neither were the venvs, flattened rootfs and system records keyed on
+      the same liveness. `prune` could collect what a crash orphaned and
+      nothing a person decided. `zygo image rm <ref>` now exists — `Store::remove`
+      plus the command, aliased `remove`. It refuses while a warm function is
+      running on the image, naming it and the `stop` that frees it, because
+      that function's rootfs is those layers mounted. Derived
+      `<ref>+system.<key>` images go with their base. It then runs the same
+      collection `prune` runs, immediately, because `rmi` frees disk and a
+      removal that leaves the bytes behind until a second command is a
+      surprise. Measured end to end in the VM: a pull plus a venv is 207 MB,
+      and `image rm python:3.12-slim` leaves 188 KB
+- [x] **A venv nothing asks for any more lived as long as its image.** The
+      report proposed keying the venv on its requirements hash; that is
+      already what `venv::cache_key` does, and it is why a changed pin
+      produces a *second* venv rather than why the first survives. The real
+      gap was that nothing recorded use: `venv::ensure` returned on the
+      marker and touched it. The hit paths for venvs and flattened rootfs now
+      stamp their marker, and `prune --unused-for <duration>` collects what
+      has not been used within it. Age never re-counts what liveness already
+      condemns, so the reported size is not doubled. Verified in the VM: a
+      venv used a second ago survives `--unused-for 1s`; the same venv, left
+      alone, is collected
+- [x] **`prune` now says what it kept and what a flag would take.** The line
+      that would have answered the report's "the data directory only grows"
+      without reaching for `du`: `kept 27.3 MB across 2 venvs, the oldest
+      unused for 33 minutes` and `kept 49.4 MB of compressed blobs beside 6
+      unpacked layers`. The size has to be visible before the flag is chosen,
+      or `--unused-for 7d` is a guess
+- [x] **The compressed blob beside every extracted layer is now optional.**
+      49.4 MB of the store on this host, and read exactly once — to unpack
+      its layer. Every path afterwards works from the unpacked directory, and
+      `pull` treats a present layer as cached without looking for the blob.
+      `prune --blobs` drops them, costing one download if a layer directory
+      is ever lost by hand; keeping them by default is what containerd does.
+      Manifest and config blobs are not layers and are never offered
+- [x] **`stop --all` on a stopped VM booted the VM to stop nothing.** The
+      report saw the narration; the cause was worse. `shim::forward` called
+      `ensure_running` before every forwarded command, so a stop against a
+      stopped machine spent sixteen seconds building one, told a supervisor
+      that does not exist to stop functions that do not exist, and stopped it
+      again. `stop`, `stop --all` and `down` now answer `nothing is running;
+      the Linux VM is stopped` and start nothing. Measured: 16 s → 48 ms.
+      `make verify-shim` is 15 checks now, the new one timing a second
+      `stop --all` rather than reading its output, because the output was
+      already plausible while the behaviour was not
+- [x] **`bench warm` now says when its own failing p99 is about A2.** Not a
+      defect in the scope fix; a consequence of A2 that greets everyone who
+      runs the command the README points at. When `admit` and `release` own
+      most of the p99 *and* the p99 missed its budget, the run prints what
+      share of the tail is the per-request cgroup rather than the handler,
+      points at A2, and names `--no-cgroup` as the measurement without it.
+      The same duty as the existing CPU-quota note: a reader must not
+      conclude the runtime is slow from a number that is about an open
+      decision. Silent on a run that passes. Measured at 78% on this host
+- [ ] **A2 still has to be settled, and the acceptance line has to end up
+      true.** Tracked under "After test"; repeated here only because the
+      second pass is right that whatever is chosen must leave `bench warm`
+      passing on a default configuration, or the budget itself has to change.
+      A note explaining a failure is a stopgap, not the answer
+
+---
+
+## Tested against a real consumer
+
+Source: running Zygo as the script sandbox for
+an early adopter — a Phoenix application whose whole purpose is executing
+somebody else's `def main(event)` in a box. It already has two such boxes
+behind one behaviour (its runner interface): CPython compiled to
+WebAssembly, and `docker run --rm`. Zygo is now a third driver written to
+that same behaviour, so the adopter's own driver suite runs against it unchanged
+— the same assertions, the same harness, the same event payload, for all
+three boxes. Its its Zygo driver is the consumer; nothing
+in it is written to flatter Zygo.
+
+The workload is not synthetic: a scratch directory mounted read-write, the
+event in as a file, the result out as a file, stdout left to the script,
+`--mem/--cpu/--pids/--scratch/--timeout`, `--net none` by default and
+`--net egress --allow` for a project's allowed hosts.
+
+### Round 1 — every test failed on one line
+
+- [x] **A `--mount` outside `$HOME` was forwarded to the VM instead of being
+      refused.** 8 of 8 Zygo tests failed identically with `applying a bind
+      mount from the spec failed: No such file or directory (os error 2)` and
+      a pointer to `zygo doctor`, which has nothing to say about it. The adopter
+      puts its scratch directory in the system temporary directory, which on
+      macOS is under `/var/folders/…` and does not exist inside the Lima VM.
+      Reduced to two lines:
+
+      ```
+      zygo run --mount /var/folders/…/tmp.X:/data:ro alpine:3 cat /data/f.txt
+      → error: applying a bind mount from the spec failed: No such file or directory
+      zygo run --mount $HOME/tmp.X:/data:ro         alpine:3 cat /data/f.txt
+      → hello
+      ```
+
+      The shim already had this rule and applied it to one of the two things
+      that need it: `workdir` refuses a command run from outside `$HOME` on
+      the stated grounds that forwarding it "would silently run against a
+      directory that is not the one the user is looking at", which is exactly
+      what a forwarded mount does. `unmapped_mounts` now applies the same
+      check to every `--mount` source of `run` and `serve`, resolving
+      relative paths against the caller's directory first, and the refusal
+      names the path, the rule and `TMPDIR`. The guest never sees the command
+
+### Round 2 — the suite, green
+
+Driver suite: 21 passed. Proved non-vacuous rather than trusted, because a
+test guarded by `available?()` passes when the driver is absent: a handler
+returning `platform.python_version()` answers `3.12.14 on linux` from a Mac
+in 284 ms, with the script's `print` coming back beside the result.
+
+### Round 3 — parity with the Docker driver
+
+No defects. Eight events at once all succeeded; a script's stderr, a 1 MB
+result (8000 rows in 175 ms), writing to the scratch `/tmp`, and `OSError`
+on a write to the read-only image root all behaved as the container driver
+does. Secrets appeared to be missing until both drivers were asked the same
+question and gave the same answer: they arrive as a `secrets` dict in the
+script's scope rather than through the environment, which is the harness's
+design and not a driver's business.
+
+### Round 4 — what Zygo is for
+
+No defects, and the two claims hold against a real consumer:
+
+| | Docker driver | Zygo driver |
+|---|---|---|
+| `python:3.12-slim`, one event | 516 ms median | 203 ms median |
+| egress allowlist | needs a proxy the app runs | `--net egress --allow` |
+
+With `network: "allowlist"` and one allowed host, `https://example.com`
+answered 200 and `https://api.github.com` raised `URLError`, enforced in the
+sandbox's own namespace with no proxy process anywhere.
+
+### Round 5 — leaks under sustained load
+
+50 events at a concurrency of 5 finished 50/50 in 3.15 s, and the VM was
+unchanged afterwards: no zygo processes, no stray cgroups, no new mounts, no
+disk growth. One defect, found by looking rather than by failing:
+
+- [x] **A failed `zygo run` leaked its sandbox root directory.** `cmd/run.rs`
+      created `tmp/root-<pid>` for the `pivot_root` target and removed it in
+      one line before its `Ok` — so a run that failed after the directory was
+      made left it behind, and *only* a failing run ever did. Sharpened to a
+      measurement before it was believed: five failing runs left five
+      directories, three succeeding runs left none. An adopter found it by
+      having tests that fail on purpose. The directory is now an RAII guard,
+      removed however the function leaves, and `remove_dir` rather than
+      `remove_dir_all` so a mount that outlived its namespace keeps its
+      contents instead of being deleted through. Re-measured after the fix:
+      five failing runs, delta zero
+- [x] **`prune` collects abandoned sandbox roots.** 31 had accumulated on this
+      host before the fix and nothing would ever have taken them. The pid is
+      in the directory's name, so liveness is answerable without bookkeeping;
+      a root whose pid is still running is left alone, because skipping one
+      costs a wait and being wrong the other way pulls the ground out from
+      under a live sandbox. All 31 collected
+
+### On real hardware
+
+Run on the Raspberry Pi rather than in the Lima VM, because GitHub Actions is
+out of quota and because two of the open items needed a kernel on metal. The
+musl build and the suites were synced over; `doctor` reports user namespaces,
+delegated cgroup v2, overlayfs, seccomp, `subuid` and `pasta` all present,
+Landlock absent on 6.5 as expected.
+
+| Suite | Result |
+|---|---|
+| `verify_launcher.sh` | 30 passed, 0 failed |
+| `escape_suite.sh` | 16 blocked, 0 escaped |
+| `fuzz_syscalls.sh` | 13 passed, 0 failed (469 syscalls × 3 profiles) |
+
+The delegated-scope fix is confirmed where it matters: the login sits in
+`session-370.scope`, undelegated, and `zygo bench warm` runs there without a
+wrapper. And A2 is settled — see "After test" above; the tail that reopened
+it does not exist on this host.
+
+### Round 6 — the rest of the surface
+
+No defects. TypeScript runs on `node:22-alpine` through the same driver
+(`console.log` comes back as output, the handler's return as the result),
+and a project's installed packages mount read-only with `/packages` on
+`sys.path` — `requests 2.34.2` imported from it.
 
 ---
 

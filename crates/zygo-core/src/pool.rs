@@ -60,9 +60,21 @@ pub struct PoolConfig {
     pub paths: Paths,
     /// Give each request its own cgroup (design doc open question A2).
     ///
-    /// Measured at 97 µs of a 1.9 ms request — 5% — in exchange for
-    /// `cgroup.kill`, which tears down a timed-out request's whole tree in one
-    /// write. On by default.
+    /// Bought for `cgroup.kill`, which tears down a timed-out request's whole
+    /// tree in one write. On by default, and the default is **settled**.
+    ///
+    /// It was reopened on a measurement that did not survive the hardware it
+    /// was repeated on. Under nested virtualisation the `admit` phase reaches
+    /// 11–12 ms at p99 and the run misses its p99 budget; on bare metal — a
+    /// Raspberry Pi, kernel 6.5, 1000 requests at 100 req/s, well under the
+    /// host's capacity — the whole cost is 238 µs at p50 and 360 µs at p99,
+    /// `admit` never exceeds 838 µs, and both configurations pass. A cgroup
+    /// `mkdir` and `rmdir` per request is expensive in a VM inside a VM and
+    /// cheap on a kernel running on metal.
+    ///
+    /// So `false` is a flag for measuring what this costs, not a production
+    /// choice: it saves a quarter of a millisecond and gives up per-request
+    /// containment. See `todo.md`, "After test".
     pub per_request_cgroup: bool,
 }
 
@@ -240,6 +252,13 @@ impl LogRing {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Status {
     pub name: String,
+    /// The image the spec named, as written there. What `zygo image rm`
+    /// checks before it removes one: a warm function's rootfs is that
+    /// image's layers, mounted, and pulling them out from under it is not a
+    /// removal but a corruption. Defaulted for answers from a supervisor
+    /// that predates the field.
+    #[serde(default)]
+    pub image: String,
     pub state: SandboxState,
     pub runtime: String,
     /// Resident memory reported at warm-up.
@@ -540,6 +559,7 @@ impl Pool {
 
                 Ok(Function::Agent(Box::new(WarmFn {
                     name: f.name.clone(),
+                    image: f.image.clone(),
                     conn,
                     replies: Mutex::new(Some(replies)),
                     socket: ours,
@@ -601,6 +621,7 @@ impl Pool {
 
         Ok(Function::Exec(Box::new(WarmExec {
             name: f.name.clone(),
+            image: f.image.clone(),
             init_pid: sandbox.pid(),
             secrets_dir,
             plan,
@@ -657,6 +678,8 @@ impl Pool {
 /// One warm function: a sandbox with an agent in it, waiting.
 pub struct WarmFn {
     name: String,
+    /// See [`Status::image`].
+    image: String,
     /// The supervisor's end of the connection to the agent.
     conn: std::sync::Arc<Conn>,
     /// The thread routing replies. Joined on drop, after the socket is shut
@@ -855,6 +878,7 @@ impl WarmFn {
         let counters = self.counters.lock().expect("counters");
         Status {
             name: self.name.clone(),
+            image: self.image.clone(),
             state: self.state(),
             runtime: self.runtime.clone(),
             // Read now, not remembered from the warm-up. `self.rss_kb` is what
@@ -1535,6 +1559,8 @@ fn write_secret_file_at(dir: &std::fs::File, name: &str, value: &str) -> Result<
 #[cfg(target_os = "linux")]
 pub struct WarmExec {
     name: String,
+    /// See [`Status::image`].
+    image: String,
     /// Host pid of the held init: the process whose death means the sandbox
     /// is gone.
     init_pid: u32,
@@ -1578,6 +1604,7 @@ impl WarmExec {
         let counters = self.counters.lock().expect("counters");
         Status {
             name: self.name.clone(),
+            image: self.image.clone(),
             state: self.state(),
             runtime: "exec".into(),
             rss_kb: resident_kb(self.init_pid).unwrap_or(0),

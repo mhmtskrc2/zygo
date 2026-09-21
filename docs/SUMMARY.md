@@ -13,4 +13,5 @@ without mdBook.
 - [Writing an agent](../examples/agents/README.md)
 - [Measurements: the PoC report](poc-report.md)
 - [Using Zygo instead of Docker: a field report](docker-replacement-report.md)
+- [Second pass: what is still open](second_test.md)
 - [Firecracker snapshots (research)](firecracker-snapshots.md)

@@ -101,6 +101,8 @@ pub fn ensure(store: &Store, image: &ImageEntry, requirements: &Path) -> Result<
     let dir = store.paths().venv_cache().join(&key);
 
     if dir.join(DONE_MARKER).is_file() {
+        // The only record of use this venv has; `prune --unused-for` reads it.
+        crate::image::store::touch(&dir.join(DONE_MARKER));
         return Ok(Venv { dir, built: false });
     }
 
@@ -164,6 +166,34 @@ pub fn unreferenced(store: &Store) -> Result<Vec<PathBuf>> {
         match built_against {
             Some(manifest) if live.contains(manifest) => {}
             _ => out.push(path),
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Venvs whose image is still here but that no request has used since
+/// `cutoff`.
+///
+/// This is the only way a venv retires while its image stays: editing one
+/// pin in a requirements file builds a new venv under a new key and says
+/// nothing about the old one, because nothing can — no spec is consulted
+/// and none has to be. Use is the marker's modification time, refreshed on
+/// every hit by [`ensure`].
+pub fn unused_since(store: &Store, cutoff: std::time::SystemTime) -> Result<Vec<PathBuf>> {
+    let stale: std::collections::BTreeSet<PathBuf> = unreferenced(store)?.into_iter().collect();
+    let dir = store.paths().venv_cache();
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir).at(&dir)? {
+        let path = entry.at(&dir)?.path();
+        if !path.is_dir() || stale.contains(&path) {
+            continue;
+        }
+        if crate::image::store::last_used(&path.join(DONE_MARKER)).is_some_and(|t| t < cutoff) {
+            out.push(path);
         }
     }
     out.sort();
@@ -408,5 +438,104 @@ mod tests {
         let venv = ensure(&store, &image, &reqs).expect("found");
         assert_eq!(venv.dir, dir);
         assert!(!venv.built, "nothing was built");
+    }
+
+    /// Editing one pin builds a venv under a new key and says nothing about
+    /// the old one — nothing can, because no spec is consulted. Age is the
+    /// only thing that retires it while the image stays.
+    #[test]
+    fn a_venv_nothing_has_used_is_collectable_by_age() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let paths = crate::paths::Paths::rooted(tmp.path());
+        paths.ensure().expect("ensure");
+        let store = Store::new(paths.clone());
+
+        let image = ImageEntry {
+            reference: "python:3.12-slim".into(),
+            manifest: "sha256:abc".into(),
+            config: "sha256:cfg".into(),
+            layers: vec![],
+            pulled_at: 0,
+            size: 0,
+            index: None,
+            platform: None,
+        };
+        store.put(image.clone()).expect("put");
+
+        let reqs = tmp.path().join("requirements.txt");
+        std::fs::write(&reqs, "six==1.16.0\n").expect("write");
+        let old = paths
+            .venv_cache()
+            .join(cache_key("sha256:abc", b"six==1.16.0\n"));
+        std::fs::create_dir_all(&old).expect("mkdir");
+        std::fs::write(old.join(DONE_MARKER), "image sha256:abc\n").expect("marker");
+
+        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(60 * 86_400);
+        std::fs::File::options()
+            .write(true)
+            .open(old.join(DONE_MARKER))
+            .expect("open")
+            .set_modified(long_ago)
+            .expect("backdate");
+
+        assert!(
+            unreferenced(&store).expect("scan").is_empty(),
+            "its image is still here, so liveness will never collect it"
+        );
+        let week = std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 86_400);
+        assert_eq!(
+            unused_since(&store, week).expect("age"),
+            std::slice::from_ref(&old)
+        );
+
+        // A request that uses it puts it back out of reach.
+        let found = ensure(&store, &image, &reqs).expect("hit");
+        assert_eq!(found.dir, old);
+        assert!(!found.built, "found, not rebuilt");
+        assert!(
+            unused_since(&store, week).expect("age").is_empty(),
+            "the hit path records the use"
+        );
+    }
+
+    /// A venv outlives the image it was built against unless something
+    /// collects it, and it is larger than the layers that image is made of.
+    #[test]
+    fn a_venv_is_collected_once_its_image_leaves_the_store() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let paths = crate::paths::Paths::rooted(tmp.path());
+        paths.ensure().expect("ensure");
+        let store = Store::new(paths.clone());
+
+        let image = ImageEntry {
+            reference: "python:3.12-slim".into(),
+            manifest: "sha256:abc".into(),
+            config: "sha256:cfg".into(),
+            layers: vec![],
+            pulled_at: 0,
+            size: 0,
+            index: None,
+            platform: None,
+        };
+        store.put(image.clone()).expect("put");
+
+        let mine = paths.venv_cache().join(cache_key("sha256:abc", b"six\n"));
+        std::fs::create_dir_all(&mine).expect("mkdir");
+        std::fs::write(mine.join(DONE_MARKER), "image sha256:abc\n").expect("marker");
+
+        // Built against an image that is not in the index any more.
+        let stale = paths.venv_cache().join(cache_key("sha256:old", b"six\n"));
+        std::fs::create_dir_all(&stale).expect("mkdir");
+        std::fs::write(stale.join(DONE_MARKER), "image sha256:old\n").expect("marker");
+
+        // Half built: no marker, never usable.
+        let partial = paths.venv_cache().join("partial");
+        std::fs::create_dir_all(&partial).expect("mkdir");
+
+        let mut found = unreferenced(&store).expect("scan");
+        found.sort();
+        let mut want = vec![partial, stale];
+        want.sort();
+        assert_eq!(found, want, "the live venv stays");
     }
 }

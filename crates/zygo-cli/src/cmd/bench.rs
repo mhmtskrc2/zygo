@@ -199,6 +199,9 @@ fn warm(
             print_handler_share(&phases, &handler_us);
         }
         print_floor(&style, &floor, &report);
+        // Last: it is a conclusion about the breakdown, so it reads after it
+        // rather than in the middle of it.
+        print_cgroup_note(&phases, &report, &style);
     }
 
     let _ = function.shutdown();
@@ -902,6 +905,63 @@ fn print_floor(style: &Style, floor: &[f64], report: &Report) {
 /// A total percentile says a tail exists; only the breakdown says which phase
 /// owns it. Three plausible explanations for one were measured and refuted
 /// before this existed.
+/// The share of the p99 spent creating and joining the request's own cgroup.
+///
+/// `admit` and `release` are the per-request cgroup and nothing else, so when
+/// they own the tail the number above is about open question A2 rather than
+/// about the warm path. Returned as a fraction of the total p99.
+fn cgroup_share_of_p99(phases: &[zygo_core::pool::CallTiming]) -> Option<f64> {
+    if phases.is_empty() {
+        return None;
+    }
+    let p99_of = |get: fn(&zygo_core::pool::CallTiming) -> Duration| {
+        let mut v: Vec<f64> = phases.iter().map(|t| get(t).as_secs_f64() * 1e6).collect();
+        v.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
+        percentile(&v, 99.0)
+    };
+    let total = p99_of(|t| t.lock + t.fork + t.admit + t.run + t.release);
+    if total <= 0.0 {
+        return None;
+    }
+    Some((p99_of(|t| t.admit) + p99_of(|t| t.release)) / total)
+}
+
+/// Say when the tail belongs to the per-request cgroup rather than to Zygo.
+///
+/// The same duty as the CPU-quota note: a reader must not conclude from a
+/// failed budget that the runtime is slow, when what they measured is a
+/// decision that is still open. `bench warm` on a default configuration is
+/// the command the README points newcomers at, and until A2 is settled it
+/// prints `p99 FAIL` — so it has to say what the number is about, and how to
+/// take the measurement without it.
+fn print_cgroup_note(phases: &[zygo_core::pool::CallTiming], report: &Report, style: &Style) {
+    let Some(share) = cgroup_share_of_p99(phases) else {
+        return;
+    };
+    // Only when it owns the tail *and* the tail is what failed. A run inside
+    // budget needs no excuse, and one that failed on p50 has another cause.
+    if share < 0.5 || !report.p99_is_meaningful() || report.p99 < WARM_P99_BUDGET_US {
+        return;
+    }
+    println!();
+    println!(
+        "{}",
+        style.yellow(&format!(
+            "  {:.0}% of the p99 above is `admit` and `release` — creating this request's\n  \
+             own cgroup and removing it, not running the handler. That cost is open\n  \
+             question A2 in todo.md, not a property of the warm path.",
+            share * 100.0
+        ))
+    );
+    println!(
+        "        measure without it: zygo bench warm --no-cgroup{}",
+        match report.count {
+            0 => String::new(),
+            n => format!(" --n {n}"),
+        }
+    );
+}
+
 fn print_phases(phases: &[zygo_core::pool::CallTiming]) {
     let micros = |d: Duration| d.as_secs_f64() * 1e6;
     /// One row of the breakdown: a label and the phase it reads.

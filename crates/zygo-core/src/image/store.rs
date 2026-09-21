@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use super::media::LayerCompression;
 use super::{ImageError, Reference};
 use crate::error::{IoContext, Result};
-use crate::paths::Paths;
+use crate::paths::{Lock, Paths};
 use crate::sandbox::RootfsView;
 use crate::sandbox::mount::{MountPoint, MountPointKind};
 
@@ -353,6 +353,7 @@ impl Store {
         let key = hex::encode(key.finalize());
         let dir = self.paths.flat_cache().join(&key);
         if dir.join(LAYER_DONE).is_file() {
+            touch(&dir.join(LAYER_DONE));
             return Ok(dir);
         }
 
@@ -470,6 +471,87 @@ impl Store {
         self.write_index(&entries)
     }
 
+    /// Forget an image, and every derived image built on it.
+    ///
+    /// Only the index changes here. The layers, and the caches keyed on the
+    /// image's liveness, become collectable and are collected by the same
+    /// pass `zygo image prune` runs — which `zygo image rm` runs immediately,
+    /// because `rmi` frees disk and a removal that leaves the bytes behind
+    /// until a second command is a surprise.
+    ///
+    /// Derived images (`<reference>+system.<key>`) go with their base: they
+    /// are that base plus one layer, named after it, and nothing asks for
+    /// one by its own name. Returns what was removed, base first, and
+    /// nothing when the reference was not in the index.
+    pub fn remove(&self, reference: &Reference) -> Result<Vec<ImageEntry>> {
+        let _lock = self.lock("index")?;
+        let key = reference.to_string();
+        let derived_prefix = format!("{key}+system.");
+        let (removed, kept): (Vec<ImageEntry>, Vec<ImageEntry>) = self
+            .read_index()
+            .into_iter()
+            .partition(|e| e.reference == key || e.reference.starts_with(&derived_prefix));
+        if removed.is_empty() {
+            return Ok(removed);
+        }
+        self.write_index(&kept)?;
+        let mut removed = removed;
+        removed.sort_by_key(|e| e.reference != key);
+        Ok(removed)
+    }
+
+    /// Compressed layer blobs that nothing needs until a layer is lost.
+    ///
+    /// A blob is read once, to unpack its layer; after that every path —
+    /// overlay, flatten, derive, `pull` itself — works from the unpacked
+    /// directory, and `pull` treats a present layer as cached without looking
+    /// for the blob. Keeping both is what containerd does and roughly doubles
+    /// the store; dropping them is `prune --blobs`, and costs one download if
+    /// a layer directory is ever removed by hand. Manifest and config blobs
+    /// are not layers and are never offered here.
+    pub fn droppable_blobs(&self) -> Result<Vec<(String, PathBuf)>> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for entry in self.read_index() {
+            for digest in entry.layers {
+                if !seen.insert(digest.clone()) || !self.has_layer(&digest) {
+                    continue;
+                }
+                if let Ok(blob) = self.blob_path(&digest) {
+                    if blob.is_file() {
+                        out.push((digest, blob));
+                    }
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// Flattened rootfs directories whose image is still here but that have
+    /// not been used since `cutoff`. Use is recorded on the completion
+    /// marker's modification time, refreshed on every hit.
+    pub fn flat_unused_since(&self, cutoff: std::time::SystemTime) -> Result<Vec<PathBuf>> {
+        let stale: std::collections::BTreeSet<PathBuf> =
+            self.unreferenced_flat()?.into_iter().collect();
+        let dir = self.paths.flat_cache();
+        if !dir.is_dir() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(&dir).at(&dir)? {
+            let path = entry.at(&dir)?.path();
+            if !path.is_dir() || stale.contains(&path) {
+                continue;
+            }
+            if last_used(&path.join(LAYER_DONE)).is_some_and(|t| t < cutoff) {
+                out.push(path);
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
     pub fn get(&self, reference: &Reference) -> Option<ImageEntry> {
         let key = reference.to_string();
         self.read_index().into_iter().find(|e| e.reference == key)
@@ -509,40 +591,28 @@ impl Store {
 
     /// Take an exclusive lock, so two `zygo pull`s of the same image do not
     /// unpack into the same directory at once.
+    ///
+    /// The same mechanism the rest of Zygo uses to serialise slow work; see
+    /// [`Paths::lock`].
     pub fn lock(&self, key: &str) -> Result<Lock> {
-        let dir = self.paths.tmp();
-        std::fs::create_dir_all(&dir).at(&dir)?;
-        let path = dir.join(format!(
-            "{}.lock",
-            key.chars()
-                .map(|c| if c.is_ascii_alphanumeric() || c == '-' {
-                    c
-                } else {
-                    '_'
-                })
-                .collect::<String>()
-        ));
-        let file = File::create(&path).at(&path)?;
-        lock_exclusive(&file).at(&path)?;
-        Ok(Lock { _file: file })
+        self.paths.lock(key)
     }
 }
 
-/// Held for as long as the caller needs exclusivity; released on drop.
-#[derive(Debug)]
-pub struct Lock {
-    _file: File,
+/// Record that a cache entry was used now.
+///
+/// The marker's modification time is the only record of use a cache entry
+/// has, and it is what `prune --unused-for` reads. Best effort: a cache that
+/// cannot be stamped is still a cache, and the next hit tries again.
+pub(crate) fn touch(marker: &Path) {
+    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(marker) {
+        let _ = file.set_modified(std::time::SystemTime::now());
+    }
 }
 
-#[cfg(unix)]
-fn lock_exclusive(file: &File) -> std::io::Result<()> {
-    rustix::fs::flock(file, rustix::fs::FlockOperation::LockExclusive)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn lock_exclusive(_file: &File) -> std::io::Result<()> {
-    Ok(())
+/// When a cache entry was last used, from its marker.
+pub(crate) fn last_used(marker: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(marker).ok()?.modified().ok()
 }
 
 /// Join `rel` under `root`, refusing anything that could escape.
@@ -1365,6 +1435,220 @@ mod tests {
         .unwrap();
 
         assert_eq!(s.unreferenced_layers().unwrap(), [orphan_d]);
+    }
+
+    /// The flattened rootfs is bigger than the layers it comes from, and for
+    /// three small images it was most of the data directory. Prune could not
+    /// see it at all until the directory recorded what it was built from.
+    #[test]
+    fn a_flattened_rootfs_is_collected_once_its_image_is_gone() {
+        let (_t, s) = store();
+        let tar = tar_of(&[("a", b"1")]);
+        let digest = sha256_of(&tar);
+        s.write_blob(&digest, &tar[..]).unwrap();
+        s.unpack_layer(&digest, LayerCompression::None).unwrap();
+
+        s.put(ImageEntry {
+            reference: "img:1".into(),
+            manifest: sha256_of(b"m"),
+            config: sha256_of(b"c"),
+            layers: vec![digest.clone()],
+            size: 1,
+            pulled_at: 1,
+            index: None,
+            platform: None,
+        })
+        .unwrap();
+
+        let flat = s
+            .flatten_with_mount_points(std::slice::from_ref(&digest), &mount_points())
+            .unwrap();
+        assert!(flat.is_dir());
+        assert!(
+            s.unreferenced_flat().unwrap().is_empty(),
+            "the image that produced it is still here"
+        );
+
+        // The image goes; the rootfs built from its layer goes with it.
+        std::fs::write(s.paths().image_index(), b"[]").unwrap();
+        assert_eq!(s.unreferenced_flat().unwrap(), [flat]);
+    }
+
+    /// Until `rm` existed, nothing a user decided they were finished with
+    /// could become unreferenced: `prune` collected only what a crash had
+    /// orphaned. This is the whole of that fix.
+    #[test]
+    fn removing_an_image_makes_its_layers_collectable() {
+        let (_t, s) = store();
+        let tar = tar_of(&[("a", b"1")]);
+        let digest = sha256_of(&tar);
+        s.write_blob(&digest, &tar[..]).unwrap();
+        s.unpack_layer(&digest, LayerCompression::None).unwrap();
+
+        let base = ImageEntry {
+            reference: "img:1".into(),
+            manifest: sha256_of(b"m"),
+            config: sha256_of(b"c"),
+            layers: vec![digest.clone()],
+            size: 1,
+            pulled_at: 1,
+            index: None,
+            platform: None,
+        };
+        s.put(base.clone()).unwrap();
+        // A derived image of that base, and an unrelated one that must stay.
+        s.put(ImageEntry {
+            reference: "img:1+system.abcdef123456".into(),
+            ..base.clone()
+        })
+        .unwrap();
+        s.put(ImageEntry {
+            reference: "other:1".into(),
+            ..base.clone()
+        })
+        .unwrap();
+
+        assert!(
+            s.unreferenced_layers().unwrap().is_empty(),
+            "everything is referenced while the images are here"
+        );
+
+        let removed = s.remove(&"img:1".parse().unwrap()).unwrap();
+        let names: Vec<&str> = removed.iter().map(|e| e.reference.as_str()).collect();
+        assert_eq!(
+            names,
+            ["img:1", "img:1+system.abcdef123456"],
+            "the derived image goes with its base, base first"
+        );
+        assert_eq!(
+            s.list().len(),
+            1,
+            "the unrelated image is untouched: {:?}",
+            s.list()
+        );
+        // Still referenced — by `other:1`, which shares the layer.
+        assert!(s.unreferenced_layers().unwrap().is_empty());
+
+        s.remove(&"other:1".parse().unwrap()).unwrap();
+        assert_eq!(
+            s.unreferenced_layers().unwrap(),
+            [digest],
+            "the last reference is gone, so the layer is collectable"
+        );
+    }
+
+    #[test]
+    fn removing_an_image_that_is_not_here_removes_nothing() {
+        let (_t, s) = store();
+        assert!(s.remove(&"ghost:1".parse().unwrap()).unwrap().is_empty());
+    }
+
+    /// A venv or a rootfs keyed on a live image is never collectable by
+    /// liveness alone, so age is the only thing that can retire it — and age
+    /// needs the hit path to leave a mark.
+    #[test]
+    fn using_a_flattened_rootfs_records_that_it_was_used() {
+        let (_t, s) = store();
+        let tar = tar_of(&[("a", b"1")]);
+        let digest = sha256_of(&tar);
+        s.write_blob(&digest, &tar[..]).unwrap();
+        s.unpack_layer(&digest, LayerCompression::None).unwrap();
+        s.put(ImageEntry {
+            reference: "img:1".into(),
+            manifest: sha256_of(b"m"),
+            config: sha256_of(b"c"),
+            layers: vec![digest.clone()],
+            size: 1,
+            pulled_at: 1,
+            index: None,
+            platform: None,
+        })
+        .unwrap();
+
+        let dir = s
+            .flatten_with_mount_points(std::slice::from_ref(&digest), &mount_points())
+            .unwrap();
+
+        // Backdate the marker, as an unused cache would be.
+        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(90 * 86_400);
+        std::fs::File::options()
+            .write(true)
+            .open(dir.join(LAYER_DONE))
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+
+        let week = std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 86_400);
+        assert_eq!(
+            s.flat_unused_since(week).unwrap(),
+            std::slice::from_ref(&dir),
+            "ninety days idle is older than a week"
+        );
+
+        // A hit moves it out of reach of the same cutoff.
+        let again = s
+            .flatten_with_mount_points(std::slice::from_ref(&digest), &mount_points())
+            .unwrap();
+        assert_eq!(again, dir, "same key, same directory");
+        assert!(
+            s.flat_unused_since(week).unwrap().is_empty(),
+            "using it is what keeps it"
+        );
+
+        // Age never collects what liveness already condemns: no double count.
+        std::fs::write(s.paths().image_index(), b"[]").unwrap();
+        assert_eq!(s.unreferenced_flat().unwrap(), [dir]);
+        assert!(
+            s.flat_unused_since(std::time::SystemTime::now())
+                .unwrap()
+                .is_empty(),
+            "already collectable as unreferenced; counting it twice would \
+             double the reported size"
+        );
+    }
+
+    /// The blob is dead weight once its layer is unpacked, and it is half the
+    /// store. Offered, never taken without `--blobs`.
+    #[test]
+    fn a_blob_is_droppable_once_its_layer_is_unpacked() {
+        let (_t, s) = store();
+        let tar = tar_of(&[("a", b"1")]);
+        let digest = sha256_of(&tar);
+        s.write_blob(&digest, &tar[..]).unwrap();
+
+        assert!(
+            s.droppable_blobs().unwrap().is_empty(),
+            "not referenced by any image yet"
+        );
+
+        s.unpack_layer(&digest, LayerCompression::None).unwrap();
+        s.put(ImageEntry {
+            reference: "img:1".into(),
+            manifest: sha256_of(b"m"),
+            config: sha256_of(b"c"),
+            layers: vec![digest.clone(), digest.clone()],
+            size: 1,
+            pulled_at: 1,
+            index: None,
+            platform: None,
+        })
+        .unwrap();
+
+        let droppable = s.droppable_blobs().unwrap();
+        assert_eq!(droppable.len(), 1, "a shared layer is offered once");
+        assert_eq!(droppable[0].0, digest);
+        assert!(droppable[0].1.is_file());
+    }
+
+    /// A directory from before the record, or from an interrupted build,
+    /// cannot prove it is live — and a cache that cannot is what prune takes.
+    #[test]
+    fn a_flat_directory_with_no_record_is_collected() {
+        let (_t, s) = store();
+        let dir = s.paths().flat_cache().join("deadbeef");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(LAYER_DONE), b"").unwrap();
+        assert_eq!(s.unreferenced_flat().unwrap(), [dir]);
     }
 
     #[test]

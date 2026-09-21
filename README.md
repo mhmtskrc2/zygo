@@ -131,6 +131,16 @@ is one `make`, and `zygo` says so if it is missing. The VM is built on the
 first command that needs it and takes about a minute; after that a command is
 milliseconds, and `zygo stop --all` puts it away again.
 
+One number to set expectations by, because the alternative is measuring the
+wrong thing and concluding the benchmark was optimistic. Crossing into the VM
+costs about 100 ms per command, and that is the floor for anything typed at a
+Mac shell: `zygo exec` and `docker exec` feel the same there, and the ~1 ms
+warm path is entirely hidden by the hop. It is reachable on a Mac — through
+the HTTP API or the library, where the round trip happens inside the VM and
+the 100 ms is paid once by the connection rather than once per request — and
+it is what a Linux host gives you at the CLI. The shim is doing its job here
+rather than failing at it; it is simply not the thing to benchmark.
+
 The VM mounts your home directory at *the same path*, writable, so
 `./handler.py` is one file seen from two sides. That is also the limit and it
 is enforced: a command run from outside `$HOME` is refused, and the message
@@ -348,7 +358,8 @@ appendix C. `zygo doctor` reports each one and prints the fix.
 On macOS the code builds, the platform-independent layers are fully tested, and
 sandboxes run in a Linux VM the shim manages — `zygo doctor` prints what that
 VM says about itself and exits with its answer. A warm `exec` from the Mac
-round-trips in 96 ms; `make verify-shim` is 14 checks against a real VM.
+round-trips in 96 ms, nearly all of it the hop into the VM rather than the
+request; `make verify-shim` is 14 checks against a real VM.
 
 One thing to know before running Zygo on Ubuntu 24.04 or later:
 `kernel.apparmor_restrict_unprivileged_userns=1` lets an unprivileged process

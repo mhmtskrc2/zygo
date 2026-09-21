@@ -218,11 +218,38 @@ pub enum Command {
 
 #[derive(Debug, Subcommand)]
 pub enum ImageCommand {
+    /// Remove an image, its derived system images, and what only they kept alive.
+    ///
+    /// Refused while a warm function is running on it: that function's
+    /// rootfs is these layers, mounted. Stop it first.
+    #[command(visible_alias = "remove")]
+    Rm {
+        /// Image references, e.g. `python:3.12-slim`.
+        #[arg(required = true)]
+        references: Vec<String>,
+    },
     /// Delete unreferenced layers and stale caches.
+    ///
+    /// Without flags, only what nothing can reach any more: layers of images
+    /// that were removed, and venvs, flattened rootfs and derived-layer
+    /// records whose image is gone. A cache whose image is still here is
+    /// kept, however long ago it was used, unless `--unused-for` says
+    /// otherwise; the compressed blobs beside every layer are kept unless
+    /// `--blobs` says otherwise.
     Prune {
         /// Report what would be deleted without deleting it.
         #[arg(long)]
         dry_run: bool,
+        /// Also collect venvs and flattened rootfs not used for this long,
+        /// e.g. `30d`. Use is recorded on every hit, so a cache that was
+        /// used yesterday is safe at `7d`.
+        #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+        unused_for: Option<Duration>,
+        /// Also drop the compressed blob of every layer that is unpacked.
+        /// Roughly halves the store; costs a download if a layer directory
+        /// is ever lost.
+        #[arg(long)]
+        blobs: bool,
     },
 }
 

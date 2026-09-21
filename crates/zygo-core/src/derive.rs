@@ -1139,4 +1139,43 @@ mod tests {
         let err = ensure(&store, &base, &["jq; rm -rf /".into()]).expect_err("rejected");
         assert!(matches!(err, Error::Spec(_)), "{err}");
     }
+
+    /// The record is only ever read to answer which versions `apt` chose, so
+    /// it is dead the moment its derived image leaves the index.
+    #[test]
+    fn a_system_record_is_collected_once_its_derived_image_is_gone() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let paths = crate::paths::Paths::rooted(tmp.path());
+        paths.ensure().expect("ensure");
+        let store = Store::new(paths.clone());
+
+        let base = "debian:12";
+        let live_key = cache_key("sha256:base", &["jq".into()], std::env::consts::ARCH);
+        let dead_key = cache_key("sha256:base", &["curl".into()], std::env::consts::ARCH);
+
+        for key in [&live_key, &dead_key] {
+            let dir = paths.system_cache().join(key);
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            std::fs::write(dir.join(RECORD), "# debian:12 sha256:base\njq=1.6\n").expect("write");
+        }
+
+        // Only one of the two derived images is in the index.
+        store
+            .put(ImageEntry {
+                reference: derived_reference(base, &live_key),
+                manifest: "sha256:derived".into(),
+                config: "sha256:cfg".into(),
+                layers: vec![],
+                size: 0,
+                pulled_at: 0,
+                index: None,
+                platform: None,
+            })
+            .expect("put");
+
+        assert_eq!(
+            unreferenced(&store).expect("scan"),
+            [paths.system_cache().join(&dead_key)]
+        );
+    }
 }
