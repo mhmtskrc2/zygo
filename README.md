@@ -31,7 +31,7 @@ Design document: [ahmed.md](ahmed.md). Plan and status: [todo.md](todo.md).
 > being enforced, and `zygo bench warm` says so rather than reporting it as
 > Zygo's cost. A cold `zygo run` with the image cached measures **p50 18.4 ms**
 > against a 50 ms budget. The launcher is checked by 52 scenarios against a real
-> kernel, 16 of them actual escape attempts, and the supervisor by 151 end-to-end
+> kernel, 16 of them actual escape attempts, and the supervisor by 139 end-to-end
 > ones. Every syscall number the architecture has is swept against all three
 > seccomp profiles, and the `gvisor` backend is checked against a real `runsc`
 > by 19 more.
@@ -366,7 +366,7 @@ make test           # Rust, agent and SDK suites
 make check-linux    # type-check the Linux-only code from a non-Linux host
 make test-linux     # the full suite inside a Linux container
 make verify-linux   # 36 isolation and limit checks against a real kernel
-make verify-supervisor-linux  # 151 end-to-end supervisor lifecycle checks
+make verify-supervisor-linux  # 139 end-to-end supervisor lifecycle checks
 make escape-linux   # 16 escape attempts against a real kernel
 make fuzz-linux     # every syscall number, against all three seccomp profiles
 make gvisor-linux   # the gvisor backend against a real runsc, compared with ns

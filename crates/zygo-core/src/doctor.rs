@@ -794,22 +794,73 @@ mod probe {
                 "the `vm` backend needs KVM; use --isolation ns here",
             );
         }
-        match std::fs::OpenOptions::new()
+        let fd = match std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)
         {
-            Ok(_) => Check::ok("kvm", "/dev/kvm"),
+            Ok(fd) => fd,
             // Absent rather than degraded: a `/dev/kvm` this user cannot open
             // is not a weaker `vm` backend, it is no `vm` backend. Reporting it
             // as degraded made `zygo doctor` list `vm` under "backends
             // available" on a host where it could not have started one.
-            Err(_) => Check::absent(
+            Err(_) => {
+                return Check::absent(
+                    "kvm",
+                    "/dev/kvm is not readable and writable by this user",
+                    "sudo usermod -aG kvm $USER, then log in again",
+                );
+            }
+        };
+
+        // Opening the device is not the question. A nested or restricted
+        // hypervisor hands out `/dev/kvm` and then refuses `KVM_CREATE_VM`,
+        // and this check used to call that host ready — which would have sent
+        // the `vm` backend to a machine that cannot start a virtual machine
+        // (V10 in docs/vm_implementation.md). So it creates one and closes it,
+        // which is the same probe that confirmed the Raspberry Pi.
+        match create_vm(&fd) {
+            Ok(()) => Check::ok("kvm", "/dev/kvm"),
+            Err(e) => Check::absent(
                 "kvm",
-                "/dev/kvm is not readable and writable by this user",
-                "sudo usermod -aG kvm $USER, then log in again",
+                format!("/dev/kvm opens but KVM_CREATE_VM failed: {e}"),
+                "this looks like a nested or restricted hypervisor; use --isolation ns here",
             ),
         }
+    }
+
+    /// Ask KVM for a virtual machine, and give it straight back.
+    ///
+    /// The descriptor is closed by `OwnedFd`'s drop, which is what makes this
+    /// safe to run from `doctor` — a diagnostic that leaves a VM behind is
+    /// worse than one that reports less.
+    #[cfg(target_os = "linux")]
+    fn create_vm(kvm: &std::fs::File) -> std::io::Result<()> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        // `KVM_CREATE_VM` is `_IO(KVMIO, 0x01)` with `KVMIO` = 0xAE, on every
+        // architecture. The machine type argument is zero, which means "this
+        // host's default" — the only thing a probe should ask for.
+        // `libc::Ioctl` is `c_ulong` on glibc and `c_int` on musl, so the
+        // constant takes the target's own type rather than a fixed one.
+        const KVM_CREATE_VM: libc::Ioctl = 0xAE01;
+
+        // SAFETY: `kvm` is an open `/dev/kvm`; the ioctl takes an integer by
+        // value and returns a descriptor or -1.
+        let vm = unsafe { libc::ioctl(kvm.as_raw_fd(), KVM_CREATE_VM, 0) };
+        if vm < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: a descriptor the kernel just created and nobody else holds.
+        drop(unsafe { OwnedFd::from_raw_fd(vm) });
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn create_vm(_kvm: &std::fs::File) -> std::io::Result<()> {
+        // There is no `/dev/kvm` to have opened, so this is unreachable; it
+        // exists so the check above compiles and is reviewed everywhere.
+        Ok(())
     }
 
     fn runsc() -> Check {

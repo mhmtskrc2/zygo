@@ -476,7 +476,7 @@ run by hand.
 - [x] The base directory travels over the wire: the supervisor has a working
       directory of its own, so `--mount ./data:/data` has to resolve against
       where the user typed it
-- [x] **`poc/verify_supervisor.sh` — 151 end-to-end checks**, with the client
+- [x] **`poc/verify_supervisor.sh` — 139 end-to-end checks**, with the client
       process exiting between each one. Wired into the Makefile and CI
 - [x] Per-request cgroup create/remove, moving the pid, `GO` synchronisation.
       **The pid move was broken until now** — see 2.2b
@@ -763,15 +763,164 @@ that, `sh -c cat` answers in 2.2 ms.
       it up
 
 ### 2.5 The `vm` backend (libkrun) — first-class in the first release
-- [ ] Static linking of libkrun + libkrunfw (licence/size); fallback
-      `zygo backend install vm`
-- [ ] A `krun_create_ctx / set_root / set_exec / start_enter` wrapper
-- [ ] Share the overlayfs view over virtiofs
-- [ ] The protocol over vsock; Landlock/seccomp inside the guest as well
-- [ ] Guest memory limit = `mem` + a kernel allowance; the host cgroup applies to
-      the VMM
-- [ ] The shared test suite passing on `vm`; a clear error plus an `ns`
-      suggestion when there is no KVM
+
+Planned in full in [docs/vm_implementation.md](docs/vm_implementation.md),
+written against the tree rather than the design alone, after the Raspberry Pi
+at `192.168.1.32` was confirmed to run `KVM_CREATE_VM` unprivileged on
+21 September 2026. **The Pi is the test target, not the build host** — it has
+no toolchain and 3 GB of disk, so the binary is built on the Mac in a
+container the way `make poc/zygo-linux-musl` already does, and copied over.
+
+The nine decisions (D1–D9) are in that document with what in the current code
+each rests on; the ones marked *provisional* name the milestone that settles
+them. The shape in one line: a `VmSandbox` is a forked process that calls
+`krun_start_enter` and *becomes* the VMM, living in the `ns` backend's own
+cgroups and network namespace, with `zygo guest-init` applying inside the
+guest what `ns/child.rs` applies on the host.
+
+#### M0 — Groundwork and PoC 8
+- [x] **`make vm-build` — V1 is answered, and the answer is yes.** libkrun
+      **v1.19.4** compiles cleanly for `aarch64-unknown-linux-musl` in about
+      33 seconds and produces `libkrun.rlib` (2.4 MB) plus its workspace
+      crates. No glibc fallback is needed, and `dist-linux` keeps its single
+      static binary.
+      - The route is **a cargo dependency, not a C library**. libkrun's own
+        `make` fails on musl for two reasons that are both about the
+        *project's* build and not about musl: it builds the whole workspace,
+        which drags in `krun-input`, whose build script wants a static
+        libclang; and it asks for a `cdylib`, which cargo says outright is an
+        unsupported crate type for a musl target. Zygo links Rust to Rust, so
+        `cargo build -p libkrun` and the rlib are the whole story — no `.so`,
+        no `.a`, no Makefile. That is D8's "linked statically", by a route the
+        plan did not name
+      - `krun_set_kernel` **is present** in this version, so D8 holds: the GPL
+        kernel stays a downloaded artefact and out of the Apache-2.0 binary
+      - The plan's pinned `v1.9.7` does not exist; the newest published tag is
+        `v1.19.4`. `poc/vm_build_probe.sh` now lists the tags and says which
+        one it measured, so the next run cannot quietly measure a different
+        thing
+      - The probe reports rather than fails, and twice had to be fixed for
+        reading a pipeline's status instead of the command's — `git clone |
+        tail` and `make | tail` both report `tail`'s success, which is how a
+        failed clone reached the next step and a failed build was called a
+        pass
+- [ ] `make vm-kernel`: fetch the libkrunfw aarch64 release, extract `Image`,
+      dump its config and confirm `CGROUPS`, `CGROUP_PIDS`, `SECCOMP_FILTER`,
+      `SECURITY_LANDLOCK`, `OVERLAY_FS`, `NF_TABLES`, `VIRTIO_FS`,
+      `VIRTIO_VSOCKETS`. **Settles V2**; anything missing is a custom kernel
+      build, which needs a week and the disk, so it is found out first
+- [ ] **PoC 8**, the one the whole project has been blocked on: boot the
+      kernel with a flattened `python:3.12-slim` over virtiofs, run
+      `python3 -c pass` and then `python3 -c "import json, re, ssl"`, twenty
+      samples each. Boot-to-exec, first import, second import, into
+      `docs/poc-report.md`. **Settles V3 and decides D3**: a flat rootfs
+      first, or layered virtiofs tags with a guest overlay
+- [x] **`poc/pi_env.sh`** — §2 of the plan as a script. On the Pi it reports
+      `api 12, up to 4 vcpus, KVM_CREATE_VM ok`, `/dev/vhost-vsock` present,
+      `cpu memory pids` delegated, `pasta` and `nft` installed — and **two
+      blockers**: 3.0 GB free where the plan asks for 4, and another session's
+      `zygo` running (**V9**, working as intended). It creates a virtual
+      machine and closes it rather than looking at the device, which is the
+      same thing `doctor` now does
+- [x] **V10, done early because everything else trusts it.** `doctor::kvm()`
+      only *opened* `/dev/kvm`, so it said ok on a nested or restricted
+      hypervisor where `KVM_CREATE_VM` fails — and would have sent the `vm`
+      backend to a host that cannot start a virtual machine. It now issues the
+      ioctl and closes the descriptor
+
+#### M1 — `zygo run --isolation vm`
+- [ ] `backend/vm.rs`, shaped like `backend/gvisor.rs`: `availability()` (KVM
+      openable, kernel installed, feature compiled in) and `start()` (fork;
+      in the child: cgroup attach, the `krun_*` calls, `krun_start_enter`)
+- [ ] `zygo guest-init` (hidden): the same `MountPlan`, `/tmp` as a tmpfs
+      sized to `scratch`, `/proc`, `/sys`, `/dev`, then `execve`. The guest
+      needs no `newuidmap` and no user namespace — it is root in its own
+      kernel, and that is the point
+- [ ] `zygo backend install vm` downloads and verifies the guest kernel, as
+      `install gvisor` verifies `runsc`; `doctor` gains a distinct
+      "kvm ok, guest kernel not installed" line (**D8**)
+- [ ] `poc/verify_vm.sh`, from `verify_gvisor.sh`: the `ns` baseline first,
+      the same probes on `vm`, `uname -r` differing, `/tmp` writable and `/`
+      not, and every refusal by name
+- [ ] `make vm-pi`: copy the binary and the suite, run it over ssh, bring the
+      log back
+- [ ] Acceptance: `verify_vm.sh` green on the Pi; `bench cold --isolation vm`
+      beside `ns`; and **whether Landlock and `cgroup.kill` appear inside the
+      guest on a host that lacks them** — if they do, the backend improves
+      that host twice, which is the §2 claim
+
+#### M2 — Limits, hardening, the escape suite inside the guest
+- [ ] Guest-side cgroup v2 in `guest-init`: `zygote/` and `request/<id>/`,
+      `pids.max` from the spec, `memory.max` as a second fence below the
+      guest's RAM
+- [ ] The same seccomp filter and Landlock ruleset, from the same
+      `SandboxConfig` the `ns` child uses — so a control `ns` has is not one
+      `vm` forgot
+- [ ] **D7's numbers, measured not guessed**: the guest RAM allowance, the
+      VMM's own overhead, and the host `memory.max` derived from them
+      (**settles V5**)
+- [ ] `escape_suite.sh` and `fuzz_syscalls.sh` gain `ISOLATION=vm`. Vectors
+      about user namespaces do not apply and are **listed with the reason**,
+      never skipped silently
+- [ ] Acceptance: `N blocked, 0 escaped` with the not-applicable list
+      printed; fuzz `0 failed`; `--mem 64M` against a 200 MB allocation exits
+      137; a fork bomb stops at `pids`; a 10 s sleep under `--timeout 2s`
+      ends in about 2 s with the VMM gone and the cgroup empty
+
+#### M3 — Warm: the agent over vsock
+- [ ] `krun_add_vsock_port(3, agent.sock)` so `WarmFn` keeps speaking
+      `READY`/`EXEC`/`FORKED`/`GO`/`DONE` unchanged; `guest-init` hands the
+      guest side to `zygo_agent.py --fd 3`
+- [ ] **`RequestControl`** (**D5**): what the pool does between `FORKED` and
+      `GO` cannot cross the boundary — `host_pid_of` reads `/proc`, `admit`
+      writes `cgroup.procs`, `enforce_deadline` writes `cgroup.kill`. A trait
+      with `admit`/`kill`/`release`; the `ns` implementation is today's code,
+      moved; the `vm` one sends three verbs on a second vsock port. The
+      timeout keeps two layers, guest-side precise and host-side unbeatable
+- [ ] Secrets over a per-sandbox virtiofs tag (**D6**), with the
+      write-`GO`-read test — virtiofs attribute caching can delay visibility,
+      and the knob is the cache mode, so the check is a test and not a
+      setting (**settles V6**)
+- [ ] `verify_supervisor.sh` gains `ISOLATION=vm`; the checks that inspect
+      the agent's `/proc/<pid>` ask the guest instead
+- [ ] Acceptance: `bench warm --isolation vm` p50/p99 beside `ns` on the same
+      machine, against "1–3 ms"; a secret readable in the request and absent
+      from `/proc/1/environ`, the agent's memory and the control socket
+
+#### M4 — Networking
+- [ ] The VMM forked inside Zygo's user+net namespace (**D2**), where
+      `launch()` parks the child today — so with TSI the guest's `connect()`
+      becomes a host `connect()` from the VMM, and the allowlist, the
+      private-range refusal and Zygo's resolver apply with no guest-side
+      network configuration at all
+- [ ] TSI measured against `krun_set_passt_fd` on the same namespace; keep
+      whichever passes the N8 checks and **record the other's failure mode**
+      (**settles V4**)
+- [ ] Acceptance: use-case scenarios 1.4 and 7.2 give the same answers on
+      `vm` as on `ns`; `169.254.169.254` and `metadata.google.internal`
+      refused from inside the guest
+
+#### M5 — Warm-exec, `shell`, `logs`, `--tty`
+- [ ] Port 4 gains `exec argv stdin`; `guest-init` forks and execs inside the
+      held guest and returns both streams and the exit code
+- [ ] `zygo shell` into a guest over the same verb with a pty; `--tty` for
+      one-shot runs via virtio-console
+- [ ] Acceptance: the Go warm-exec example and `bench warm -- sh -c cat` on
+      `vm`; `zygo shell` shows the guest's own `/proc/1/cgroup` and `uname -r`
+
+#### M6 — Distribution, docs, CI
+- [ ] `dist-linux` builds the vm-capable binary inside the budget, or a
+      `dist-linux-vm` target and a sentence in the README saying why
+- [ ] README, `docs/threat-model.md` T3, `spec-reference.md`,
+      `docs/comparison.md` and `ahmed.md` §3.9 carry **measured** numbers in
+      place of designed ones; the "not built" sentences go
+- [ ] CI's `pending-hardware` stops saying KVM has no home: either a
+      self-hosted runner on the Pi for a manual-dispatch job (never on pull
+      requests from forks) or `make vm-pi` run by hand with its log committed
+- [ ] **V10**, worth doing before any of this ships: `doctor::kvm()` today
+      only *opens* `/dev/kvm`, so it says ok on a nested or restricted
+      hypervisor where `KVM_CREATE_VM` fails. Attempt the ioctl and close it,
+      as the probe on the Pi did
 
 ### 2.6 The library and its bindings
 - [x] `zygo-core`: `Pool` + `WarmFn` written and working end-to-end on Linux —
@@ -2456,9 +2605,11 @@ original code first, and each failed there and passes now.
 - [ ] **C-03 / C-04 / C-05** `tempfile` listed twice in `zygo-cli`; Makefile
       `.PHONY`/`help` gaps and the unconditional `-t`; one build profile in
       the `unit` job.
-- [ ] **X-01** The counts in README, todo.md, Makefile and SECURITY.md
-      disagree (151/157 supervisor, 14/15 shim, 27/37 Python, 5.3/5.15
-      kernel floor). Have the suites print their totals; quote those.
+- [~] **X-01** The supervisor count is now the one the suite prints: **139**,
+      measured on the Pi, quoted in README, Makefile and here. The others are
+      still to reconcile (14/15 shim, 27/37 Python, 5.3/5.15 kernel floor),
+      and the durable fix is the report's: have each suite print its total and
+      quote that rather than a number in prose.
 - [ ] **X-02..X-07** `PING` liveness is promised by the spec and not sent;
       SUMMARY.md links outside the book root; ported allow rules are
       TCP-only and undocumented; kernel series table ages silently; the
@@ -2511,34 +2662,51 @@ Three things the use-case walk-through found, all of them now closed.
 | A2 | A cgroup per request, or one per tenant? | Support both; per request by default. **Reopened**: the field report measured the per-request cgroup at +645 µs p50 and +13.6 ms p99 under sustained load, enough to fail the p99 criterion on its own — see "After test" |
 | A3 | JSON or MessagePack for the protocol? | Start with JSON, measure at 100 KB+ payloads |
 
-## Open, with evidence
+## Resolved: the queued request during a replacement
 
-**A request queued behind a function being replaced ran on the old one.**
-Seen once, on the Raspberry Pi, by the check written to tell that apart from
-a slow host:
+**The symptom.** One Raspberry Pi run of `verify_supervisor.sh` reported that
+a request queued behind a function being replaced ran on the **old** one,
+although the replacement had been ready 402 ms into an 8 s window. Every
+ordering in `Supervisor::serve` and `Gate::close` read as though that could
+not happen, the container passed every time, and each attempt on that machine
+was a thirty-five minute run. It was left open for want of a reproduction
+tight enough to instrument.
 
-```
-FAIL  the queued request ran on the old function although the replacement
-      was ready 402 ms in, with 7400 ms of queue left
-```
+**The reproduction.** `poc/repro_blue_green.sh` does that scenario and nothing
+else, N times, in minutes. Building it found the answer, and it was in the
+check rather than in the supervisor.
 
-`Supervisor::serve` documents the opposite — "requests the old one accepted
-finish on it, and requests that were queued behind it are admitted to the new
-one" — and the code reads as though it holds. `retire` closes the old gate
-immediately after the registry swap; `Gate::close` sets `closed` and
-`notify_all`; a waiter's predicate is `!closed && in_flight >= limit`, so it
-wakes, sees `closed`, and the caller's loop looks the name up again and gets
-the replacement. Every ordering I can trace ends on the new function.
+- [x] **The check could not tell a queued request from one that was never
+      queued.** It launched the slot-holder, slept 300 ms, and launched the
+      second request. On a Pi `zygo exec` takes longer than 300 ms to connect,
+      so the *second* one could win the race to the only slot — and then it
+      never queued at all, ran on the function that was current when it ran,
+      and the check reported a supervisor bug that was a stopwatch. The first
+      version of the reproduction had the same flaw and produced the same
+      "failure" twice.
+- [x] With the ordering made certain — the handler writes a marker from inside
+      the sandbox the moment a request starts, and nothing queues until that
+      marker exists — the symptom **did not reproduce once in about forty
+      rounds**, across a Raspberry Pi and a container. `verify_supervisor.sh`
+      now waits for the same marker, so it cannot produce that false failure
+      again
+- [x] **The second bound nobody was counting.** `QUEUE_WAIT` is five seconds:
+      a request waits that long for a slot and is then told to retry, by
+      design. The scenario holds the slot for eight, so a queued request can
+      *never* reach the old function — it gives up first. Any round where `up`
+      takes longer than what is left of those five seconds decides nothing,
+      and both the check and the reproduction now say so instead of voting
+- [x] On a fast host the answer is unambiguous: **10 rounds, 10 on the
+      replacement, none inconclusive**, and the queued request answered in
+      1.62–1.65 s every time
 
-The premises check out: `concurrency = 1`, the handler really does
-`time.sleep(event["sleep"])`, and the default timeout is 30 s, so the 8 s
-in-flight request was not killed early and did hold the only slot. The
-container passes this check every time.
-
-What is missing is a reproduction tight enough to instrument, and each attempt
-on that machine is a thirty-five minute run. Left open rather than guessed at.
-The check stays as it is: it asserts the documented behaviour, it distinguishes
-that from `up` being slow, and it will say so again.
+**What is left.** On a heavily loaded Raspberry Pi some rounds still end with
+the queued request told to retry although `up` landed promptly — but in every
+such round the request's own wait (`queued_ms`) had already exceeded five
+seconds, so its patience most likely ran out before `up` began. That is not
+proven either way from outside the supervisor, and proving it needs gate
+transitions logged against the request id. The harness is in place to chase it;
+`make repro-blue-green-linux`.
 
 ## Risks (tracked)
 

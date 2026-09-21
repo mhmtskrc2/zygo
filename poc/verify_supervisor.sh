@@ -1617,6 +1617,7 @@ say "blue/green deploys"
 # taking requests, requests the old one accepted finishing on it, and requests
 # queued behind it admitted to the new one.
 work /tmp/bg
+mkdir -p /tmp/bg-marker
 cat > sandbox.toml <<'TOML'
 [defaults]
 image = "python:3.12-slim"
@@ -1624,6 +1625,10 @@ image = "python:3.12-slim"
 [fn.v]
 entry = "v.py"
 concurrency = 1
+# Writable, because the handler writes a marker from inside the sandbox the
+# moment a request starts. See the blue/green check below: a marker the host
+# wrote would say nothing about whether the request reached the handler.
+mounts = ["/tmp/bg-marker:/marker:rw"]
 
 [fn.other]
 entry = "other.py"
@@ -1632,7 +1637,7 @@ entry = "other.py"
 entry = "s.py"
 secrets = ["TOKEN"]
 TOML
-printf 'import time\n\n\ndef handler(event):\n    time.sleep(event.get("sleep", 0))\n    return {"version": 1}\n' > v.py
+printf 'import os, time\n\n\ndef handler(event):\n    if event.get("sleep"):\n        open("/marker/started", "w").write(str(os.getpid()))\n    time.sleep(event.get("sleep", 0))\n    return {"version": 1}\n' > v.py
 printf 'def handler(event):\n    return {"other": True}\n' > other.py
 printf 'def handler(event):\n    return {"token": open("/run/secrets/TOKEN").read()}\n' > s.py
 export TOKEN=a
@@ -1700,18 +1705,41 @@ esac
 # enough now that it is not close, and `up` is timed so that a run where it
 # *was* close says so instead of voting.
 HOLD_S=8
+rm -f /tmp/bg-marker/started
 "$ZYGO" exec v "{\"sleep\": $HOLD_S}" >/tmp/bg-inflight.out 2>&1 &
 inflight=$!
-sleep 0.3
+# Wait for the holder to be *inside* the handler, not merely started.
+#
+# `sleep 0.3` was not enough on a Raspberry Pi, where `zygo exec` takes longer
+# than that to connect: the second request then won the race to the only slot,
+# ran on the function that was current at the time, and this check reported a
+# supervisor bug that was a stopwatch. That single failure was the whole of
+# todo.md's "Open, with evidence" entry, and `poc/repro_blue_green.sh` could
+# not reproduce it once the ordering was made certain.
+i=0
+while [ $i -lt 400 ]; do
+    [ -f /tmp/bg-marker/started ] && break
+    i=$((i+1)); sleep 0.05
+done
+if [ ! -f /tmp/bg-marker/started ]; then
+    bad "the slot-holder never reached its handler, so nothing could queue behind it"
+fi
 "$ZYGO" exec v '{}' >/tmp/bg-queued.out 2>&1 &
 queued=$!
-sleep 0.3
+settle_ms=1500
+sleep 1.5
 sed -i 's/"version": 3/"version": 4/' v.py
 up_started=$(date +%s%N)
 "$ZYGO" up >/dev/null 2>&1
 up_ms=$(( ($(date +%s%N) - up_started) / 1000000 ))
-# What was left of the hold when `up` began.
-window_ms=$(( HOLD_S * 1000 - 600 ))
+# How long the replacement had to land for the queued request still to be
+# there. Two bounds and the smaller decides: what is left of the hold, and
+# `QUEUE_WAIT` — a request waits five seconds for a slot and is then told to
+# retry, by design. The settle time comes off, because the request may have
+# started waiting the instant it was launched.
+window_ms=$(( 5000 - settle_ms ))
+hold_left_ms=$(( HOLD_S * 1000 - settle_ms ))
+[ "$hold_left_ms" -lt "$window_ms" ] && window_ms=$hold_left_ms
 wait $queued
 rc=$?
 out=$(tr -d '\n ' </tmp/bg-queued.out)
@@ -1723,6 +1751,14 @@ case "$rc:$out" in
             ok "the queued request ran on the old function, and could not have done otherwise: \`up\` took ${up_ms} ms and the queue only held for ${window_ms} ms"
         else
             bad "the queued request ran on the old function although the replacement was ready ${up_ms} ms in, with ${window_ms} ms of queue left"
+        fi ;;
+    *busy*|*retry*)
+        # Told to retry. Correct when `up` outlasted the five seconds the
+        # request would wait, which on a slow host is most of the time.
+        if [ "$up_ms" -ge "$window_ms" ]; then
+            ok "the queued request was told to retry, and could not have been admitted: \`up\` took ${up_ms} ms of a ${window_ms} ms window"
+        else
+            bad "the queued request was refused although the replacement landed ${up_ms} ms in, with ${window_ms} ms of window: $out"
         fi ;;
     *) bad "the queued request during a replacement: exit $rc, $out" ;;
 esac

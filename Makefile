@@ -2,7 +2,7 @@
         verify-mcp check check-linux test-linux \
         verify-linux verify-supervisor-linux escape-linux dist-linux \
         fuzz-linux gvisor-linux verify-login-linux verify-shim \
-        repro-blue-green-linux verify-api-linux \
+        repro-blue-green-linux verify-api-linux vm-build \
         syscall-tables conformance conformance-node examples-go-linux \
         seccomp-matrix-linux fmt lint clean
 
@@ -12,12 +12,13 @@ help:
 	@echo "test-sdk     the Python and Node clients, against a stand-in API"
 	@echo "verify-mcp   drive the MCP server over a pipe, as an agent host does"
 	@echo "verify-api-linux  the HTTP API end to end, through the Python client"
+	@echo "vm-build     ask whether libkrun links against musl (the vm plan V1)"
 	@echo "check        type-check the workspace"
 	@echo "conformance  run the agent protocol suite against both reference agents"
 	@echo "check-linux  type-check the Linux-only code from a non-Linux host"
 	@echo "test-linux   run the full suite inside a Linux container"
 	@echo "verify-linux run the ns launcher isolation checks against a real kernel"
-	@echo "verify-supervisor-linux  151 end-to-end supervisor lifecycle checks"
+	@echo "verify-supervisor-linux  139 end-to-end supervisor lifecycle checks"
 	@echo "repro-blue-green-linux   the one open supervisor question, five times"
 	@echo "escape-linux attempt every known escape vector against a real kernel"
 	@echo "fuzz-linux   sweep every syscall number against all three seccomp profiles"
@@ -181,6 +182,18 @@ verify-api-linux:
 	docker run --rm --privileged -v "$(PWD):/src:ro" \
 		-e ZYGO_DATA_HOME=/tmp/zdata-api python:3.12-slim \
 		sh /src/poc/verify_api.sh
+
+# V1, the question the whole `vm` plan rests on: does libkrun build and link
+# against musl? `dist-linux` ships one static binary under 15 MB, and if the
+# answer is no the vm-capable build is a separate glibc target and the README
+# has to say so. The probe reports rather than fails — either answer is the
+# deliverable (docs/vm_implementation.md, M0.1).
+vm-build:
+	docker build -f poc/Dockerfile.vm -t zygo-vm-build poc/
+	@mkdir -p poc/vm-out
+	docker run --rm -v "$(PWD)/poc/vm-out:/out" zygo-vm-build 2>&1 | tee poc/vm-out/v1-probe.log
+	@echo ""
+	@echo "the log is in poc/vm-out/v1-probe.log"
 
 # Known escape vectors (design doc §3.10), each actually attempted.
 escape-linux:

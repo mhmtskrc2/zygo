@@ -252,10 +252,11 @@ pub fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<u8> {
     forward_signals(sandbox.pid());
 
     let started = std::time::Instant::now();
-    // Kept before the wait: the sandbox's teardown removes the directory, and
-    // the counters inside it are the only record of *why* a process died.
-    let cgroup = sandbox.cgroup().map(std::path::Path::to_path_buf);
     let waited = sandbox.wait();
+    // The backend sampled this during teardown, which is the last moment the
+    // cgroup exists. Reading the directory from here found it already gone and
+    // reported zero — which reads exactly like "it was not killed".
+    let kernel = sandbox.outcome();
 
     if let Some(handle) = relay {
         let _ = handle.join();
@@ -281,15 +282,8 @@ pub fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<u8> {
             .as_ref()
             .err()
             .is_some_and(zygo_core::Error::timed_out),
-        oom_killed: cgroup
-            .as_deref()
-            .and_then(zygo_core::cgroup::oom_kills)
-            .is_some_and(|n| n > 0),
-        peak_rss_kb: cgroup
-            .as_deref()
-            .and_then(zygo_core::cgroup::peak_memory)
-            .map(|b| b.get() / 1024)
-            .unwrap_or(0),
+        oom_killed: kernel.oom_kills > 0,
+        peak_rss_kb: kernel.peak_rss_kb,
         wall_ms: started.elapsed().as_secs_f64() * 1000.0,
     };
     if let Some(path) = &args.outcome {

@@ -50,13 +50,20 @@ pub struct Captured {
     pub stdout: String,
     pub stderr: String,
     /// The sandbox ran out of time: either the launcher's own deadline, which
-    /// it reports in the outcome file, or the outer bound this module applies
-    /// when the child never gets that far.
+    /// it reports in the outcome file, or [`Captured::abandoned`].
     ///
     /// Reported rather than inferred. A deadline kill and an out-of-memory
     /// kill are both exit 137, so a caller deciding between "too slow" and
     /// "too much memory" cannot tell from the status alone.
     pub timed_out: bool,
+    /// The *outer* bound fired and this module killed the child.
+    ///
+    /// Distinct from `timed_out`, and the distinction is the difference
+    /// between a sandbox doing its job and Zygo failing to do its own. A
+    /// sandbox killed by its own `timeout` ran, and everything it said is
+    /// here; a child killed by this bound was abandoned, and what it would
+    /// have said is unknown.
+    pub abandoned: bool,
     /// The kernel killed something in the sandbox for running out of memory.
     pub oom_killed: bool,
     /// Peak resident memory of the sandbox, from its cgroup. Zero when the
@@ -214,6 +221,7 @@ pub fn run(
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
         timed_out: timed_out || outcome.timed_out,
+        abandoned: timed_out,
         oom_killed: outcome.oom_killed,
         peak_rss_kb: outcome.peak_rss_kb,
         wall_ms: started.elapsed().as_secs_f64() * 1000.0,
@@ -352,6 +360,10 @@ mod tests {
         assert_eq!(captured.stdout.trim(), "ran");
         assert!(captured.oom_killed, "{captured:?}");
         assert!(!captured.timed_out, "{captured:?}");
+        assert!(
+            !captured.abandoned,
+            "a child that finished on its own was reported as abandoned"
+        );
         assert_eq!(captured.peak_rss_kb, 65_536);
         assert_eq!(
             captured.exit_code, 137,
@@ -375,6 +387,7 @@ mod tests {
         .expect("the stand-in ran");
 
         assert!(captured.timed_out, "{captured:?}");
+        assert!(captured.abandoned, "{captured:?}");
         assert!(!captured.oom_killed, "{captured:?}");
     }
 
@@ -452,6 +465,11 @@ mod tests {
         )
         .expect("the stand-in ran");
         assert!(slow.timed_out, "the deadline did not fire: {slow:?}");
+        assert!(
+            slow.abandoned,
+            "the outer bound has to be distinguishable from a sandbox's own \
+             timeout: {slow:?}"
+        );
         assert_ne!(slow.exit_code, 0, "a killed child reported success");
         assert!(
             slow.wall_ms < 5_000.0,

@@ -95,11 +95,20 @@ def main() -> int:
 
         # The two kills are both exit 137. This is the whole point of the
         # fields, so it is attempted rather than asserted about.
-        slow = client.run(image, ["sleep", "30"], timeout="2s")
-        if slow.timed_out and not slow.oom_killed:
-            ok(f"a run over its time limit reports timed_out ({slow.exit_code})")
-        else:
-            bad("the timeout was not reported as one", slow)
+        # A sandbox killed by the `timeout` its caller asked for is a *result*,
+        # not an exception: it ran, and this is what happened to it. Answering
+        # 408 made the client raise instead — which contradicts the rule that a
+        # non-zero exit is not an exception, and hid the fields that say why.
+        try:
+            slow = client.run(image, ["sleep", "30"], timeout="2s")
+        except zygo.Timeout as e:
+            bad("a sandbox that hit its own timeout was raised as an API timeout", e)
+            slow = None
+        if slow is not None:
+            if slow.timed_out and not slow.oom_killed and slow.exit_code == 137:
+                ok(f"a run over its time limit comes back with timed_out set ({slow.wall_ms:.0f} ms)")
+            else:
+                bad("the timeout was not reported as one", slow)
 
         starved = client.run(
             image,

@@ -13,6 +13,19 @@ pub mod gvisor;
 #[cfg(target_os = "linux")]
 pub mod ns;
 
+/// What the kernel had to say about a sandbox, after it ended.
+///
+/// Everything here is a *reason*, which the wait status cannot carry: a
+/// deadline kill and an out-of-memory kill are both `SIGKILL`, so both are
+/// exit 137.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SandboxOutcome {
+    /// Processes the kernel killed here for running out of memory.
+    pub oom_kills: u64,
+    /// Peak resident memory, where the kernel reports one (5.19+).
+    pub peak_rss_kb: u64,
+}
+
 /// A started sandbox, owned by whoever will outlive it.
 ///
 /// `Sync` as well as `Send` because the supervisor shares one `WarmFn` — and so
@@ -22,6 +35,19 @@ pub mod ns;
 pub trait Sandbox: Send + Sync {
     /// Host pid of the sandbox's init process.
     fn pid(&self) -> u32;
+
+    /// What the kernel recorded about this sandbox, read while it still had a
+    /// cgroup to read it from.
+    ///
+    /// Sampled by the backend during teardown rather than by the caller
+    /// afterwards, because the cgroup directory is removed as part of reaping
+    /// and the counters go with it — a caller that read them after `wait`
+    /// found an empty directory and reported zero, which reads exactly like
+    /// "it was not killed". Found by `poc/verify_api.sh` against a real
+    /// kernel.
+    fn outcome(&self) -> SandboxOutcome {
+        SandboxOutcome::default()
+    }
 
     /// The sandbox's namespaces, held open, for a held (warm-exec) sandbox.
     ///

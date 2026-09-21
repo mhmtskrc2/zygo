@@ -18,3 +18,4 @@ __pycache__/
 
 # Built by `make examples-go-linux`
 /examples/warm-exec/go/bin/
+poc/vm-out/

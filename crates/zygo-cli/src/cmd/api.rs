@@ -962,10 +962,17 @@ async fn one_shot(api: &Arc<Api>, body: &[u8]) -> Result<Response<Full<Bytes>>, 
     .await
     .context("the sandbox task panicked")??;
 
-    // 200 with a non-zero `exit_code` rather than a 500: the sandbox ran, and
-    // this is what it said. A 500 would mean Zygo failed, and the difference
-    // is what a caller needs in order to decide whether to retry.
-    let status = if captured.timed_out {
+    // 200 whenever the sandbox *ran*, whatever ended it — a non-zero exit, its
+    // own timeout, an out-of-memory kill. The body says which, and that is the
+    // whole reason those fields exist; answering 408 for a sandbox that hit
+    // the `timeout` its caller asked for made the SDK raise instead of
+    // returning the result, which contradicts "a non-zero exit is not an
+    // exception". Found by `poc/verify_api.sh` against a real kernel.
+    //
+    // 408 is kept for the one case it fits: this API's own outer bound fired,
+    // the child was killed, and what it would have said is unknown. That is
+    // Zygo failing to finish, not a sandbox doing its job.
+    let status = if captured.abandoned {
         StatusCode::REQUEST_TIMEOUT
     } else {
         StatusCode::OK

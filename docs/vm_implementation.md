@@ -384,7 +384,7 @@ which would need nested virtualisation Lima's `vz` does not offer.
 
 | # | Risk | Settled by |
 |---|---|---|
-| V1 | libkrun does not link against musl, or its static build is unsupported | M0 step 1; fallback is a glibc `dist-linux-vm` |
+| V1 | ~~libkrun does not link against musl~~ **Settled, 21 Sep 2026: it does.** libkrun v1.19.4 builds for `aarch64-unknown-linux-musl` in ~33 s and yields `libkrun.rlib` (2.4 MB). The route is a **cargo dependency**, not a C library: the project's own `make` fails on musl because it builds the whole workspace (pulling in `krun-input`, whose build script wants a static libclang) and asks for a `cdylib`, which cargo refuses on musl. Zygo links Rust to Rust, so neither applies. `krun_set_kernel` is present, so D8 holds. The plan's pinned `v1.9.7` was never published; the newest tag is `v1.19.4`. Log: `poc/vm-out/v1-probe.log`, reproduced by `make vm-build` | Settled |
 | V2 | libkrunfw's kernel lacks a config Zygo needs (Landlock, nftables, cgroup pids) | M0 step 2; fallback is a custom kernel build, which needs the disk |
 | V3 | virtiofs makes Python imports slow (design R6) | PoC 8; fallback is layered tags plus guest overlay in M3 |
 | V4 | TSI does not honour the VMM's network namespace, or breaks UDP to the resolver | M4; fallback is `passt` on a descriptor |
@@ -393,7 +393,7 @@ which would need nested virtualisation Lima's `vz` does not offer.
 | V7 | `krun_start_enter` swallows the child's tracing and panics | Stderr pipe from the child kept open through the fork; a panic hook that writes before `_exit` |
 | V8 | The Pi's kernel is EOL and the host side of the boundary is what it is | Stated in the report; the guest kernel is the newer one, and that is an argument for the backend, not against the host |
 | V9 | Another session is using the Pi when the suite runs | `make vm-pi` checks `pgrep zygo` and refuses; `ZYGO_DATA_HOME` per run under `~/zygo-vm/` |
-| V10 | `doctor` says `kvm ok` on a host where `KVM_CREATE_VM` fails (a nested or restricted hypervisor) | Extend `doctor::kvm()` to attempt `KVM_CREATE_VM` and close it, as the probe in §2 did |
+| V10 | ~~`doctor` says `kvm ok` where `KVM_CREATE_VM` fails~~ **Done.** `doctor::kvm()` now creates a virtual machine and closes it; `poc/pi_env.sh` does the same and prints the API version and vCPU ceiling | Settled |
 
 ## 7. The todo 2.5 checklist, rewritten
 

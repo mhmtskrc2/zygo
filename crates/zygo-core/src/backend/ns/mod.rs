@@ -201,6 +201,8 @@ pub struct NsSandbox {
     /// `/run/secrets` inside this sandbox, handed out by the child before it
     /// hardened. The only way in: see `child::hand_out_secrets_dir`.
     secrets_dir: Option<std::os::fd::OwnedFd>,
+    /// What the cgroup said, sampled in `reap` before the directory goes.
+    outcome: crate::backend::SandboxOutcome,
 }
 
 impl NsSandbox {
@@ -328,6 +330,14 @@ impl NsSandbox {
             crate::net::stop_pasta(file);
         }
         if let Some(dir) = &self.cgroup_dir {
+            // Read before the removal, and only here: this is the last moment
+            // at which the kernel's account of why the sandbox ended exists.
+            self.outcome = crate::backend::SandboxOutcome {
+                oom_kills: cgroup::oom_kills(dir).unwrap_or(0),
+                peak_rss_kb: cgroup::peak_memory(dir)
+                    .map(|b| b.get() / 1024)
+                    .unwrap_or(0),
+            };
             let _ = cgroup::Hierarchy::remove(dir);
             // The tenant above it is left for its other generations; if this
             // was the last, the now-empty directory goes too. `remove_dir` is
@@ -351,6 +361,10 @@ fn exit_code_of(status: libc::c_int) -> i32 {
 }
 
 impl Sandbox for NsSandbox {
+    fn outcome(&self) -> crate::backend::SandboxOutcome {
+        self.outcome
+    }
+
     fn cgroup(&self) -> Option<&std::path::Path> {
         self.cgroup_dir.as_deref()
     }
@@ -526,6 +540,7 @@ pub fn launch(config: &SandboxConfig, hierarchy: Option<&cgroup::Hierarchy>) -> 
                 pasta_pid_file: None,
                 dns: None,
                 secrets_dir: None,
+                outcome: crate::backend::SandboxOutcome::default(),
             };
 
             // For a held sandbox, open its namespaces now, while the child is
