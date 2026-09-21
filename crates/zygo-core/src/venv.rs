@@ -64,9 +64,24 @@ impl Venv {
     /// the venv's, which finds `pyvenv.cfg` beside itself and uses the venv's
     /// site-packages. `VIRTUAL_ENV` is a courtesy for tools that read it.
     pub fn env() -> Vec<(String, String)> {
+        Venv::env_over(DEFAULT_PATH)
+    }
+
+    /// The same, in front of a `PATH` that came from somewhere else.
+    ///
+    /// `zygo run` knows the image's own `PATH` — it reads the image config to
+    /// resolve a bare `python3` — and discarding it would break every other
+    /// program the image ships. The warm path has no image config to hand and
+    /// uses the built-in default.
+    pub fn env_over(base_path: &str) -> Vec<(String, String)> {
+        let base = if base_path.is_empty() {
+            DEFAULT_PATH
+        } else {
+            base_path
+        };
         vec![
             ("VIRTUAL_ENV".to_string(), VENV_IN_SANDBOX.to_string()),
-            ("PATH".to_string(), venv_path(DEFAULT_PATH)),
+            ("PATH".to_string(), venv_path(base)),
         ]
     }
 }

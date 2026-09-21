@@ -797,6 +797,72 @@ class ForkFallbackTests(unittest.TestCase):
             stderr = h.close()
         self.assertIn("falling back to spawn", stderr)
 
+    def test_the_spawn_fallback_answers_everything_while_it_waits_for_go(self):
+        """B-09: the fallback took the next frame and demanded it be `GO`.
+
+        Anything else — a second `EXEC`, a `PING`, a `GO` for another request
+        — killed the worker and answered nothing at all, so the supervisor
+        waited out the whole deadline for a reply that was never coming.
+        `zygo agent test`'s own concurrency check sends two `EXEC`s before any
+        `GO`, so every handler that fell back to spawning failed conformance
+        for this reason.
+
+        Driven by hand rather than through `call`, because what is under test
+        is exactly the frames `call` does not send.
+        """
+        h = AgentHarness(
+            """
+            import os, threading, time
+
+            def _spin():
+                while True:
+                    time.sleep(3600)
+
+            threading.Thread(target=_spin, daemon=True).start()
+
+            def handler(event):
+                return {"n": event["n"] + 1}
+            """
+        )
+        try:
+            self.assertEqual(h.ready()["type"], "READY")
+
+            h.wire.send({"type": "EXEC", "id": "a", "event": {"n": 1}, "timeout_ms": 30_000})
+            forked = h.wire.recv()
+            self.assertEqual(forked["type"], "FORKED")
+
+            # A second request arrives before `a` is released. It must be
+            # *answered* — a supervisor that got silence would hold the slot
+            # until the deadline.
+            h.wire.send({"type": "EXEC", "id": "b", "event": {"n": 9}, "timeout_ms": 30_000})
+            busy = h.wire.recv()
+            self.assertEqual(busy["type"], "ERROR", busy)
+            self.assertEqual(busy["id"], "b")
+            self.assertEqual(busy["code"], "overloaded", busy)
+
+            # And liveness still works while a request is parked.
+            h.wire.send({"type": "PING", "seq": 7})
+            pong = h.wire.recv()
+            self.assertEqual(pong["type"], "PONG", pong)
+            self.assertEqual(pong["seq"], 7)
+
+            # A `GO` for a request nobody is running is reported, not obeyed.
+            h.wire.send({"type": "GO", "id": "nonexistent"})
+            confused = h.wire.recv()
+            self.assertEqual(confused["type"], "ERROR", confused)
+            self.assertEqual(confused["code"], "bad_message", confused)
+
+            # The original request is still parked, and still runs.
+            h.wire.send({"type": "GO", "id": "a"})
+            done = h.wire.recv()
+            self.assertEqual(done["type"], "DONE", done)
+            self.assertEqual(done["id"], "a")
+            self.assertEqual(done["exit_code"], 0, done.get("error"))
+            self.assertEqual(done["result"], {"n": 2})
+        finally:
+            stderr = h.close()
+        self.assertIn("falling back to spawn", stderr)
+
 
 def _execve_denying_filter() -> bytes | None:
     """A seven-instruction seccomp program that refuses `execve` with EPERM.

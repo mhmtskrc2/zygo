@@ -195,6 +195,23 @@ pub enum Command {
     /// Run the HTTP API in the foreground.
     Api(ApiArgs),
 
+    /// Serve Zygo's tools to an agent over the Model Context Protocol.
+    ///
+    /// Speaks JSON-RPC on standard input and output, which is what an agent
+    /// host starts as a child process. Add it to one and the host gains a code
+    /// interpreter whose limits, network and mounts are the ones set here —
+    /// not ones the model chooses.
+    ///
+    /// ```text
+    /// { "mcpServers": { "zygo": { "command": "zygo", "args": ["mcp"] } } }
+    /// ```
+    ///
+    /// The flags are a ceiling, not a default: the tools expose a language and
+    /// a program, and nothing that could widen the sandbox. A model that needs
+    /// more than this gives it declares a function in `sandbox.toml`, and
+    /// calls that by name.
+    Mcp(McpArgs),
+
     /// Measure the warm path.
     #[command(subcommand)]
     Bench(BenchCommand),
@@ -382,9 +399,42 @@ pub struct RunArgs {
     #[arg(short = 't', long)]
     pub tty: bool,
 
+    /// Dependency file installed into a shared, cached venv, mounted at
+    /// `/venv` with `/venv/bin` first on `PATH`.
+    ///
+    /// The same cache `zygo serve` uses, keyed on the image's digest and the
+    /// file's bytes — so a one-shot run and a warm function with identical
+    /// requirements share one venv, built once.
+    #[arg(long)]
+    pub requirements: Option<PathBuf>,
+
+    /// Write why the sandbox ended to this file, as JSON.
+    ///
+    /// `{"exit_code":137,"timed_out":true,"oom_killed":false,"peak_rss_kb":…,
+    /// "wall_ms":…}`. The exit status cannot carry this: a deadline kill and
+    /// an out-of-memory kill are both 137, and a caller deciding between "too
+    /// slow" and "too much memory" — an online judge, a CI step — has nothing
+    /// else to go on. Out of band because standard output belongs to the
+    /// program.
+    #[arg(long, value_name = "PATH")]
+    pub outcome: Option<PathBuf>,
+
     /// Print the resolved plan instead of running anything.
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Suppress Zygo's own progress output.
+    ///
+    /// "pulling python:3.12-slim", "installed libwebp7" and resolution
+    /// warnings all go to standard error, which is also where the sandbox
+    /// writes — so a caller that captures the streams gets Zygo's chatter
+    /// mixed into the program's. That is a nuisance at a terminal and a real
+    /// problem for anything reading the output, including a model.
+    ///
+    /// The sandbox's own streams are untouched: this hides what Zygo says,
+    /// never what the program says. Errors are still reported.
+    #[arg(short, long)]
+    pub quiet: bool,
 }
 
 #[derive(Debug, Args)]
@@ -403,6 +453,17 @@ pub struct ApiArgs {
     #[arg(long)]
     pub no_auth: bool,
 
+    /// Let callers create and destroy sandboxes, not only call declared ones.
+    ///
+    /// Without it the API can `POST /fn/<name>` against functions somebody
+    /// already served, and `PUT /fn/<name>`, `DELETE /fn/<name>` and
+    /// `POST /run` are refused. With it, anyone holding the token can run any
+    /// image with any mount as this user — which is a shell, not an API. Turn
+    /// it on for a local SDK or an embedder you control, and think twice
+    /// anywhere else.
+    #[arg(long)]
+    pub allow_deploy: bool,
+
     /// Push metrics to an OTLP/HTTP collector at this base URL, e.g.
     /// `http://localhost:4318` (`/v1/metrics` is appended). The same numbers
     /// as `/metrics`, JSON-encoded; `OTEL_EXPORTER_OTLP_HEADERS` adds request
@@ -413,6 +474,58 @@ pub struct ApiArgs {
     /// How often to push to the OTLP collector.
     #[arg(long, value_name = "DURATION", default_value = "60s", value_parser = parse_duration)]
     pub otlp_interval: Duration,
+}
+
+#[derive(Debug, Args)]
+pub struct McpArgs {
+    #[command(flatten)]
+    pub spec_file: SpecFileArgs,
+
+    /// Directory the tools may read and write, mounted at `/work`.
+    ///
+    /// Without it each server gets a scratch directory of its own, removed
+    /// when the server exits — so a model can write a file in one call and
+    /// read it in the next, and nothing survives the session. Naming one makes
+    /// that directory real, and is how an agent is given a project to work on.
+    ///
+    /// Not to be confused with `--workdir`, which `SandboxArgs` contributes
+    /// and which names a directory *inside* the sandbox.
+    #[arg(long, value_name = "DIR")]
+    pub workspace: Option<PathBuf>,
+
+    /// Image behind `language: "python"`.
+    #[arg(long, value_name = "IMAGE", default_value = "python:3.12-slim")]
+    pub python_image: String,
+
+    /// Image behind `language: "node"`.
+    #[arg(long, value_name = "IMAGE", default_value = "node:22-slim")]
+    pub node_image: String,
+
+    /// Image behind `language: "sh"`.
+    #[arg(long, value_name = "IMAGE", default_value = "alpine:3")]
+    pub sh_image: String,
+
+    #[command(flatten)]
+    pub limits: LimitArgs,
+
+    #[command(flatten)]
+    pub sandbox: SandboxArgs,
+}
+
+impl McpArgs {
+    /// The sandbox every `run_code` call gets, before its workdir mounts are
+    /// added.
+    ///
+    /// The limits come from the flags, and where a flag was not given the
+    /// resolver's own defaults apply — so a sandbox here is never less bounded
+    /// than one from `zygo run`, which is the property that matters when the
+    /// caller is a model rather than a person.
+    pub fn to_layer(&self) -> anyhow::Result<Layer> {
+        let mut layer = Layer::default();
+        self.limits.apply(&mut layer);
+        self.sandbox.apply(&mut layer)?;
+        Ok(layer)
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -612,6 +725,7 @@ impl RunArgs {
     pub fn to_layer(&self) -> anyhow::Result<Layer> {
         let mut layer = Layer {
             image: Some(self.image.clone()),
+            requirements: self.requirements.clone(),
             ..Default::default()
         };
         if !self.command.is_empty() {

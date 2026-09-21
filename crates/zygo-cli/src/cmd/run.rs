@@ -28,8 +28,22 @@ pub fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<u8> {
     let spec = Spec::discover(args.spec_file.path())?.unwrap_or_default();
     let resolved = spec.resolve(None, &overrides, &options)?;
 
+    // Zygo's own output shares a file descriptor with the sandbox's, so a
+    // caller capturing the streams would otherwise read "pulling python:3.12-slim"
+    // as something the program wrote.
+    let say = |message: &str| {
+        if !args.quiet {
+            eprintln!("{message}");
+        }
+    };
+    let warn = |message: &str| {
+        if !args.quiet {
+            output::warn(message);
+        }
+    };
+
     for w in &resolved.warnings {
-        output::warn(w);
+        warn(w);
     }
 
     let paths = super::paths(cli);
@@ -68,7 +82,7 @@ pub fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<u8> {
                 .build()?;
             runtime.block_on(client.pull(&reference, |event| {
                 if let PullProgress::Resolving { reference } = event {
-                    eprintln!("{} {reference}", style.dim("pulling"));
+                    say(&format!("{} {reference}", style.dim("pulling")));
                 }
             }))?
         }
@@ -80,25 +94,54 @@ pub fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<u8> {
     } else {
         let derived = zygo_core::derive::ensure(&store, &entry, &resolved.system)?;
         if derived.built {
-            eprintln!(
+            say(&format!(
                 "{} {}",
                 Style::stdout().dim("installed"),
                 derived.versions.join(" ")
-            );
+            ));
         }
         derived.image
+    };
+
+    // `requirements`: the venv the warm path builds, for a one-shot.
+    //
+    // The same cache, keyed the same way, so a `zygo run --requirements` and a
+    // `zygo serve --requirements` on the same image and the same file share
+    // one venv. `examples/ci-job` documented this flag before it existed
+    // (2026-09-21 use-case pass), and the workaround it forced — installing
+    // packages into a directory and bind-mounting it — rebuilt them per job.
+    let mut resolved = resolved;
+    let venv = match &resolved.requirements {
+        Some(requirements) => {
+            anyhow::ensure!(
+                requirements.is_file(),
+                "`{}` does not exist\n  → --requirements takes a path to a \
+                 requirements file, resolved against the working directory",
+                requirements.display()
+            );
+            let venv = zygo_core::venv::ensure(&store, &entry, requirements)?;
+            if venv.built {
+                say(&format!(
+                    "{} {}",
+                    Style::stdout().dim("built venv"),
+                    venv.dir.display()
+                ));
+            }
+            resolved.mounts.push(venv.mount());
+            Some(venv)
+        }
+        None => None,
     };
 
     // The network, when this run has one: the allowlist is resolved here on
     // the host, and `/etc/resolv.conf` is bound in rather than written.
     // `--dry-run` wants the mount in the plan it prints, so this comes first.
-    let mut resolved = resolved;
     let net = zygo_core::net::setup(store.paths(), &resolved.name, &resolved)?;
     if let Some(mount) = net.mount.clone() {
         resolved.mounts.push(mount);
     }
     for w in &net.warnings {
-        output::warn(w);
+        warn(w);
     }
     let resolved = resolved;
 
@@ -156,8 +199,21 @@ pub fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<u8> {
         resolved.cmd.clone()
     };
 
-    let mut config =
-        SandboxConfig::from_resolved(&resolved, &view, newroot, argv, &image_config.env_pairs());
+    // The image's own environment, with the venv's `PATH` in front of it when
+    // there is one. In front rather than instead: the image ships other
+    // programs, and a venv is not a reason to lose them.
+    let mut env = image_config.env_pairs();
+    if venv.is_some() {
+        let image_path = env
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        env.retain(|(k, _)| k != "PATH" && k != "VIRTUAL_ENV");
+        env.extend(zygo_core::venv::Venv::env_over(&image_path));
+    }
+
+    let mut config = SandboxConfig::from_resolved(&resolved, &view, newroot, argv, &env);
     config.allow_resolved = net.allowed;
     config.pasta_pid_file = net.pid_file;
 
@@ -195,14 +251,78 @@ pub fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<u8> {
     // program deserves the chance to shut down on its own terms.
     forward_signals(sandbox.pid());
 
-    let code = sandbox.wait()?;
+    let started = std::time::Instant::now();
+    // Kept before the wait: the sandbox's teardown removes the directory, and
+    // the counters inside it are the only record of *why* a process died.
+    let cgroup = sandbox.cgroup().map(std::path::Path::to_path_buf);
+    let waited = sandbox.wait();
 
     if let Some(handle) = relay {
         let _ = handle.join();
     }
     drop(raw_mode);
 
+    // Why it ended, for a caller that cannot tell from the exit status.
+    //
+    // A deadline kill and an out-of-memory kill are both exit 137, and a judge
+    // — or any caller deciding between "too slow" and "too big" — cannot tell
+    // them apart from that alone (2026-09-21 use-case pass, UC6). The launcher
+    // knows the first; the kernel's `memory.events` records the second. Both
+    // are written to the file `--outcome` names, out of band, because standard
+    // output belongs to the program.
+    let outcome = Outcome {
+        // `sandbox.wait()` returns the library's own error type, so the
+        // conventions it carries are read directly rather than downcast.
+        exit_code: match &waited {
+            Ok(code) => (*code).clamp(0, 255),
+            Err(e) => e.exit_code(),
+        },
+        timed_out: waited
+            .as_ref()
+            .err()
+            .is_some_and(zygo_core::Error::timed_out),
+        oom_killed: cgroup
+            .as_deref()
+            .and_then(zygo_core::cgroup::oom_kills)
+            .is_some_and(|n| n > 0),
+        peak_rss_kb: cgroup
+            .as_deref()
+            .and_then(zygo_core::cgroup::peak_memory)
+            .map(|b| b.get() / 1024)
+            .unwrap_or(0),
+        wall_ms: started.elapsed().as_secs_f64() * 1000.0,
+    };
+    if let Some(path) = &args.outcome {
+        outcome.write(path)?;
+    }
+
+    let code = waited?;
     Ok(code.clamp(0, 255) as u8)
+}
+
+/// Why a one-shot sandbox ended, beyond its exit status.
+#[derive(serde::Serialize)]
+struct Outcome {
+    exit_code: i32,
+    /// The launcher's own deadline killed it.
+    timed_out: bool,
+    /// The kernel killed something here for running out of memory.
+    oom_killed: bool,
+    peak_rss_kb: u64,
+    wall_ms: f64,
+}
+
+impl Outcome {
+    /// Written whole, then renamed: a reader that finds the file finds all of
+    /// it, never half a JSON document.
+    fn write(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        let temporary = path.with_extension("outcome-tmp");
+        std::fs::write(&temporary, serde_json::to_vec(self)?)
+            .with_context(|| format!("cannot write {}", temporary.display()))?;
+        std::fs::rename(&temporary, path)
+            .with_context(|| format!("cannot write {}", path.display()))?;
+        Ok(())
+    }
 }
 
 /// A directory that belongs to one run, removed when that run is over.

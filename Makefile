@@ -1,34 +1,65 @@
-.PHONY: help build test test-rust test-agent check check-linux test-linux \
+.PHONY: help build test test-rust test-agent test-sdk test-sdk-python test-sdk-node \
+        verify-mcp check check-linux test-linux \
         verify-linux verify-supervisor-linux escape-linux dist-linux \
+        fuzz-linux gvisor-linux verify-login-linux verify-shim \
+        repro-blue-green-linux verify-api-linux \
         syscall-tables conformance conformance-node examples-go-linux \
         seccomp-matrix-linux fmt lint clean
 
 help:
 	@echo "build        build the zygo binary"
 	@echo "test         run every test suite"
+	@echo "test-sdk     the Python and Node clients, against a stand-in API"
+	@echo "verify-mcp   drive the MCP server over a pipe, as an agent host does"
+	@echo "verify-api-linux  the HTTP API end to end, through the Python client"
 	@echo "check        type-check the workspace"
 	@echo "conformance  run the agent protocol suite against both reference agents"
 	@echo "check-linux  type-check the Linux-only code from a non-Linux host"
 	@echo "test-linux   run the full suite inside a Linux container"
 	@echo "verify-linux run the ns launcher isolation checks against a real kernel"
 	@echo "verify-supervisor-linux  151 end-to-end supervisor lifecycle checks"
+	@echo "repro-blue-green-linux   the one open supervisor question, five times"
 	@echo "escape-linux attempt every known escape vector against a real kernel"
 	@echo "fuzz-linux   sweep every syscall number against all three seccomp profiles"
 	@echo "gvisor-linux the gvisor backend against a real runsc, compared with ns"
 	@echo "dist-linux   build the static musl binary and check it against N6"
+	@echo "verify-login-linux  zygo login against a registry that really refuses people"
+	@echo "examples-go-linux   the Go warm-exec example, built and run for real"
+	@echo "seccomp-matrix-linux  five reference packages under default and strict"
+	@echo "conformance / conformance-node  the agent protocol suite"
+	@echo "verify-shim  the macOS shim, against the Linux VM it manages"
 	@echo "syscall-tables  regenerate the seccomp syscall number tables"
 	@echo "fmt / lint   rustfmt / clippy"
 
 build:
 	cargo build --release
 
-test: test-rust test-agent
+test: test-rust test-agent test-sdk
 
 test-rust:
 	cargo test --workspace
 
 test-agent:
 	python3 -W error::ResourceWarning -m unittest discover -s agents/python
+
+# The two clients. Neither needs Linux, a kernel or a sandbox: what is under
+# test is the client — the transport, the error mapping, the connection pool.
+# A test that needs a real sandbox belongs in the Rust suites.
+test-sdk: test-sdk-python test-sdk-node
+
+test-sdk-python:
+	cd sdk/python && python3 -W error::ResourceWarning -m unittest discover -s tests
+
+test-sdk-node:
+	cd sdk/node && node --test 'test/*.test.js'
+
+# `zygo mcp` driven over a pipe, the way an agent host drives it: a real
+# handshake, a real tool list, and a tool call that really runs a sandbox.
+# Needs a kernel, so it runs in a container.
+verify-mcp:
+	docker run --rm --privileged -v "$(PWD):/src:ro" \
+		-e ZYGO_DATA_HOME=/tmp/zdata python:3.12-slim \
+		sh /src/poc/verify_mcp.sh
 
 check:
 	cargo check --workspace --all-targets
@@ -86,10 +117,13 @@ verify-login-linux:
 	@docker run -d --name zygo-reg -v /tmp/zygo-reg-auth:/auth \
 		-e REGISTRY_AUTH=htpasswd -e REGISTRY_AUTH_HTPASSWD_REALM=zygo \
 		-e REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd registry:2 >/dev/null
-	@sleep 3
-	-docker run --rm --network container:zygo-reg -v "$(PWD):/src:ro" \
-		python:3.12-slim sh /src/poc/verify_login.sh
-	@docker rm -f zygo-reg >/dev/null 2>&1 || true
+	@poc/wait_for_registry.sh
+	@set +e; \
+		docker run --rm --network container:zygo-reg -v "$(PWD):/src:ro" \
+			python:3.12-slim sh /src/poc/verify_login.sh; \
+		status=$$?; \
+		docker rm -f zygo-reg >/dev/null 2>&1; \
+		exit $$status
 
 # The macOS shim: a real Lima VM, a real Linux kernel, from this Mac. Skips
 # itself anywhere else, and where `limactl` is not installed.
@@ -130,6 +164,23 @@ verify-supervisor-linux:
 	docker run --rm --privileged -v "$(PWD):/src:ro" \
 		python:3.12-slim \
 		sh /src/poc/verify_supervisor.sh
+
+# The one open supervisor question, on its own: a request queued behind a
+# function being replaced. `verify-supervisor-linux` checks it once inside a
+# thirty-five minute run and it failed once on a Raspberry Pi; this runs only
+# that scenario, five times, and prints the timings of each.
+repro-blue-green-linux:
+	docker run --rm --privileged -v "$(PWD):/src:ro" \
+		-e ZYGO_DATA_HOME=/tmp/zdata-bluegreen python:3.12-slim \
+		sh /src/poc/repro_blue_green.sh
+
+# The HTTP API end to end, driven by the Python client that ships with it:
+# client -> unix socket -> `zygo api` -> the supervisor -> a real sandbox. The
+# unit tests on either side of that line cannot reach it.
+verify-api-linux:
+	docker run --rm --privileged -v "$(PWD):/src:ro" \
+		-e ZYGO_DATA_HOME=/tmp/zdata-api python:3.12-slim \
+		sh /src/poc/verify_api.sh
 
 # Known escape vectors (design doc §3.10), each actually attempted.
 escape-linux:

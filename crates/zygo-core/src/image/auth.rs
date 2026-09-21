@@ -14,10 +14,38 @@ use serde::Deserialize;
 use super::ImageError;
 
 /// A username/password pair for one registry.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is written out rather than derived, and so are the three types
+/// below that hold the same secret in other shapes. A derived one puts the
+/// password into any `{:?}` — a `tracing` field, an `anyhow` context, a test
+/// assertion message — and a credential that reaches a log has to be rotated.
+/// The 2026-09-21 review (S-01) found four such derives.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Credential {
     pub username: String,
     pub password: String,
+}
+
+impl std::fmt::Debug for Credential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credential")
+            .field("username", &self.username)
+            .field("password", &Redacted)
+            .finish()
+    }
+}
+
+/// Stands in for a secret in `Debug` output.
+///
+/// Its own type rather than the string `"<redacted>"`, so it prints without
+/// quotation marks and cannot be mistaken for a password that happens to read
+/// that way.
+struct Redacted;
+
+impl std::fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
 }
 
 impl Credential {
@@ -31,13 +59,13 @@ impl Credential {
     }
 }
 
-#[derive(Debug, Deserialize, serde::Serialize, Default)]
+#[derive(Deserialize, serde::Serialize, Default)]
 struct DockerConfig {
     #[serde(default)]
     auths: BTreeMap<String, DockerAuthEntry>,
 }
 
-#[derive(Debug, Deserialize, serde::Serialize, Default)]
+#[derive(Deserialize, serde::Serialize, Default)]
 struct DockerAuthEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     auth: Option<String>,
@@ -48,9 +76,19 @@ struct DockerAuthEntry {
 }
 
 /// Credentials read from Docker's config file.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct CredentialStore {
     entries: BTreeMap<String, Credential>,
+}
+
+impl std::fmt::Debug for CredentialStore {
+    /// Names the registries and no passwords: which ones are configured is
+    /// the useful half, and it is the half that is safe to print.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialStore")
+            .field("registries", &self.entries.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 impl CredentialStore {
@@ -316,8 +354,8 @@ fn urlencode(s: &str) -> String {
         .collect()
 }
 
-/// A registry token response.
-#[derive(Debug, Clone, Deserialize)]
+/// A registry token response. A bearer token is a credential too.
+#[derive(Clone, Deserialize)]
 pub struct TokenResponse {
     #[serde(default)]
     pub token: Option<String>,
@@ -326,6 +364,19 @@ pub struct TokenResponse {
     pub access_token: Option<String>,
     #[serde(default)]
     pub expires_in: Option<u64>,
+}
+
+impl std::fmt::Debug for TokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenResponse")
+            .field("token", &self.token.as_ref().map(|_| Redacted))
+            .field(
+                "access_token",
+                &self.access_token.as_ref().map(|_| Redacted),
+            )
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
 }
 
 impl TokenResponse {
@@ -545,5 +596,55 @@ mod tests {
         assert_eq!(t.bearer().unwrap(), "b");
         let t: TokenResponse = serde_json::from_str(r#"{"expires_in":300}"#).unwrap();
         assert!(t.bearer().is_err());
+    }
+
+    /// No type that holds a credential prints one.
+    ///
+    /// Attempted rather than asserted about the derives: each value is
+    /// formatted and the password looked for in the output, because a field
+    /// added later gets a derived `Debug` for free and this is the only thing
+    /// that would notice.
+    #[test]
+    fn nothing_that_holds_a_secret_prints_it() {
+        const PASSWORD: &str = "hunter2-do-not-log-me";
+
+        let credential = Credential {
+            username: "zygotest".into(),
+            password: PASSWORD.into(),
+        };
+        let printed = format!("{credential:?}");
+        assert!(!printed.contains(PASSWORD), "{printed}");
+        assert!(printed.contains("<redacted>"), "{printed}");
+        // The username is not a secret, and hiding it would make a wrong-user
+        // failure undiagnosable.
+        assert!(printed.contains("zygotest"), "{printed}");
+
+        let store = CredentialStore::parse(&format!(
+            r#"{{"auths":{{"registry.example.com":{{"username":"u","password":"{PASSWORD}"}}}}}}"#
+        ));
+        let printed = format!("{store:?}");
+        assert!(!printed.contains(PASSWORD), "{printed}");
+        assert!(
+            printed.contains("registry.example.com"),
+            "which registries are configured is the useful, safe half: {printed}"
+        );
+
+        let token: TokenResponse =
+            serde_json::from_str(&format!(r#"{{"token":"{PASSWORD}","expires_in":300}}"#))
+                .expect("a token response");
+        let printed = format!("{token:?}");
+        assert!(!printed.contains(PASSWORD), "{printed}");
+        assert!(printed.contains("300"), "{printed}");
+
+        // The Docker config structs are private, so they are reached through
+        // the only thing that holds them.
+        let printed = format!(
+            "{:?}",
+            CredentialStore::parse(&format!(
+                r#"{{"auths":{{"r":{{"auth":"{}"}}}}}}"#,
+                base64::engine::general_purpose::STANDARD.encode(format!("u:{PASSWORD}"))
+            ))
+        );
+        assert!(!printed.contains(PASSWORD), "{printed}");
     }
 }

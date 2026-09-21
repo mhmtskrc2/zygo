@@ -1003,7 +1003,15 @@ pub(crate) mod linux {
             msg.msg_iovlen = 1;
             msg.msg_control = control.as_mut_ptr().cast();
             msg.msg_controllen = libc::CMSG_SPACE(4) as _;
-            if libc::recvmsg(sock, &mut msg, 0) < 0 {
+            // `MSG_CMSG_CLOEXEC`, so the descriptor the kernel installs is
+            // close-on-exec from the moment it exists. Without it the
+            // sandbox's `/run/secrets` directory descriptor was inherited by
+            // every later `Command` the supervisor spawned — `pasta`, `nft`,
+            // `newuidmap`, a re-exec of itself (S-04, 2026-09-21 review). The
+            // flag has to be set here rather than afterwards: between
+            // `recvmsg` and an `fcntl` there is a window in which another
+            // thread can fork.
+            if libc::recvmsg(sock, &mut msg, libc::MSG_CMSG_CLOEXEC) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             let cmsg = libc::CMSG_FIRSTHDR(&msg);

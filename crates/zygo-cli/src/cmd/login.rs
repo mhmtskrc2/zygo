@@ -147,14 +147,87 @@ fn prompt_password(registry: &str, prompt: &str) -> anyhow::Result<String> {
         return Err(std::io::Error::last_os_error()).context("could not turn the echo off");
     }
 
+    // `ISIG` stays on, so Ctrl-C at the prompt is how you cancel it — and it
+    // killed the process with echo still off, leaving the shell typing
+    // invisibly (B-08, 2026-09-21 review). This handler puts the echo back and
+    // then lets the signal do what it was going to do.
+    let restore = EchoRestored { fd };
+    install_echo_handler(fd);
+
     let typed = prompt_line(prompt);
 
     // Restored before the result is examined, so an error on the way in does
-    // not leave the user with a terminal that has stopped echoing.
-    // SAFETY: restoring the mode read above.
-    unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &original) };
+    // not leave the user with a terminal that has stopped echoing. The guard
+    // covers the paths this line does not: a panic, and `panic = "abort"`.
+    drop(restore);
     println!();
     typed
+}
+
+/// Puts the echo back, however this scope is left.
+#[cfg(unix)]
+struct EchoRestored {
+    fd: std::os::fd::RawFd,
+}
+
+#[cfg(unix)]
+impl Drop for EchoRestored {
+    fn drop(&mut self) {
+        restore_echo(self.fd);
+    }
+}
+
+/// Turn echo back on for `fd`.
+///
+/// Reads the current settings and sets one flag rather than writing back a
+/// saved copy, which is what makes it usable from a signal handler:
+/// `tcgetattr` and `tcsetattr` are both async-signal-safe, and no state has to
+/// be shared with the handler at all.
+#[cfg(unix)]
+fn restore_echo(fd: std::os::fd::RawFd) {
+    // SAFETY: both calls take a descriptor and a `termios` this function owns.
+    unsafe {
+        let mut current: libc::termios = core::mem::zeroed();
+        if libc::tcgetattr(fd, &mut current) == 0 {
+            current.c_lflag |= libc::ECHO;
+            libc::tcsetattr(fd, libc::TCSAFLUSH, &current);
+        }
+    }
+}
+
+/// The descriptor the signal handler should put back, or `-1`.
+#[cfg(unix)]
+static PROMPTING: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+#[cfg(unix)]
+fn install_echo_handler(fd: std::os::fd::RawFd) {
+    use std::sync::atomic::Ordering;
+
+    PROMPTING.store(fd, Ordering::SeqCst);
+
+    extern "C" fn on_interrupt(signal: libc::c_int) {
+        use std::sync::atomic::Ordering;
+        let fd = PROMPTING.load(Ordering::SeqCst);
+        if fd >= 0 {
+            restore_echo(fd);
+        }
+        // Default disposition, then re-raise: the user asked to cancel, and
+        // this handler's only business was the terminal.
+        //
+        // SAFETY: restoring a default disposition and re-raising is the
+        // standard way to let a signal proceed after cleaning up.
+        unsafe {
+            libc::signal(signal, libc::SIG_DFL);
+            libc::raise(signal);
+        }
+    }
+
+    // SAFETY: `on_interrupt` does nothing that is not async-signal-safe.
+    unsafe {
+        let handler = on_interrupt as *const () as libc::sighandler_t;
+        libc::signal(libc::SIGINT, handler);
+        libc::signal(libc::SIGTERM, handler);
+    }
 }
 
 #[cfg(not(unix))]

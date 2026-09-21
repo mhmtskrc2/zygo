@@ -69,7 +69,8 @@ Design document: [ahmed.md](ahmed.md). Plan and status: [todo.md](todo.md).
 [concepts](docs/concepts.md) · [`sandbox.toml` reference](docs/spec-reference.md) ·
 [seccomp profiles](docs/seccomp-profiles.md) · [threat model](docs/threat-model.md) ·
 [comparison](docs/comparison.md) · [examples](examples/) ·
-[writing an agent](examples/agents/README.md) · [the protocol](spec/protocol.md)
+[writing an agent](examples/agents/README.md) · [the protocol](spec/protocol.md) ·
+[the SDKs](docs/sdk.md) · [the MCP server](docs/mcp.md)
 
 ---
 
@@ -295,6 +296,51 @@ same nine checks the Python one does. For a language that starts fast there is
 nothing to amortise: [`examples/warm-exec/go`](examples/warm-exec/go) is a Go
 program as a warm function, and the whole integration is a `cmd`.
 
+## From a program, and from an agent
+
+The CLI is for a person. A platform embeds the API, and an agent host speaks a
+protocol of its own; both are shipped.
+
+```python
+import zygo
+
+client = zygo.connect()                   # `zygo api`, on loopback or a unix socket
+out = client.fn("resize")({"url": "..."})  # ~2 ms, a fresh process
+r = client.run("python:3.12-slim", ["python3", "-c", "print(6*7)"], mem="128M")
+```
+
+```js
+import { connect } from 'zygo';
+const out = await connect().fn('resize')({ url: '...' });
+```
+
+Both clients have **no dependencies** and both speak to the same HTTP API,
+over a unix socket at `0600` when it is on this machine — so there is no port
+and no token in the usual case. Every kind of failure is its own type, because
+each implies something different: a `Busy` means the request never ran and
+retrying is correct, a `HandlerError` means it will fail again.
+[docs/sdk.md](docs/sdk.md).
+
+`zygo api` starts **call-only**: a token reaches the functions somebody
+declared in a spec file and nothing else. `--allow-deploy` adds serving,
+stopping and one-shot runs, which together are a shell rather than an API, so
+it is a flag rather than a default.
+
+For an agent, `zygo mcp` speaks the Model Context Protocol over a pipe:
+
+```json
+{ "mcpServers": { "zygo": { "command": "zygo", "args": ["mcp"] } } }
+```
+
+That is the whole installation, and the host gains `run_code`,
+`list_functions`, `call_function` and `function_logs`. The tools expose a
+*program* and nothing else — no image, no mounts, no network, no limits. Those
+are set once, on the command line, by the person who installed the server,
+because a model reads untrusted text and that text can ask it for things. A
+model that needs more declares a function in `sandbox.toml` and calls it by
+name, so the boundary lives in a file somebody reviewed.
+[docs/mcp.md](docs/mcp.md).
+
 ## Layout
 
 ```
@@ -309,12 +355,14 @@ crates/zygo-core     the library; the CLI and the bindings sit on top (ADR-008)
 crates/zygo-cli      the `zygo` binary
 agents/python        the reference runtime agent and its conformance suite
 spec/protocol.md     the wire protocol
+sdk/python           the Python client, and the async one beside it
+sdk/node             the Node client, with types and no build step
 ```
 
 ## Development
 
 ```bash
-make test           # Rust + Python suites
+make test           # Rust, agent and SDK suites
 make check-linux    # type-check the Linux-only code from a non-Linux host
 make test-linux     # the full suite inside a Linux container
 make verify-linux   # 36 isolation and limit checks against a real kernel
@@ -322,6 +370,8 @@ make verify-supervisor-linux  # 151 end-to-end supervisor lifecycle checks
 make escape-linux   # 16 escape attempts against a real kernel
 make fuzz-linux     # every syscall number, against all three seccomp profiles
 make gvisor-linux   # the gvisor backend against a real runsc, compared with ns
+make verify-mcp     # 26 checks driving `zygo mcp` over a pipe, against a real kernel
+make test-sdk       # the Python and Node clients, against a stand-in API
 make verify-shim    # 14 macOS checks, against the Linux VM the shim manages
 make verify-login-linux  # 15 checks against a registry that really refuses people
 make dist-linux     # the static musl binary, checked against N6

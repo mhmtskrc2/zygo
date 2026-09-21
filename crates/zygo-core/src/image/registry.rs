@@ -10,6 +10,7 @@ use futures_util::StreamExt;
 use tokio::sync::Mutex;
 
 use super::auth::{Challenge, Credential, CredentialStore, TokenResponse};
+use super::digest_of;
 use super::media::{self, Index, LayerCompression, Manifest, Platform};
 use super::store::{ImageEntry, Store};
 use super::{ImageConfig, ImageError, Reference};
@@ -64,10 +65,27 @@ pub struct RegistryClient {
     tokens: Arc<Mutex<std::collections::HashMap<String, String>>>,
 }
 
+/// How long to wait for a registry to accept a connection.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How long to wait between bytes once it has.
+///
+/// Not a deadline for the whole request: a layer is hundreds of megabytes and
+/// a slow link is not a failure. What this catches is a connection that has
+/// stopped producing anything at all.
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl RegistryClient {
     pub fn new(store: Store) -> Result<Self> {
         let http = reqwest::Client::builder()
             .user_agent(format!("zygo/{}", crate::VERSION))
+            // A registry that accepts a connection and then says nothing would
+            // otherwise hang `pull` — and therefore `run` and `serve` — for
+            // ever, with no output and nothing to interrupt in a supervisor.
+            // Per-read rather than per-request, so a genuinely large layer on
+            // a slow link still completes (S-02).
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(READ_TIMEOUT)
             .build()
             .map_err(|e| ImageError::Registry(e.to_string()))?;
 
@@ -200,7 +218,7 @@ impl RegistryClient {
         let response = self
             .authorised_get(reference, &url, media::MANIFEST_ACCEPT)
             .await?;
-        let digest = response
+        let header_digest = response
             .headers()
             .get("docker-content-digest")
             .and_then(|v| v.to_str().ok())
@@ -209,6 +227,36 @@ impl RegistryClient {
             .bytes()
             .await
             .map_err(|e| ImageError::Registry(e.to_string()))?;
+
+        // What was actually served. Computed every time, and then compared
+        // against everything that claimed to know it.
+        //
+        // Until the 2026-09-21 review (B-05) the header was taken as the
+        // answer when present and the body hashed only when it was absent —
+        // and neither was ever compared with `reference.digest`. So
+        // `zygo pull python@sha256:<X>` accepted any self-consistent manifest
+        // the registry felt like returning, which is the one thing pinning by
+        // digest is for.
+        let digest = digest_of(&body);
+        if let Some(claimed) = &header_digest
+            && claimed != &digest
+        {
+            return Err(ImageError::Registry(format!(
+                "{}: the registry's Docker-Content-Digest says {claimed} and the \
+                 body hashes to {digest}",
+                reference
+            ))
+            .into());
+        }
+        if let Some(wanted) = &reference.digest
+            && wanted != &digest
+        {
+            return Err(ImageError::Registry(format!(
+                "{}: asked for {wanted} and the registry served {digest}",
+                reference
+            ))
+            .into());
+        }
 
         // The media type in the document is authoritative; the `Content-Type`
         // header is not always set correctly by proxying registries.
@@ -242,11 +290,14 @@ impl RegistryClient {
                         },
                     })?;
 
-            let index_digest = digest.unwrap_or_else(|| {
-                use sha2::{Digest, Sha256};
-                format!("sha256:{}", hex::encode(Sha256::digest(&body)))
-            });
-            // Recurse once, pinned to the selected manifest digest.
+            // The index's own digest, verified above, is what goes into
+            // `zygo.lock`: it used to be the header's value, unparsed.
+            let index_digest = digest;
+            // Parsed before it reaches a URL. A descriptor is registry-supplied
+            // and `version()` interpolates it into a path.
+            Store::parse_digest(&descriptor.digest)?;
+            // Recurse once, pinned to the selected manifest digest — which the
+            // recursive call now checks against what it is served.
             let pinned = Reference {
                 digest: Some(descriptor.digest.clone()),
                 ..reference.clone()
@@ -258,10 +309,12 @@ impl RegistryClient {
         let manifest: Manifest = serde_json::from_slice(&body)
             .map_err(|e| ImageError::Registry(format!("malformed manifest: {e}")))?;
 
-        let digest = digest.unwrap_or_else(|| {
-            use sha2::{Digest, Sha256};
-            format!("sha256:{}", hex::encode(Sha256::digest(&body)))
-        });
+        // Every digest in it reaches a URL or a path, so each is parsed here
+        // rather than wherever it is first used.
+        Store::parse_digest(&manifest.config.digest)?;
+        for layer in &manifest.layers {
+            Store::parse_digest(&layer.digest)?;
+        }
 
         self.store.write_blob(&digest, body.as_ref())?;
         Ok((manifest, digest, None))

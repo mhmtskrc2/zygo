@@ -40,6 +40,12 @@ live here.
 | `zygo login` | **Works** — verified against the registry before it is stored, `auth.json` at 0600, Docker's file read and never written |
 | `zygo stats` | **Works** — counters since the warm-up beside latencies over the log window, with the two labelled apart; no `p99` under a hundred samples |
 | `zygo top` | **Works** — `ps` on a timer plus the rate columns one sample cannot have; the first frame says `—` rather than inventing a zero |
+| `zygo mcp` | **Works** — the Model Context Protocol over stdio; `run_code`, `list_functions`, `call_function`, `function_logs`; the tools expose a program and nothing that widens the sandbox; 26 checks against a real kernel |
+| `zygo run --quiet` | **Works** — separates Zygo's own progress output from the sandbox's, which share a descriptor; what `oneshot` and the MCP server need |
+| `zygo run --requirements` | **Works** — the same venv cache `serve` uses, so a one-shot job and a warm function with identical requirements share one build. Documented in `examples/ci-job` before it existed |
+| `zygo run --outcome` | **Works** — writes why the sandbox ended as JSON: `timed_out` from the launcher, `oom_killed` from the kernel's own counter. Both kills are exit 137, so the status cannot carry it |
+| Python SDK (`sdk/python`) | **Works** — sync and async, no dependencies, unix socket or TCP; 20 checks against a stand-in API |
+| Node SDK (`sdk/node`) | **Works** — no dependencies and no build step, types beside the JavaScript; 16 checks |
 
 Test status: **591 Rust tests on Linux** (498 on macOS, run; the Linux figure
 adds the unchanged 93 Linux-only tests and wants CI to confirm it) + 37 Python +
@@ -776,8 +782,37 @@ that, `sh -c cat` answers in 2.2 ms.
 - [x] `CallTiming`: a per-request phase breakdown (lock/fork/admit/run/release) —
       the metrics §3.12 asks for, and the only way to localise a tail
 - [ ] Rewrite the CLI on top of this API (a thin client)
-- [ ] Python binding (PyO3): `zygo.Pool()`, embedded use without a supervisor
-- [ ] API stability policy (0.x flexible, 1.0 SemVer)
+- [x] **Python and Node clients over the HTTP API** (`sdk/python`, `sdk/node`) —
+      the thin layer ADR-008's target users actually want, shipped before the
+      embedded one because it is what an agent framework, a worker and a
+      webhook all reach for. Both have **no dependencies**: the standard
+      library has an HTTP client in each language, and a unix socket is thirty
+      lines on top of it. Python ships an `asyncio` client beside the
+      synchronous one, because an agent framework is asynchronous and a tool
+      that blocks the loop for the length of a sandbox request is unusable
+      inside one; Node ships hand-written types rather than a build step, so
+      what is in the repository is what executes
+- [x] Every kind of failure is its own type — `Busy`, `Timeout`,
+      `HandlerError`, `NotFound`, `AuthError`, `SpecError`, `TransportError` —
+      because each implies a different next move. `Busy` means the request
+      never ran and retrying is correct; `HandlerError` means it will fail
+      again. A `batch` element is a result *or* an error, returned rather than
+      raised, so one refused event does not hide the answers to the others
+- [x] Both clients pool connections, and both suites prove it twice: once that
+      five calls use one connection, once that eight concurrent calls against a
+      200 ms server finish in about 200 ms rather than 1.6 s. A single
+      connection would serialise callers behind a socket, and on a path
+      measured in milliseconds that is the whole cost
+- [ ] Python binding (PyO3): `zygo.Pool()`, embedded use without a supervisor.
+      Still wanted for an embedder whose worker is already long-lived; much
+      more expensive than the above (manylinux wheels, a Linux-only extension)
+      and no longer blocking anybody
+- [x] API stability policy: `api` in `GET /version` is the number a client
+      checks, bumped only on an incompatible change to a route. `0.x` may
+      change with a release note; after `1.0` it will not without a major
+      version. Separate from the crate version and from `CONTROL_VERSION`,
+      which no SDK speaks — reported anyway, because a mismatch there explains
+      an API that is up and answering errors
 
 ### 2.7 venv cache
 - [x] `requirements.txt` → `cache/venvs/<hash>`, read-only bind at `/venv`
@@ -833,6 +868,79 @@ that, `sh -c cat` answers in 2.2 ms.
       apart. That is what makes the 408 honest instead of guessed
 - [x] `WARM` control request, for `/fn/<name>/warm` and anything else that
       wants a function ready before its first real request
+- [x] **The routes an SDK needs**, added in 2.10: `GET /version`,
+      `PUT /fn/<name>` (serve), `DELETE /fn/<name>` (stop),
+      `GET /fn/<name>/logs`, `POST /run` (one-shot)
+- [x] **The deploy gate.** The three that create or destroy a sandbox are
+      refused unless `zygo api --allow-deploy` says otherwise, with a 403 that
+      names the flag. Without it a token reaches the functions somebody
+      declared in a spec file and nothing else; with it the same token can
+      serve any image with any mount, which is a shell rather than an API.
+      P6 says a widened boundary is spelled out, so it is a flag, not a default
+- [x] `allow_host_net`, `allow_private_net` and `allow_unlimited` are **never**
+      taken from a request body, whatever the gate says. Each removes a
+      guarantee, and a caller that could remove one over HTTP would make the
+      flag on the server meaningless
+
+### 2.10 The SDKs, the MCP server, and what they needed from the API
+
+Added after the market read in `docs/`: the target user (a platform, an agent
+framework) embeds an API rather than calling a process, and the two languages
+they write in are Python and TypeScript. ADR-008 said this in the design
+document; what was shipped until now was the Rust crate and a CLI.
+
+- [x] `crates/zygo-cli/src/cmd/oneshot.rs` — one sandbox, one command, output
+      captured. Spawns `zygo run` as a child rather than launching in-process:
+      a one-shot has no supervisor and no RPC boundary, so in-process would
+      save a millisecond against a cold start of eighteen, and would cost a
+      second copy of resolve, pull, derive, rootfs view, network setup and
+      backend selection — a copy that would drift, in the code that builds
+      sandbox boundaries
+- [x] Found by its own test: killing the child left its `sleep` holding the
+      output pipe, and reading that pipe to end-of-file waited the full thirty
+      seconds — so a 200 ms deadline returned in 30 s. The child now leads a
+      process group of its own and the deadline kills the group. The test
+      checks the grandchild is gone, which an elapsed-time assertion cannot:
+      giving up on the pipe looks identical from outside while leaving a
+      process behind
+- [x] Also found there: this binary sets `SIGPIPE` back to its default
+      disposition, so writing input to a child that had already exited would
+      have killed the API process serving other requests. The writing thread
+      blocks the signal for itself, which turns it back into `EPIPE`
+- [x] **`zygo run --quiet`.** Zygo's own progress output — "pulling
+      python:3.12-slim" — shares a descriptor with the sandbox's standard
+      error, so a caller capturing the streams reads it as something the
+      program wrote. Found by the MCP suite on the Pi, where `print(6 * 7)`
+      came back as `42` followed by a pull line. The flag hides what Zygo says
+      and never what the program says
+- [x] **`zygo mcp`** — JSON-RPC over stdio, which is what an agent host starts
+      as a child process. Four tools; each request is handled on a thread of
+      its own so a thirty-second `run_code` does not block a `list_functions`
+      behind it, and answers are written one line at a time so two cannot
+      interleave
+- [x] The tools expose a **program and nothing else**: no image, no mounts, no
+      network mode, no limits. A model reads untrusted text and that text can
+      ask it for things, so the boundary is set once on the command line by
+      whoever installed the server. A unit test fails if any tool schema ever
+      grows an `image`, `mount`, `network` or `mem` field, and the Linux suite
+      attempts it for real by sending `mounts: ["/:/hostroot:rw"]` and checking
+      that `/hostroot` is not there
+- [x] `/work` persists between calls and `/zygo` holds the program, read-only —
+      so a model can write a file in one call and read it in the next, and a
+      program cannot rewrite itself mid-run. Without `--workspace` the former
+      is a scratch directory removed when the server exits
+- [x] A tool that fails answers with `isError`, not a JSON-RPC error: an error
+      at the protocol layer is handled by the host and never reaches the model
+      that could fix the traceback
+- [x] `poc/verify_mcp.sh` — **26 checks against a real kernel**, driving the
+      server over a pipe as a host does. Every boundary claim is attempted from
+      inside: the read-only root by writing to it, the absent network by
+      opening a socket, the memory limit by allocating past it (with the
+      positive case first, so "it was killed" cannot be satisfied by nothing
+      having run). Three of its first four failures were the test's fault, and
+      one was the product's — the pull line above
+- [x] `make test-sdk`, `make verify-mcp`, and `make test` now includes the
+      first
 
 ### 2.9 Measurement
 - [x] `zygo bench warm` — against the real `Pool`, with a phase breakdown, a
@@ -2133,6 +2241,267 @@ and a project's installed packages mount read-only with `/packages` on
 `sys.path` — `requests 2.34.2` imported from it.
 
 ---
+
+## Code health — from the 2026-09-21 review
+
+Source: [docs/code_check.md](docs/code_check.md). A read-only pass over the
+whole tree at `945e41a`; the IDs below are the report's. Nothing here changes
+behaviour for inputs that work today — each item fixes a path that is wrong
+today, or removes a way for the next change to go wrong. Every fix lands with
+the test that would have caught it.
+
+### Fixed (P0 — latent bugs and hygiene)
+
+All of them, each with the test that would have caught it. Where the test is
+the interesting part it is named; three of them were checked against the
+original code first, and each failed there and passes now.
+
+- [x] **B-01** A partially failed secret write left files in `/run/secrets`
+      and every later request on that function failed with EACCES: the
+      directory was recorded *after* the loop, so `unlink_all` had nothing to
+      aim at. Recorded before it now, a failed write undoes what it managed,
+      and `O_TRUNC` became `unlinkat` + `O_EXCL` — the old comment blamed "a
+      file from a previous generation", which a fresh tmpfs never has; the
+      real culprit was a 0400 file the supervisor cannot reopen for writing
+- [x] **B-02** `reject_foreign_peer` failed **open**: the syscall and the
+      policy shared one `?`, so "could not read the credentials" and "the
+      credentials are ours" returned the same answer. Split into
+      `peer_verdict(ours, peer)`, which refuses `None`, and tested for all
+      three inputs — a socket on which `SO_PEERCRED` genuinely fails cannot be
+      conjured from a process that owns both ends
+- [x] **B-03** `F_DUPFD` and `dup2` both *clear* close-on-exec, so a warm-exec
+      request inherited all thirteen renumbered descriptors — seven namespace
+      descriptors among them — past `execve`, exactly opposite to what the
+      comment above them promised. `F_DUPFD_CLOEXEC` + `dup3(O_CLOEXEC)`, and
+      the failure report now goes to the *parked* error pipe rather than to
+      the descriptor being duplicated. Escape suite case 16 attempts it
+- [x] **B-04** The unpack path was hardened against hostile tars and the
+      *flatten* path was not: `create_dir_all` follows a lower layer's
+      symlink, and `Path::exists` is false for a dangling one, so both
+      branches wrote through. Every decision now uses `symlink_metadata` and
+      removes what is there first; the `hard_link` fallback narrowed to the
+      errors that mean "links unsupported". Two tests, both confirmed against
+      the old code: one plants `etc` as a link outside the store, one leaves a
+      dangling link in the destination
+- [x] **B-05** The registry client never compared what it was served with what
+      it asked for. The body is hashed every time and checked against the
+      header, `reference.digest` and the index descriptor; every digest in a
+      manifest is parsed before it reaches a URL. Tested against
+      `tests/registry_client.rs` — about a hundred lines of `std::net` that is
+      enough to be a registry — which also covers the 401 → token → retry
+      path for the first time, and that a token is reused rather than fetched
+      per blob
+- [x] **B-06** `make verify-login-linux` could not fail: the `-` prefix
+      discarded the suite's exit status and CI ran the target verbatim. The
+      status is captured before the cleanup now, and `sleep 3` became
+      `poc/wait_for_registry.sh`, which polls the endpoint the suite is about
+      to use
+- [x] **B-07** `is_fn_name` at the top of `resolve_layer`, so every entry
+      point gets it: `cgroup::sanitise` covered the cgroup and `tenant_data`,
+      `agent_sock` and the pasta pid file joined the raw name, while
+      `[fn."../x"]` is legal TOML
+- [x] **B-08** `Drop` cannot restore a terminal under `panic = "abort"`,
+      which is the release profile — the `catch_unwind` test passed only
+      because the test profile unwinds. A panic hook restores from a registry
+      now, and the new test reaches the same path through `mem::forget`,
+      which *is* "no destructor ran". `prompt_password` grew a Drop guard and
+      a SIGINT handler that turns echo back on and re-raises; it reads the
+      current settings rather than a saved copy, so it needs nothing shared
+      with the handler
+- [x] **B-09** The Python spawn fallback took the next frame and demanded it
+      be `GO`; anything else killed the worker and answered **nothing**, so
+      the supervisor waited out the whole deadline. `zygo agent test` sends
+      two `EXEC`s before any `GO`, so every handler that fell back failed
+      conformance for this. `_await_go` now answers `overloaded`, `PONG` and
+      `bad_message` and loops to this request's `GO`. Confirmed against the
+      old code, where the new test times out
+- [x] **S-01** Four types derived `Debug` over a password. Hand-written impls
+      with a `<redacted>` marker, and a test that formats each and looks for
+      the secret in the output — a field added later gets a derived `Debug`
+      for free, and nothing else would notice
+- [x] **S-02** `connect_timeout` and `read_timeout` on the registry client: a
+      registry that accepted a connection and then said nothing hung `pull`,
+      and so `run` and `serve`, for ever. Per-read rather than per-request, so
+      a large layer on a slow link still completes
+- [x] **S-03 / S-04** The ready pipe is `pipe_cloexec` (it stayed open across
+      the spawns of `newuidmap`, `nft` and the long-lived `pasta`), and
+      `recvmsg` takes `MSG_CMSG_CLOEXEC` so the `/run/secrets` descriptor is
+      close-on-exec from the moment it exists rather than after a window in
+      which another thread can fork
+- [x] **C-01** `rust-version = "1.88"`, which is what let-chains need. Raising
+      it enabled three clippy lints that the false floor had been suppressing
+      (`collapsible_if` ×2, `manual_is_multiple_of`); all three applied
+- [x] **T-04** `cargo test -p zygo-core --no-default-features` compiles: the
+      `CredentialStore` sweep is gated on `feature = "registry"`. Added the
+      DNS wire-parser sweep the report asked for — the only parser that reads
+      raw bytes a *tenant* sent, in a process that serves every other function
+      on the host — which promptly caught **B-16** below
+- [x] **E-11 / C-03** `parse_digest` rejects upper-case hex, which `write_blob`
+      could never verify; `tempfile` is no longer listed as both a dependency
+      and a dev-dependency of `zygo-cli`
+
+### Then (P1 — robustness, ceilings, drifted policy)
+
+- [ ] **B-10** N concurrent requests on a crashed function queue N warm-ups;
+      re-check the registry under the lock and hold a per-name "warming" flag.
+- [ ] **B-11** `tier_idle` can freeze a function between `resume()` and the
+      permit; resume after the permit, refuse `pause` while in flight.
+- [ ] **B-12** When the agent's pid cannot be translated no request cgroup is
+      created and a timed-out request is never killed; do what the comment
+      says or refuse before `GO`. (`pool.rs:1188`)
+- [ ] **B-13** `read_status` blocks with no deadline after `collect_request`
+      gave up; poll with the remaining grace.
+- [ ] **B-14 / B-15** `wait()` on a zero-timeout sandbox SIGKILLs it after
+      5 s; two `launch` error paths `reap` a live child instead of `kill`.
+      Then split `launch` (R-01) so the next error path cannot miss it.
+- [x] **B-16** ANCOUNT was written as `answers.len()` while the loop stopped
+      at the packet limit, so a name with ~28 addresses produced a header
+      promising records that were not there — a resolver reports that as a
+      failed lookup, not a short one. The list is truncated before the header
+      is written. The truncation bit is deliberately *not* set: it tells a
+      client to retry over TCP and this resolver is UDP-only, so obeying it
+      would mean no answer instead of a usable subset. Found by the new DNS
+      sweep, which fails on the old code with "the header promises 80 records
+      and the body holds 464 bytes"
+- [ ] **B-17** Bare IPv6 literals in `allow` are mis-split on the last colon;
+      accept `[v6]:port`. (`spec/types.rs:634`)
+- [ ] **B-18** One `is_private(IpAddr)` for `types.rs`, `dns.rs` and the
+      nftables sets; today `100.64/10` passes resolve and is dead in the
+      ruleset.
+- [ ] **B-19** Normalise mount targets before the reserved-path check and
+      compare against the launcher's own `MANAGED_TARGETS` (`/tmp`, `/run`
+      are missing today).
+- [ ] **B-20 / B-21 / B-22** `write_blob` temp file left behind on error and
+      collides across threads; a corrupt `index.json` is silently emptied
+      then overwritten; prune can delete a layer mid-unpack.
+- [ ] **B-23 / B-24 / B-25** Python agent: `GO` barrier accepts EOF; an
+      oversize result kills the agent instead of `bad_result`; the forked
+      child can unwind into the parent loop (`finally: os._exit`).
+- [ ] **B-26** Node agent finalises on `'exit'`; use `'close'`, and
+      `128 + signals[signal]`.
+- [ ] **B-27 / B-28** macOS shim: guest-binary stamp survives
+      `limactl delete`; the environment (`--secret`, `ZYGO_API_TOKEN`, …) is
+      not forwarded and signals do not reach `limactl shell`.
+- [x] **B-30** `zygo_api_errors_total` counted in the `Err` arm *and* again on
+      the status it produced, so the error rate on a dashboard was twice the
+      truth. Counted once, from the status actually sent
+- [ ] **B-29** Exit-code mapping walks only the outer error, so any
+      `.context()` wrapper turns the library's 2/125 into 1.
+- [x] **S-06..S-09** All four ceilings, each a number that was absent and each
+      absent in the same shape — a request that costs the *server* more the
+      larger the caller makes it. `MAX_BATCH` (1024) with a
+      `BATCH_IN_FLIGHT` semaphore, so one caller cannot take every supervisor
+      connection; `MAX_IDLE_CLIENTS`, because each idle one pins a supervisor
+      thread and the pool only ever grew; `MAX_TIMEOUT_MS`, refused rather
+      than clamped so a caller is never told it waited for what it asked for;
+      and a `TokioTimer` on the hyper builder, without which
+      `header_read_timeout` is accepted and silently ignored. A panicking
+      batch element is now that element's failure rather than the whole
+      batch's — which is the one thing a batch exists to prevent
+- [ ] **E-01** A panicking warm-up job kills the launcher thread for the
+      supervisor's lifetime; `catch_unwind` around `job()`.
+- [ ] **E-02** `apt`/`pip` build failures are reported as
+      `BackendUnavailable` (exit 125); an `Error::Build` (exit 1) — decide on
+      the exit code first, it is visible to scripts.
+- [ ] **E-03** Drop `#[from]` on `Error::Bare(io::Error)` so a bare `?` no
+      longer compiles without a path; give `ImageError::Unpack`/`Registry` a
+      `#[source]`.
+- [ ] **E-14** `--json` output of `up` and `image rm` is several documents on
+      one stdout, and some failures print nothing in JSON mode.
+- [ ] **S-13** CI: pin actions by SHA, top-level `permissions: contents:
+      read`, `timeout-minutes`, a `concurrency` group.
+
+### When the file is next open (P2 — structure, duplication, dead code)
+
+- [ ] **R-01** Split the seven functions over 175 lines: `resolve_layer`,
+      `child::apply`, `serve_with_logs`, `cmd::supervisor::up` (move the lock
+      policy into `zygo-core::lock`), `ns::launch`, `cmd::run::run`,
+      `call_timed`.
+- [ ] **R-02** `WarmFn`/`WarmExec` share nine methods verbatim; one `Common`.
+- [ ] **R-03** `Message::Result`/`Done` share seven fields; one payload
+      struct, fixtures pin the wire.
+- [ ] **R-04** venv/derive build scaffolding → one `oneshot::Build`.
+- [ ] **R-05** Stop running the full `doctor` to learn "overlayfs in userns"
+      (four call sites, matched by display name); memoised
+      `doctor::overlay_in_userns()`, `pub const` check names, one egress name.
+- [ ] **R-06** Collapse the helpers written two to seven times (`which`,
+      `is_timeout`, request-id generator — and make `zygo logs` ids equal the
+      protocol ids as the comment claims — `pipe_cloexec`, `Platform`
+      display, `digest_of`, NaN-safe sort, "no supervisor" fallback, …).
+- [ ] **R-07 / R-08** One `block_on` helper instead of six runtimes in the
+      CLI; `image_config` sync on `Store`; `spawn_blocking` around
+      `unpack_layer` in `pull`.
+- [ ] **R-09 / R-10** `Store::skeleton` gets a per-key lock, a `Paths`
+      accessor and a prune entry; split `store.rs` into store / unpack /
+      flatten.
+- [ ] **R-11** Duplicate the namespace descriptors at serve time so
+      `WarmExec::call_timed` no longer holds the sandbox mutex across `enter`.
+- [ ] **R-16** `poc/lib.sh` for the nine copied preludes; `mktemp -d` +
+      `trap` per suite instead of shared `/tmp` paths; one `POC_RUN` in the
+      Makefile; one prepare step in CI.
+- [ ] **D-01..D-03** Delete the unused items (`agent_failure`,
+      `WarmupTiming`, `Supervisor::load`, `locate_field`, `_read_result`,
+      `absolute()`, …), the never-sent `Step` variants, the unreachable
+      seccomp instructions.
+- [ ] **D-04** Rewrite the twenty-odd comments that describe the previous
+      design (list in the report).
+- [ ] **D-07** Hide `exec --batch` until it exists.
+- [ ] **T-02 / T-03 / T-08** Tests for the reply demultiplexer, `enter.rs`
+      and `wait_within`, and the HTTP router; a `Function::Fake` arm for the
+      tiering transitions.
+- [ ] **T-05 / T-06 / T-07** Inject the resolver in `net` tests; assert
+      `defaults()` fills every field `resolve_layer` expects; one
+      `Limits::for_tests()`.
+- [ ] **C-02** A `lint` CI job: `cargo deny`, `shellcheck`, `ruff`.
+- [ ] **C-03 / C-04 / C-05** `tempfile` listed twice in `zygo-cli`; Makefile
+      `.PHONY`/`help` gaps and the unconditional `-t`; one build profile in
+      the `unit` job.
+- [ ] **X-01** The counts in README, todo.md, Makefile and SECURITY.md
+      disagree (151/157 supervisor, 14/15 shim, 27/37 Python, 5.3/5.15
+      kernel floor). Have the suites print their totals; quote those.
+- [ ] **X-02..X-07** `PING` liveness is promised by the spec and not sent;
+      SUMMARY.md links outside the book root; ported allow rules are
+      TCP-only and undocumented; kernel series table ages silently; the
+      Python floor is stated nowhere; `fn.run.mem` in error paths.
+
+## From the use-case pass
+
+Three things the use-case walk-through found, all of them now closed.
+
+- [x] **`zygo run --requirements` did not exist**, and `examples/ci-job`
+      documented it. Marked as a documentation defect; it was a missing
+      feature the documentation had already promised, and the workaround it
+      forced — installing packages into a directory and bind-mounting it —
+      rebuilt them per job. Implemented against the venv cache `serve`
+      already uses, so the two share: same key (image digest + the file's
+      bytes), same `/venv` mount, same read-only guarantee. The image's own
+      `PATH` is kept, with `/venv/bin` in front of it rather than instead of
+      it — `Venv::env_over`, because the warm path has no image config to
+      hand and uses the built-in default
+- [x] **A time-limit kill and a memory-limit kill were both exit 137** at the
+      CLI, so a judge could not tell them apart. They still are, because both
+      are `SIGKILL` and the wait status has nothing else — so the *reason*
+      now travels out of band. `zygo run --outcome PATH` writes
+      `{"exit_code","timed_out","oom_killed","peak_rss_kb","wall_ms"}`:
+      `timed_out` from the launcher, which enforced the deadline, and
+      `oom_killed` from `memory.events` in the sandbox's own cgroup, read
+      after it exits and before the directory is removed. Out of band because
+      standard output belongs to the program
+  - [x] `POST /run` reports all three, which is what UC6 asked for; both SDKs
+        parse them; the MCP server says "ran out of memory" and "exceeded its
+        time limit" in different sentences, because a model told "exit 137"
+        cannot know which of its two problems to fix
+  - [x] The exit code is still taken from the wait status and never from the
+        file — a child killed after writing one would otherwise report the
+        success it had written
+- [x] **A reproduction for the one open supervisor question.**
+      `poc/repro_blue_green.sh` does only the queued-request-during-a-replacement
+      scenario, five times by default, and prints the timings of each round:
+      how long `up` took, how much of the queue window was left, how long the
+      queued request waited. A round where `up` outlasted the window is
+      reported as *inconclusive* rather than counted either way, which is the
+      distinction the single check inside `verify-supervisor-linux` has to
+      make in one shot. `make repro-blue-green-linux`
 
 ## Open decisions (design document, section 6)
 

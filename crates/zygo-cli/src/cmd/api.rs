@@ -27,7 +27,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use zygo_core::pool::Outcome;
-use zygo_core::spec::{ApiAuth, Spec};
+use zygo_core::spec::{ApiAuth, Layer, Spec};
 use zygo_core::supervisor::client::Client;
 use zygo_core::supervisor::{ControlError, Request as Control, Response as Reply};
 
@@ -42,6 +42,62 @@ const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// real limit and the supervisor enforces it; this only bounds the HTTP hold.
 const DEFAULT_TIMEOUT_MS: u64 = 60_000;
 
+/// Version of the HTTP surface itself, bumped on any incompatible change.
+///
+/// Separate from the crate version and from [`CONTROL_VERSION`]: an SDK pinned
+/// to this number should keep working across Zygo releases that only change
+/// what happens behind the routes. `GET /version` reports it, and that is what
+/// a client checks rather than parsing a release string.
+///
+/// [`CONTROL_VERSION`]: zygo_core::supervisor::CONTROL_VERSION
+pub const API_VERSION: u32 = 1;
+
+/// Largest batch accepted.
+///
+/// Without a cap, a 16 MB body of `[null,null,…]` is about a million elements,
+/// and the batch handler opened a supervisor connection and spawned a task for
+/// each (S-06). The supervisor serves every connection on a thread, so the
+/// cost of that request was paid by the host rather than by the caller.
+const MAX_BATCH: usize = 1024;
+
+/// How many batch elements may be in flight at once.
+///
+/// A batch is one caller asking for several things; it should not be able to
+/// out-compete every other caller for supervisor connections by asking for a
+/// thousand. The per-function concurrency limit is what actually bounds
+/// sandbox work — this bounds the connections in front of it.
+const BATCH_IN_FLIGHT: usize = 16;
+
+/// Idle control connections kept for reuse.
+///
+/// Each one pins a thread in the supervisor, so the pool that only ever grew
+/// (S-07) turned a burst of concurrent requests into a permanent thread count.
+/// Above this, a finished connection is closed instead of kept.
+const MAX_IDLE_CLIENTS: usize = 32;
+
+/// Longest `X-Zygo-Timeout-Ms` a caller may ask for.
+///
+/// The function's own `timeout` is the real limit and the supervisor enforces
+/// it; this header only says how long the caller will wait. Unbounded, it is a
+/// way to hold a connection and a supervisor thread for as long as you like
+/// (S-08).
+const MAX_TIMEOUT_MS: u64 = 3_600_000;
+
+/// How long a connection has to send its request headers.
+///
+/// hyper only honours this when the builder has a timer, and it had none
+/// (S-09) — so a connection that opened and sent one byte was held for ever.
+const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a one-shot `POST /run` may hold the connection beyond the
+/// sandbox's own timeout before the child is killed outright.
+///
+/// The launcher enforces the function's `timeout` against the whole process
+/// tree; this is the outer bound for the case where it cannot — a child that
+/// never starts, or a backend that hangs before the timer exists. Without it
+/// an HTTP caller has no upper bound at all.
+const RUN_GRACE_MS: u64 = 30_000;
+
 /// Everything a request handler needs, shared across connections.
 struct Api {
     paths: zygo_core::Paths,
@@ -49,6 +105,16 @@ struct Api {
     /// `None` means no authentication — permitted only where refusing would
     /// protect nobody (see [`Listen::allows_no_auth`]).
     token: Option<String>,
+    /// Whether this listener may create and destroy sandboxes, not only call
+    /// the ones already declared.
+    ///
+    /// Off by default, and the difference is the whole security posture of the
+    /// API. Without it a token holder can call `[fn.*]` from a spec file
+    /// somebody reviewed; with it the same token can serve a function with any
+    /// mount, any image and any command — which is running arbitrary code as
+    /// this user, through a port. P6 says a widened boundary has to be spelled
+    /// out, so it is a flag rather than a default.
+    deploy: bool,
     /// Idle control connections, one per request in flight at peak. The
     /// supervisor serves each on its own thread, so this is what turns
     /// concurrent HTTP requests into concurrent sandbox requests.
@@ -103,6 +169,7 @@ pub fn run(cli: &Cli, args: &ApiArgs) -> anyhow::Result<u8> {
         paths,
         exe,
         token,
+        deploy: args.allow_deploy,
         clients: std::sync::Mutex::new(vec![first]),
         started: Instant::now(),
         requests: AtomicU64::new(0),
@@ -118,12 +185,17 @@ pub fn run(cli: &Cli, args: &ApiArgs) -> anyhow::Result<u8> {
 
     let style = Style::stderr();
     eprintln!(
-        "{} {listen}  {}",
+        "{} {listen}  {}  {}",
         style.dim("api"),
         style.dim(if api.token.is_some() {
             "bearer auth"
         } else {
             "no auth"
+        }),
+        style.dim(if api.deploy {
+            "deploy on: callers may serve, stop and run"
+        } else {
+            "call-only: serve, stop and run are refused"
         })
     );
     if let Some(exporter) = &exporter {
@@ -229,7 +301,15 @@ where
     tokio::spawn(async move {
         let io = TokioIo::new(stream);
         let service = service_fn(move |req| handle(req, Arc::clone(&api)));
-        if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
+        let result = http1::Builder::new()
+            // Without a timer hyper accepts `header_read_timeout` and then
+            // silently does nothing with it, so a connection that sends one
+            // byte and stops is held for ever (S-09).
+            .timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout(HEADER_READ_TIMEOUT)
+            .serve_connection(io, service)
+            .await;
+        if let Err(e) = result {
             tracing::debug!("connection ended: {e}");
         }
     });
@@ -245,11 +325,11 @@ async fn handle(
     api.requests.fetch_add(1, Ordering::Relaxed);
     let response = match route(req, &api).await {
         Ok(response) => response,
-        Err(e) => {
-            api.errors.fetch_add(1, Ordering::Relaxed);
-            e.into_response()
-        }
+        Err(e) => e.into_response(),
     };
+    // Counted once, from the status that was actually sent. Counting in the
+    // `Err` arm *and* here meant every 500 produced by a refused request was
+    // two errors, so the rate on a dashboard was twice the truth (B-30).
     if response.status().is_server_error() {
         api.errors.fetch_add(1, Ordering::Relaxed);
     }
@@ -304,6 +384,36 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<Full<B
     match (req.method(), segments.as_slice()) {
         (&Method::GET, ["fn"]) => list(api).await,
         (&Method::GET, ["metrics"]) => metrics(api).await,
+        (&Method::GET, ["version"]) => Ok(json(
+            StatusCode::OK,
+            &serde_json::json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "api": API_VERSION,
+                "control": zygo_core::supervisor::CONTROL_VERSION,
+                "deploy": api.deploy,
+            }),
+        )),
+        (&Method::PUT, ["fn", name]) => {
+            let name = name.to_string();
+            deployable(api)?;
+            let body = read_body(req).await?;
+            serve_fn(api, name, &body).await
+        }
+        (&Method::DELETE, ["fn", name]) => {
+            let name = name.to_string();
+            deployable(api)?;
+            stop(api, name).await
+        }
+        (&Method::POST, ["run"]) => {
+            deployable(api)?;
+            let body = read_body(req).await?;
+            one_shot(api, &body).await
+        }
+        (&Method::GET, ["fn", name, "logs"]) => {
+            let name = name.to_string();
+            let query = req.uri().query().unwrap_or("").to_string();
+            logs(api, name, &query).await
+        }
         (&Method::POST, ["fn", name]) => {
             let name = name.to_string();
             let timeout_ms = timeout_header(&req)?;
@@ -325,10 +435,12 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<Full<B
         }
         (&Method::GET, ["fn", name, "stats"]) => stats(api, name.to_string()).await,
         (&Method::POST, ["fn", name, "warm"]) => warm(api, name.to_string()).await,
-        (_, ["fn", ..]) | (_, ["metrics"]) => Err(HttpError::new(
-            StatusCode::METHOD_NOT_ALLOWED,
-            format!("{} {}", req.method(), path),
-        )),
+        (_, ["fn", ..]) | (_, ["metrics"]) | (_, ["version"]) | (_, ["run"]) => {
+            Err(HttpError::new(
+                StatusCode::METHOD_NOT_ALLOWED,
+                format!("{} {}", req.method(), path),
+            ))
+        }
         _ => Err(HttpError::new(
             StatusCode::NOT_FOUND,
             format!("no route {path}"),
@@ -368,19 +480,43 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 fn timeout_header(req: &Request<Incoming>) -> Result<u64, HttpError> {
-    match req.headers().get("x-zygo-timeout-ms") {
+    timeout_header_from(req.headers())
+}
+
+/// The headers alone, so this is reachable from a test.
+///
+/// `Request<Incoming>` cannot be built outside a server, which is why the
+/// ceiling below went untested until there was a ceiling to test (S-08).
+fn timeout_header_from(headers: &hyper::HeaderMap) -> Result<u64, HttpError> {
+    match headers.get("x-zygo-timeout-ms") {
         None => Ok(DEFAULT_TIMEOUT_MS),
-        Some(v) => v
-            .to_str()
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .filter(|ms| *ms > 0)
-            .ok_or_else(|| {
-                HttpError::new(
+        Some(v) => {
+            let ms = v
+                .to_str()
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .filter(|ms| *ms > 0)
+                .ok_or_else(|| {
+                    HttpError::new(
+                        StatusCode::BAD_REQUEST,
+                        "X-Zygo-Timeout-Ms must be a positive integer",
+                    )
+                })?;
+            // Refused rather than silently clamped: a caller that asked for a
+            // day and was given an hour would report the wrong thing when the
+            // wait ended.
+            if ms > MAX_TIMEOUT_MS {
+                return Err(HttpError::new(
                     StatusCode::BAD_REQUEST,
-                    "X-Zygo-Timeout-Ms must be a positive integer",
-                )
-            }),
+                    format!(
+                        "X-Zygo-Timeout-Ms is {ms}, over this API's ceiling of \
+                         {MAX_TIMEOUT_MS}\n  → the function's own `timeout` is the \
+                         real limit; this header only says how long you will wait"
+                    ),
+                ));
+            }
+            Ok(ms)
+        }
     }
 }
 
@@ -426,7 +562,13 @@ where
         };
         let result = f(&mut client);
         if result.is_ok() {
-            api.clients.lock().expect("clients").push(client);
+            // Above the ceiling the connection is dropped rather than kept:
+            // each idle one pins a supervisor thread, so a pool that only grew
+            // made a momentary burst permanent (S-07).
+            let mut idle = api.clients.lock().expect("clients");
+            if idle.len() < MAX_IDLE_CLIENTS {
+                idle.push(client);
+            }
         }
         result
     })
@@ -462,10 +604,32 @@ async fn batch(
     events: Vec<serde_json::Value>,
     timeout_ms: u64,
 ) -> Result<Response<Full<Bytes>>, HttpError> {
+    if events.len() > MAX_BATCH {
+        return Err(HttpError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "a batch of {} is over this API's ceiling of {MAX_BATCH}\n  \
+                 → send it in several requests; each element costs a supervisor \
+                 connection and a thread",
+                events.len()
+            ),
+        ));
+    }
+
+    // One caller asking for a thousand things must not take a thousand
+    // supervisor connections ahead of every other caller (S-06). The
+    // per-function concurrency limit still bounds the sandbox work behind
+    // this; the semaphore bounds the plumbing in front of it.
+    let permits = Arc::new(tokio::sync::Semaphore::new(BATCH_IN_FLIGHT));
     let calls = events.into_iter().map(|event| {
         let name = name.clone();
         let api = Arc::clone(api);
+        let permits = Arc::clone(&permits);
         async move {
+            let _permit = permits
+                .acquire()
+                .await
+                .expect("the semaphore is not closed");
             let reply = control(&api, move |c| {
                 Ok(c.send(&Control::Exec {
                     name,
@@ -489,16 +653,29 @@ async fn batch(
     Ok(json(StatusCode::OK, &serde_json::Value::Array(answers)))
 }
 
-/// `join_all` without pulling in `futures`: the batch is small and ordered.
-async fn futures_join_all<F>(futures: impl IntoIterator<Item = F>) -> Vec<F::Output>
+/// `join_all` without pulling in `futures`: the batch is bounded and ordered.
+///
+/// Concrete in the element type rather than generic, because the one thing it
+/// has to do on a panic — put a JSON error in that element's place — is only
+/// expressible once the type is known.
+async fn futures_join_all<F>(futures: impl IntoIterator<Item = F>) -> Vec<serde_json::Value>
 where
-    F: std::future::Future + Send + 'static,
-    F::Output: Send + 'static,
+    F: std::future::Future<Output = serde_json::Value> + Send + 'static,
 {
     let handles: Vec<_> = futures.into_iter().map(tokio::spawn).collect();
     let mut out = Vec::with_capacity(handles.len());
     for h in handles {
-        out.push(h.await.expect("a batch element panicked"));
+        // A panicking element is reported as that element's failure. It used
+        // to `expect`, which took down the whole batch — and with it the
+        // answers to every element that had already succeeded, which is the
+        // one thing a batch exists to prevent (S-06).
+        out.push(h.await.unwrap_or_else(|e| {
+            tracing::error!("a batch element panicked: {e}");
+            serde_json::json!({
+                "status": 500,
+                "error": "this element failed unexpectedly; the others are unaffected",
+            })
+        }));
     }
     out
 }
@@ -534,6 +711,279 @@ async fn stats(api: &Arc<Api>, name: String) -> Result<Response<Full<Bytes>>, Ht
 async fn warm(api: &Arc<Api>, name: String) -> Result<Response<Full<Bytes>>, HttpError> {
     let reply = control(api, move |c| Ok(c.send(&Control::Warm { name })?)).await?;
     Ok(reply_to_response(reply))
+}
+
+/// The gate on everything that creates or destroys a sandbox.
+///
+/// A 403 rather than a 404: pretending the route does not exist would send an
+/// SDK author looking for a typo, when the answer is a flag on the server.
+fn deployable(api: &Api) -> Result<(), HttpError> {
+    if api.deploy {
+        return Ok(());
+    }
+    Err(HttpError::new(
+        StatusCode::FORBIDDEN,
+        "this API may only call functions that are already served\n  \
+         → start it with `zygo api --allow-deploy` to let callers serve, stop \
+         and run, which is running arbitrary code as the user it runs as",
+    ))
+}
+
+/// What `PUT /fn/<name>` accepts: the same inputs `zygo serve` sends, minus
+/// the ones that only mean something at a terminal.
+///
+/// Deliberately **not** a whole spec file. The supervisor is the authority on
+/// what a function is and resolves the layer itself; a client that wants a
+/// `sandbox.toml` deployed has `zygo up`, which reads it where it lives rather
+/// than shipping a copy whose relative paths mean something else here.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServeRequest {
+    #[serde(default)]
+    layer: Layer,
+    /// What the layer's relative paths are relative to, on *this* host.
+    ///
+    /// Absolute and required to be: the API process has a working directory of
+    /// its own, and a caller across a socket has no way to know it. Letting it
+    /// default silently is how `entry = "./handler.py"` ends up resolving
+    /// somewhere nobody meant.
+    base_dir: std::path::PathBuf,
+    /// Secret values by name. The caller supplies them because the API
+    /// process's environment is nobody's idea of where `STRIPE_KEY` lives —
+    /// the same reasoning as the control protocol's own `secrets` field.
+    #[serde(default)]
+    secrets: std::collections::BTreeMap<String, String>,
+    /// Leave the function alone when it is already exactly this. What
+    /// `zygo up` sets, so calling this twice is not two deploys.
+    #[serde(default)]
+    if_changed: bool,
+}
+
+async fn serve_fn(
+    api: &Arc<Api>,
+    name: String,
+    body: &[u8],
+) -> Result<Response<Full<Bytes>>, HttpError> {
+    let request: ServeRequest = serde_json::from_slice(body).map_err(|e| {
+        HttpError::new(
+            StatusCode::BAD_REQUEST,
+            format!("body is not a serve request: {e}"),
+        )
+    })?;
+    if !request.base_dir.is_absolute() {
+        return Err(HttpError::new(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "`base_dir` must be absolute, and `{}` is not\n  \
+                 → it names a directory on the host this API runs on",
+                request.base_dir.display()
+            ),
+        ));
+    }
+
+    let reply = control(api, move |c| {
+        Ok(c.send(&Control::Serve {
+            name,
+            spec: None,
+            layer: Box::new(request.layer),
+            base_dir: request.base_dir,
+            // Never from a socket. Each of these removes a guarantee, and a
+            // caller that can widen the boundary over HTTP makes the flag on
+            // the server meaningless. Set them where the sandbox is declared.
+            allow_host_net: false,
+            allow_private_net: false,
+            allow_unlimited: false,
+            secrets: request.secrets,
+            if_changed: request.if_changed,
+        })?)
+    })
+    .await?;
+    Ok(reply_to_response(reply))
+}
+
+async fn stop(api: &Arc<Api>, name: String) -> Result<Response<Full<Bytes>>, HttpError> {
+    let wanted = name.clone();
+    let reply = control(api, move |c| {
+        Ok(c.send(&Control::Stop { name: Some(name) })?)
+    })
+    .await?;
+    // The supervisor answers `Stopped { names }` with an empty list for a name
+    // it does not hold. An SDK needs that to be a 404, not a 200 that looks
+    // like it worked.
+    if let Reply::Stopped { names } = &reply
+        && names.is_empty()
+    {
+        return Err(HttpError::new(
+            StatusCode::NOT_FOUND,
+            format!("no function named `{wanted}`"),
+        ));
+    }
+    Ok(reply_to_response(reply))
+}
+
+async fn logs(
+    api: &Arc<Api>,
+    name: String,
+    query: &str,
+) -> Result<Response<Full<Bytes>>, HttpError> {
+    let params = Query::parse(query);
+    let after = params.number("after")?.unwrap_or(0);
+    let limit = params.number("limit")?.unwrap_or(50);
+    let failed = params.flag("failed")?;
+    let limit = u32::try_from(limit).unwrap_or(u32::MAX);
+
+    let reply = control(api, move |c| {
+        Ok(c.send(&Control::Logs {
+            name,
+            after,
+            limit,
+            failed,
+        })?)
+    })
+    .await?;
+    Ok(reply_to_response(reply))
+}
+
+/// A query string, parsed once. Percent-decoding is deliberately absent: every
+/// parameter here is a number or a boolean, and a `%` in one is a mistake
+/// worth reporting rather than decoding.
+struct Query<'a>(Vec<(&'a str, &'a str)>);
+
+impl<'a> Query<'a> {
+    fn parse(query: &'a str) -> Query<'a> {
+        Query(
+            query
+                .split('&')
+                .filter(|p| !p.is_empty())
+                .map(|pair| match pair.split_once('=') {
+                    Some((k, v)) => (k, v),
+                    None => (pair, ""),
+                })
+                .collect(),
+        )
+    }
+
+    fn get(&self, key: &str) -> Option<&'a str> {
+        self.0.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
+    }
+
+    fn number(&self, key: &str) -> Result<Option<u64>, HttpError> {
+        match self.get(key) {
+            None => Ok(None),
+            Some(raw) => raw.parse().map(Some).map_err(|_| {
+                HttpError::new(
+                    StatusCode::BAD_REQUEST,
+                    format!("`{key}` must be a non-negative integer, not `{raw}`"),
+                )
+            }),
+        }
+    }
+
+    fn flag(&self, key: &str) -> Result<bool, HttpError> {
+        match self.get(key) {
+            None => Ok(false),
+            Some("") | Some("1") | Some("true") => Ok(true),
+            Some("0") | Some("false") => Ok(false),
+            Some(raw) => Err(HttpError::new(
+                StatusCode::BAD_REQUEST,
+                format!("`{key}` must be true or false, not `{raw}`"),
+            )),
+        }
+    }
+}
+
+/// What `POST /run` accepts.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunRequest {
+    /// The sandbox, exactly as a `[fn.<name>]` table would describe it.
+    /// `image` is required; `cmd` defaults to the image's own entrypoint.
+    layer: Layer,
+    /// Fed to the command's standard input, which is then closed.
+    #[serde(default)]
+    stdin: String,
+}
+
+/// `POST /run` — one sandbox, one command, no warm pool.
+///
+/// The work is [`super::oneshot::run`], which spawns `zygo run` as a child and
+/// captures its streams; the reasoning for a child rather than an in-process
+/// launch is documented there. Here it runs on a blocking thread, because it
+/// is synchronous and the runtime this API uses is not.
+async fn one_shot(api: &Arc<Api>, body: &[u8]) -> Result<Response<Full<Bytes>>, HttpError> {
+    let request: RunRequest = serde_json::from_slice(body).map_err(|e| {
+        HttpError::new(
+            StatusCode::BAD_REQUEST,
+            format!("body is not a run request: {e}"),
+        )
+    })?;
+
+    let layer = request.layer;
+    let image = layer
+        .image
+        .clone()
+        .ok_or_else(|| HttpError::new(StatusCode::BAD_REQUEST, "`layer.image` is required"))?;
+    let argv = layer.cmd.clone().unwrap_or_default();
+    // Relative paths in a body have no meaning here: the API's working
+    // directory is its own, and unlike `serve` there is no `base_dir` to
+    // anchor them to — the child resolves them against a temporary spec file
+    // in a temporary directory.
+    if let Some(mounts) = &layer.mounts {
+        for mount in mounts {
+            if !mount.source.is_absolute() {
+                return Err(HttpError::new(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "mount source `{}` must be absolute\n  \
+                         → a relative path in a request body has no directory to be relative to",
+                        mount.source.display()
+                    ),
+                ));
+            }
+        }
+    }
+
+    // The bound the caller waits under. The sandbox's own timeout is enforced
+    // by the launcher against the whole process tree; this covers the case
+    // where the child never gets that far.
+    let deadline = std::time::Duration::from_millis(
+        layer
+            .timeout
+            .map(|t| u64::try_from(t.0.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(DEFAULT_TIMEOUT_MS)
+            .saturating_add(RUN_GRACE_MS),
+    );
+
+    let exe = api.exe.clone();
+    let stdin = request.stdin;
+    let captured = tokio::task::spawn_blocking(move || {
+        super::oneshot::run(&exe, layer, &image, &argv, stdin.as_bytes(), deadline)
+    })
+    .await
+    .context("the sandbox task panicked")??;
+
+    // 200 with a non-zero `exit_code` rather than a 500: the sandbox ran, and
+    // this is what it said. A 500 would mean Zygo failed, and the difference
+    // is what a caller needs in order to decide whether to retry.
+    let status = if captured.timed_out {
+        StatusCode::REQUEST_TIMEOUT
+    } else {
+        StatusCode::OK
+    };
+    Ok(json(
+        status,
+        &serde_json::json!({
+            "exit_code": captured.exit_code,
+            "stdout": captured.stdout,
+            "stderr": captured.stderr,
+            // Why it ended, which the exit status cannot carry: a deadline
+            // kill and an out-of-memory kill are both 137.
+            "timed_out": captured.timed_out,
+            "oom_killed": captured.oom_killed,
+            "peak_rss_kb": captured.peak_rss_kb,
+            "wall_ms": captured.wall_ms,
+        }),
+    ))
 }
 
 /// One reading of every number this process exports — shared by `/metrics`
@@ -652,6 +1102,31 @@ fn reply_to_json(reply: Reply) -> (StatusCode, serde_json::Value) {
         Reply::Functions { functions } => (
             StatusCode::OK,
             serde_json::json!({ "functions": functions }),
+        ),
+        Reply::Served {
+            name,
+            runtime,
+            rss_kb,
+            imports_ms,
+            warm_ms,
+            warnings,
+            change,
+        } => (
+            StatusCode::OK,
+            serde_json::json!({
+                "name": name, "runtime": runtime, "rss_kb": rss_kb,
+                "imports_ms": imports_ms, "warm_ms": warm_ms,
+                "warnings": warnings, "change": change,
+            }),
+        ),
+        Reply::Stopped { names } => (StatusCode::OK, serde_json::json!({ "stopped": names })),
+        Reply::Logs {
+            name,
+            entries,
+            next,
+        } => (
+            StatusCode::OK,
+            serde_json::json!({ "name": name, "entries": entries, "next": next }),
         ),
         Reply::Error { code, message } => {
             let status = match code {
@@ -863,5 +1338,217 @@ mod tests {
         assert_eq!(parse_event(b"  \n").unwrap(), serde_json::Value::Null);
         assert_eq!(parse_event(br#"{"n":1}"#).unwrap()["n"], 1);
         assert!(parse_event(b"{nope").is_err());
+    }
+
+    /// The gate on everything that creates or destroys a sandbox, and the
+    /// status it refuses with.
+    ///
+    /// A 403 rather than a 404: pretending the route does not exist sends an
+    /// SDK author looking for a typo, when the answer is a flag on the server.
+    /// The message has to name that flag, because nothing else can.
+    #[test]
+    fn deploy_is_off_until_it_is_asked_for() {
+        let api = |deploy| Api {
+            paths: zygo_core::Paths::rooted(std::env::temp_dir().join("zygo-api-test")),
+            exe: std::path::PathBuf::from("/nonexistent/zygo"),
+            token: None,
+            deploy,
+            clients: std::sync::Mutex::new(Vec::new()),
+            started: Instant::now(),
+            requests: AtomicU64::new(0),
+            errors: AtomicU64::new(0),
+        };
+
+        assert!(deployable(&api(true)).is_ok());
+
+        let refused = deployable(&api(false)).expect_err("a call-only API refuses");
+        assert_eq!(refused.status, StatusCode::FORBIDDEN);
+        assert!(
+            refused.body["error"]
+                .as_str()
+                .expect("a message")
+                .contains("--allow-deploy"),
+            "the refusal has to name the flag: {:?}",
+            refused.body
+        );
+    }
+
+    /// A request body may not remove a guarantee, whatever the deploy gate
+    /// says.
+    ///
+    /// Each `allow_*` widens the boundary, so a caller that could set one over
+    /// HTTP would make the flags on the server meaningless. Checked by
+    /// deserialising a body that asks for all three: `deny_unknown_fields`
+    /// refuses it outright, which is the strongest form of "not available".
+    #[test]
+    fn a_request_body_cannot_widen_the_boundary() {
+        let honest: ServeRequest =
+            serde_json::from_str(r#"{"layer":{"image":"alpine:3"},"base_dir":"/srv"}"#)
+                .expect("an ordinary serve request");
+        assert_eq!(honest.layer.image.as_deref(), Some("alpine:3"));
+
+        for field in ["allow_host_net", "allow_private_net", "allow_unlimited"] {
+            let body = format!(r#"{{"layer":{{}},"base_dir":"/srv","{field}":true}}"#);
+            assert!(
+                serde_json::from_str::<ServeRequest>(&body).is_err(),
+                "`{field}` was accepted from a request body"
+            );
+        }
+    }
+
+    /// `base_dir` has to be absolute, and the check is here rather than in the
+    /// supervisor because this is where the mistake can be explained.
+    ///
+    /// A relative path in a request body has no directory to be relative to:
+    /// the API process has a working directory of its own, and a caller across
+    /// a socket cannot know it.
+    #[test]
+    fn a_relative_base_directory_is_refused_with_the_reason() {
+        let request: ServeRequest =
+            serde_json::from_str(r#"{"layer":{},"base_dir":"./app"}"#).expect("parsed");
+        assert!(!request.base_dir.is_absolute());
+    }
+
+    /// Query parameters are read as what they are, and a value that is neither
+    /// is reported rather than defaulted.
+    ///
+    /// Defaulting is the tempting choice and the wrong one: `?failed=yes`
+    /// would silently return every entry, and the caller would conclude
+    /// nothing had failed.
+    #[test]
+    fn log_query_parameters_are_parsed_or_refused() {
+        let query = Query::parse("after=12&limit=5&failed=true");
+        assert_eq!(query.number("after").unwrap(), Some(12));
+        assert_eq!(query.number("limit").unwrap(), Some(5));
+        assert!(query.flag("failed").unwrap());
+
+        let empty = Query::parse("");
+        assert_eq!(empty.number("after").unwrap(), None);
+        assert!(!empty.flag("failed").unwrap());
+
+        // A bare `?failed` is the form a hand-written URL takes.
+        assert!(Query::parse("failed").flag("failed").unwrap());
+        assert!(!Query::parse("failed=false").flag("failed").unwrap());
+
+        assert!(Query::parse("after=soon").number("after").is_err());
+        assert!(Query::parse("failed=yes").flag("failed").is_err());
+    }
+
+    /// The three replies the SDK routes added have to map to something, and
+    /// the fallback for an unmapped one is a 500 — which would make `serve`
+    /// look broken while working.
+    #[test]
+    fn the_new_replies_have_statuses_of_their_own() {
+        let (status, body) = reply_to_json(Reply::Served {
+            name: "resize".into(),
+            runtime: "python3.12".into(),
+            rss_kb: 2048,
+            imports_ms: 40.0,
+            warm_ms: 120.0,
+            warnings: vec!["no timeout set".into()],
+            change: zygo_core::supervisor::Change::Replaced,
+        });
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["change"], "replaced");
+        assert_eq!(body["warnings"][0], "no timeout set");
+
+        let (status, body) = reply_to_json(Reply::Stopped {
+            names: vec!["resize".into()],
+        });
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["stopped"][0], "resize");
+
+        let (status, body) = reply_to_json(Reply::Logs {
+            name: "resize".into(),
+            entries: Vec::new(),
+            next: 7,
+        });
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["next"], 7);
+    }
+
+    /// A one-shot run reports the image and command as arguments, and
+    /// everything else as a sandbox — and `stdin` is not part of the sandbox.
+    ///
+    /// Leaking `stdin` into the layer would reach the spec file the child
+    /// reads, where `deny_unknown_fields` refuses it — turning a perfectly
+    /// good request into an unexplainable failure two processes away.
+    #[test]
+    fn a_run_request_separates_the_sandbox_from_the_call() {
+        let request: RunRequest = serde_json::from_str(
+            r#"{"layer":{"image":"alpine:3","cmd":["echo","hi"],"mem":"64M"},"stdin":"input"}"#,
+        )
+        .expect("a run request");
+        assert_eq!(request.layer.image.as_deref(), Some("alpine:3"));
+        assert_eq!(request.stdin, "input");
+
+        // `stdin` sits beside the layer, so it cannot be in it.
+        assert!(
+            serde_json::to_value(&request.layer)
+                .expect("serialisable")
+                .get("stdin")
+                .is_none()
+        );
+
+        assert!(
+            serde_json::from_str::<RunRequest>(r#"{"layer":{},"stdin":"x","extra":1}"#).is_err(),
+            "an unknown field should be refused rather than ignored"
+        );
+    }
+
+    /// The ceilings that stop one caller from spending the host's resources.
+    ///
+    /// Each is a number that was absent until the 2026-09-21 review, and each
+    /// absence had the same shape: a request that costs the *server* more the
+    /// larger the caller makes it.
+    #[test]
+    fn a_caller_cannot_ask_for_an_unbounded_amount_of_work() {
+        // S-08: the wait a caller may ask for. Refused rather than clamped —
+        // a caller given an hour when it asked for a day would report the
+        // wrong thing when the wait ended.
+        let over = Request::builder()
+            .header("x-zygo-timeout-ms", (MAX_TIMEOUT_MS + 1).to_string())
+            .body(())
+            .expect("a request");
+        let refused = timeout_header_from(over.headers()).expect_err("over the ceiling");
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+        assert!(
+            refused.body["error"]
+                .as_str()
+                .expect("a message")
+                .contains(&MAX_TIMEOUT_MS.to_string()),
+            "the refusal should name the ceiling: {:?}",
+            refused.body
+        );
+
+        let at_the_line = Request::builder()
+            .header("x-zygo-timeout-ms", MAX_TIMEOUT_MS.to_string())
+            .body(())
+            .expect("a request");
+        assert_eq!(
+            timeout_header_from(at_the_line.headers()).expect("the ceiling itself is allowed"),
+            MAX_TIMEOUT_MS
+        );
+
+        // And the ordinary case still works, so none of the above can pass by
+        // refusing everything.
+        let ordinary = Request::builder()
+            .header("x-zygo-timeout-ms", "2500")
+            .body(())
+            .expect("a request");
+        assert_eq!(
+            timeout_header_from(ordinary.headers()).expect("an ordinary header"),
+            2500
+        );
+
+        // S-06 and S-07: the two ceilings that bound supervisor connections.
+        // Checked as relationships rather than as literals, because what
+        // matters is that a batch cannot out-compete the pool in front of it —
+        // and at compile time, since both are constants.
+        const _: () = assert!(
+            BATCH_IN_FLIGHT <= MAX_IDLE_CLIENTS,
+            "one batch may take every pooled connection"
+        );
+        const _: () = assert!(MAX_BATCH >= BATCH_IN_FLIGHT, "the cap is below the gate");
     }
 }

@@ -347,10 +347,11 @@ impl Hierarchy {
             if !is_empty_subtree(&path) {
                 continue;
             }
-            if Self::remove(&path).is_ok() && !path.exists() {
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    cleaned.push(name.to_string());
-                }
+            if Self::remove(&path).is_ok()
+                && !path.exists()
+                && let Some(name) = path.file_name().and_then(|n| n.to_str())
+            {
+                cleaned.push(name.to_string());
             }
         }
         cleaned
@@ -455,6 +456,28 @@ pub fn peak_memory(dir: &Path) -> Option<Bytes> {
         .parse()
         .ok()
         .map(Bytes)
+}
+
+/// How many processes the kernel has killed here for running out of memory.
+///
+/// From `memory.events`, which counts events for this cgroup and its
+/// descendants. Read *after* the sandbox has exited and *before* the cgroup is
+/// removed: it is the only thing that can tell an out-of-memory kill from a
+/// deadline kill, because both arrive as exit 137 and the wait status carries
+/// nothing else. `None` when the file is absent, which is a kernel without the
+/// memory controller delegated rather than a count of zero.
+pub fn oom_kills(dir: &Path) -> Option<u64> {
+    let text = std::fs::read_to_string(dir.join("memory.events")).ok()?;
+    let mut total = None;
+    for line in text.lines() {
+        // `oom_kill` counts processes killed; `oom` counts times the limit was
+        // hit, which a group that recovered also reports. The kill is what a
+        // caller means by "it ran out of memory".
+        if let Some(rest) = line.strip_prefix("oom_kill ") {
+            total = rest.trim().parse().ok();
+        }
+    }
+    total
 }
 
 /// Apply a batch of limit writes.

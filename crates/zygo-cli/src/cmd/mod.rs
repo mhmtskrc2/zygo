@@ -8,6 +8,8 @@ pub mod doctor;
 pub mod image;
 pub mod login;
 pub mod logs;
+pub mod mcp;
+pub mod oneshot;
 pub mod otlp;
 pub mod run;
 pub mod shell;

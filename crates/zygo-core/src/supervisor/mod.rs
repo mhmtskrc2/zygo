@@ -1275,14 +1275,31 @@ fn merge(result: std::result::Result<Response, Response>) -> Response {
 /// away from being wrong, and the consequence is arbitrary code execution as
 /// this user.
 fn reject_foreign_peer(stream: &UnixStream) -> Option<Response> {
-    let peer = peer_uid(stream)?;
-    let ours = current_uid();
-    (peer != ours).then(|| {
-        Response::error(
+    peer_verdict(current_uid(), peer_uid(stream))
+}
+
+/// The decision itself, separated from the syscall that feeds it.
+///
+/// Fails **closed**. `peer_uid` returns `None` when the credentials could not
+/// be read at all, and the honest reading of that is "this connection's owner
+/// is unknown" — which, for a check whose failure mode is arbitrary code
+/// execution as this user, has to be a refusal. It read as `None` meaning
+/// *allowed* until the 2026-09-21 review (B-02), because the syscall and the
+/// policy shared one `?`.
+fn peer_verdict(ours: u32, peer: Option<u32>) -> Option<Response> {
+    match peer {
+        None => Some(Response::error(
+            ControlError::Unauthorised,
+            "cannot read the credentials of the process at the other end of this \
+             connection, so it is refused"
+                .to_string(),
+        )),
+        Some(peer) if peer != ours => Some(Response::error(
             ControlError::Unauthorised,
             format!("this supervisor belongs to uid {ours}, not uid {peer}"),
-        )
-    })
+        )),
+        Some(_) => None,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -2172,5 +2189,40 @@ mod tests {
             "our own uid must not be refused"
         );
         drop(client);
+    }
+
+    /// A peer whose credentials cannot be read is refused, not admitted.
+    ///
+    /// The syscall is the input to this decision, so the decision is what is
+    /// tested; a socket on which `SO_PEERCRED` genuinely fails cannot be
+    /// conjured from inside a process that owns both ends. The bug this pins
+    /// (B-02) was that the syscall and the policy shared one `?`, so "could
+    /// not read the credentials" and "the credentials are ours" returned the
+    /// same answer: allowed.
+    #[test]
+    fn a_peer_that_cannot_be_identified_is_refused() {
+        let ours = 1000;
+
+        let unknown = peer_verdict(ours, None).expect("an unidentifiable peer is refused");
+        match unknown {
+            Response::Error { code, message } => {
+                assert_eq!(code, ControlError::Unauthorised);
+                assert!(message.contains("cannot read the credentials"), "{message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+
+        let stranger = peer_verdict(ours, Some(1001)).expect("another user is refused");
+        assert!(matches!(
+            stranger,
+            Response::Error {
+                code: ControlError::Unauthorised,
+                ..
+            }
+        ));
+
+        // The positive case, so neither refusal above can be satisfied by a
+        // check that refuses everything.
+        assert!(peer_verdict(ours, Some(ours)).is_none());
     }
 }

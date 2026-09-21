@@ -104,6 +104,17 @@ impl Store {
         if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(ImageError::digest(digest, "not a 64-character hex sha256"));
         }
+        // Lower case only. `write_blob` compares against a freshly computed
+        // digest, which `digest_of` renders in lower case, so an upper-case
+        // reference named a blob that could be written and never verified
+        // (E-11, 2026-09-21 review). Refusing it here says so once, where the
+        // reference was written.
+        if hex.chars().any(|c| c.is_ascii_uppercase()) {
+            return Err(ImageError::digest(
+                digest,
+                "sha256 digests are written in lower-case hex",
+            ));
+        }
         Ok(hex)
     }
 
@@ -517,10 +528,10 @@ impl Store {
                 if !seen.insert(digest.clone()) || !self.has_layer(&digest) {
                     continue;
                 }
-                if let Ok(blob) = self.blob_path(&digest) {
-                    if blob.is_file() {
-                        out.push((digest, blob));
-                    }
+                if let Ok(blob) = self.blob_path(&digest)
+                    && blob.is_file()
+                {
+                    out.push((digest, blob));
                 }
             }
         }
@@ -742,19 +753,35 @@ fn create_mount_points(dir: &Path, mount_points: &[MountPoint]) -> Result<()> {
 /// across what may be different filesystems, and for stores on filesystems that
 /// do not support hard links at all. It costs disk, not correctness.
 fn link_or_copy(source: &Path, dest: &Path) -> Result<()> {
-    if !source.exists() {
+    if std::fs::symlink_metadata(source).is_err() {
         return Err(ImageError::Unpack(format!(
             "hard link target {} is missing from the layer",
             source.display()
         ))
         .into());
     }
-    if dest.exists() {
-        std::fs::remove_file(dest).at(dest)?;
-    }
+    // `symlink_metadata`, and a removal that does not follow a link: a
+    // dangling symlink at `dest` does not "exist", so `copy` created the
+    // link's *target* — on the host, if the link pointed outside the layer
+    // (B-04).
+    remove_whatever_is_there(dest)?;
     match std::fs::hard_link(source, dest) {
         Ok(()) => Ok(()),
-        Err(_) => std::fs::copy(source, dest).at(dest).map(|_| ()),
+        // Narrow on purpose. The fallback exists for filesystems that have no
+        // hard links and for a link across a mount point; catching every error
+        // turned a full disk or a permission problem into a silent copy, and
+        // then into a failure somewhere else.
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::CrossesDevices
+                    | std::io::ErrorKind::Unsupported
+                    | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            std::fs::copy(source, dest).at(dest).map(|_| ())
+        }
+        Err(e) => Err(crate::Error::io(dest, e)),
     }
 }
 
@@ -798,6 +825,16 @@ pub(crate) fn is_internal_entry(name: &std::ffi::OsStr) -> bool {
     name == LAYER_DONE || name == WHITEOUT_FILE
 }
 
+/// Copy one layer's tree over what earlier layers left.
+///
+/// Every decision about the destination is taken with `symlink_metadata`, and
+/// anything of the wrong kind is removed before it is written through. That is
+/// not a refinement: the unpack path was hardened against hostile tars
+/// (`safe_join`, `ensure_real_directory`) and this one was not, so a lower
+/// layer could plant `etc` as a symlink to `/etc` and an upper layer's
+/// `etc/passwd` would be created **on the host** (B-04, 2026-09-21 review).
+/// `create_dir_all` follows a symlink, and `Path::exists` is false for a
+/// dangling one — so both branches wrote through it.
 fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     for entry in std::fs::read_dir(src).at(src)? {
         let entry = entry.at(src)?;
@@ -809,25 +846,52 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
         let from = entry.path();
         let to = dst.join(&name);
         let md = std::fs::symlink_metadata(&from).at(&from)?;
+        // `symlink_metadata`, never `exists`: a dangling symlink does not
+        // exist and is exactly the thing that has to be removed.
+        let existing = std::fs::symlink_metadata(&to);
 
         if md.is_dir() {
+            // A directory over anything that is not a real directory: the
+            // symlink or file goes first, or `create_dir_all` resolves it.
+            match &existing {
+                Ok(there) if there.is_dir() => {}
+                Ok(_) => remove_whatever_is_there(&to)?,
+                Err(_) => {}
+            }
             std::fs::create_dir_all(&to).at(&to)?;
             copy_tree(&from, &to)?;
-        } else if md.file_type().is_symlink() {
-            let _ = std::fs::remove_file(&to);
-            #[cfg(unix)]
-            {
-                let target = std::fs::read_link(&from).at(&from)?;
-                std::os::unix::fs::symlink(&target, &to).at(&to)?;
-            }
         } else {
-            if to.exists() {
-                std::fs::remove_file(&to).at(&to)?;
+            if existing.is_ok() {
+                remove_whatever_is_there(&to)?;
             }
-            std::fs::copy(&from, &to).at(&to)?;
+            if md.file_type().is_symlink() {
+                #[cfg(unix)]
+                {
+                    let target = std::fs::read_link(&from).at(&from)?;
+                    std::os::unix::fs::symlink(&target, &to).at(&to)?;
+                }
+            } else {
+                std::fs::copy(&from, &to).at(&to)?;
+            }
         }
     }
     Ok(())
+}
+
+/// Remove whatever is at `path`, whether it is a file, a symlink or a
+/// directory, without following a link.
+fn remove_whatever_is_there(path: &Path) -> Result<()> {
+    let md = match std::fs::symlink_metadata(path) {
+        Ok(md) => md,
+        Err(_) => return Ok(()),
+    };
+    // A real directory is removed recursively; a *symlink* to one is removed
+    // as a link, which is why the kind is read without following it.
+    if md.is_dir() {
+        std::fs::remove_dir_all(path).at(path)
+    } else {
+        std::fs::remove_file(path).at(path)
+    }
 }
 
 #[cfg(test)]
@@ -1169,6 +1233,89 @@ mod tests {
         let err = s.unpack_layer(&digest, LayerCompression::None).unwrap_err();
         assert!(err.to_string().contains("symlink"), "{err}");
         assert!(!Path::new("/tmp/zygo-should-not-exist").exists());
+    }
+
+    /// The same escape as above, on the *flatten* path.
+    ///
+    /// The unpack path has been hardened since the first pass; the flatten path
+    /// had not (B-04). A lower layer plants a directory name as a symlink
+    /// pointing outside the store, and an upper layer then writes a file under
+    /// that name — `create_dir_all` follows the link and the file lands on the
+    /// host.
+    ///
+    /// Attempted rather than inspected: the assertion is that the path outside
+    /// the store does not exist afterwards.
+    #[cfg(unix)]
+    #[test]
+    fn flattening_does_not_write_through_a_symlink_a_lower_layer_planted() {
+        let (t, s) = store();
+        let outside = t.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+
+        // The lower layer: `etc` is a symlink to somewhere else entirely.
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut link = tar::Header::new_gnu();
+        link.set_entry_type(tar::EntryType::Symlink);
+        link.set_size(0);
+        link.set_mode(0o777);
+        builder
+            .append_link(&mut link, "etc", outside.to_str().unwrap())
+            .unwrap();
+        let lower = builder.into_inner().unwrap();
+        let lower_d = sha256_of(&lower);
+        s.write_blob(&lower_d, &lower[..]).unwrap();
+        s.unpack_layer(&lower_d, LayerCompression::None).unwrap();
+
+        // The upper layer writes under that name.
+        let upper = tar_of(&[("etc/passwd", b"pwned")]);
+        let upper_d = sha256_of(&upper);
+        s.write_blob(&upper_d, &upper[..]).unwrap();
+        s.unpack_layer(&upper_d, LayerCompression::None).unwrap();
+
+        // Flattening is what a host without unprivileged overlayfs does on
+        // every run, so this is not an unusual path.
+        let _ = s.rootfs_view(&[lower_d, upper_d], false, &mount_points());
+
+        assert!(
+            !outside.join("passwd").exists(),
+            "the flatten wrote through a planted symlink, onto the host"
+        );
+    }
+
+    /// A dangling symlink left by a lower layer is replaced, not written
+    /// through.
+    ///
+    /// `Path::exists` is false for a dangling link, which is why both the
+    /// copy branch and the hard-link branch skipped their removal and created
+    /// the link's target instead (B-04).
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_in_the_destination_is_replaced() {
+        let t = tempfile::tempdir().unwrap();
+        let from = t.path().join("from");
+        let to = t.path().join("to");
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::create_dir_all(&to).unwrap();
+        std::fs::write(from.join("f"), b"real").unwrap();
+
+        let elsewhere = t.path().join("elsewhere");
+        std::os::unix::fs::symlink(&elsewhere, to.join("f")).unwrap();
+        assert!(!to.join("f").exists(), "the link really is dangling");
+
+        copy_tree(&from, &to).expect("copy over a dangling link");
+
+        assert!(
+            !elsewhere.exists(),
+            "the copy created the symlink's target instead of replacing the link"
+        );
+        assert_eq!(std::fs::read(to.join("f")).unwrap(), b"real");
+        assert!(
+            !std::fs::symlink_metadata(to.join("f"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link is still there"
+        );
     }
 
     #[test]

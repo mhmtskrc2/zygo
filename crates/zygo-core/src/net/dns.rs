@@ -120,7 +120,7 @@ pub enum Rcode {
 /// Build the answer to `query`: the question echoed, then one record per
 /// address of the queried type.
 pub fn response(query: &Query, rcode: Rcode, addrs: &[IpAddr]) -> Vec<u8> {
-    let answers: Vec<&IpAddr> = addrs
+    let mut answers: Vec<&IpAddr> = addrs
         .iter()
         .filter(|a| match query.qtype {
             TYPE_A => a.is_ipv4(),
@@ -128,6 +128,22 @@ pub fn response(query: &Query, rcode: Rcode, addrs: &[IpAddr]) -> Vec<u8> {
             _ => false,
         })
         .collect();
+
+    // How many records actually fit, decided *before* the header is written.
+    //
+    // ANCOUNT used to be `answers.len()` while the loop below stopped at the
+    // packet limit, so a name with enough addresses produced a header
+    // promising records that were not there — a malformed answer that a
+    // resolver reports as a failed lookup rather than a short one
+    // (B-16, 2026-09-21 review).
+    //
+    // The truncation bit is deliberately *not* set. It tells a client to retry
+    // over TCP, and this resolver listens on UDP only (see `serve`), so a
+    // client that obeyed would get no answer at all instead of a usable
+    // subset. A sandbox that needs every address of a thirty-address name is
+    // not a case this resolver is for.
+    let fits = usable_answers(query, &answers);
+    answers.truncate(fits);
 
     let mut out = Vec::with_capacity(MAX_PACKET);
     out.extend_from_slice(&query.id.to_be_bytes());
@@ -146,9 +162,6 @@ pub fn response(query: &Query, rcode: Rcode, addrs: &[IpAddr]) -> Vec<u8> {
     out.extend_from_slice(&query.question);
 
     for addr in answers {
-        if out.len() + 28 > MAX_PACKET {
-            break; // a client with this many addresses will manage with fewer
-        }
         // A pointer to the name in the question, at offset 12.
         out.extend_from_slice(&[0xC0, 0x0C]);
         out.extend_from_slice(&query.qtype.to_be_bytes());
@@ -166,6 +179,22 @@ pub fn response(query: &Query, rcode: Rcode, addrs: &[IpAddr]) -> Vec<u8> {
         }
     }
     out
+}
+
+/// How many of `answers` fit in one packet, given this query's question.
+///
+/// A record is a two-byte name pointer, type, class, a four-byte TTL, a
+/// two-byte length and the address itself: 16 bytes for A, 28 for AAAA. The
+/// header is twelve and the question is echoed whole.
+fn usable_answers(query: &Query, answers: &[&IpAddr]) -> usize {
+    const HEADER: usize = 12;
+    let fixed = HEADER + query.question.len();
+    let each = match query.qtype {
+        TYPE_AAAA => 28,
+        _ => 16,
+    };
+    let room = MAX_PACKET.saturating_sub(fixed) / each;
+    room.min(answers.len())
 }
 
 /// What the allowlist says about a name.

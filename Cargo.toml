@@ -5,7 +5,11 @@ members = ["crates/zygo-core", "crates/zygo-cli"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+# 1.88, not 1.85: let-chains (`if let .. && ..`) are used throughout and were
+# stabilised in 1.88. The declared floor was false until the 2026-09-21 review
+# (C-01) — `cargo check` on the machine that wrote it passed because that
+# machine was newer, which is how an MSRV drifts.
+rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/zygo-dev/zygo"
 authors = ["Zygo contributors"]

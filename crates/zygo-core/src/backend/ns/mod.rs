@@ -459,7 +459,13 @@ pub fn launch(config: &SandboxConfig, hierarchy: Option<&cgroup::Hierarchy>) -> 
         None => None,
     };
 
-    let (ready_read, ready_write) = pipe()?;
+    // Close-on-exec, like every other pipe here. It stays open across the
+    // spawns of `newuidmap`, `nft` and the long-lived `pasta` below, and a
+    // `pasta` holding the write end means the parent never sees end of file
+    // on it — quite apart from handing an unrelated process a descriptor into
+    // this launch (S-03, 2026-09-21 review). The child gets its copy through
+    // `clone`, which does not exec, so the flag costs it nothing.
+    let (ready_read, ready_write) = pipe_cloexec()?;
     let (err_read, err_write) = pipe_cloexec()?;
 
     // A held sandbox hands `/run/secrets` back over this pair. Only a held
@@ -757,10 +763,6 @@ fn run_id_helper(helper: &str, pid: u32, map: &str) -> Result<()> {
         });
     }
     Ok(())
-}
-
-fn pipe() -> Result<(OwnedFd, OwnedFd)> {
-    rustix::pipe::pipe().map_err(|e| Error::primitive("pipe", "internal launcher error", e.into()))
 }
 
 /// A pipe whose write end closes on `execve`, which is how a successful launch

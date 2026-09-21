@@ -208,6 +208,22 @@ fn resolve_layer(
     let field = |suffix: &str| format!("fn.{name}.{suffix}");
     let mut warnings = Vec::new();
 
+    // The name before anything else, because everything after this joins it
+    // into a path. `cgroup::sanitise` exists for exactly this reason and only
+    // the cgroup hierarchy goes through it: `Paths::tenant_data`,
+    // `Paths::agent_sock` and the pasta pid file all join the name raw, and
+    // `[fn."../x"]` is legal TOML while `--name` is free text (B-07,
+    // 2026-09-21 review). One check here covers every entry point, because
+    // every one of them resolves before it builds a path.
+    if !is_fn_name(name) {
+        return Err(SpecError::invalid_with(
+            format!("fn.{name}"),
+            format!("`{name}` is not a usable function name"),
+            "use letters, digits, `-`, `_` and `.`, starting with a letter or \
+             digit; the name becomes a directory, a socket and a cgroup",
+        ));
+    }
+
     // --- what to run -------------------------------------------------------
     let entry = l.entry.map(|e| absolutise(base_dir, &e));
 
@@ -565,6 +581,23 @@ fn is_reserved_mount_target(target: &Path) -> bool {
         target.to_str(),
         Some("/") | Some("/proc") | Some("/sys") | Some("/dev")
     )
+}
+
+/// Whether a function name is safe to join into a path.
+///
+/// Deliberately stricter than "does not contain a slash": the name reaches a
+/// directory name, a unix socket path, a pasta pid file and a cgroup
+/// directory, and each of those has its own opinion about leading dots,
+/// spaces and control characters. An allowlist has one opinion.
+///
+/// `.` and `..` pass the character filter and are still traversal, so they are
+/// excluded by the first-character rule rather than by a special case.
+pub fn is_fn_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
 fn is_env_name(s: &str) -> bool {
@@ -953,6 +986,42 @@ mem = "1G"
     fn invalid_env_names_are_rejected() {
         let s = spec("[fn.f]\nimage=\"a\"\ncmd=[\"x\"]\n\n[fn.f.env]\n\"1BAD\"=\"v\"\n");
         assert!(s.resolve(Some("f"), &Layer::default(), &opts()).is_err());
+    }
+
+    /// A function name becomes a directory, a socket path, a pasta pid file
+    /// and a cgroup directory, so it is validated before any of them is built.
+    ///
+    /// `cgroup::sanitise` existed for this and covered only the cgroup; the
+    /// other three joined the raw name (B-07). `[fn."../x"]` is legal TOML and
+    /// `--name` is free text, so the check belongs where every path agrees to
+    /// start: resolution.
+    #[test]
+    fn a_function_name_that_would_escape_its_directory_is_refused() {
+        for name in ["../x", "a/b", ".", "..", "", " leading", "a b", "a\u{0}b"] {
+            assert!(
+                !is_fn_name(name),
+                "`{name}` would be joined into a path unchanged"
+            );
+        }
+        for name in ["resize", "resize-2", "a_b.c", "x", "9lives"] {
+            assert!(is_fn_name(name), "`{name}` is an ordinary name");
+        }
+
+        // And the resolver refuses it rather than leaving it to whichever
+        // path is built first.
+        let s = spec("[fn.\"../escape\"]\nimage=\"a\"\ncmd=[\"x\"]\n");
+        let err = s
+            .resolve(Some("../escape"), &Layer::default(), &opts())
+            .expect_err("a traversing name is refused");
+        assert!(
+            err.to_string().contains("usable function name"),
+            "the refusal should say what is wrong: {err}"
+        );
+
+        // A name nobody asked about must not be refused on somebody else's
+        // behalf: `resolve` only resolves the one it was given.
+        let s = spec("[fn.good]\nimage=\"a\"\ncmd=[\"x\"]\n");
+        assert!(s.resolve(Some("good"), &Layer::default(), &opts()).is_ok());
     }
 
     #[test]

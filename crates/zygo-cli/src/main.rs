@@ -107,6 +107,7 @@ fn run(cli: &Cli) -> anyhow::Result<u8> {
         Command::Top { interval, once } => cmd::top::run(cli, *interval, *once),
         Command::Stats { name } => cmd::stats::run(cli, name.as_deref()),
         Command::Api(args) => cmd::api::run(cli, args),
+        Command::Mcp(args) => cmd::mcp::run(cli, args),
         Command::Up { file, relock } => cmd::supervisor::up(cli, file.path(), *relock),
         Command::Down { file } => cmd::supervisor::down(cli, file.path()),
         Command::Login {

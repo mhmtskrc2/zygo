@@ -20,6 +20,9 @@ clap.workspace = true
 clap_complete.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# `POST /run` hands the sandbox to a child `zygo run` as a spec file, which is
+# the one place the CLI writes TOML rather than reading it.
+toml.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -37,5 +40,5 @@ hex.workspace = true
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
-[dev-dependencies]
-tempfile.workspace = true
+# `tempfile` is a real dependency of this crate (`cmd/oneshot.rs`,
+# `cmd/mcp.rs`), so it is not repeated here.

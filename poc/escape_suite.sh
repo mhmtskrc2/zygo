@@ -364,6 +364,55 @@ print(','.join(reachable) if reachable else 'none')")
 [ "$out" = "none" ] && ok "the image store is not reachable from inside" \
                     || bad "the store is reachable: $out"
 
+# --- 16. descriptors inherited into a warm-exec request ---------------------
+#
+# A warm-exec request is forked inside the held sandbox and its helper
+# renumbers thirteen descriptors — seven namespace descriptors among them —
+# before `execve`. `F_DUPFD` and `dup2` both *clear* close-on-exec, so until
+# the 2026-09-21 review (B-03) every one of them was inherited by the tenant
+# program: the namespace descriptors it would need to `setns` back out, and a
+# second copy of the helper's error pipe.
+#
+# `setns` is denied by the seccomp filter, so this was a leak rather than an
+# escape. It is checked here because it is the kind that stops being a leak the
+# moment a profile changes.
+
+say "16. inherit descriptors into a warm-exec request"
+WORK=$(mktemp -d)
+cat > "$WORK/fds.sh" <<'FDEOF'
+#!/bin/sh
+# Everything open, by name, so a stray descriptor can be identified rather
+# than merely counted.
+for fd in /proc/self/fd/*; do
+    printf '%s->%s ' "${fd##*/}" "$(readlink "$fd" 2>/dev/null)"
+done
+printf '\n'
+FDEOF
+cat > "$WORK/sandbox.toml" <<TOMLEOF
+[fn.fdcheck]
+image = "$IMAGE"
+cmd   = ["/bin/sh", "/w/fds.sh"]
+mounts = ["$WORK:/w:ro"]
+TOMLEOF
+
+if zygo up -f "$WORK/sandbox.toml" >/tmp/escape-fd.err 2>&1; then
+    out=$(zygo exec fdcheck '{}' 2>>/tmp/escape-fd.err)
+    zygo stop fdcheck >/dev/null 2>&1
+    # The program's own stdio is 0, 1 and 2; `sh` opens the script it runs and
+    # the glob above opens the directory, so a small number of extra
+    # descriptors belonging to the shell is expected. What must not be there
+    # is anything pointing into a namespace.
+    leaked=$(printf '%s' "$out" | tr ' ' '\n' | grep -c 'ns/' || true)
+    if [ "${leaked:-0}" -eq 0 ]; then
+        ok "no namespace descriptor reached the tenant program"
+    else
+        bad "the program inherited $leaked namespace descriptor(s): $out"
+    fi
+else
+    skip "16. warm-exec could not be started: $(tail -2 /tmp/escape-fd.err | tr '\n' ' ')"
+fi
+rm -rf "$WORK"
+
 say ""
 say "----------------------------------------"
 say "escape suite: $PASS blocked, $FAIL escaped, $SKIP skipped"

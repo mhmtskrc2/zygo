@@ -81,3 +81,13 @@ impl ImageError {
         }
     }
 }
+
+/// The `sha256:<hex>` name of a byte string.
+///
+/// One place, because the spelling is load-bearing: `Store::parse_digest`
+/// compares lower-case hex, and a second implementation that produced upper
+/// case would write a blob nothing could ever find (R-06, E-11).
+pub fn digest_of(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
+}

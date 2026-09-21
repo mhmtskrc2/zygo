@@ -87,6 +87,20 @@ impl Error {
     /// codes. 137 is `128 + SIGKILL`, the same answer `docker run` gives and
     /// literally what happened — the deadline is enforced with `cgroup.kill` or
     /// a `SIGKILL` to every member of the request's cgroup.
+    /// Whether this is the launcher's own deadline, rather than any other
+    /// failure that also ends in a `SIGKILL`.
+    ///
+    /// The wait status cannot say: a deadline kill and an out-of-memory kill
+    /// are both exit 137, and only the side that enforced the deadline knows
+    /// which it was. The warm path records the same thing in
+    /// `Outcome::timed_out`; this is the one-shot path's version of it.
+    pub fn timed_out(&self) -> bool {
+        matches!(
+            self,
+            Error::Primitive { source, .. } if source.raw_os_error() == Some(libc::ETIMEDOUT)
+        )
+    }
+
     pub fn exit_code(&self) -> i32 {
         match self {
             Error::Spec(_) => 2,

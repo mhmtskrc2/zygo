@@ -194,7 +194,7 @@ impl fmt::Display for Duration {
             (60_000, "m"),
             (1_000, "s"),
         ] {
-            if ms % unit_ms == 0 {
+            if ms.is_multiple_of(unit_ms) {
                 return write!(f, "{}{unit}", ms / unit_ms);
             }
         }

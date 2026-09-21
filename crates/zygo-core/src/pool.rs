@@ -1432,10 +1432,29 @@ fn write_secrets(secrets: &mut Secrets, at: SecretsAt<'_>) -> Result<()> {
         ),
     };
 
-    for (name, value) in &secrets.values {
-        write_secret_file_at(&dir, name, value)?;
-    }
+    // The directory is recorded **before** the files are written, so a write
+    // that fails half way leaves something `unlink_all` can clean. It was set
+    // afterwards until the 2026-09-21 review (B-01): the second of three
+    // writes failing left the first file on the tmpfs at mode 0400, `dir` was
+    // `None` so nothing removed it, and every later request on that function
+    // failed with EACCES trying to create a file that was already there.
     secrets.dir = Some(dir);
+    let dir = secrets.dir.as_ref().expect("just set");
+
+    let mut written = Vec::with_capacity(secrets.values.len());
+    for (name, value) in &secrets.values {
+        if let Err(e) = write_secret_file_at(dir, name, value) {
+            // Undo this attempt rather than leaving a partial set: a handler
+            // that received two of its three secrets is a worse failure than
+            // one that received none and was told why.
+            for done in &written {
+                let _ = rustix::fs::unlinkat(dir, *done, rustix::fs::AtFlags::empty());
+            }
+            secrets.dir = None;
+            return Err(e);
+        }
+        written.push(name.as_str());
+    }
     Ok(())
 }
 
@@ -1524,12 +1543,20 @@ fn write_secret_file_at(dir: &std::fs::File, name: &str, value: &str) -> Result<
     use std::io::Write as _;
 
     // `openat`, so the directory is named by the descriptor and not by a path
-    // that may no longer resolve. `O_TRUNC` because a rewarm may find the
-    // file from a previous generation still there.
+    // that may no longer resolve.
+    //
+    // `O_EXCL` after an `unlinkat`, not `O_TRUNC`. The old comment said
+    // `O_TRUNC` was for "a file from a previous generation", which is not a
+    // thing that happens — a rewarm gets a fresh tmpfs. What does happen is a
+    // partially written set left by an earlier failure, and opening one of
+    // those with `O_TRUNC` fails with EACCES because the file is 0400 and the
+    // supervisor is not root. Removing first means the mode of whatever was
+    // there cannot decide whether this request works (B-01).
+    let _ = rustix::fs::unlinkat(dir, name, rustix::fs::AtFlags::empty());
     let fd = rustix::fs::openat(
         dir,
         name,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::CLOEXEC,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
         Mode::from_bits_truncate(0o400),
     )
     .map_err(|e| {
@@ -2655,11 +2682,66 @@ mod tests {
         let dir = std::fs::File::open(tmp.path()).expect("dirfd");
         let path = tmp.path().join("KEY");
         write_secret_file_at(&dir, "KEY", "a-long-value").expect("write");
-        // The file is 0400, so it has to be replaced rather than reopened for
-        // writing: the owner of a 0400 file cannot write it.
-        std::fs::remove_file(&path).expect("rm");
         write_secret_file_at(&dir, "KEY", "short").expect("rewrite");
         assert_eq!(std::fs::read_to_string(&path).expect("read"), "short");
+    }
+
+    /// A secret left behind by an earlier failure does not stop the next
+    /// write.
+    ///
+    /// The file is `0400` and the supervisor is not root, so opening it with
+    /// `O_TRUNC` fails with EACCES — and every later request on that function
+    /// failed with it, for ever (B-01). Attempted with a real `0400` file
+    /// rather than asserted about the flags, because the flags are not what
+    /// broke: the mode of a file nobody expected to be there was.
+    #[cfg(unix)]
+    #[test]
+    fn a_secret_left_by_a_failed_write_does_not_wedge_the_next_one() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = std::fs::File::open(tmp.path()).expect("dirfd");
+        write_secret_file_at(&dir, "KEY", "from-a-failed-attempt").expect("write");
+
+        write_secret_file_at(&dir, "KEY", "the-real-value")
+            .expect("a 0400 file from an earlier attempt must not refuse the next write");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("KEY")).expect("read"),
+            "the-real-value"
+        );
+    }
+
+    /// A write that fails part way through leaves nothing behind.
+    ///
+    /// `write_secrets` records the directory *before* it writes, so the
+    /// cleanup has somewhere to aim; it recorded it afterwards until B-01, and
+    /// `unlink_all` then saw `dir == None` and removed nothing. The failure is
+    /// provoked with a name that cannot be created.
+    #[cfg(unix)]
+    #[test]
+    fn a_partly_written_set_of_secrets_is_removed_rather_than_left() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut secrets = Secrets::default();
+        secrets.values.insert("AAA_GOOD".into(), "value".into());
+        // A name with a slash cannot be created in this directory, and sorts
+        // after the good one, so the first write succeeds and the second does
+        // not — which is exactly the shape that left a file behind.
+        secrets.values.insert("ZZZ/BAD".into(), "value".into());
+
+        let dir = std::fs::File::open(tmp.path()).expect("dirfd");
+        let err = {
+            use std::os::fd::AsFd;
+            write_secrets(&mut secrets, SecretsAt::Dir(dir.as_fd()))
+                .expect_err("a name with a slash cannot be created")
+        };
+        assert!(format!("{err}").contains("secret"), "{err}");
+
+        assert!(
+            !tmp.path().join("AAA_GOOD").exists(),
+            "the secret written before the failure was left behind"
+        );
+        assert!(
+            secrets.dir.is_none(),
+            "a failed placement must not look like a successful one"
+        );
     }
 
     /// A directory named by a descriptor, which is the whole point: the path

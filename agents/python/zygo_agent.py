@@ -763,10 +763,7 @@ class Agent:
             return
 
         self._wire.send({"type": "FORKED", "id": request_id, "pid": proc.pid})
-        reply = self._wire.recv()
-        if reply is None or reply.get("type") != "GO":
-            proc.kill()
-            proc.wait()
+        if not self._await_go(request_id, proc):
             return
 
         body = json.dumps(request, separators=(",", ":")).encode()
@@ -794,6 +791,84 @@ class Agent:
             }
         result["type"] = "DONE"
         self._wire.send(result)
+
+    def _await_go(self, request_id: str, proc) -> bool:
+        """Wait for *this* request's `GO`, answering anything else on the way.
+
+        The spawn fallback used to take the next frame and require it to be
+        `GO`: a second `EXEC`, a `PING`, or a `GO` for another request killed
+        the worker and answered **nothing** — the supervisor then waited out
+        the whole deadline for a reply that was never coming. `zygo agent test`
+        sends two `EXEC`s before any `GO`, so every handler that made this
+        agent fall back to spawning failed conformance for this reason
+        (B-09, 2026-09-21 review).
+
+        Returns `True` when this request may run.
+        """
+        while True:
+            try:
+                reply = self._wire.recv()
+            except BadFrame as e:
+                # Reportable, not fatal: the stream is still aligned.
+                self._wire.send(
+                    {"type": "ERROR", "id": None, "code": "bad_message", "message": str(e)}
+                )
+                continue
+            except (ConnectionError, OSError):
+                reply = None
+
+            if reply is None:
+                self._kill(proc)
+                return False
+
+            kind = reply.get("type")
+            if kind == "GO" and reply.get("id") == request_id:
+                return True
+            if kind == "PING":
+                self._wire.send({"type": "PONG", "seq": reply.get("seq", 0)})
+                continue
+            if kind == "EXEC":
+                # One at a time on this path: the fallback exists because
+                # forking is unavailable, and a second interpreter would not
+                # share the warmed one's memory anyway.
+                self._wire.send(
+                    {
+                        "type": "ERROR",
+                        "id": reply.get("id"),
+                        "code": "overloaded",
+                        "message": "this agent runs one spawned request at a time",
+                    }
+                )
+                continue
+            if kind == "SHUTDOWN":
+                self._kill(proc)
+                return False
+            if kind == "GO":
+                # A `GO` for a request this agent is not running. Reported
+                # rather than ignored: it means the two sides disagree about
+                # what is in flight.
+                self._wire.send(
+                    {
+                        "type": "ERROR",
+                        "id": reply.get("id"),
+                        "code": "bad_message",
+                        "message": "no such request is waiting to be released",
+                    }
+                )
+                continue
+            self._wire.send(
+                {
+                    "type": "ERROR",
+                    "id": reply.get("id"),
+                    "code": "bad_message",
+                    "message": f"unexpected message `{kind}` while waiting for GO",
+                }
+            )
+
+    @staticmethod
+    def _kill(proc) -> None:
+        proc.kill()
+        proc.wait()
 
     def _reap_finished(self) -> None:
         """Collect children that have finished exiting, without waiting.

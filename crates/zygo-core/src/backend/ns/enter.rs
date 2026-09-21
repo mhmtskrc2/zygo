@@ -88,9 +88,12 @@ impl Entered {
 /// is written, which is the supervisor's moment to put it in a cgroup. Same
 /// handshake as `FORKED`/`GO` on the agent path, for the same reason.
 pub fn enter(plan: &PreparedLaunch, ns: &NamespaceFds) -> Result<Entered> {
-    // Every pipe close-on-exec: the request `dup2`s the three it keeps onto
-    // 0, 1 and 2 (which clears the flag on the copies) and the rest vanish at
-    // `execve` without anyone having to remember them.
+    // Every pipe close-on-exec, and every copy made of one below keeps the
+    // flag: the request `dup2`s the three it keeps onto 0, 1 and 2 (which
+    // clears the flag on those three, as it must) and the rest vanish at
+    // `execve` without anyone having to remember them. The renumbering used
+    // `F_DUPFD`/`dup2`, which clear the flag, so until B-03 the rest did not
+    // vanish at all — see the comment there.
     let (go_r, go_w) = pipe_cloexec()?;
     let (stdin_r, stdin_w) = pipe_cloexec()?;
     let (stdout_r, stdout_w) = pipe_cloexec()?;
@@ -248,16 +251,34 @@ unsafe fn helper_main(plan: &PreparedLaunch, ns: &NamespaceFds, ends: Ends) -> !
     const PARKED: c_int = 64;
     let mut parked = [0 as c_int; 13];
     for (i, fd) in needed.iter().enumerate() {
-        // SAFETY: `fcntl` with F_DUPFD on a descriptor we hold.
-        parked[i] = unsafe { libc::fcntl(*fd, libc::F_DUPFD, PARKED) };
+        // `F_DUPFD_CLOEXEC`, not `F_DUPFD`. The plain form *clears*
+        // close-on-exec on the copy, and nothing set it again — so the tenant
+        // program inherited all thirteen descriptors past `execve`: seven
+        // namespace descriptors, second copies of its own stdio, and the
+        // helper's error pipe. `setns` is denied by the seccomp filter, so it
+        // was a leak rather than an escape, but the comment at the top of this
+        // function promised the opposite (B-03, 2026-09-21 review).
+        //
+        // SAFETY: `fcntl` with F_DUPFD_CLOEXEC on a descriptor we hold.
+        parked[i] = unsafe { libc::fcntl(*fd, libc::F_DUPFD_CLOEXEC, PARKED) };
         if parked[i] < 0 {
             child::fail(ends.err_w, Step::Setns);
         }
     }
     for (i, fd) in parked.iter().enumerate() {
-        // SAFETY: both are descriptors we hold.
-        if unsafe { libc::dup2(*fd, FIRST + i as c_int) } < 0 {
-            child::fail(*fd, Step::Setns);
+        // `dup3` with `O_CLOEXEC` for the same reason: `dup2` clears the flag
+        // on the new descriptor.
+        //
+        // SAFETY: both are descriptors we hold, and they differ — `parked` is
+        // at 64 and above, the targets are 3..16, so `dup3`'s EINVAL for equal
+        // descriptors cannot arise.
+        if unsafe { libc::dup3(*fd, FIRST + i as c_int, libc::O_CLOEXEC) } < 0 {
+            // The *parked* copy of the error pipe. `ends.err_w` cannot be
+            // used here — this loop is overwriting 3..16 and the original may
+            // already have been one of them — and the original code passed
+            // `*fd`, the descriptor being duplicated, so a failure reported
+            // itself down whichever pipe happened to be in hand.
+            child::fail(parked[needed.len() - 1], Step::Setns);
         }
     }
     unsafe { close_from(FIRST + needed.len() as c_int) };

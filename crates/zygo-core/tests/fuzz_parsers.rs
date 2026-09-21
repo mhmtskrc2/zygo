@@ -10,6 +10,11 @@
 //! A coverage-guided `cargo-fuzz` target still belongs in the plan; this closes
 //! the "must never panic" hole today.
 
+// Gated because `image::auth` is: a build without the registry client has no
+// credential store to sweep, and `cargo test --no-default-features` failed to
+// compile here until the 2026-09-21 review (T-04) — so the feature-off build
+// was never tested at all.
+#[cfg(feature = "registry")]
 use zygo_core::image::auth::CredentialStore;
 use zygo_core::image::media::{Index, Manifest};
 use zygo_core::lock::LockFile;
@@ -379,6 +384,7 @@ fn registry_documents_never_panic_when_a_plausible_one_is_damaged() {
 /// whether or not it makes sense. `parse` is written to return an empty store
 /// rather than fail, so the property is that it always returns *something* —
 /// including for input that is not JSON at all.
+#[cfg(feature = "registry")]
 #[test]
 fn docker_credentials_never_panic_and_always_return_a_store() {
     let mut rng = Rng(0x00C0_FFEE_A417);
@@ -432,5 +438,132 @@ digest = "sha256:000000000000000000000000000000000000000000000000000000000000000
             bytes[at] = rng.byte();
         }
         let _ = toml::from_str::<LockFile>(&String::from_utf8_lossy(&bytes));
+    }
+}
+
+/// The DNS wire parser is the only one in Zygo that reads raw bytes a *tenant*
+/// sent.
+///
+/// Every other parser here reads a file a person wrote or a frame an agent
+/// Zygo started produced. `parse_query` reads whatever a program inside the
+/// sandbox puts on a UDP socket, and the resolver runs in the supervisor's
+/// process — so a panic there is a denial of service against every other
+/// function on the host, reached from inside one sandbox.
+///
+/// The properties: parsing never panics, and every answer the resolver would
+/// send is a well-formed packet whose header describes what is actually in it.
+#[test]
+fn dns_queries_from_a_sandbox_never_panic_and_always_answer_with_a_valid_packet() {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use zygo_core::net::dns::{self, Rcode};
+
+    let mut rng = Rng(0x0D_1157_4E17);
+
+    // Arbitrary bytes, including packets that claim to be well-formed.
+    for _ in 0..20_000 {
+        let len = rng.below(600);
+        let bytes: Vec<u8> = (0..len).map(|_| rng.byte()).collect();
+        if let Some(query) = dns::parse_query(&bytes) {
+            check_answer(&query, &[]);
+        }
+    }
+
+    // A real query with a few bytes changed: the shape that gets past the
+    // header checks and then fails in the name.
+    let seed = query_for("registry-1.docker.io", 1);
+    for _ in 0..20_000 {
+        let mut bytes = seed.clone();
+        for _ in 0..1 + rng.below(4) {
+            let at = rng.below(bytes.len());
+            bytes[at] = rng.byte();
+        }
+        if let Some(query) = dns::parse_query(&bytes) {
+            check_answer(&query, &[]);
+        }
+    }
+
+    // A name with more addresses than one packet holds. The header used to
+    // promise every one of them while the body stopped at the limit, which is
+    // a malformed answer and reads to a resolver as a failed lookup (B-16).
+    let many_v4: Vec<IpAddr> = (0..80)
+        .map(|i| IpAddr::V4(Ipv4Addr::new(203, 0, 113, i as u8)))
+        .collect();
+    let many_v6: Vec<IpAddr> = (0..80)
+        .map(|i| IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, i as u16)))
+        .collect();
+    for (qtype, addrs) in [(1u16, &many_v4), (28u16, &many_v6)] {
+        // A long name leaves less room for records, so both ends are covered.
+        for name in [
+            "a.example.com",
+            &"x".repeat(60),
+            &format!("{}.example.com", "y".repeat(180)),
+        ] {
+            let Some(query) = dns::parse_query(&query_for(name, qtype)) else {
+                continue;
+            };
+            let written = check_answer(&query, addrs);
+            assert!(
+                written > 0,
+                "no records fitted for a {qtype} query on a {}-byte name",
+                name.len()
+            );
+        }
+    }
+
+    /// Build the answer and check it describes itself honestly.
+    ///
+    /// Returns how many records it carries, so the caller can assert that the
+    /// packet is not merely well-formed but also useful — a response with
+    /// ANCOUNT 0 satisfies "the header matches the body" and answers nobody.
+    fn check_answer(query: &dns::Query, addrs: &[IpAddr]) -> usize {
+        let packet = dns::response(query, Rcode::NoError, addrs);
+        assert!(
+            packet.len() >= 12,
+            "an answer shorter than a DNS header: {} bytes",
+            packet.len()
+        );
+        assert!(
+            packet.len() <= 512,
+            "an answer over the 512-byte limit: {} bytes",
+            packet.len()
+        );
+
+        let ancount = u16::from_be_bytes([packet[6], packet[7]]) as usize;
+        let each = if query.qtype == 28 { 28 } else { 16 };
+        let body = packet.len() - 12 - query_section_len(&packet);
+        assert_eq!(
+            ancount * each,
+            body,
+            "the header promises {ancount} records and the body holds {} bytes",
+            body
+        );
+        ancount
+    }
+
+    /// The question section's length, read back out of the packet.
+    fn query_section_len(packet: &[u8]) -> usize {
+        let mut at = 12;
+        while at < packet.len() {
+            let label = packet[at] as usize;
+            at += 1;
+            if label == 0 {
+                break;
+            }
+            at += label;
+        }
+        (at + 4).min(packet.len()) - 12
+    }
+
+    /// One well-formed question, as a resolver in a sandbox would send it.
+    fn query_for(name: &str, qtype: u16) -> Vec<u8> {
+        let mut packet = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        for label in name.split('.') {
+            packet.push(label.len().min(63) as u8);
+            packet.extend_from_slice(&label.as_bytes()[..label.len().min(63)]);
+        }
+        packet.push(0);
+        packet.extend_from_slice(&qtype.to_be_bytes());
+        packet.extend_from_slice(&1u16.to_be_bytes());
+        packet
     }
 }

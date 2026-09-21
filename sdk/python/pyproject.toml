@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "zygo"
+version = "0.1.0"
+description = "Python client for Zygo — warm, isolated sandboxes for function-shaped code"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "Apache-2.0"
+authors = [{ name = "Zygo contributors" }]
+keywords = ["sandbox", "isolation", "agent", "serverless", "container"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Interpreters",
+    "Topic :: System :: Systems Administration",
+]
+# Deliberately empty. An SDK for a runtime whose argument is a small, auditable
+# boundary should not arrive with a dependency tree of its own; the standard
+# library has an HTTP client, and a unix socket is thirty lines on top of it.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/zygo-dev/zygo"
+Source = "https://github.com/zygo-dev/zygo/tree/main/sdk/python"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/zygo"]

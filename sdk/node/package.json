@@ -1,0 +1,38 @@
+{
+  "name": "zygo",
+  "version": "0.1.0",
+  "description": "Node client for Zygo — warm, isolated sandboxes for function-shaped code",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./src/index.js",
+  "types": "./src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "default": "./src/index.js"
+    }
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test 'test/*.test.js'"
+  },
+  "keywords": [
+    "sandbox",
+    "isolation",
+    "agent",
+    "serverless",
+    "container"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zygo-dev/zygo.git",
+    "directory": "sdk/node"
+  },
+  "homepage": "https://github.com/zygo-dev/zygo/tree/main/sdk/node"
+}

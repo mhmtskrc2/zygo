@@ -1,0 +1,349 @@
+/**
+ * What the Node client promises, checked against a stand-in API.
+ *
+ * These need no Linux, no kernel and no sandbox: what is under test is the
+ * client — the transport, the error mapping, the connection pool — and putting
+ * a real supervisor behind it would test the supervisor instead, more slowly
+ * and on one platform.
+ */
+
+import assert from 'node:assert/strict';
+import test from 'node:test';
+
+import { FakeApi } from './fake-api.js';
+import {
+  AuthError,
+  Busy,
+  HandlerError,
+  Timeout,
+  TransportError,
+  ZygoError,
+  connect,
+  parseEndpoint,
+} from '../src/index.js';
+
+const OK_RESULT = {
+  result: { size: [80, 60] },
+  stdout: 'resized\n',
+  stderr: '',
+  metrics: { wall_ms: 1.7, cpu_ms: 1.2, peak_rss_kb: 2048 },
+};
+
+test('every address form is understood', () => {
+  const unix = parseEndpoint('unix:///run/user/1000/zygo/api.sock');
+  assert.equal(unix.isUnix, true);
+  assert.equal(unix.socketPath, '/run/user/1000/zygo/api.sock');
+
+  const tcp = parseEndpoint('http://10.0.0.4:7700');
+  assert.deepEqual([tcp.host, tcp.port, tcp.tls], ['10.0.0.4', 7700, false]);
+  assert.equal(parseEndpoint('box:9000').port, 9000);
+  assert.equal(parseEndpoint('https://zygo.example.com:8443').tls, true);
+});
+
+test('an address that cannot work is refused where the mistake is', () => {
+  // Rather than as a connection failure thirty seconds later against a host
+  // nobody meant.
+  assert.throws(() => parseEndpoint('unix://'), TypeError);
+  assert.throws(() => parseEndpoint('ftp://host:21'), TypeError);
+  assert.throws(() => parseEndpoint('host:not-a-port'), TypeError);
+});
+
+test('a call returns the handler’s own value', async () => {
+  const api = await FakeApi.start();
+  api.answer('POST', '/fn/resize', 200, OK_RESULT);
+  const client = connect(api.url, { token: null });
+  try {
+    const out = await client.fn('resize')({ url: 'http://example.com/a.png' });
+    assert.deepEqual(out.result, { size: [80, 60] });
+    assert.equal(out.stdout, 'resized\n');
+    assert.equal(out.metrics.wallMs, 1.7);
+    assert.deepEqual(api.requests[0].body, { url: 'http://example.com/a.png' });
+  } finally {
+    client.close();
+    await api.close();
+  }
+});
+
+test('a call works over a unix socket', async () => {
+  // The transport the local case actually uses: no port, no token, and
+  // permissions the operating system enforces. A client that only ever ran
+  // over TCP would fail here and nowhere else.
+  const api = await FakeApi.start({ unix: true });
+  api.answer('POST', '/fn/resize', 200, OK_RESULT);
+  const client = connect(api.url, { token: null });
+  try {
+    const out = await client.call('resize', {});
+    assert.deepEqual(out.result, { size: [80, 60] });
+  } finally {
+    client.close();
+    await api.close();
+  }
+});
+
+test('the token is sent, and the timeout header with it', async () => {
+  const api = await FakeApi.start();
+  api.answer('POST', '/fn/f', 200, OK_RESULT);
+  const client = connect(api.url, { token: 's3cret' });
+  try {
+    await client.call('f', {}, { timeout: 2.5 });
+    assert.equal(api.requests[0].headers.authorization, 'Bearer s3cret');
+    assert.equal(api.requests[0].headers['x-zygo-timeout-ms'], '2500');
+  } finally {
+    client.close();
+    await api.close();
+  }
+});
+
+test('a name that needs escaping reaches the right route', async () => {
+  const api = await FakeApi.start();
+  api.answer('POST', '/fn/a%2Fb', 200, OK_RESULT);
+  const client = connect(api.url, { token: null });
+  try {
+    await client.call('a/b', {});
+    // Without escaping this is `POST /fn/a/b`, which is a different route.
+    assert.equal(api.requests[0].path, '/fn/a%2Fb');
+  } finally {
+    client.close();
+    await api.close();
+  }
+});
+
+test('a handler that threw carries its output', async () => {
+  const api = await FakeApi.start();
+  api.answer('POST', '/fn/f', 500, {
+    error: 'ZeroDivisionError: division by zero',
+    stdout: 'before\n',
+    stderr: 'Traceback...\n',
+    exit_code: 1,
+    metrics: { wall_ms: 2 },
+  });
+  const client = connect(api.url, { token: null });
+  try {
+    await assert.rejects(
+      () => client.call('f', {}),
+      (e) => {
+        assert.ok(e instanceof HandlerError);
+        assert.equal(e.stderr, 'Traceback...\n');
+        assert.equal(e.exitCode, 1);
+        return true;
+      }
+    );
+  } finally {
+    client.close();
+    await api.close();
+  }
+});
+
+test('backpressure is not a failure of the call', async () => {
+  // A 429 means the request never ran, so it has to be distinguishable from a
+  // handler that failed: the answer to one is to retry, and the answer to the
+  // other is to fix the code.
+  const api = await FakeApi.start();
+  api.answer('POST', '/fn/f', 429, { error: 'at its limit', in_flight: 4, queued: 16, limit: 4 });
+  const client = connect(api.url, { token: null });
+  try {
+    await assert.rejects(
+      () => client.call('f', {}),
+      (e) => {
+        assert.ok(e instanceof Busy);
+        assert.ok(!(e instanceof HandlerError));
+        assert.equal(e.limit, 4);
+        assert.equal(e.retryAfter, 3);
+        return true;
+      }
+    );
+  } finally {
+    client.close();
+    await api.close();
+  }
+});
+
+test('a deadline kill is its own type', async () => {
+  const api = await FakeApi.start();
+  api.answer('POST', '/fn/f', 408, { error: 'the request exceeded its timeout', stderr: 'killed\n' });
+  const client = connect(api.url, { token: null });
+  try {
+    await assert.rejects(
+      () => client.call('f', {}),
+      (e) => e instanceof Timeout && e.stderr === 'killed\n'
+    );
+  } finally {
+    client.close();
+    await api.close();
+  }
+});
+
+test('a refused deploy says which flag turns it on', async () => {
+  const api = await FakeApi.start();
+  api.answer('POST', '/run', 403, {
+    error: 'this API may only call functions that are already served\n  -> start it with `zygo api --allow-deploy`',
+  });
+  const client = connect(api.url, { token: null });
+  try {
+    await assert.rejects(
+      () => client.run('alpine:3', ['echo', 'hi']),
+      (e) => e instanceof AuthError && /--allow-deploy/.test(e.message)
+    );
+  } finally {
+    client.close();
+    await api.close();
+  }
+});
+
+test('an unreachable API is a transport error, not a sandbox one', async () => {
+  // The distinction matters: nothing ran, so nothing about the sandbox can be
+  // concluded from it.
+  const client = connect('http://127.0.0.1:1', { token: null, timeout: 2000 });
+  try {
+    await assert.rejects(() => client.functions(), TransportError);
+  } finally {
+    client.close();
+  }
+});
+
+test('one refused event does not hide the others', async () => {
+  // The whole reason `/batch` answers with a status per element. A client that
+  // threw on the first bad one would throw away the good answers.
+  const api = await FakeApi.start();
+  api.answer('POST', '/fn/f/batch', 200, [
+    { ...OK_RESULT, status: 200 },
+    { status: 429, error: 'at its limit', limit: 4 },
+    { ...OK_RESULT, status: 200 },
+  ]);
+  const client = connect(api.url, { token: null });
+  try {
+    const answers = await client.batch('f', [{}, {}, {}]);
+    assert.equal(answers.length, 3);
+    assert.ok(!(answers[0] instanceof ZygoError));
+    assert.ok(answers[1] instanceof Busy);
+    assert.ok(!(answers[2] instanceof ZygoError));
+  } finally {
+    client.close();
+    await api.close();
+  }
+});
+
+test('connections are reused between calls', async () => {
+  // Keep-alive is what keeps this client's overhead off the warm path: a fresh
+  // connection per call would cost more than a warm request does.
+  const api = await FakeApi.start();
+  api.answer('POST', '/fn/f', 200, OK_RESULT);
+  const client = connect(api.url, { token: null });
+  try {
+    for (let i = 0; i < 5; i += 1) await client.call('f', {});
+    assert.equal(api.connections, 1);
+  } finally {
+    client.close();
+    await api.close();
+  }
+});
+
+test('concurrent callers are concurrent at the socket', async () => {
+  // One pooled connection would serialise these, and elapsed time is the only
+  // thing that can tell the difference: eight calls against a server that
+  // holds each for 200 ms take 1.6 s in a queue and about 200 ms in parallel.
+  const api = await FakeApi.start();
+  api.answer('POST', '/fn/f', 200, OK_RESULT);
+  api.delay = 200;
+  const client = connect(api.url, { token: null });
+  try {
+    const started = Date.now();
+    await Promise.all(Array.from({ length: 8 }, () => client.call('f', {})));
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed < 1000, `the calls were serialised behind one connection (${elapsed} ms)`);
+    assert.ok(api.connections >= 2);
+  } finally {
+    client.close();
+    await api.close();
+  }
+});
+
+test('running out of memory and out of time are different answers', async () => {
+  // Both are SIGKILL, so both are exit 137. A caller deciding between "too
+  // slow" and "too much memory" needs two values, not two readings of one.
+  const api = await FakeApi.start();
+  api.answer('POST', '/run', 200, {
+    exit_code: 137,
+    stdout: '',
+    stderr: '',
+    timed_out: false,
+    oom_killed: true,
+    peak_rss_kb: 65536,
+    wall_ms: 412.7,
+  });
+  const client = connect(api.url, { token: null });
+  try {
+    const starved = await client.run('python:3.12-slim', ['python3', '-c', 'b=bytearray(1<<30)']);
+    assert.equal(starved.exitCode, 137);
+    assert.equal(starved.oomKilled, true);
+    assert.equal(starved.timedOut, false);
+    assert.equal(starved.peakRssKb, 65536);
+    assert.equal(starved.ok, false);
+  } finally {
+    client.close();
+    await api.close();
+  }
+});
+
+test('an older API that reports no reason still parses', async () => {
+  // The fields were added after the route; a client that required them would
+  // fail against a Zygo one release behind.
+  const api = await FakeApi.start();
+  api.answer('POST', '/run', 200, { exit_code: 0, stdout: 'hi\n' });
+  const client = connect(api.url, { token: null });
+  try {
+    const run = await client.run('alpine:3', ['echo', 'hi']);
+    assert.equal(run.ok, true);
+    assert.equal(run.oomKilled, false);
+    assert.equal(run.peakRssKb, 0);
+  } finally {
+    client.close();
+    await api.close();
+  }
+});
+
+test('serving sends an absolute base directory', async () => {
+  // The API refuses a relative one, and it is right to: a path in a request
+  // body has no meaning on the host that receives it.
+  const api = await FakeApi.start();
+  api.answer('PUT', '/fn/resize', 200, { name: 'resize', change: 'started', warm_ms: 40 });
+  const client = connect(api.url, { token: null });
+  try {
+    const served = await client.serve('resize', { entry: './resize.py' }, { baseDir: '/srv/app' });
+    assert.equal(served.change, 'started');
+    assert.equal(api.requests[0].body.base_dir, '/srv/app');
+  } finally {
+    client.close();
+    await api.close();
+  }
+});
+
+test('a one-shot run reports a non-zero exit without throwing', async () => {
+  // The sandbox ran; this is what it said. Throwing would make it impossible
+  // to read the output of a command that failed on purpose.
+  const api = await FakeApi.start();
+  api.answer('POST', '/run', 200, {
+    exit_code: 2,
+    stdout: '',
+    stderr: 'boom\n',
+    timed_out: false,
+    wall_ms: 21,
+  });
+  const client = connect(api.url, { token: null });
+  try {
+    const run = await client.run('alpine:3', ['false'], { mem: '64M', network: 'none' });
+    assert.equal(run.ok, false);
+    assert.equal(run.exitCode, 2);
+    assert.equal(run.stderr, 'boom\n');
+    const sent = api.requests[0].body.layer;
+    assert.equal(sent.image, 'alpine:3');
+    assert.equal(sent.mem, '64M');
+    assert.equal(sent.network, 'none');
+    // `stdin` describes the call, not the sandbox, and must not leak into the
+    // spec the server writes — `deny_unknown_fields` would refuse it there.
+    assert.ok(!('stdin' in sent));
+  } finally {
+    client.close();
+    await api.close();
+  }
+});
