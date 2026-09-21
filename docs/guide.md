@@ -1,7 +1,9 @@
 # The Zygo guide
 
-Everything you need to run other people's code safely, in order. The
-[quickstart](quickstart.md) is the five-minute version; this is the rest.
+Everything you need to run other people's code safely, in the order you meet
+it. The [quickstart](quickstart.md) is the short version; this is the rest.
+Every timing in it was measured on one of the three machines named in
+[what Zygo costs](performance.md#the-machines), and none of them is x86_64.
 
 1. [Installing](#installing)
 2. [Your first sandbox](#your-first-sandbox)
@@ -11,10 +13,11 @@ Everything you need to run other people's code safely, in order. The
 6. [Networking](#networking)
 7. [Secrets](#secrets)
 8. [Dependencies](#dependencies)
-9. [Deploying](#deploying)
-10. [Running it in production](#running-it-in-production)
-11. [Choosing an isolation backend](#choosing-an-isolation-backend)
-12. [What Zygo will not do](#what-zygo-will-not-do)
+9. [Images and registries](#images-and-registries)
+10. [Deploying](#deploying)
+11. [Running it in production](#running-it-in-production)
+12. [Choosing an isolation backend](#choosing-an-isolation-backend)
+13. [What Zygo will not do](#what-zygo-will-not-do)
 
 ---
 
@@ -96,11 +99,41 @@ capabilities, a seccomp allowlist, and memory, CPU and process limits it cannot
 exceed. What it does not have: your filesystem, your network, your processes,
 or any way to reach the image store it was built from.
 
+Everything after the image is the command, run inside the sandbox — so a script
+of your own has to be mounted in first, because the sandbox cannot see your
+filesystem:
+
+```bash
+zygo run --mount ./hello.py:/hello.py:ro python:3.12-slim python3 /hello.py
+zygo run --mount ./src:/src:ro python:3.12-slim python3 /src/main.py --flag
+printf '{"n": 21}' | zygo run --mount ./src:/src:ro python:3.12-slim python3 /src/double.py
+```
+
+A single file or a whole directory can be mounted, read-only unless `:rw`, and
+standard input, output and the exit code pass straight through. With no
+command, the image's own entrypoint runs.
+
+The same goes for a program from your host: mount it and name it. It runs
+against the *image's* libraries, not your host's, so a dynamically linked
+binary needs an image with a compatible libc — a glibc `/bin/pwd` from Ubuntu
+runs in `python:3.12-slim` and fails in `alpine:3` with "the program does not
+exist", because the loader it names is not there. A static binary runs
+anywhere.
+
+```bash
+zygo run alpine:3 pwd                                      # the image's own pwd: /
+zygo run --workdir /tmp alpine:3 pwd                       # /tmp
+zygo run --mount /bin/pwd:/opt/pwd:ro python:3.12-slim /opt/pwd   # your host's pwd
+```
+
 ```bash
 zygo run --mem 128M --pids 16 --timeout 10s alpine:3 /bin/sh
-zygo run --mount ./data:/data:ro alpine:3 /bin/ls /data
 zygo run --tty alpine:3 /bin/sh          # a terminal of its own
 ```
+
+Coming from Docker: the sentence is the same, the defaults are the opposite,
+and there is no container object left behind. [The comparison](comparison.md#docker-run-and-zygo-run-side-by-side)
+puts the two side by side, flag by flag.
 
 **Before you trust it**, look at what it will actually do:
 
@@ -186,8 +219,9 @@ no code from you beyond the program.
 
 ```toml
 [fn.parse]
-image = "golang:1.23"
-cmd   = ["/app/parser"]
+image  = "alpine:3"
+mounts = ["./bin/parse:/app/parse:ro"]   # a static binary you built
+cmd    = ["/app/parse"]
 ```
 
 **An agent** is for a runtime that is expensive to start. It warms once and
@@ -226,8 +260,9 @@ mem          = "512M"
 mounts       = ["./cache:/cache:rw"]
 
 [fn.parse]
-image = "golang:1.23"              # no runtime → warm-exec
-cmd   = ["/app/parser"]
+image  = "alpine:3"                # no runtime → warm-exec
+mounts = ["./bin/parse:/app/parse:ro"]
+cmd    = ["/app/parse"]
 
 [fn.fetch]
 entry       = "./fetch.py"
@@ -376,6 +411,50 @@ every warm function with the same pair, reuses it.
 
 ---
 
+## Images and registries
+
+Any OCI image from any registry is a sandbox's filesystem, and the image is
+never modified: layers are unpacked once into a content-addressed store and
+bound read-only into every sandbox that uses them.
+
+```bash
+zygo pull python:3.12-slim              # into the local store
+zygo pull --platform linux/amd64 alpine:3
+zygo images                             # reference, digest, layers, size, when pulled
+```
+
+`zygo run` pulls on first use, as `docker run` does. `zygo serve` and `zygo up`
+do **not**: a deploy should not silently depend on a registry being reachable,
+so they ask you to pull first.
+
+For a private registry:
+
+```bash
+zygo login ghcr.io -u you                # prompts, echo off
+echo "$TOKEN" | zygo login ghcr.io -u you --password-stdin   # CI
+```
+
+There is deliberately no `--password` flag, because an argument is visible in
+`ps` to every process on the machine. The credential is checked against the
+registry before it is stored, and it goes into Zygo's own `auth.json`; an
+existing `~/.docker/config.json` is read too, and never edited.
+
+Reclaiming space:
+
+```bash
+zygo image prune --dry-run
+zygo image prune                         # only what nothing can reach any more
+zygo image prune --unused-for 30d --blobs
+zygo image rm python:3.11-slim           # refused while a warm function runs on it
+```
+
+Without flags `prune` removes only what is unreachable: layers of images that
+were removed, and venvs and derived layers whose image is gone. `--blobs` drops
+the compressed copy kept beside every unpacked layer, which roughly halves the
+store at the cost of a download if a layer directory is ever lost.
+
+---
+
 ## Deploying
 
 ```bash
@@ -455,11 +534,30 @@ one-shot runs, which together are a shell rather than an API. See
 
 That is the whole installation. See [the MCP server](mcp.md).
 
+### Idle functions
+
+A function nobody has called for `idle_timeout` (default ten minutes) is
+**paused**: frozen in place, still resident, and thawed on the next request in
+single-digit milliseconds. One nobody has called for `cold_after` (default an
+hour) is **cold**: the sandbox is dropped and only the spec kept, and the next
+request pays the warm-up again.
+
+```toml
+idle_timeout = "10m"
+cold_after   = "1h"
+```
+
+`zygo ps` shows which state each function is in. To bring one back before a
+real request arrives, `POST /fn/<name>/warm` over the API or `client.warm(name)`
+in the SDKs.
+
 ### Capacity
 
-Zygo's capacity is a per-host budget. A function at its `concurrency` limit
-queues briefly and then answers `429` with the numbers, which is backpressure
-and not a failure: the request never ran, and retrying is the right response.
+Zygo's capacity is a per-host budget. Each function takes `concurrency`
+requests at once (default 4) and queues four times that many behind them for
+up to five seconds; past that it answers `429` with the numbers, which is
+backpressure and not a failure: the request never ran, and retrying is the
+right response.
 
 ---
 

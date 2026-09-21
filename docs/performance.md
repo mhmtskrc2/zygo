@@ -1,8 +1,25 @@
 # What Zygo costs
 
 Every number here was measured by a command in this repository, against a real
-kernel, and every one can be reproduced by running that command. Where a
-measurement is sensitive to the machine it ran on, the machine is named.
+kernel, and every one can be reproduced by running that command. The machines
+are below; every millisecond in this documentation came from one of them.
+
+## The machines
+
+| | Raspberry Pi 5 | Docker Desktop's VM | Lima VM (the macOS shim) |
+|---|---|---|---|
+| Hardware | 4× Cortex-A76, 8 GiB, aarch64 | 5 vCPU, 8 GiB, of an Apple M1 Max | 2 vCPU, 4 GiB, of the same Mac |
+| OS and kernel | Ubuntu 23.10, Linux 6.5 | LinuxKit, Linux 5.10 | Ubuntu 24.04, Linux 6.8 |
+| How Zygo ran | an ordinary user, under a systemd session — the way a real host runs it | a privileged container, as root | forwarded from the Mac shell, as an ordinary user |
+| What was measured here | the fifty use-case scenarios, the supervisor and MCP suites, warm-up, and the `vm` backend's attempt to boot | the warm path, the cold start, throughput, the escape suite, the seccomp sweep and matrix | the shim's own overhead, and the same suites through the hop |
+
+Two things follow. **Unless a section says otherwise, a number below is from
+Docker Desktop's VM**, which is the slowest of the three for this work: a
+cgroup operation there costs several times what it does on bare metal, so the
+warm-path figures are conservative rather than flattering. And **no number
+here is from an x86_64 machine**; all three hosts are aarch64. The CI workflow
+builds and tests on x86_64 runners and the syscall tables are generated for it,
+but nothing was timed there.
 
 Reproduce any of them:
 
@@ -29,6 +46,13 @@ That is overhead: the time Zygo adds around your handler, with the handler's
 own work subtracted. `zygo bench warm` reports the two separately, and it
 reports the host's own `fork()` floor beside them, so you can see how much of
 the number belongs to the machine.
+
+**Warming up** is paid once, by `zygo serve` or the first `zygo up`: the cold
+sandbox, the interpreter, and whatever the handler imports. On the Raspberry
+Pi a Python handler that imports nothing is warm in about **270 ms**; one that
+imports `json`, `re`, `ssl`, `decimal`, `datetime`, `hashlib` and
+`urllib.request` in about **470 ms**. Both include starting the supervisor,
+which the first `serve` does. After `cold_after` the same cost is paid again.
 
 **Warm-exec**, where the sandbox is held and each request is a fresh process
 rather than a fork, costs a median of 2.2 ms. That is the mode a compiled

@@ -11,8 +11,9 @@ needs no code from you at all:
 
 ```toml
 [fn.parse]
-image = "golang:1.23"
-cmd   = ["/app/parser"]     # the event on stdin, JSON on stdout
+image  = "alpine:3"
+mounts = ["./bin/parse:/app/parse:ro"]
+cmd    = ["/app/parse"]     # the event on stdin, JSON on stdout
 ```
 
 That costs about 2.2 ms a request. An agent is what you write when importing

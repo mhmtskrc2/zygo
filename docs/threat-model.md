@@ -1,7 +1,7 @@
 # Threat model
 
-This is the design document's §3.10 in full, written against what is actually
-built and measured rather than what is planned. Where a control is not
+The threat model, written against what is actually built and measured rather
+than what is planned. Where a control is not
 implemented, or is implemented and unverified, it says so — a threat model that
 overstates its coverage is worse than none, because it is what people plan
 around.
@@ -27,8 +27,8 @@ for. Three trust classes, from the design:
 | T2 | Authenticated, contracted customers | `ns` + strict seccomp + Landlock + a network allowlist | A kernel local-privilege-escalation CVE — historically a few critical ones a year |
 | T3 | Anonymous, hostile | `vm` | A VMM or KVM CVE, which are much rarer |
 
-**The `vm` backend cannot be relied on yet** (it builds and links; no host available to this project can boot a guest on it, so it needs a
-machine with KVM). Until it is, T3 workloads do not have the boundary the
+**The `vm` backend cannot be relied on yet.** It builds and links, and no host
+available to this project has booted a guest on it. Until it can, T3 workloads do not have the boundary the
 design assigns them, and the honest answer for anonymous code today is a
 separate machine.
 
@@ -59,7 +59,7 @@ the table below is refused.
 
 | Vector | Control | Status |
 |---|---|---|
-| Kernel syscall surface | seccomp allowlist (~120 calls); `bpf`, `io_uring`, `userfaultfd`, `keyctl`, `perf_event_open` and `ptrace` refused | **attempted** — and swept: all 469 syscall numbers under each profile, 300 refused with EPERM under `default` |
+| Kernel syscall surface | seccomp allowlist (~190 syscalls named; about 170 of them exist on a given architecture); `bpf`, `io_uring`, `userfaultfd`, `keyctl`, `perf_event_open` and `ptrace` refused | **attempted** — and swept: all 469 syscall numbers under each profile, 300 refused with EPERM under `default` |
 | Overwriting the runtime binary (CVE-2019-5736 shape) | read-only root; `/proc/self/exe` is not writable | **attempted** |
 | `cgroup` `release_agent` | cgroupfs is not mounted in the sandbox at all | **attempted** |
 | `mount()` to reach the host | `CAP_SYS_ADMIN` dropped; seccomp refuses `mount` | **attempted** |
@@ -146,10 +146,9 @@ Said plainly, because `zygo doctor` says it too:
 ## What has not been reviewed
 
 **No external security audit has been done.** That is the largest gap in this
-document; it needs an
-auditor, not a commit. The other two hardening items of that phase are built:
-the syscall sweep described above, and the kernel-age warning in `zygo
-doctor`.
+document, and it needs an auditor, not a commit. The hardening that could be
+done without one is in place: the syscall sweep described above, and the
+kernel-age warning in `zygo doctor`.
 
 Until an audit happens, the strongest honest statement is the one at the top
 of this file: every vector listed above is attempted by a suite that runs on

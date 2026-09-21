@@ -69,6 +69,7 @@ executes.
 | | Python | Node | Needs `--allow-deploy` |
 |---|---|---|---|
 | Call a warm function | `client.call(name, event)` | `client.call(name, event)` | no |
+| A callable for one function | `client.fn(name)` | `client.fn(name)` | no |
 | Several events at once | `client.batch(name, events)` | `client.batch(name, events)` | no |
 | List functions | `client.functions()` | `client.functions()` | no |
 | Counters | `client.stats(name)` | `client.stats(name)` | no |

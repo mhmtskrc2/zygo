@@ -23,7 +23,8 @@ Nothing is built on the request path. For a compiled program the sandbox is
 fresh process entered into them — about 2 ms. For an interpreter the sandbox
 holds an *agent* that has already imported the handler, and each request is a
 `fork()` of it — copy-on-write, so no copying, but a fresh process, so no
-state carried over. Measured: p50 1.7 ms through the CLI at 250 requests/s.
+state carried over. Measured: p50 1.7 ms at 250 requests/s, on the machines
+named in [what Zygo costs](performance.md#the-machines).
 
 **Cost.** A warm function is resident memory — a Python zygote is ~35 MB. The
 idle policy pauses it (frozen, still resident) after `idle_timeout` and drops
@@ -35,8 +36,9 @@ it after `cold_after`; the next request then pays the warm-up again.
 the backend decides where the boundary is drawn. `ns` is the kernel; `vm` is
 KVM with a guest kernel; `gvisor` is a userspace kernel.
 
-**Cost.** `ns` and `gvisor` are built; `vm` needs a machine with KVM and is
-next. `zygo backend install gvisor` downloads the runtime, and the same
+**Cost.** `ns` and `gvisor` are built; `vm` builds and links, and no host
+available to this project has booted a guest on it, so it is not yet a choice
+you can make. `zygo backend install gvisor` downloads the runtime, and the same
 command run on both backends gives the same answer while `uname -r` inside
 reports `4.19.0-gvisor` rather than the host's kernel — which is the point.
 
@@ -55,8 +57,8 @@ Python packages, apt packages — is expressed in the spec instead and built
 function that names the same thing. The image itself is never modified.
 
 **Cost.** A derived layer is a copy of the image, an install, and a diff;
-about five seconds the first time. Overlayfs would be faster and cannot be
-used rootless on the kernels this runs on.
+about five seconds the first time. Overlayfs would be faster, and rootless
+overlayfs needs kernel 5.11, which not every host this runs on has.
 
 ## P5 — Rootless, daemonless
 

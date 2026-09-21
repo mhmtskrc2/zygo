@@ -13,6 +13,7 @@ with `zygo spec validate` in the same run.
 | [`warm-exec/go/`](warm-exec/go) | A compiled program as a warm function. No agent, no protocol — a `cmd` is the whole integration. |
 | [`agents/`](agents) | Writing an agent for a runtime that is expensive to start: the guide, a Node agent with a worker pool, and a complete agent in POSIX sh. |
 
-A Windmill worker integration is described in the design document (§4.8)
-and not written here: it is a change on Windmill's side — "how do I run a
-script" — and belongs in that repository.
+There is no Windmill or Temporal worker example here on purpose: that
+integration is a change on the workflow engine's side — "how do I run a
+script" — and belongs in that repository. The shape is `zygo serve` per script
+and `zygo exec` per run, or the SDK where the worker is Python or Node.

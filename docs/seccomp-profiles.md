@@ -64,8 +64,7 @@ keeps transfer, and a unit test holds the line in both directions.
 
 The sandbox's filter cannot remove `execve`: the launcher installs it
 immediately before exec-ing the agent, so a profile without `execve` is a
-sandbox that cannot start. The design (§3.4.1) puts that tightening where it
-belongs — in the agent's *forked child*, which is already running the
+sandbox that cannot start. So that tightening goes where it belongs — in the agent's *forked child*, which is already running the
 interpreter and never needs another program.
 
 Under `strict` the supervisor builds a second program

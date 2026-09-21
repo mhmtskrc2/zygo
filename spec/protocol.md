@@ -3,8 +3,8 @@
 Status: **draft**, implemented by `zygo-core` and by the reference Python agent.
 
 This is the contract between the **supervisor** (on the host) and a **runtime
-agent** (inside the sandbox). It is deliberately small and language independent
-(ADR-009): anything that speaks it — the built-in Python agent, a Node agent,
+agent** (inside the sandbox). It is deliberately small and language independent:
+anything that speaks it — the built-in Python agent, a Node agent,
 thirty lines of bash — gets resource limits, timeouts, idle tiering, metrics and
 `vm` transport for free.
 

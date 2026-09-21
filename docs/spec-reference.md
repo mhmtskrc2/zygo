@@ -27,7 +27,7 @@ an error, not a warning.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `isolation` | `ns` \| `vm` \| `gvisor` | `ns` | Where the boundary is. `ns` is built; `gvisor` runs one-shot sandboxes after `zygo backend install gvisor`, and refuses warm and networked ones; `vm` needs KVM and is not built. |
+| `isolation` | `ns` \| `vm` \| `gvisor` | `ns` | Where the boundary is. `ns` is built; `gvisor` runs one-shot sandboxes after `zygo backend install gvisor`, and refuses warm and networked ones; `vm` builds and links but no host available to this project has booted a guest on it, so it is not yet usable. |
 | `seccomp` | `default` \| `strict` \| `permissive` | `default` | The syscall allowlist. See [seccomp profiles](seccomp-profiles.md). |
 
 ## Limits
@@ -38,7 +38,7 @@ then only `timeout`.
 | Field | Type | Default | Maps to |
 |---|---|---|---|
 | `mem` | bytes (`256M`, `2G`) | `256M` | `memory.max`; `memory.high` at 90%; swap off; the whole request tree is killed together. Minimum 8M. |
-| `cpu` | cores (`0.5`, `2`) | `1.0` | `cpu.max`. A tenant that spins is throttled, not the host. |
+| `cpu` | cores (`0.5`, `2`) | `0.5` | `cpu.max`. A tenant that spins is throttled, not the host. |
 | `pids` | integer | `64` | `pids.max` and `RLIMIT_NPROC`: the fork-bomb limit. |
 | `timeout` | duration (`30s`, `5m`) | `30s` | Wall clock per request, enforced by the supervisor with `cgroup.kill`. Exit 137. `0` needs `--allow-unlimited`. |
 | `scratch` | bytes | `64M` | `/tmp`, a tmpfs. Counts against `mem`, so it must be smaller. |

@@ -44,6 +44,21 @@ systemd-run --user --scope -p Delegate=yes -- zygo run alpine:3 /bin/true
 If that works and a bare `zygo run` does not, your `systemd-run` is refusing
 the delegation. `loginctl enable-linger $USER` is often the missing piece.
 
+### "the program does not exist inside the image", and it plainly does
+
+Three causes, in order of likelihood:
+
+- **It is on your host, not in the image.** Everything after the image is run
+  *inside* the sandbox. Mount the file in and name its path there:
+  `zygo run --mount ./hello.py:/hello.py:ro python:3.12-slim python3 /hello.py`.
+- **It is a dynamically linked binary and the image has the wrong libc.** The
+  kernel reports a missing *loader* as a missing program, so a glibc binary in
+  `alpine:3` fails with this exact message. Use an image from the same family
+  as the binary, or a static binary.
+- **The path is relative** and the working directory is not what you assumed.
+  `workdir` defaults to `/app` and falls back to `/` when the image lacks it;
+  `zygo run --workdir /where …` sets it.
+
 ### "this host cannot run sandboxes" (exit 125)
 
 `zygo doctor` will say which of the preconditions is missing. The common ones

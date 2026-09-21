@@ -2,7 +2,7 @@
 
 An agent is the piece that lives *inside* a warm sandbox, loads a handler once,
 and forks a process per request. Zygo ships one for Python; the protocol is
-language independent on purpose (ADR-009), and anything that speaks it gets
+language independent on purpose, and anything that speaks it gets
 resource limits, request deadlines, idle tiering, metrics, secrets and the `vm`
 transport without knowing they exist.
 

@@ -7,69 +7,11 @@ Docker's ergonomics, but without the container create/destroy cycle. The sandbox
 waits warm; a request costs a `fork()`.
 
 ```bash
-zygo run python:3.12 hello.py           # first run: pulls the image
-zygo run python:3.12 hello.py           # second: ~30 ms, mostly Python itself
-zygo serve ./handler.py --name resize   # a warm zygote comes up
-zygo exec resize '{"url": "..."}'       # ~1 ms of overhead
+zygo run --mount ./hello.py:/hello.py:ro python:3.12 python3 /hello.py   # first run pulls the image
+zygo run --mount ./hello.py:/hello.py:ro python:3.12 python3 /hello.py   # second: ~30 ms, mostly Python itself
+zygo serve ./handler.py --name resize                                     # a warm zygote comes up
+zygo exec resize '{"url": "..."}'                                         # ~2 ms of overhead
 ```
-
-**Docs:** the [quickstart](docs/quickstart.md) gets you to three warm
-functions; the [guide](docs/guide.md) is everything else. Also:
-[concepts](docs/concepts.md) ·
-[`sandbox.toml` reference](docs/spec-reference.md) ·
-[what it costs](docs/performance.md) ·
-[threat model](docs/threat-model.md) ·
-[seccomp profiles](docs/seccomp-profiles.md) ·
-[comparison](docs/comparison.md) ·
-[the SDKs](docs/sdk.md) ·
-[the MCP server](docs/mcp.md) ·
-[troubleshooting](docs/troubleshooting.md) ·
-[examples](examples/) ·
-[writing an agent](docs/agents.md) ·
-[the wire protocol](spec/protocol.md)
-
-## What works
-
-`zygo run` builds a real sandbox: namespaces, cgroup limits, `pivot_root`,
-every capability dropped, a seccomp allowlist and Landlock where the kernel
-has it. `zygo serve`, `exec`, `ps` and `stop` run a warm pool in your own
-session, with per-function concurrency limits, backpressure, request deadlines
-enforced against the whole process tree, automatic rewarming after a crash, and
-idle functions that pause and wake in single-digit milliseconds.
-
-`zygo up` brings a whole `sandbox.toml` up and down. It is a deploy rather than
-a restart: it replaces only what changed, blue/green. `system = [...]` installs
-apt packages once as a layer of their own, with no Dockerfile.
-`network = "egress"` gives a sandbox an allowlist enforced by nftables inside
-its own network namespace, with no privilege anywhere.
-
-There is an [HTTP API](docs/sdk.md) with bearer auth, [Python and Node
-clients](docs/sdk.md) with no dependencies, and an [MCP server](docs/mcp.md)
-that gives an agent host a code interpreter whose limits live in a file
-somebody reviewed.
-
-**What is measured rather than asserted.** The warm path is a median of
-**1.70 ms** and a 99th percentile of **2.81 ms** through the shipping code at
-250 requests a second, and it sustains **981 requests a second** at a
-concurrency of four. A cold `zygo run` with the image cached is a median of
-**18.4 ms**. [What Zygo costs](docs/performance.md) has the rest, including
-what is *not* measured and why.
-
-The suites run in three places, which turned out to matter: a privileged
-container, a Raspberry Pi as an ordinary user with a systemd session, and a
-Mac. The launcher is checked against a real kernel, including actual escape
-attempts; every syscall number the architecture has is swept against all three
-seccomp profiles; and fifty scenarios shaped by use case rather than by
-mechanism run on two of the three.
-
-**What is not ready.** The `vm` backend builds and links libkrun, and no host
-available to this project can boot a guest on it, so nothing about it is
-claimed. `gvisor` runs one-shot sandboxes only; warm functions and networked
-sandboxes on it are refused with a reason rather than weakened. Zygo scales to
-one machine, and answers `429` past its capacity. No external audit has been
-done.
-
----
 
 ## Why
 
@@ -81,12 +23,53 @@ about 1 ms, a cgroup 0.1 ms, a seccomp filter microseconds. It is orchestration
 Zygo removes both: the orchestration leaves the request path, and the
 interpreter start is amortised by a warm zygote that forks per request.
 
-| | Docker (per request) | Docker `exec` | Zygo, warm |
-|---|---|---|---|
-| Overhead | 300–1000 ms | 50–100 ms | **1–2 ms** |
-| Daemon | yes | yes | **no** |
-| Clean state per request | yes | no | **yes** |
-| Boundary | kernel | kernel | kernel / gVisor / **KVM** |
+| | `docker run` | `docker exec` | `zygo run` | `zygo exec` (warm) |
+|---|---|---|---|---|
+| Overhead per request | 300–1000 ms | 50–100 ms | **18 ms** | **1.7 ms** |
+| What that pays for | daemon, shim, `runc`, a container object | the daemon round trip | namespaces, cgroup, mounts — in one process | a `fork()` |
+| Paid once, up front | — | a `docker run -d`: 300–1000 ms | — | a `zygo serve`: ~270 ms for a Python handler, plus your imports |
+| Daemon | yes | yes | **no** | **no** |
+| Root | yes | yes | **no** | **no** |
+| Clean state per request | yes | no | **yes** | **yes** |
+| Boundary | kernel | kernel | kernel, or gVisor | kernel |
+
+Zygo's two numbers are medians with the image cached, on the machines named in
+[what Zygo costs](docs/performance.md#the-machines) — a Raspberry Pi 5 and two
+VMs on an Apple-silicon Mac, all aarch64; Docker's are its commonly measured
+range. The program's own start-up is on top of every column.
+
+## Try it
+
+```bash
+cargo build --release && sudo install -m 0755 target/release/zygo /usr/local/bin/zygo
+
+zygo doctor                                   # can this host run sandboxes?
+zygo run python:3.12-slim python3 -c 'print("hello")'
+zygo run --mem 128M --pids 16 --timeout 10s alpine:3 /bin/sh
+zygo run --tty alpine:3 /bin/sh               # with a terminal of its own
+zygo run --dry-run --json python:3.12-slim    # the plan, without running it
+```
+
+**Linux** needs kernel 5.3 or newer, unprivileged user namespaces and cgroup v2
+controllers delegated to your user; 6.1 or newer is recommended, because that
+is where Landlock's network rules, `cgroup.kill` and `memory.peak` are all
+present. `zygo doctor` attempts each requirement rather than reading a setting,
+and prints the fix for anything missing. On Ubuntu and Debian two AppArmor
+policies get in the way of sandboxes and of networked sandboxes respectively;
+[troubleshooting](docs/troubleshooting.md) has both, and `doctor` names them.
+
+**macOS** gets a Linux VM. Every sandbox command is forwarded into one that
+Zygo starts and manages, with the same arguments, working directory and
+streams, and your home directory mounted at the same path. Two things to have:
+
+```bash
+brew install lima            # what starts the VM
+make poc/zygo-linux-musl     # the Linux build that runs inside it
+```
+
+Crossing into the VM costs about 100 ms per command, which hides the warm path
+from anything typed at a Mac shell; it is still there through the API and the
+SDKs. [The guide](docs/guide.md#macos) has the details.
 
 ## How
 
@@ -99,211 +82,73 @@ Three ideas:
    start is expensive, a small in-sandbox *agent* warms it once and forks per
    request — copy-on-write, so no copying, but no leaked state either.
 3. **Isolation is one flag.** `ns` (namespaces), `gvisor` (userspace kernel),
-   `vm` (libkrun/Firecracker). Same spec, same command, same protocol.
+   `vm` (libkrun). Same spec, same command, same protocol.
 
-## Try it
+## What is in the box
 
-```bash
-cargo build --release
-
-zygo doctor                                   # can this host run sandboxes?
-zygo run python:3.12-slim python3 -c 'print("hello")'
-zygo run --mem 128M --pids 16 --timeout 10s alpine:3 /bin/sh
-zygo run --tty alpine:3 /bin/sh               # with a terminal of its own
-zygo run --dry-run --json python:3.12-slim    # the plan, without running it
-```
-
-Sandboxes need Linux, and on a Mac they get one. Every command except
-`doctor`, `completion` and `agent test` is run by a Linux `zygo` inside a VM
-Zygo starts for itself, with the same arguments, the same working directory
-and the same streams; the exit status comes back out. Two things to have, and
-then the lines above work unchanged:
-
-```bash
-brew install lima            # what starts the VM
-make poc/zygo-linux-musl     # the Linux build that runs inside it
-```
-
-The second is what a release would ship beside the binary; from a checkout it
-is one `make`, and `zygo` says so if it is missing. The VM is built on the
-first command that needs it and takes about a minute; after that a command is
-milliseconds, and `zygo stop --all` puts it away again.
-
-One number to set expectations by, because the alternative is measuring the
-wrong thing and concluding the benchmark was optimistic. Crossing into the VM
-costs about 100 ms per command, and that is the floor for anything typed at a
-Mac shell: `zygo exec` and `docker exec` feel the same there, and the ~1 ms
-warm path is entirely hidden by the hop. It is reachable on a Mac — through
-the HTTP API or the library, where the round trip happens inside the VM and
-the 100 ms is paid once by the connection rather than once per request — and
-it is what a Linux host gives you at the CLI. The shim is doing its job here
-rather than failing at it; it is simply not the thing to benchmark.
-
-The VM mounts your home directory at *the same path*, writable, so
-`./handler.py` is one file seen from two sides. That is also the limit and it
-is enforced: a command run from outside `$HOME` is refused, and the message
-names both directories rather than quietly running somewhere else.
-
-`--dry-run` prints the resolved configuration, the mount plan and the cgroup
-values the launcher will apply — how to review a sandbox's boundaries without
-running it.
-
-## `sandbox.toml`
+One file describes a project:
 
 ```toml
 [defaults]
 image     = "python:3.12-slim"
-isolation = "ns"          # ns | gvisor | vm
 mem       = "256M"
 cpu       = 0.5
-pids      = 64
 timeout   = "30s"
 network   = "none"
 
 [fn.resize]
-entry        = "./resize.py"       # defines handler(event)
+entry        = "./resize.py"       # defines handler(event); warmed once, forked per request
 requirements = "./requirements.txt"
 system       = ["libwebp7"]        # apt packages, installed once as a layer
 mem          = "512M"
-mounts       = ["./cache:/cache:rw"]
 
 [fn.parse]
-image = "golang:1.23"              # no runtime → warm-exec
-cmd   = ["/app/parser"]            # stdin: JSON event, stdout: JSON result
+image  = "alpine:3"                # no runtime → warm-exec: a fresh process per request
+mounts = ["./bin/parse:/app/parse:ro"]  # a static binary you built, mounted in
+cmd    = ["/app/parse"]            # stdin: JSON event, stdout: JSON result
 
 [fn.fetch]
-entry       = "./fetch.py"
-network     = "egress"             # nothing else is reachable
-allow       = ["api.stripe.com:443", "*.example.com:443", "203.0.113.0/24:5432"]
-connections = 32                   # concurrent TCP connections
-bandwidth   = "2M"                 # bytes/s the function may send
-secrets     = ["STRIPE_KEY"]       # delivered as a file, only to the child
-```
-
-Precedence, highest first: **CLI flag → `[fn.<name>]` → `[defaults]` → built-in
-default**. `zygo spec explain <fn>` prints the result.
-
-Every limit has a default, and there is no way to disable one without
-`--allow-unlimited`. Anything that widens the boundary — host networking,
-private-range egress, a writable mount — must be spelled out.
-
-`requirements` and `system` never touch the image: the venv is built inside a
-sandbox with the image's own `pip`, and the packages are installed inside a
-writable copy of the image and diffed into a layer of their own. Both are
-keyed on the image digest and the list, built once, and shared by every
-function that names the same thing.
-
-### Networking
-
-`none` (the default) gives the sandbox an empty network namespace — loopback
-and nothing else. `egress` and `full` hand that namespace to
-[`pasta`](https://passt.top), which moves packets in userspace as your own
-user, and install an nftables allowlist *inside* it:
-
-| | reachable |
-|---|---|
-| `none` | nothing |
-| `egress` | exactly what `allow` names, plus DNS |
-| `full` | the public internet |
-| `host` | everything, no namespace (needs `--allow-host-net`) |
-
-Private and link-local ranges — the host and its neighbours — stay refused in
-every namespaced mode unless you pass `--allow-private-net`. DNS is forced to a
-resolver Zygo controls, so a handler cannot reach a resolver of its own to work
-around the list, and the host's search domains never enter the sandbox. If
-`pasta` or `nft` is missing, a networked sandbox **does not start** rather than
-starting unconfined.
-
-`allow` takes `host:port`, `*.domain:port` and `CIDR:port`. Under `egress` the
-sandbox's resolver is Zygo's own, running inside the sandbox's namespace: a
-name the list does not cover does not resolve, and one it covers has its
-addresses admitted to the filter before the answer goes back — so a wildcard
-is enforced on the name asked for, and a service that changes address keeps
-working.
-
-Two more limits apply to a networked function: `connections` (default 256
-concurrent TCP connections, refused with a reset past that) and `bandwidth`
-(bytes per second the sandbox may *send*; what it receives is shaped too where
-the host has an `ifb` device, and `zygo doctor`'s advice applies where it does
-not).
-
-### Deploying a project
-
-```bash
-zygo up        # every [fn.*] warm; run it again and only what changed restarts
-zygo down      # stops what this spec declares, nothing else
+entry   = "./fetch.py"
+network = "egress"                 # nothing else is reachable
+allow   = ["api.stripe.com:443", "*.example.com:443"]
+secrets = ["STRIPE_KEY"]           # delivered as a file, only to the request's process
 ```
 
 ```bash
-zygo shell resize                    # a debug shell inside the warm sandbox
-zygo shell resize -- cat /proc/1/cgroup
-zygo logs resize -f                  # the zygote's output and every request
-zygo logs resize --failed -n 20      # only the ones that failed
-zygo completion zsh > "${fpath[1]}/_zygo"
+zygo up                            # every function warm; run it again and only what changed restarts
+zygo exec fetch '{"path": "/v1/ping"}'
+zygo logs fetch --failed -n 20
+zygo shell resize                  # a debug shell inside the warm sandbox
+zygo down
 ```
 
-`up` compares each function's resolved spec, secret values and the bytes of its
-handler and requirements files against what the supervisor already holds.
-An unchanged function is left alone — warm pages, request counters and all — and
-a changed one is replaced blue/green: the new sandbox is warm before the old one
-stops taking requests, requests the old one had accepted finish on it, and
-requests queued behind it are admitted to the new one. `zygo serve` on a name
-always replaces, because you just said what you want it to be.
+- **Every limit is mandatory** — memory, CPU, pids, wall clock, scratch, open
+  files — with a default, and no way to disable one without a flag you have to
+  type. The deadline kills the request's whole process tree.
+- **Networking is off by default.** `egress` is an allowlist by name, enforced
+  by nftables inside the sandbox's own namespace with a resolver Zygo controls;
+  private ranges and the cloud metadata address stay refused. No privilege
+  anywhere: `pasta` moves the packets as your own user.
+- **Dependencies never touch the image.** `requirements` becomes a venv built
+  with the image's own `pip`; `system` becomes an OCI layer of its own. Both are
+  built once and shared by everything that names the same thing.
+- **`zygo up` is a deploy, not a restart.** Unchanged functions are left warm;
+  changed ones are replaced blue/green. It writes `zygo.lock` with the digest
+  each image resolved to, and refuses to run a moved image silently.
+- **Secrets are files, for the duration of a request.** Read from your shell,
+  written by the supervisor from outside the sandbox at mode 0400, never in the
+  environment and never in the warm agent's memory.
+- **Any language.** Python handlers get the fork path. Anything else is
+  warm-exec with a `cmd`, or an agent of your own — the protocol is language
+  independent, and `zygo agent test` checks an implementation against it.
 
-It also writes **`zygo.lock`** beside the spec: the digest each `image`
-resolved to and the versions `apt` chose for each `system` package. Commit it.
-A later `up` whose spec nobody edited, on an image that has moved, stops and
-prints both digests rather than quietly running something else; `zygo up
---relock` accepts the move. Editing the spec re-locks that function without
-asking, because you just asked for the change.
-
-## Handler contract
-
-```python
-from PIL import Image          # imported once, in the zygote
-import io, base64
-
-MAX = (800, 800)               # module-level state is shared, copy-on-write
-
-def handler(event: dict) -> dict:
-    """Runs in a fresh fork per request. Writing to globals is safe, but the
-    next request will not see it."""
-    img = Image.open(io.BytesIO(base64.b64decode(event["image"])))
-    img.thumbnail(MAX)
-    out = io.BytesIO(); img.save(out, "WEBP")
-    return {"image": base64.b64encode(out.getvalue()).decode(), "size": img.size}
-```
-
-Any other language runs as warm-exec: give the function a `cmd` and no runtime,
-and each request is a fresh process in the held sandbox with the event on stdin
-and JSON expected on stdout.
-
-Where starting your runtime is expensive enough to be worth amortising, write an
-*agent* instead. The wire protocol is language independent
-([spec/protocol.md](spec/protocol.md)) and `zygo agent test` checks an
-implementation against it:
-
-```bash
-zygo agent test /bin/sh -- examples/agents/sh/agent.sh examples/agents/sh/handler.sh
-```
-
-[`examples/agents/`](examples/agents) has the guide, a Node agent with a
-worker pool, and a complete agent in POSIX sh — about 130 lines, passing the
-same nine checks the Python one does. For a language that starts fast there is
-nothing to amortise: [`examples/warm-exec/go`](examples/warm-exec/go) is a Go
-program as a warm function, and the whole integration is a `cmd`.
-
-## From a program, and from an agent
-
-The CLI is for a person. A platform embeds the API, and an agent host speaks a
-protocol of its own; both are shipped.
+From a program, the same functions are behind an HTTP API with bearer auth and
+two dependency-free clients:
 
 ```python
 import zygo
-
-client = zygo.connect()                   # `zygo api`, on loopback or a unix socket
-out = client.fn("resize")({"url": "..."})  # ~2 ms, a fresh process
-r = client.run("python:3.12-slim", ["python3", "-c", "print(6*7)"], mem="128M")
+client = zygo.connect()                          # a unix socket, or 127.0.0.1:7700
+out = client.fn("resize")({"url": "..."})        # ~2 ms, a fresh process
 ```
 
 ```js
@@ -311,37 +156,58 @@ import { connect } from 'zygo';
 const out = await connect().fn('resize')({ url: '...' });
 ```
 
-Both clients have **no dependencies** and both speak to the same HTTP API,
-over a unix socket at `0600` when it is on this machine — so there is no port
-and no token in the usual case. Every kind of failure is its own type, because
-each implies something different: a `Busy` means the request never ran and
-retrying is correct, a `HandlerError` means it will fail again.
-[docs/sdk.md](docs/sdk.md).
-
-`zygo api` starts **call-only**: a token reaches the functions somebody
-declared in a spec file and nothing else. `--allow-deploy` adds serving,
-stopping and one-shot runs, which together are a shell rather than an API, so
-it is a flag rather than a default.
-
-For an agent, `zygo mcp` speaks the Model Context Protocol over a pipe:
+For an agent host, `zygo mcp` speaks the Model Context Protocol over a pipe.
+The tools expose a *program* and nothing else — no image, no mounts, no network,
+no limits — because a model reads untrusted text and that text can ask it for
+things. Those are set once, by whoever installed the server:
 
 ```json
 { "mcpServers": { "zygo": { "command": "zygo", "args": ["mcp"] } } }
 ```
 
-That is the whole installation, and the host gains `run_code`,
-`list_functions`, `call_function` and `function_logs`. The tools expose a
-*program* and nothing else — no image, no mounts, no network, no limits. Those
-are set once, on the command line, by the person who installed the server,
-because a model reads untrusted text and that text can ask it for things. A
-model that needs more declares a function in `sandbox.toml` and calls it by
-name, so the boundary lives in a file somebody reviewed.
-[docs/mcp.md](docs/mcp.md).
+## Status
+
+**Measured, not asserted.** The warm path is a median of **1.70 ms** and a 99th
+percentile of **2.81 ms** through the shipping code at 250 requests a second,
+sustaining **981 requests a second** at a concurrency of four; a cold `zygo run`
+with the image cached is a median of **18.4 ms**. The suites run in three
+places, which turned out to matter: a privileged container, a Raspberry Pi as
+an ordinary user under a systemd session, and a Mac. The launcher is checked
+against a real kernel, including actual escape attempts; every syscall number
+the architecture has is swept against all three seccomp profiles; and fifty
+scenarios shaped by use case rather than by mechanism run on two of the three.
+[What Zygo costs](docs/performance.md) has the numbers, the hosts, and what is
+*not* measured.
+
+**Not ready.** The `vm` backend builds and links libkrun, and no host available
+to this project has booted a guest on it, so nothing about it is claimed.
+`gvisor` runs one-shot sandboxes only; warm functions and networked sandboxes
+on it are refused with a reason rather than weakened. Zygo scales to one
+machine, and answers `429` past its capacity. No external audit has been done.
+
+## Documentation
+
+| | |
+|---|---|
+| [Quickstart](docs/quickstart.md) | From a checkout to three warm functions behind HTTP. |
+| [The guide](docs/guide.md) | Everything, in the order you meet it: installing, sandboxes, warm functions, limits, networking, secrets, dependencies, images, deploying, production, backends. |
+| [Concepts](docs/concepts.md) | The eight principles, and what each one costs. |
+| [`sandbox.toml` reference](docs/spec-reference.md) | Every field, its default, and what it maps to. |
+| [What Zygo costs](docs/performance.md) | The measured numbers and the hosts they came from. |
+| [Troubleshooting](docs/troubleshooting.md) | The errors people actually hit, and the fix for each. |
+| [Threat model](docs/threat-model.md) | Every vector, the control against it, and whether the suite attempts it. |
+| [Seccomp profiles](docs/seccomp-profiles.md) | The three syscall profiles and the compatibility matrix. |
+| [The SDKs](docs/sdk.md) | The Python and Node clients, the HTTP API, and the deploy gate. |
+| [The MCP server](docs/mcp.md) | Giving an agent host a code interpreter with a reviewed boundary. |
+| [Writing an agent](docs/agents.md) | Warm functions in a language of your own. |
+| [Comparison](docs/comparison.md) | Against Docker, gVisor, Firecracker and the function platforms — including `docker run` and `zygo run` side by side, flag by flag. |
+| [`examples/`](examples/) | A webhook, a CI job, an LLM tool, a Go program, and agents in Node and POSIX sh. |
+| [`spec/protocol.md`](spec/protocol.md) | The wire protocol between the supervisor and an agent. |
 
 ## Layout
 
 ```
-crates/zygo-core     the library; the CLI and the bindings sit on top (ADR-008)
+crates/zygo-core     the library; the CLI and the bindings sit on top
   spec/              sandbox.toml surface, layering, validation
   image/             OCI references, content-addressed store, registry client
   sandbox/           mount plan and resource limits, backend independent
@@ -371,7 +237,7 @@ make verify-mcp     # 26 checks driving `zygo mcp` over a pipe, against a real k
 make test-sdk       # the Python and Node clients, against a stand-in API
 make verify-shim    # 14 macOS checks, against the Linux VM the shim manages
 make verify-login-linux  # 15 checks against a registry that really refuses people
-make dist-linux     # the static musl binary, checked against N6
+make dist-linux     # the static musl binary, checked against its size budget
 make lint
 ```
 
@@ -395,37 +261,6 @@ Four rules the test suite is built on, all learned the hard way here:
 Several checks here passed — or failed — for the wrong reason before those rules
 were applied.
 
-Zygo is Linux-first. The `ns` backend needs Linux **5.3+** — the floor is
-`clone3`, which has no fallback — plus user namespaces and delegated cgroup v2
-controllers. Two later kernels unlock things rather than gate them: 5.11 adds
-unprivileged overlayfs (below it the store flattens image layers, which costs
-disk and first-run time) and 6.1 has everything in the design document's
-appendix C. `zygo doctor` reports each one and prints the fix.
-
-On macOS the code builds, the platform-independent layers are fully tested, and
-sandboxes run in a Linux VM the shim manages — `zygo doctor` prints what that
-VM says about itself and exits with its answer. A warm `exec` from the Mac
-round-trips in 96 ms, nearly all of it the hop into the VM rather than the
-request; `make verify-shim` is 14 checks against a real VM.
-
-Two things to know before running Zygo on Ubuntu or Debian. Both are the same
-shape: a distribution's AppArmor policy, not a Zygo setting, and `zygo doctor`
-or the error message names the fix.
-
-A **networked** sandbox needs `pasta`, and Ubuntu ships an AppArmor profile
-that confines it. Where that profile is enforcing, `pasta` is denied
-`/proc/<pid>/ns/user` and `network = "egress"` or `"full"` cannot start — on a
-host where `/dev/net/tun` is present and working. The error says so and names
-`aa-complain`; `network = "none"`, the default, needs no `pasta` at all.
-
-And:
-`kernel.apparmor_restrict_unprivileged_userns=1` lets an unprivileged process
-create a user namespace and then refuses the first mount inside it, which is
-the first thing every sandbox does. `zygo doctor` detects it by attempting
-that mount, and prints the one-line fix — read
-[docs/threat-model.md](docs/threat-model.md) first, because the fix turns off
-a protection for every process on the machine, not only Zygo's.
-
 ## Security
 
 Zygo runs other people's code on purpose, so an escape is the most serious kind
@@ -435,11 +270,6 @@ through GitHub, not as an issue — and what is in scope.
 against it, and whether the escape suite actually attempts it. It also has a
 section on where the boundary is weaker than it looks, which is the part worth
 reading before you trust this with anything.
-
-[docs/seccomp-profiles.md](docs/seccomp-profiles.md) describes the three
-syscall profiles and the compatibility matrix — five reference packages
-exercised under `default` and `strict`, every cell an attempt — including the
-two bugs the first run of that matrix found in the profile itself.
 
 No external audit has been done.
 

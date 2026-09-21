@@ -27,20 +27,12 @@ systemctl --user daemon-reexec
 ```
 
 Whatever runs Zygo also has to *be* somewhere delegated, and an ssh login is
-not: it sits in a `session-N.scope` that systemd owns, where a sandbox cannot
-create the cgroup that would hold its limits. **Zygo handles that half
-itself** — a command that builds a sandbox re-executes inside a transient
-scope of its own, the way `podman` does, so there is nothing to type.
-
-`zygo doctor` reports on the cgroup it is standing in, and it *attempts* the
-thing rather than reading `cgroup.controllers`: from a plain ssh session it
-says `cgroup v2 … FAIL`, which is the truth about that cgroup even though
-`zygo run` from the same shell will work. To see what a sandbox sees, ask it
-from a scope:
-
-```bash
-systemd-run --user --scope -p Delegate=yes -- zygo doctor
-```
+not. **Zygo handles that half itself**: a command that builds a sandbox
+re-executes inside a transient scope of its own, the way `podman` does. One
+consequence is that `zygo doctor` from a plain ssh session reports `cgroup v2
+… FAIL` — the truth about the cgroup it is standing in — while `zygo run` from
+the same shell works. [Troubleshooting](troubleshooting.md#no-cgroup-controllers-or-there-is-no-memorymax-here)
+has the rest.
 
 ## 2. One function
 
