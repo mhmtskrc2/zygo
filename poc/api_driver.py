@@ -270,6 +270,119 @@ def main() -> int:
             ok("and is gone afterwards")
         client.delete_script(other.sha256)
 
+        # --- runtime pools ---------------------------------------------------
+        #
+        # The embedder's whole path, and the reason the rest of this exists:
+        # one warm pool, scripts that live in the caller's database, and no
+        # file on the Zygo host.
+        print("\nruntime pools")
+
+        pool = client.serve_runtime(
+            "py-pool",
+            {"image": image, "agent": "python", "min_warm": 1, "max_warm": 2, "timeout": "20s"},
+        )
+        if pool.get("warm", 0) >= 1:
+            ok(f"a runtime pool is warm ({pool['warm']} zygote, {pool.get('warm_ms', 0):.0f} ms)")
+        else:
+            bad("POST /runtimes", pool)
+
+        pools = {p.name: p for p in client.runtimes()}
+        if "py-pool" in pools and pools["py-pool"].max_warm == 2:
+            ok("and is listed with its floor and ceiling")
+        else:
+            bad("GET /runtimes", list(pools))
+
+        registered = client.put_script(
+            "import os\n\n\n"
+            "def handler(event):\n"
+            "    return {'pid': os.getpid(), 'n': event.get('n', 0) + 1}\n"
+        )
+        out = client.run_script("py-pool", registered.sha256, {"n": 1})
+        if out.result.get("n") == 2:
+            ok("a registered script runs in the pool, named by its digest alone")
+        else:
+            bad("POST /runtimes/<name>/call", out)
+
+        # The property the whole design rests on: the zygote is anonymous, so
+        # two scripts in one pool cannot see each other — and each request is
+        # its own process.
+        first = client.run_script("py-pool", registered.sha256, {}).result["pid"]
+        second = client.run_script("py-pool", registered.sha256, {}).result["pid"]
+        if first != second:
+            ok(f"each script request is a fresh process ({first} then {second})")
+        else:
+            bad("two requests in the pool shared a process", f"{first} == {second}")
+
+        leak = client.run_script(
+            "py-pool",
+            "def handler(event):\n"
+            "    import sys\n"
+            "    return {'mods': [m for m in sys.modules if 'zygo_request' in m]}\n",
+        )
+        if leak.result.get("mods") == []:
+            ok("and the zygote carries nothing of the last script")
+        else:
+            bad("a script was left in the zygote", leak.result)
+
+        # How the script got in, asked of the script itself. The supervisor
+        # writes it into the sandbox and sends a path, so that the zygote —
+        # which is shared — never holds a tenant's code; and the directory is
+        # 0711, so a script cannot list what else is in flight beside it.
+        delivery = client.run_script(
+            "py-pool",
+            "import os\n\n\n"
+            "def handler(event):\n"
+            "    try:\n"
+            "        listed = sorted(os.listdir('/run/script'))\n"
+            "    except OSError as e:\n"
+            "        listed = str(e.__class__.__name__)\n"
+            "    return {'file': __file__, 'listed': listed}\n",
+        )
+        if delivery.result.get("file", "").startswith("/run/script/"):
+            ok(f"the script reached the child as a file ({delivery.result['file'][:28]}…)")
+        else:
+            bad("the script was sent through the zygote instead of written in", delivery.result)
+        if delivery.result.get("listed") == "PermissionError":
+            ok("and the directory it is in cannot be listed by the script")
+        else:
+            bad("/run/script is listable from inside", delivery.result.get("listed"))
+
+        one_off = client.run_script(
+            "py-pool", "def handler(event):\n    return {'from': 'a one-off'}\n"
+        )
+        if one_off.result.get("from") == "a one-off":
+            ok("a script that was never registered runs too")
+        else:
+            bad("an inline script", one_off)
+
+        named = client.run_script(
+            "py-pool",
+            "def main(event):\n    return {'called': 'main'}\n",
+            entry_point="main",
+        )
+        if named.result.get("called") == "main":
+            ok("and `entry_point` names the function to call")
+        else:
+            bad("entry_point", named)
+
+        try:
+            client.run_script("py-pool", "sha256:" + "e" * 64)
+            bad("a digest nobody registered ran anyway")
+        except zygo.NotFound:
+            ok("a digest the host does not hold is a NotFound")
+
+        try:
+            client.run_script("nowhere", registered.sha256)
+            bad("a call to a pool that does not exist succeeded")
+        except zygo.NotFound:
+            ok("a call to an unknown runtime is a NotFound")
+
+        if client.stop_runtime("py-pool") == ["py-pool"]:
+            ok("a pool can be stopped")
+        else:
+            bad("DELETE /runtimes/<name>")
+        client.delete_script(registered.sha256)
+
         # --- the ceilings ----------------------------------------------------
         print("\nceilings")
 
@@ -318,6 +431,11 @@ def call_only(socket_path: str) -> int:
             ("DELETE /fn/<name>", lambda: client.stop("x")),
             ("PUT /scripts", lambda: client.put_script("x = 1\n")),
             ("DELETE /scripts/<hash>", lambda: client.delete_script("sha256:" + "c" * 64)),
+            (
+                "POST /runtimes",
+                lambda: client.serve_runtime("x", {"image": "alpine:3", "agent": "python"}),
+            ),
+            ("DELETE /runtimes/<name>", lambda: client.stop_runtime("x")),
         ):
             try:
                 call()

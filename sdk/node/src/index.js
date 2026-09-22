@@ -246,6 +246,59 @@ export class Client {
   }
 
   /**
+   * Register a **runtime pool**: an image, a dependency set, an agent.
+   *
+   * A pool holds no code. Scripts arrive with each call, so one pool serves
+   * ten thousand of them where ten thousand functions would be ten thousand
+   * warm zygotes. `layer` is a `[runtime.<name>]` table as an object —
+   * `image`, `agent`, `min_warm`, `max_warm` and the limits.
+   *
+   * Needs an API started with `--allow-deploy`.
+   */
+  async serveRuntime(name, layer, { baseDir } = {}) {
+    const body = { name, layer: { ...layer } };
+    if (baseDir !== undefined) {
+      const { resolve: resolvePath } = await import('node:path');
+      body.base_dir = resolvePath(baseDir);
+    }
+    return this.#request('POST', '/runtimes', { body });
+  }
+
+  /** Every runtime pool this host holds. */
+  async runtimes() {
+    const body = await this.#request('GET', '/runtimes');
+    return body.runtimes ?? [];
+  }
+
+  /** Stop a pool and drop its zygotes. */
+  async stopRuntime(name) {
+    const body = await this.#request('DELETE', `/runtimes/${esc(name)}`);
+    return body.stopped ?? [];
+  }
+
+  /**
+   * Run one script in a pool.
+   *
+   * `script` is either a `sha256:…` digest this host holds — register it once
+   * with {@link putScript} — or the source itself. The digest is the shape to
+   * build on: the bytes cross the wire once rather than on every call, and the
+   * host can put the file in the sandbox instead of sending it through the
+   * zygote.
+   */
+  async runScript(runtime, script, event = null, { entryPoint, timeout } = {}) {
+    const body = {
+      script: script.startsWith('sha256:') ? script : { source: script },
+      event,
+    };
+    if (entryPoint !== undefined) body.entry_point = entryPoint;
+    const answer = await this.#request('POST', `/runtimes/${esc(runtime)}/call`, {
+      body,
+      headers: timeoutHeader(timeout),
+    });
+    return parseResult(answer);
+  }
+
+  /**
    * Register a script and get back the name the host gave it.
    *
    * The name is the SHA-256 of the bytes, so this is idempotent in the

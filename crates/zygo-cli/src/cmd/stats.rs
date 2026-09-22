@@ -66,10 +66,35 @@ pub fn run(cli: &Cli, name: Option<&str>) -> anyhow::Result<u8> {
     let paths = super::paths(cli);
     let mut client = Client::connect(&paths)?;
 
-    let functions = match client.send(&Request::List)? {
+    let mut functions = match client.send(&Request::List)? {
         Response::Functions { functions } => functions,
         other => return super::supervisor::report_failure(cli, &other),
     };
+
+    // Pools are summarised the same way, from the same log: a request is a
+    // request whether the code came with the zygote or with the call, and the
+    // latencies are the number an embedder is here for. What a pool has
+    // instead of one state is several zygotes, so the row says how many.
+    let pools = match client.send(&Request::Runtimes)? {
+        Response::Runtimes { runtimes } => runtimes,
+        other => return super::supervisor::report_failure(cli, &other),
+    };
+    functions.extend(pools.iter().map(|p| Status {
+        name: p.name.clone(),
+        image: p.image.clone(),
+        state: if p.warm > 0 {
+            SandboxState::Warm
+        } else if p.paused > 0 {
+            SandboxState::Paused
+        } else {
+            SandboxState::Cold
+        },
+        runtime: format!("{} ×{}", p.runtime, p.warm + p.paused),
+        rss_kb: p.rss_kb,
+        imports_ms: 0.0,
+        requests: p.requests,
+        failures: p.failures,
+    }));
 
     let wanted: Vec<Status> = match name {
         Some(n) => functions.into_iter().filter(|f| f.name == n).collect(),
@@ -79,7 +104,7 @@ pub fn run(cli: &Cli, name: Option<&str>) -> anyhow::Result<u8> {
     if let Some(n) = name
         && wanted.is_empty()
     {
-        anyhow::bail!("no function named `{n}`; `zygo ps` lists the warm ones");
+        anyhow::bail!("no function or runtime named `{n}`; `zygo ps` lists the warm ones");
     }
 
     let mut stats = Vec::with_capacity(wanted.len());

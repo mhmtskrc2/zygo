@@ -106,7 +106,14 @@ fn secrets_from_env(
 
 /// `zygo serve <handler> --name <name>` — warm a function, starting the
 /// supervisor if there is not one.
+///
+/// With `--runtime <name>` it warms a **pool** instead: no handler, several
+/// zygotes, and the scripts arrive with the requests.
 pub fn serve(cli: &Cli, args: &ServeArgs) -> anyhow::Result<u8> {
+    let name = match args.target()? {
+        crate::cli::ServeTarget::Function(name) => name,
+        crate::cli::ServeTarget::Runtime(name) => return serve_runtime(cli, args, &name),
+    };
     let paths = super::paths(cli);
     let layer = args.to_layer()?;
     let spec = Spec::discover(args.spec_file.path())?;
@@ -127,7 +134,7 @@ pub fn serve(cli: &Cli, args: &ServeArgs) -> anyhow::Result<u8> {
         .clone()
         .unwrap_or_default()
         .resolve_for_serve(
-            &args.name,
+            &name,
             &layer,
             &zygo_core::spec::ResolveOptions {
                 base_dir: Some(base_dir.clone()),
@@ -141,7 +148,7 @@ pub fn serve(cli: &Cli, args: &ServeArgs) -> anyhow::Result<u8> {
     let mut client = Client::connect_or_start(&paths, &exe)?;
 
     let response = client.send(&Request::Serve {
-        name: args.name.clone(),
+        name: name.clone(),
         spec: spec.map(Box::new),
         layer: Box::new(layer),
         base_dir,
@@ -192,6 +199,87 @@ pub fn serve(cli: &Cli, args: &ServeArgs) -> anyhow::Result<u8> {
                     );
                 }
                 println!("  {}", style.dim(&format!("zygo exec {name} '{{}}'")));
+            }
+            Ok(0)
+        }
+        other => report_failure(cli, &other),
+    }
+}
+
+/// `zygo serve --runtime <name>` — warm a pool of anonymous zygotes.
+///
+/// No handler, no secrets and no sources to hash: a pool is an image, a
+/// dependency set and an agent, and everything a request runs arrives with it.
+/// That is also why this is a shorter function than `serve` — most of what
+/// serving a function does is about the code it is warming.
+fn serve_runtime(cli: &Cli, args: &ServeArgs, name: &str) -> anyhow::Result<u8> {
+    let paths = super::paths(cli);
+    let layer = args.to_layer()?;
+    let spec = Spec::discover(args.spec_file.path())?;
+    let base_dir = match &spec {
+        Some(spec) => absolute(&spec.base_dir())?,
+        None => std::env::current_dir().context("cannot read the working directory")?,
+    };
+    let options = args.sandbox.resolve_options();
+
+    let exe = std::env::current_exe().context("cannot find this binary to start a supervisor")?;
+    let mut client = Client::connect_or_start(&paths, &exe)?;
+    let response = client.send(&Request::ServeRuntime {
+        name: name.to_string(),
+        spec: spec.map(Box::new),
+        layer: Box::new(layer),
+        base_dir,
+        allow_host_net: options.allow_host_net,
+        allow_private_net: options.allow_private_net,
+        allow_unlimited: options.allow_unlimited,
+    })?;
+
+    let style = Style::stdout();
+    match response {
+        Response::RuntimeServed {
+            name,
+            runtime,
+            warm,
+            rss_kb,
+            imports_ms,
+            warm_ms,
+            warnings,
+            change,
+        } => {
+            for w in &warnings {
+                output::warn(w);
+            }
+            if cli.json {
+                output::json(&serde_json::json!({
+                    "name": name,
+                    "runtime": runtime,
+                    "warm": warm,
+                    "rss_kb": rss_kb,
+                    "imports_ms": imports_ms,
+                    "warm_ms": warm_ms,
+                    "warnings": warnings,
+                    "change": change,
+                }))?;
+            } else {
+                println!(
+                    "{} runtime {name} is warm — {runtime}, {warm} zygote{}, \
+                     {} MB resident, ready in {warm_ms:.0} ms",
+                    style.green("✓"),
+                    if warm == 1 { "" } else { "s" },
+                    rss_kb / 1024
+                );
+                if change == Change::Replaced {
+                    println!(
+                        "  {}",
+                        style.dim("replaced the previous pool under this name")
+                    );
+                }
+                println!(
+                    "  {}",
+                    style.dim(&format!(
+                        "zygo exec --runtime {name} --script handler.py '{{}}'"
+                    ))
+                );
             }
             Ok(0)
         }
@@ -487,7 +575,7 @@ pub fn down(cli: &Cli, file: Option<&std::path::Path>) -> anyhow::Result<u8> {
     Ok(0)
 }
 
-/// `zygo exec <name> [json]`.
+/// `zygo exec <name> [json]`, or `zygo exec --runtime <name> --script <file>`.
 pub fn exec(cli: &Cli, args: &ExecArgs) -> anyhow::Result<u8> {
     anyhow::ensure!(
         !args.batch,
@@ -501,11 +589,23 @@ pub fn exec(cli: &Cli, args: &ExecArgs) -> anyhow::Result<u8> {
     let timeout_ms = args
         .timeout
         .map_or(DEFAULT_EXEC_TIMEOUT_MS, |t| t.as_millis());
-    let response = client.send(&Request::Exec {
-        name: args.name.clone(),
-        event,
-        timeout_ms,
-    })?;
+    let request = match &args.runtime {
+        Some(runtime) => Request::ExecScript {
+            runtime: runtime.clone(),
+            script: script_for(args)?,
+            event,
+            timeout_ms,
+        },
+        None => Request::Exec {
+            name: args
+                .name
+                .clone()
+                .context("which function? `zygo exec <name> '<json>'`")?,
+            event,
+            timeout_ms,
+        },
+    };
+    let response = client.send(&request)?;
 
     match response {
         Response::Executed { outcome } => {
@@ -559,7 +659,44 @@ fn exit_status(outcome: &Outcome) -> u8 {
 /// socket timeout, so a client spoke to a wedged supervisor for ever.
 const DEFAULT_EXEC_TIMEOUT_MS: u64 = 60_000;
 
+/// What `--script` names: a file on this host, or a digest the host holds.
+///
+/// A digest is the embedder's shape — register once with `PUT /scripts`, run
+/// it ten thousand times — and a path is the developer's, where the file is
+/// right there and registering it first would be a step with no purpose. Told
+/// apart by the `sha256:` prefix, which a filename cannot have without a
+/// directory in front of it.
+fn script_for(args: &ExecArgs) -> anyhow::Result<zygo_core::protocol::Script> {
+    let named = args
+        .script
+        .as_deref()
+        .context("`--runtime` needs a `--script`")?;
+    let mut script = if named.starts_with("sha256:") {
+        zygo_core::protocol::Script {
+            path: None,
+            source: None,
+            digest: Some(named.to_string()),
+            entry_point: None,
+        }
+    } else {
+        let source = std::fs::read_to_string(named)
+            .with_context(|| format!("cannot read the script `{named}`"))?;
+        zygo_core::protocol::Script::inline(source)
+    };
+    script.entry_point = args.entry_point.clone();
+    Ok(script)
+}
+
 fn read_event(args: &ExecArgs) -> anyhow::Result<serde_json::Value> {
+    // With `--runtime` the first positional is the event: a pool has no
+    // function name, so `zygo exec --runtime py --script s.py '{"n":1}'`
+    // reads the way it is written rather than binding the JSON to a name.
+    if args.runtime.is_some()
+        && args.event.is_none()
+        && let Some(text) = &args.name
+    {
+        return parse_event(text);
+    }
     let text = match &args.event {
         Some(text) => text.clone(),
         None => {
@@ -571,10 +708,14 @@ fn read_event(args: &ExecArgs) -> anyhow::Result<serde_json::Value> {
             buf
         }
     };
+    parse_event(&text)
+}
+
+fn parse_event(text: &str) -> anyhow::Result<serde_json::Value> {
     if text.trim().is_empty() {
         return Ok(serde_json::Value::Null);
     }
-    serde_json::from_str(&text).with_context(|| format!("the event is not valid JSON: {text}"))
+    serde_json::from_str(text).with_context(|| format!("the event is not valid JSON: {text}"))
 }
 
 /// `zygo ps`.
@@ -839,10 +980,13 @@ mod tests {
     #[test]
     fn an_event_may_be_given_or_omitted() {
         let args = |event: Option<&str>| ExecArgs {
-            name: "x".into(),
+            name: Some("x".into()),
             event: event.map(str::to_string),
             batch: false,
             timeout: None,
+            runtime: None,
+            script: None,
+            entry_point: None,
         };
         assert_eq!(
             read_event(&args(Some(r#"{"n":1}"#))).expect("json"),

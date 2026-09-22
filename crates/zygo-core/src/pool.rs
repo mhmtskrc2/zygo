@@ -129,19 +129,27 @@ impl BuiltinAgent {
     /// `--fd` rather than a socket path: nothing has to exist in the
     /// sandbox's filesystem, so no bind mount and no assumption about the
     /// image.
-    pub fn argv(self, mode: &str) -> Vec<String> {
+    ///
+    /// Without a handler this is a **runtime pool**: the agent is told no
+    /// tenant code at all and every request brings its own `script`. The
+    /// argument is absent rather than empty, because the agent decides which
+    /// shape it is by whether it was given one (`spec/protocol.md` §2).
+    pub fn argv(self, mode: &str, handler: bool) -> Vec<String> {
         let interpreter = match self {
             BuiltinAgent::Python => "python3",
             BuiltinAgent::Node => "node",
         };
-        vec![
+        let mut argv = vec![
             interpreter.to_string(),
             self.agent_in_sandbox().to_string(),
             "--fd".to_string(),
             AGENT_FD.to_string(),
-            self.handler_in_sandbox().to_string(),
-            mode.to_string(),
-        ]
+        ];
+        if handler {
+            argv.push(self.handler_in_sandbox().to_string());
+            argv.push(mode.to_string());
+        }
+        argv
     }
 }
 
@@ -543,6 +551,28 @@ impl Pool {
             }
         };
 
+        // A pool zygote holds no tenant code, and this is where that stops
+        // being an intention and becomes a fact: nothing of the tenant's is
+        // mounted, the agent is started without a handler argument, and the
+        // only code that reaches the sandbox afterwards arrives per request
+        // and is loaded in the child. Asserted rather than assumed, because
+        // every isolation claim about a shared pool rests on it.
+        if f.is_pool() {
+            debug_assert!(f.entry.is_none() && f.cmd.is_empty());
+            if f.entry.is_some() {
+                return Err(Error::BackendUnavailable {
+                    backend: "pool",
+                    reason: format!(
+                        "`{}` is a runtime pool and was given a handler to warm",
+                        f.name
+                    ),
+                    remedy: "a pool's zygotes are shared between tenants, so nothing \
+                             may be imported into one"
+                        .into(),
+                });
+            }
+        }
+
         let mut warm = f.clone();
         warm.mounts = match mode {
             Mode::Agent(agent) => agent_mounts(agent, self.agent_path_for(agent), f),
@@ -562,7 +592,7 @@ impl Pool {
             tracing::warn!("{w}");
         }
         let argv = match mode {
-            Mode::Agent(agent) => agent.argv(f.mode.as_str()),
+            Mode::Agent(agent) => agent.argv(f.mode.as_str(), f.entry.is_some()),
             Mode::Exec => f.cmd.clone(),
         };
 
@@ -1882,13 +1912,22 @@ pub const SECRETS_DIR_IN_SANDBOX: &str = "/run/secrets";
 
 /// Where a request's own script lands inside the sandbox (protocol 1.1).
 ///
-/// One directory, mode `0711`, and files named by the SHA-256 of their
+/// One directory, mode `0311`, and files named by the SHA-256 of their
 /// contents at `0400`. Together those are the access rule: a child can open a
 /// script whose digest it already knows, and cannot list what else is there.
 /// In a runtime pool the sandbox is shared between tenants — that is the whole
 /// point of it — so "what else is there" is every other tenant's code that
-/// happens to be in flight, and `0711` is what keeps a `readdir` from being an
+/// happens to be in flight, and `0311` is what keeps a `readdir` from being an
 /// inventory of it.
+///
+/// `0311` rather than `0711`, and the missing bit is the whole control:
+/// everything in the sandbox runs as the uid this directory belongs to, so
+/// the *owner* bits are the ones a tenant gets. `r` there would let any script
+/// list every digest in flight beside it, which `0711` did until a test asked
+/// a script to try. Write and execute stay, because the supervisor has to
+/// create the files and the child has to traverse to them — which is also why
+/// the supervisor holds the directory open with `O_PATH`, the one way to keep
+/// a descriptor to a directory it may not read.
 ///
 /// It is *not* a boundary against a tenant that already knows the digest: the
 /// child runs as the same uid as the supervisor maps to, so it can unlink the
@@ -1897,6 +1936,17 @@ pub const SECRETS_DIR_IN_SANDBOX: &str = "/run/secrets";
 /// that arrived over the control socket rather than through the filesystem.
 /// See `spec/protocol.md` §3.
 pub const SCRIPT_DIR_IN_SANDBOX: &str = "/run/script";
+
+/// The mode [`SCRIPT_DIR_IN_SANDBOX`] is created with. See above for why the
+/// read bit is absent.
+#[cfg(target_os = "linux")]
+pub const SCRIPT_DIR_MODE: u32 = 0o311;
+
+/// Everywhere else there is no sandbox to share and no `O_PATH` to open an
+/// unreadable directory with. The delivery path is Linux's; this keeps the
+/// tests that exercise it on a developer's Mac able to open what they wrote.
+#[cfg(not(target_os = "linux"))]
+pub const SCRIPT_DIR_MODE: u32 = 0o711;
 
 /// Scripts present in the sandbox for the requests that named them.
 ///
@@ -2003,10 +2053,28 @@ fn write_script(
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            // Enter but do not list: see `SCRIPT_DIR_IN_SANDBOX`.
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o711)).at(dir)?;
+            // Write and traverse, never list: see `SCRIPT_DIR_IN_SANDBOX`.
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(SCRIPT_DIR_MODE))
+                .at(dir)?;
         }
-        scripts.dir = Some(std::fs::File::open(dir).at(dir)?);
+        // `O_PATH`, because the mode above denies read to this process too —
+        // it is the same uid as everything in the sandbox, which is the point.
+        // An `O_PATH` descriptor names the directory without opening it for
+        // anything, and is exactly what `openat` and `unlinkat` need.
+        #[cfg(target_os = "linux")]
+        let opened = std::fs::File::from(
+            rustix::fs::open(
+                dir,
+                rustix::fs::OFlags::PATH
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(|e| Error::io(dir, std::io::Error::from(e)))?,
+        );
+        #[cfg(not(target_os = "linux"))]
+        let opened = std::fs::File::open(dir).at(dir)?;
+        scripts.dir = Some(opened);
     }
     let dir = scripts.dir.as_ref().expect("just set");
     write_request_file_at(dir, name, source, "writing a script into the sandbox")
@@ -2745,6 +2813,36 @@ impl Function {
         each!(self, f => f.call_timed(event, timeout))
     }
 
+    /// Serve one request against a script that did not come with the zygote.
+    ///
+    /// The runtime-pool shape. Only an agent can do this: warm-exec has no
+    /// protocol to carry a script in, and a `cmd` that took one as an
+    /// argument is the *warm-exec runtime* of the roadmap's Phase 3.4 rather
+    /// than this.
+    pub fn call_script_with_timeout(
+        &self,
+        event: serde_json::Value,
+        script: Option<crate::protocol::Script>,
+        timeout: std::time::Duration,
+    ) -> Result<Outcome> {
+        match self {
+            Function::Agent(f) => f
+                .call_script_timed(event, script, timeout)
+                .map(|(outcome, _)| outcome),
+            #[cfg(target_os = "linux")]
+            Function::Exec(f) => match script {
+                None => f.call_timed(event, timeout).map(|(outcome, _)| outcome),
+                Some(_) => Err(Error::BackendUnavailable {
+                    backend: "pool",
+                    reason: "a warm-exec function cannot be given a script".into(),
+                    remedy: "run scripts in a runtime pool, whose agent loads one per \
+                             request"
+                        .into(),
+                }),
+            },
+        }
+    }
+
     /// Ask the function to wind down. An agent is told so it can finish what
     /// it holds; a held sandbox has nothing to be told — its requests are
     /// children of the supervisor, not of the init, and finish on their own.
@@ -3411,7 +3509,8 @@ mod tests {
         );
         assert_eq!(
             std::fs::metadata(&dir).expect("stat").permissions().mode() & 0o777,
-            0o711
+            SCRIPT_DIR_MODE,
+            "the directory a tenant could list is the one thing this must not be"
         );
 
         drop(lease);
@@ -3713,6 +3812,26 @@ mod tests {
         resolve_standalone("demo", &layer, &ResolveOptions::default()).unwrap()
     }
 
+    /// A runtime pool: an image and an agent, and nothing of anybody's.
+    fn resolved_pool() -> ResolvedFn {
+        let layer = Layer {
+            image: Some("python:3.12-slim".into()),
+            runtime: Some(crate::spec::Runtime::Builtin(
+                crate::spec::BuiltinRuntime::Python,
+            )),
+            ..Default::default()
+        };
+        resolve_standalone(
+            "demo-pool",
+            &layer,
+            &ResolveOptions {
+                pool: true,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
     #[test]
     fn the_embedded_agent_is_the_real_one() {
         assert!(
@@ -3781,7 +3900,7 @@ mod tests {
             (BuiltinAgent::Python, "python3"),
             (BuiltinAgent::Node, "node"),
         ] {
-            let argv = agent.argv("function");
+            let argv = agent.argv("function", true);
             assert_eq!(argv[0], interpreter);
             assert_eq!(argv[1], agent.agent_in_sandbox());
             assert_eq!(argv[2], "--fd");
@@ -3792,6 +3911,39 @@ mod tests {
                 "a socket path would have to exist inside the sandbox: {argv:?}"
             );
         }
+    }
+
+    /// A pool zygote is started with no handler *argument*, not with an empty
+    /// one: the agent decides which shape it is by whether it was given one,
+    /// and an empty string is a path it would try to open.
+    #[test]
+    fn a_pool_zygote_is_started_without_a_handler_at_all() {
+        for agent in [BuiltinAgent::Python, BuiltinAgent::Node] {
+            let argv = agent.argv("function", false);
+            assert_eq!(argv.len(), 4, "{argv:?}");
+            assert_eq!(argv[3], AGENT_FD.to_string());
+            assert!(
+                !argv.iter().any(|a| a.contains("handler")),
+                "a pool zygote must not be told about a handler: {argv:?}"
+            );
+        }
+    }
+
+    /// And nothing of the tenant's is mounted into one either. The pool's
+    /// whole isolation claim is that its zygote is anonymous.
+    #[test]
+    fn a_pool_zygote_mounts_the_agent_and_nothing_else() {
+        let pool = resolved_pool();
+        let mounts = agent_mounts(
+            BuiltinAgent::Python,
+            std::path::Path::new("/data/agents/python/zygo_agent.py"),
+            &pool,
+        );
+        assert_eq!(mounts.len(), 1, "{mounts:?}");
+        assert_eq!(
+            mounts[0].target,
+            PathBuf::from(BuiltinAgent::Python.agent_in_sandbox())
+        );
     }
 
     /// The extension is not decoration: `require` and `import` both decide

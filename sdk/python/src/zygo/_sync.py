@@ -18,7 +18,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from ._endpoint import Endpoint, resolve
 from ._errors import NotFound, SpecError, TransportError, ZygoError, from_response
-from ._models import Function, LogPage, Result, Run, Script, Served
+from ._models import Function, LogPage, Result, Run, Runtime, Script, Served
 
 #: Largest answer read into memory. The API's own request limit is the same
 #: order, and an answer past it is a bug rather than a large result.
@@ -233,6 +233,70 @@ class Client:
         if cmd is not None:
             described["cmd"] = list(cmd)
         return Run.parse(self._request("POST", "/run", body={"layer": described, "stdin": stdin}))
+
+    def serve_runtime(
+        self,
+        name: str,
+        layer: Mapping[str, Any],
+        *,
+        base_dir: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Register a **runtime pool**: an image, a dependency set, an agent.
+
+        A pool holds no code. Scripts arrive with each call, so one pool serves
+        ten thousand of them where ten thousand functions would be ten thousand
+        warm zygotes. ``layer`` is a ``[runtime.<name>]`` table as a dictionary
+        — ``image``, ``agent``, ``min_warm``, ``max_warm`` and the limits.
+
+        Needs an API started with ``--allow-deploy``.
+        """
+        payload: Dict[str, Any] = {"name": name, "layer": dict(layer)}
+        if base_dir is not None:
+            payload["base_dir"] = os.path.abspath(base_dir)
+        return self._request("POST", "/runtimes", body=payload)
+
+    def runtimes(self) -> List[Runtime]:
+        """Every runtime pool this host holds."""
+        body = self._request("GET", "/runtimes")
+        return [Runtime.parse(r) for r in body.get("runtimes", [])]
+
+    def stop_runtime(self, name: str) -> List[str]:
+        """Stop a pool and drop its zygotes."""
+        body = self._request("DELETE", f"/runtimes/{_escape(name)}")
+        return list(body.get("stopped", []))
+
+    def run_script(
+        self,
+        runtime: str,
+        script: str,
+        event: Any = None,
+        *,
+        entry_point: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ) -> Result:
+        """Run one script in a pool.
+
+        ``script`` is either a ``sha256:…`` digest this host holds — register
+        it once with :meth:`put_script` — or the source itself. The digest is
+        the shape to build on: the bytes cross the wire once rather than on
+        every call, and the host can put the file in the sandbox instead of
+        sending it through the zygote.
+
+        Raises the same exceptions :meth:`call` does.
+        """
+        payload: Dict[str, Any] = {
+            "script": script if script.startswith("sha256:") else {"source": script},
+            "event": event,
+        }
+        if entry_point is not None:
+            payload["entry_point"] = entry_point
+        body = self._request(
+            "POST",
+            f"/runtimes/{_escape(runtime)}/call",
+            body=payload,
+            headers=_timeout_header(timeout),
+        )
+        return Result.parse(body)
 
     def put_script(self, source: str) -> Script:
         """Register a script and get back the name the host gave it.

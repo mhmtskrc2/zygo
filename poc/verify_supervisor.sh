@@ -1643,7 +1643,86 @@ fi
 "$ZYGO" stop nap2 >/dev/null 2>&1
 
 say ""
+say "runtime pools"
+# The other warm shape: a zygote that holds an interpreter and no tenant code,
+# with the script arriving in the request. What has to be true for several
+# tenants to share one is that the zygote is anonymous, so the checks here are
+# mostly about what is *not* in it.
+work /tmp/pool
+cat > a.py <<'PY'
+import os
+
+
+def handler(event):
+    return {"from": "a", "pid": os.getpid(), "file": __file__}
+PY
+cat > b.py <<'PY'
+def handler(event):
+    import sys
+    return {"saw_a": any("zygo_request" in m for m in sys.modules)}
+PY
+
+exits 0 "a runtime pool is served with no handler at all" \
+    "$ZYGO" serve --runtime pool --image "$IMAGE" --agent python --min-warm 1
+
+out=$("$ZYGO" exec --runtime pool --script a.py '{}' 2>&1)
+case $out in
+    *'"from": "a"'*) ok "a script from the command line runs in the pool" ;;
+    *) bad "exec --runtime: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-160)" ;;
+esac
+
+# The supervisor writes the script into the sandbox rather than sending it
+# through the zygote, which is what keeps a shared zygote free of tenant code.
+case $out in
+    *'/run/script/'*) ok "and reached the child as a file, not through the zygote" ;;
+    *) bad "the script did not arrive as a file: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-160)" ;;
+esac
+
+first_pid=$(printf '%s' "$out" | tr -d '\n ' | grep -o '"pid":[0-9]*' | grep -o '[0-9]*$')
+out=$("$ZYGO" exec --runtime pool --script a.py '{}' 2>&1)
+second_pid=$(printf '%s' "$out" | tr -d '\n ' | grep -o '"pid":[0-9]*' | grep -o '[0-9]*$')
+if [ -n "$first_pid" ] && [ "$first_pid" != "$second_pid" ]; then
+    ok "each script request is its own process ($first_pid then $second_pid)"
+else
+    bad "two script requests shared a process ($first_pid, $second_pid)"
+fi
+
+out=$("$ZYGO" exec --runtime pool --script b.py '{}' 2>&1)
+case $out in
+    *'"saw_a": false'*) ok "the zygote carries nothing from the script before" ;;
+    *) bad "a script was left in the zygote: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-160)" ;;
+esac
+
+# A pool is a row of its own in `top`, because it has no single state: counts
+# of warm and paused zygotes are what an operator needs instead.
+out=$("$ZYGO" top --once 2>&1)
+case $out in
+    *RUNTIME*WARM*PAUSED*) ok "\`top\` shows the pool with its zygote counts" ;;
+    *) bad "top has no runtime table: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)" ;;
+esac
+case $out in
+    *"pool "*) ok "and names it" ;;
+    *) bad "the pool is not in the table: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)" ;;
+esac
+
+out=$("$ZYGO" stats pool 2>&1)
+case $out in
+    *pool*) ok "\`stats\` summarises the pool's requests beside the functions'" ;;
+    *) bad "stats has no row for the pool: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-160)" ;;
+esac
+
+# A pool may not be given code to warm: that is the isolation claim, so it is
+# refused rather than quietly accepted.
+exits 1 "a pool that is given a handler is refused" \
+    "$ZYGO" serve a.py --runtime pool2 --image "$IMAGE"
+exits 4 "a script for a runtime nobody served is \`not found\`" \
+    "$ZYGO" exec --runtime nowhere --script a.py '{}'
+
+say ""
 say "replacement and shutdown"
+# Back where `handler.py` is: the pool section above works in a directory of
+# its own, and `serve handler.py` below resolves against the one it is in.
+work /tmp/sup-work
 # `double` has served several requests by now. Re-serving must give a new
 # sandbox with its own counters, not keep running the code that was loaded
 # before the handler was edited.

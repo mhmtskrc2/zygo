@@ -420,6 +420,23 @@ impl<'de> Deserialize<'de> for Runtime {
     }
 }
 
+/// `python`, `node`, or the path to an agent of your own.
+///
+/// The same two shapes the spec file's `runtime` takes, so a flag and a table
+/// key cannot disagree about syntax. A path is told apart by having a
+/// separator in it: an agent lives at an absolute path inside the sandbox, and
+/// a built-in is one word.
+impl std::str::FromStr for Runtime {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Runtime, ParseError> {
+        if s.contains('/') {
+            return Ok(Runtime::Agent(PathBuf::from(s)));
+        }
+        s.parse::<BuiltinRuntime>().map(Runtime::Builtin)
+    }
+}
+
 impl Serialize for Runtime {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         match self {

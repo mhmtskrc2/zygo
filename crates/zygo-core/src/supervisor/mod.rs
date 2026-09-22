@@ -22,6 +22,7 @@
 pub mod client;
 pub mod gate;
 pub mod protocol;
+pub mod runtime;
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -38,6 +39,7 @@ use crate::spec::{Layer, ResolveOptions, ResolvedFn, Spec};
 
 pub use gate::{Gate, Rejected};
 pub use protocol::{CONTROL_VERSION, Change, ControlError, Request, Response};
+pub use runtime::RuntimeStatus;
 
 /// How long a request waits for a concurrency slot before it is told to retry.
 ///
@@ -297,6 +299,9 @@ pub struct Supervisor {
     launcher: Launcher,
     paths: Paths,
     functions: Mutex<BTreeMap<String, Arc<Entry>>>,
+    /// Runtime pools: several anonymous zygotes each, with the script
+    /// arriving in the request. See [`runtime`].
+    runtimes: Mutex<BTreeMap<String, Arc<runtime::RuntimePool>>>,
     /// Functions tiered down to cold: registered, but with no sandbox.
     cold: Mutex<BTreeMap<String, Cold>>,
     /// Rewarm history per name. See [`Backoff`] for why it is not in `Entry`.
@@ -346,6 +351,7 @@ impl Supervisor {
             launcher: Launcher::new()?,
             paths,
             functions: Mutex::new(BTreeMap::new()),
+            runtimes: Mutex::new(BTreeMap::new()),
             cold: Mutex::new(BTreeMap::new()),
             rewarms: Mutex::new(BTreeMap::new()),
             warming: Mutex::new(BTreeMap::new()),
@@ -669,6 +675,7 @@ impl Supervisor {
                 tiered.paused.push(name);
             }
         }
+        self.tier_idle_runtimes(&mut tiered);
         tiered
     }
 
@@ -1311,6 +1318,13 @@ impl Listener {
                         for name in &tiered.cooled {
                             tracing::info!(function = %name, "idle: gone cold");
                         }
+                        // Both directions in one pass, on one thread: a pool
+                        // that is shrinking must not be growing at the same
+                        // time, and the cheapest way to guarantee that is for
+                        // the same loop to do both.
+                        for name in supervisor.scale_runtimes() {
+                            tracing::info!(runtime = %name, "load: grew by one zygote");
+                        }
                     }
                 })
                 .map_err(|e| Error::primitive("spawn", "idle thread", e))?
@@ -1400,6 +1414,7 @@ fn handle(supervisor: &Supervisor, stream: UnixStream) -> Result<()> {
                     allow_unlimited,
                     base_dir: Some(base_dir),
                     one_shot: true,
+                    pool: false,
                 };
                 // Received before anything else, and before deciding
                 // anything: the client has already sent them, and leaving
@@ -1501,6 +1516,7 @@ fn dispatch(supervisor: &Supervisor, request: Request, greeted: &mut bool) -> Re
                 allow_unlimited,
                 base_dir: Some(base_dir),
                 one_shot: false,
+                pool: false,
             };
             merge(supervisor.serve(
                 &name,
@@ -1525,6 +1541,40 @@ fn dispatch(supervisor: &Supervisor, request: Request, greeted: &mut bool) -> Re
             limit,
             failed,
         } => merge(supervisor.logs(&name, after, limit, failed)),
+        Request::ServeRuntime {
+            name,
+            spec,
+            layer,
+            base_dir,
+            allow_host_net,
+            allow_private_net,
+            allow_unlimited,
+        } => {
+            let options = ResolveOptions {
+                allow_host_net,
+                allow_private_net,
+                allow_unlimited,
+                base_dir: Some(base_dir),
+                one_shot: false,
+                pool: true,
+            };
+            merge(supervisor.serve_runtime(&name, spec.as_deref(), &layer, &options))
+        }
+        Request::ExecScript {
+            runtime,
+            script,
+            event,
+            timeout_ms,
+        } => merge(supervisor.exec_script(
+            &runtime,
+            script,
+            event,
+            Duration::from_millis(timeout_ms),
+        )),
+        Request::Runtimes => Response::Runtimes {
+            runtimes: supervisor.runtimes(),
+        },
+        Request::StopRuntime { name } => merge(supervisor.stop_runtime(&name)),
         Request::PutScript { source } => merge(supervisor.put_script(&source)),
         Request::GetScript { digest } => merge(supervisor.get_script(&digest)),
         Request::DeleteScript { digest } => merge(supervisor.delete_script(&digest)),

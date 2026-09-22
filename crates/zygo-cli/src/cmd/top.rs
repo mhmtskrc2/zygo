@@ -46,6 +46,13 @@ pub fn run(cli: &Cli, interval: f64, once: bool) -> anyhow::Result<u8> {
             Response::Functions { functions } => functions,
             other => return super::supervisor::report_failure(cli, &other),
         };
+        // Two registries, two tables. A pool has no single state and no one
+        // handler, so its row is warm/paused/cold counts rather than the
+        // function columns with three of them left blank.
+        let pools = match client.send(&Request::Runtimes)? {
+            Response::Runtimes { runtimes } => runtimes,
+            other => return super::supervisor::report_failure(cli, &other),
+        };
         let now = Instant::now();
         let rows: Vec<Row> = functions
             .iter()
@@ -53,7 +60,10 @@ pub fn run(cli: &Cli, interval: f64, once: bool) -> anyhow::Result<u8> {
             .collect();
 
         if cli.json {
-            output::json(&rows)?;
+            output::json(&serde_json::json!({
+                "functions": rows,
+                "runtimes": pools,
+            }))?;
             return Ok(0);
         }
 
@@ -63,7 +73,8 @@ pub fn run(cli: &Cli, interval: f64, once: bool) -> anyhow::Result<u8> {
             // understand it is left with a readable log instead of garbage.
             print!("\x1b[H\x1b[J");
         }
-        print(&rows, &style, previous.is_none());
+        print(&rows, &style, previous.is_none() && pools.is_empty());
+        print_pools(&pools, &style);
 
         previous = Some(Sample {
             at: now,
@@ -120,6 +131,42 @@ impl Row {
             failures_per_s: rates.map(|(_, f)| f),
         }
     }
+}
+
+/// One row per runtime pool: how many zygotes it has, in what state, and how
+/// much room is left between them and `max_warm`.
+///
+/// Counts rather than a state, because a pool does not have one: four zygotes
+/// of which two are frozen is a pool that is working and idle at once, and
+/// collapsing that into a word would lose the thing an operator is looking
+/// for.
+fn print_pools(pools: &[zygo_core::supervisor::RuntimeStatus], style: &Style) {
+    if pools.is_empty() {
+        return;
+    }
+    let name_w = pools.iter().map(|p| p.name.len()).max().unwrap_or(7).max(7);
+    println!();
+    println!(
+        "{:name_w$}  {:>5} {:>6} {:>5}  {:>7}  {:>9}  {:>8}  {:>8}",
+        "RUNTIME", "WARM", "PAUSED", "ROOM", "IN/QUEUE", "RSS", "REQUESTS", "FAILURES"
+    );
+    for p in pools {
+        println!(
+            "{:name_w$}  {:>5} {:>6} {:>5}  {:>7}  {:>9}  {:>8}  {:>8}",
+            p.name,
+            p.warm,
+            p.paused,
+            p.cold,
+            format!("{}/{}", p.in_flight, p.queued),
+            format!("{:.1} MB", p.rss_kb as f64 / 1024.0),
+            p.requests,
+            p.failures,
+        );
+    }
+    println!(
+        "{}",
+        style.dim("  ROOM is what is left between the zygotes that exist and max_warm")
+    );
 }
 
 fn print(rows: &[Row], style: &Style, first_frame: bool) {

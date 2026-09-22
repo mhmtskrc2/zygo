@@ -33,7 +33,10 @@ use crate::spec::{Layer, Spec};
 ///   supervisor on the client's streams.
 /// - v3: `PUT_SCRIPT`, `GET_SCRIPT`, `DELETE_SCRIPT` and `SCRIPT` — the
 ///   content-addressed script store behind `PUT /scripts`.
-pub const CONTROL_VERSION: u32 = 3;
+/// - v4: `SERVE_RUNTIME`, `EXEC_SCRIPT`, `RUNTIMES`, `STOP_RUNTIME` and their
+///   answers — runtime pools, where the zygote is warm and the script arrives
+///   with the request.
+pub const CONTROL_VERSION: u32 = 4;
 
 /// CLI → supervisor.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -190,6 +193,40 @@ pub enum Request {
 
     /// Forget a script. `not_found` if it was never registered.
     DeleteScript { digest: String },
+
+    /// Register a runtime pool and warm `min_warm` zygotes.
+    ///
+    /// The same inputs as `SERVE` minus the secrets, because a pool holds
+    /// none: a secret belongs to a tenant's request, and a pool's zygotes are
+    /// shared. What it may not carry is `entry` or `cmd` — the resolver
+    /// refuses those for a pool, and that refusal is the isolation claim.
+    ServeRuntime {
+        name: String,
+        spec: Option<Box<Spec>>,
+        layer: Box<Layer>,
+        base_dir: std::path::PathBuf,
+        allow_host_net: bool,
+        allow_private_net: bool,
+        allow_unlimited: bool,
+    },
+
+    /// Run one script in a pool.
+    ///
+    /// `script` is the request's own code, as protocol 1.1 carries it: either
+    /// `source` or a `digest` the store already holds. The supervisor decides
+    /// how it reaches the child.
+    ExecScript {
+        runtime: String,
+        script: crate::protocol::Script,
+        event: serde_json::Value,
+        timeout_ms: u64,
+    },
+
+    /// Everything `zygo top` shows about the pools.
+    Runtimes,
+
+    /// Stop a pool and drop its zygotes.
+    StopRuntime { name: String },
 }
 
 fn default_log_limit() -> u32 {
@@ -300,6 +337,26 @@ pub enum Response {
     Warmed {
         name: String,
         state: crate::sandbox::SandboxState,
+    },
+
+    /// A runtime pool is registered and its floor is warm.
+    RuntimeServed {
+        name: String,
+        /// What the agent announced, e.g. `python/3.12.4`.
+        runtime: String,
+        /// Zygotes warmed, which is the pool's `min_warm`.
+        warm: u32,
+        rss_kb: u64,
+        imports_ms: f64,
+        warm_ms: f64,
+        warnings: Vec<String>,
+        #[serde(default)]
+        change: Change,
+    },
+
+    /// Answer to `Runtimes`.
+    Runtimes {
+        runtimes: Vec<super::runtime::RuntimeStatus>,
     },
 
     /// Answer to `PutScript` and `GetScript`.
@@ -464,6 +521,29 @@ mod tests {
             Request::DeleteScript {
                 digest: "sha256:abc".into(),
             },
+            Request::ServeRuntime {
+                name: "py312".into(),
+                spec: None,
+                layer: Box::new(Layer {
+                    image: Some("python:3.12-slim".into()),
+                    min_warm: Some(2),
+                    ..Default::default()
+                }),
+                base_dir: "/srv".into(),
+                allow_host_net: false,
+                allow_private_net: false,
+                allow_unlimited: false,
+            },
+            Request::ExecScript {
+                runtime: "py312".into(),
+                script: crate::protocol::Script::inline("def handler(e):\n    return e\n"),
+                event: serde_json::json!({ "n": 1 }),
+                timeout_ms: 30_000,
+            },
+            Request::Runtimes,
+            Request::StopRuntime {
+                name: "py312".into(),
+            },
         ];
         for r in &requests {
             assert_eq!(&roundtrip_request(r), r, "{r:?}");
@@ -510,6 +590,34 @@ mod tests {
                 digest: "sha256:abc".into(),
                 size: 41,
                 existed: true,
+            },
+            Response::RuntimeServed {
+                name: "py312".into(),
+                runtime: "python/3.12.4".into(),
+                warm: 2,
+                rss_kb: 15_000,
+                imports_ms: 120.5,
+                warm_ms: 410.0,
+                warnings: vec![],
+                change: Change::Started,
+            },
+            Response::Runtimes {
+                runtimes: vec![crate::supervisor::runtime::RuntimeStatus {
+                    name: "py312".into(),
+                    image: "python:3.12-slim".into(),
+                    runtime: "python/3.12.4".into(),
+                    warm: 2,
+                    paused: 1,
+                    cold: 1,
+                    min_warm: 2,
+                    max_warm: 4,
+                    in_flight: 3,
+                    queued: 0,
+                    requests: 91,
+                    failures: 2,
+                    rss_kb: 30_000,
+                    uptime_s: 42,
+                }],
             },
             Response::Sandbox {
                 name: "resize".into(),

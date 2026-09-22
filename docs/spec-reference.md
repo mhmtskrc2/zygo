@@ -1,8 +1,9 @@
 # `sandbox.toml` reference
 
-Three sections: `[defaults]`, one `[fn.<name>]` per function, and an optional
-`[api]`. Every function field may also appear in `[defaults]`, and every one
-has a CLI flag on `zygo run` and `zygo serve`. Precedence, highest first:
+Four sections: `[defaults]`, one `[fn.<name>]` per function, one
+`[runtime.<name>]` per runtime pool, and an optional `[api]`. Every function
+field may also appear in `[defaults]`, and every one has a CLI flag on
+`zygo run` and `zygo serve`. Precedence, highest first:
 **CLI flag → `[fn.<name>]` → `[defaults]` → built-in default**.
 `zygo spec explain <name>` prints the result of that merge, resolved; `zygo
 spec validate` checks the file without running anything. An unknown field is
@@ -69,6 +70,55 @@ then only `timeout`.
 | `concurrency` | integer | `4` | Requests in flight at once; four times that may queue, and the rest get `BUSY` (`429` over HTTP, exit 75 from the CLI). |
 | `idle_timeout` | duration | `10m` | After this long without a request the function is *paused*: frozen, still resident, thawed on the next request in single-digit milliseconds. |
 | `cold_after` | duration | `1h` | After this long it is *cold*: the sandbox is dropped and only the spec kept. The next request pays the warm-up. Must not be shorter than `idle_timeout`. |
+
+## `[runtime.<name>]` — a runtime pool
+
+The other warm shape. A `[fn.<name>]` warms *one script* into one zygote,
+which is right for a function that is called often. A `[runtime.<name>]` warms
+an **interpreter and its dependency set, with no code in it at all**: several
+anonymous zygotes that any script can run in, one script per request, loaded
+in the forked child and gone with it.
+
+That is what an embedder with ten thousand scripts needs. A warm zygote costs
+about 10 MB of proportional memory ([`bench-embed.md`](bench-embed.md)), which
+is 97 GiB at ten thousand functions and about 40 MB at four pooled zygotes.
+
+```toml
+[runtime.py312]
+image = "python:3.12-slim"
+agent = "python"                 # or "node", or { agent = "/app/my-agent" }
+requirements = "requirements.txt"
+min_warm = 2
+max_warm = 8
+mem = "512M"
+timeout = "60s"
+```
+
+```bash
+zygo serve --runtime py312 --image python:3.12-slim --agent python
+zygo exec --runtime py312 --script report.py '{"month": "2026-09"}'
+```
+
+Every field above except these three is an ordinary function field and means
+the same thing — limits, network, mounts, `system`, `requirements`. What
+differs:
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `agent` | `python`, `node`, `{ agent = "…" }` | — (required) | Which agent the zygotes run. The same values `runtime` takes on a function, under the name that reads better here. |
+| `min_warm` | integer | `1` | Zygotes kept warm whatever the load. The floor is what the next request's latency depends on. |
+| `max_warm` | integer | `4` | Zygotes the pool may grow to. It adds one per second while every warm zygote is full, and gives them back through the ordinary `idle_timeout`/`cold_after` tiering — the ones above `min_warm` first. |
+
+`entry` and `cmd` are **refused** in a `[runtime.…]` table, and that refusal
+is the isolation claim rather than a style rule: a pool's zygotes are shared
+between tenants, so anything warmed into one is code every tenant's request
+forks from. `concurrency` is per zygote, so a pool admits
+`concurrency × max_warm` requests before it answers `BUSY`.
+
+Scripts reach a pool as bytes in the request, or by the digest of a script
+registered once with `PUT /scripts`. Either way the supervisor writes the file
+into the sandbox and the child loads it: the zygote never holds it. See
+[the SDK guide](sdk.md#the-script-store).
 
 ## `[api]`
 

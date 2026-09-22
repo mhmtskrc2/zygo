@@ -386,3 +386,47 @@ test('a script the host does not have is a NotFound', async () => {
     await api.close();
   }
 });
+
+test('a runtime pool is registered, listed, called and stopped', async () => {
+  // The embedder's path end to end: one pool, a script registered once, and a
+  // call that names the digest rather than shipping the bytes again.
+  const api = await FakeApi.start();
+  const digest = 'sha256:' + '1'.repeat(64);
+  api.answer('POST', '/runtimes', 200, {
+    name: 'py312', runtime: 'python/3.12.4', warm: 2, warm_ms: 410, change: 'started',
+  });
+  api.answer('GET', '/runtimes', 200, {
+    runtimes: [{ name: 'py312', warm: 2, paused: 0, cold: 2, min_warm: 2, max_warm: 4 }],
+  });
+  api.answer('POST', '/runtimes/py312/call', 200, {
+    result: { ok: true }, stdout: '', stderr: '', metrics: { wall_ms: 2.1 },
+  });
+  api.answer('DELETE', '/runtimes/py312', 200, { stopped: ['py312'] });
+
+  const client = connect(api.url, { token: null });
+  try {
+    const served = await client.serveRuntime('py312', {
+      image: 'python:3.12-slim', agent: 'python', min_warm: 2,
+    });
+    assert.equal(served.warm, 2);
+    assert.equal(api.requests[0].body.layer.agent, 'python');
+
+    const pools = await client.runtimes();
+    assert.equal(pools[0].max_warm, 4);
+
+    const out = await client.runScript('py312', digest, { n: 1 });
+    assert.deepEqual(out.result, { ok: true });
+    const sent = api.requests[2].body;
+    assert.equal(sent.script, digest, 'a digest goes as a string, not as source');
+    assert.deepEqual(sent.event, { n: 1 });
+
+    // And a one-off, where there is nothing registered to name.
+    await client.runScript('py312', 'def handler(e):\n    return e\n');
+    assert.equal(api.requests[3].body.script.source.startsWith('def handler'), true);
+
+    assert.deepEqual(await client.stopRuntime('py312'), ['py312']);
+  } finally {
+    client.close();
+    await api.close();
+  }
+});

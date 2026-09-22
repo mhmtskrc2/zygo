@@ -77,11 +77,15 @@ executes.
 | Recent log | `client.logs(name)` | `client.logs(name)` | no |
 | Version | `client.version()` | `client.version()` | no |
 | Look a script up | `client.script(digest)` | `client.script(digest)` | no |
+| Run a script in a pool | `client.run_script(runtime, script)` | `client.runScript(runtime, script)` | no |
+| List runtime pools | `client.runtimes()` | `client.runtimes()` | no |
 | Serve a function | `client.serve(name, layer)` | `client.serve(name, layer)` | **yes** |
 | Stop one | `client.stop(name)` | `client.stop(name)` | **yes** |
 | One-shot sandbox | `client.run(image, cmd)` | `client.run(image, cmd)` | **yes** |
 | Register a script | `client.put_script(source)` | `client.putScript(source)` | **yes** |
 | Forget a script | `client.delete_script(digest)` | `client.deleteScript(digest)` | **yes** |
+| Serve a runtime pool | `client.serve_runtime(name, layer)` | `client.serveRuntime(name, layer)` | **yes** |
+| Stop one | `client.stop_runtime(name)` | `client.stopRuntime(name)` | **yes** |
 
 A one-shot run answers with more than an exit code, because the exit code
 cannot carry what a caller needs:
@@ -96,6 +100,41 @@ A deadline kill and an out-of-memory kill are both `SIGKILL`, so both are 137.
 comes from the kernel's own counter in the sandbox's cgroup. Neither is a
 guess, and a caller deciding between "too slow" and "too much memory" — an
 online judge, a CI step — has nothing else to go on.
+
+## Runtime pools
+
+A warm function is one script in one zygote. A **runtime pool** is the other
+shape: an image, a dependency set and an agent, with no code in it, and the
+script arrives with the call.
+
+```python
+client.serve_runtime("py312", {                 # POST /runtimes
+    "image": "python:3.12-slim",
+    "agent": "python",
+    "min_warm": 2, "max_warm": 8,
+    "mem": "512M", "timeout": "60s",
+})
+
+script = client.put_script(source)              # once, PUT /scripts
+out = client.run_script("py312", script.sha256, {"month": "2026-09"})
+print(out.result, out.metrics.wall_ms)
+```
+
+```js
+await client.serveRuntime('py312', { image: 'python:3.12-slim', agent: 'python' });
+const { sha256 } = await client.putScript(source);
+const out = await client.runScript('py312', sha256, { month: '2026-09' });
+```
+
+`client.runtimes()` lists the pools with their zygote counts, and
+`client.stop_runtime(name)` drops them. `run_script` also takes the source
+directly, for a one-off that is not worth registering.
+
+The request never reaches the zygote: the supervisor writes the script into
+the sandbox and the forked child loads it, after the child's seccomp filter is
+installed. That is what makes it safe for two tenants to share a pool, and it
+is checked rather than asserted — `poc/verify_api.sh` asks a script where it
+was loaded from and whether it can list what else is in flight.
 
 ## The script store
 
@@ -132,15 +171,19 @@ declared in a spec file and nothing else, which is the shape most deployments
 want: the boundary lives in a file that was reviewed.
 
 `--allow-deploy` adds `PUT /fn/<name>`, `DELETE /fn/<name>`, `POST /run`,
-`PUT /scripts` and `DELETE /scripts/<hash>`. The first three let a caller name
+`PUT /scripts`, `DELETE /scripts/<hash>`, `POST /runtimes` and
+`DELETE /runtimes/<name>`. The first three let a caller name
 any image, any mount and any command, which is running arbitrary code as the
 user the API runs as — a shell, not an API. Turn it on for a local SDK or an
 embedder you control, and think twice anywhere else.
 
-Registering a script is behind the same gate for now, and that is a placeholder
-rather than a judgement: a script nobody can run is not a widened boundary, but
-a *tenant* registering one is exactly what per-tenant tokens are for, and those
-do not exist yet. `GET /scripts/<hash>` is not gated — it answers a size.
+Registering a script and creating a pool are behind the same gate for now, and
+for registering that is a placeholder rather than a judgement: a script nobody
+can run is not a widened boundary, but a *tenant* registering one is exactly
+what per-tenant tokens are for, and those do not exist yet. Creating a pool is
+a deploy in its own right — it names an image and mounts. `GET /scripts/<hash>`,
+`GET /runtimes` and `POST /runtimes/<name>/call` are not gated: calling a pool
+somebody else declared is exactly what a call-only token is for.
 
 Without it, those calls raise `AuthError` and the message names the flag.
 

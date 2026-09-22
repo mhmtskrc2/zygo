@@ -113,6 +113,53 @@ class Served:
 
 
 @dataclass(frozen=True)
+class Runtime:
+    """One runtime pool: several anonymous zygotes any script can run in.
+
+    ``warm`` and ``paused`` are zygotes that exist; ``cold`` is the room left
+    between them and ``max_warm``. A pool has no single state — four zygotes of
+    which two are frozen is working and idle at once — so the counts are what
+    is reported rather than a word.
+    """
+
+    name: str
+    image: str = ""
+    runtime: str = ""
+    warm: int = 0
+    paused: int = 0
+    cold: int = 0
+    min_warm: int = 0
+    max_warm: int = 0
+    in_flight: int = 0
+    queued: int = 0
+    requests: int = 0
+    failures: int = 0
+    rss_kb: int = 0
+    uptime_s: int = 0
+    raw: Dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def parse(cls, raw: Dict[str, Any]) -> "Runtime":
+        return cls(
+            name=str(raw.get("name", "")),
+            image=str(raw.get("image", "")),
+            runtime=str(raw.get("runtime", "")),
+            warm=int(raw.get("warm", 0)),
+            paused=int(raw.get("paused", 0)),
+            cold=int(raw.get("cold", 0)),
+            min_warm=int(raw.get("min_warm", 0)),
+            max_warm=int(raw.get("max_warm", 0)),
+            in_flight=int(raw.get("in_flight", 0)),
+            queued=int(raw.get("queued", 0)),
+            requests=int(raw.get("requests", 0)),
+            failures=int(raw.get("failures", 0)),
+            rss_kb=int(raw.get("rss_kb", 0)),
+            uptime_s=int(raw.get("uptime_s", 0)),
+            raw=raw,
+        )
+
+
+@dataclass(frozen=True)
 class Script:
     """A script the host holds, named by the SHA-256 of its bytes.
 

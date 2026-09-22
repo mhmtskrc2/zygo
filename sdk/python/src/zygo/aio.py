@@ -20,7 +20,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from ._endpoint import Endpoint, resolve
 from ._errors import TransportError, ZygoError
-from ._models import Function, LogPage, Result, Run, Script, Served
+from ._models import Function, LogPage, Result, Run, Runtime, Script, Served
 from ._sync import (
     MAX_BODY,
     _batch_element,
@@ -156,6 +156,49 @@ class AsyncClient:
             described["cmd"] = list(cmd)
         body = await self._request("POST", "/run", body={"layer": described, "stdin": stdin})
         return Run.parse(body)
+
+    async def serve_runtime(
+        self,
+        name: str,
+        layer: Mapping[str, Any],
+        *,
+        base_dir: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"name": name, "layer": dict(layer)}
+        if base_dir is not None:
+            payload["base_dir"] = os.path.abspath(base_dir)
+        return await self._request("POST", "/runtimes", body=payload)
+
+    async def runtimes(self) -> List[Runtime]:
+        body = await self._request("GET", "/runtimes")
+        return [Runtime.parse(r) for r in body.get("runtimes", [])]
+
+    async def stop_runtime(self, name: str) -> List[str]:
+        body = await self._request("DELETE", f"/runtimes/{_escape(name)}")
+        return list(body.get("stopped", []))
+
+    async def run_script(
+        self,
+        runtime: str,
+        script: str,
+        event: Any = None,
+        *,
+        entry_point: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ) -> Result:
+        payload: Dict[str, Any] = {
+            "script": script if script.startswith("sha256:") else {"source": script},
+            "event": event,
+        }
+        if entry_point is not None:
+            payload["entry_point"] = entry_point
+        body = await self._request(
+            "POST",
+            f"/runtimes/{_escape(runtime)}/call",
+            body=payload,
+            headers=_timeout_header(timeout),
+        )
+        return Result.parse(body)
 
     async def put_script(self, source: str) -> Script:
         return Script.parse(await self._request("PUT", "/scripts", raw_body=source.encode()))

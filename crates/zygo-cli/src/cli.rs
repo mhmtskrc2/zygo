@@ -587,12 +587,21 @@ pub enum SupervisorCommand {
 
 #[derive(Debug, Args)]
 pub struct ServeArgs {
-    /// Handler file.
-    pub handler: PathBuf,
+    /// Handler file. Omitted for a runtime pool, which holds no code.
+    pub handler: Option<PathBuf>,
 
     /// Name to register the function under.
     #[arg(long)]
-    pub name: String,
+    pub name: Option<String>,
+
+    /// Serve a **runtime pool** under this name instead of a function.
+    ///
+    /// A pool is an image, a dependency set and an agent, with no handler:
+    /// scripts arrive with the request (`zygo exec --runtime <name>
+    /// --script <file>`). One pool serves ten thousand scripts; ten thousand
+    /// functions would be ten thousand warm zygotes.
+    #[arg(long, value_name = "NAME", conflicts_with = "name")]
+    pub runtime: Option<String>,
 
     #[command(flatten)]
     pub spec_file: SpecFileArgs,
@@ -604,6 +613,27 @@ pub struct ServeArgs {
     /// Concurrent forks allowed per zygote.
     #[arg(long)]
     pub concurrency: Option<u32>,
+
+    /// Image to warm the sandbox from.
+    ///
+    /// Defaults to the spec file's, or to the runtime's own
+    /// (`python:3.12-slim`, `node:22-slim`). A runtime pool has no handler to
+    /// infer one from, so it is the usual way to say which image a pool is.
+    #[arg(long)]
+    pub image: Option<String>,
+
+    /// Which agent a runtime pool warms: `python`, `node`, or the path to an
+    /// agent of your own inside the sandbox. With `--runtime`.
+    #[arg(long, requires = "runtime", value_name = "AGENT", value_parser = parse_runtime)]
+    pub agent: Option<zygo_core::spec::Runtime>,
+
+    /// Zygotes a pool keeps warm whatever the load. With `--runtime`.
+    #[arg(long, requires = "runtime")]
+    pub min_warm: Option<u32>,
+
+    /// Zygotes a pool may grow to under load. With `--runtime`.
+    #[arg(long, requires = "runtime")]
+    pub max_warm: Option<u32>,
 
     /// Pause the zygote after this long idle.
     #[arg(long, value_parser = parse_duration)]
@@ -627,11 +657,25 @@ pub struct ServeArgs {
 
 #[derive(Debug, Args)]
 pub struct ExecArgs {
-    /// Function name.
-    pub name: String,
+    /// Function name. With `--runtime`, this positional is the event instead:
+    /// a pool has no function name to give.
+    pub name: Option<String>,
 
     /// JSON event. Read from stdin when omitted.
     pub event: Option<String>,
+
+    /// Run a script in this **runtime pool** rather than calling a function.
+    #[arg(long, value_name = "NAME", requires = "script")]
+    pub runtime: Option<String>,
+
+    /// The script to run in the pool, as a file on this host or a
+    /// `sha256:…` digest the host already holds (`PUT /scripts`).
+    #[arg(long, value_name = "FILE|DIGEST", requires = "runtime")]
+    pub script: Option<String>,
+
+    /// The function in the script to call, when it is not `handler`.
+    #[arg(long, requires = "script")]
+    pub entry_point: Option<String>,
 
     /// Read newline-delimited JSON events and run them in parallel.
     #[arg(long)]
@@ -765,6 +809,7 @@ impl SandboxArgs {
             allow_unlimited: self.allow_unlimited,
             base_dir: None,
             one_shot: false,
+            pool: false,
         }
     }
 }
@@ -790,18 +835,55 @@ impl ServeArgs {
     /// The override layer these flags describe.
     pub fn to_layer(&self) -> anyhow::Result<Layer> {
         let mut layer = Layer {
-            entry: Some(self.handler.clone()),
+            image: self.image.clone(),
+            entry: self.handler.clone(),
             requirements: self.requirements.clone(),
             concurrency: self.concurrency,
             idle_timeout: self.idle_timeout,
             mode: self.mode,
+            runtime: self.agent.clone(),
             secrets: (!self.secrets.is_empty()).then(|| self.secrets.clone()),
+            min_warm: self.min_warm,
+            max_warm: self.max_warm,
             ..Default::default()
         };
         self.limits.apply(&mut layer);
         self.sandbox.apply(&mut layer)?;
         Ok(layer)
     }
+
+    /// What this invocation is serving, with the combinations that make no
+    /// sense refused where the user can see them.
+    pub fn target(&self) -> anyhow::Result<ServeTarget> {
+        match (&self.runtime, &self.name, &self.handler) {
+            (Some(runtime), _, None) => Ok(ServeTarget::Runtime(runtime.clone())),
+            (Some(runtime), _, Some(handler)) => anyhow::bail!(
+                "`--runtime {runtime}` and a handler ({}) cannot both be given\n  \
+                 → a pool's zygotes are shared between tenants, so nothing is \
+                 warmed into one; scripts arrive with the request",
+                handler.display()
+            ),
+            (None, Some(name), Some(_)) => Ok(ServeTarget::Function(name.clone())),
+            (None, Some(name), None) => anyhow::bail!(
+                "`--name {name}` needs a handler file\n  \
+                 → `zygo serve handler.py --name {name}`, or `--runtime {name}` \
+                 for a pool with no handler at all"
+            ),
+            (None, None, _) => anyhow::bail!(
+                "nothing to serve\n  \
+                 → `zygo serve handler.py --name <name>` for a function, or \
+                 `zygo serve --runtime <name> --image <image> --agent python` \
+                 for a runtime pool"
+            ),
+        }
+    }
+}
+
+/// What a `zygo serve` is registering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServeTarget {
+    Function(String),
+    Runtime(String),
 }
 
 // Value parsers. Each defers to the same `FromStr` the spec file uses, so a
@@ -823,6 +905,7 @@ parser!(parse_seccomp, SeccompProfile);
 parser!(parse_mount, Mount);
 parser!(parse_allow, AllowRule);
 parser!(parse_mode, HandlerMode);
+parser!(parse_runtime, zygo_core::spec::Runtime);
 
 #[cfg(test)]
 mod tests {
@@ -986,7 +1069,7 @@ mod tests {
         let Command::Serve(args) = cli.command else {
             panic!()
         };
-        assert_eq!(args.name, "fetch");
+        assert_eq!(args.name.as_deref(), Some("fetch"));
         let layer = args.to_layer().unwrap();
         assert_eq!(layer.entry, Some(PathBuf::from("./handler.py")));
         assert_eq!(layer.network, Some(Network::Egress));

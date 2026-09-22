@@ -94,6 +94,31 @@ export interface RunResult {
   readonly ok: boolean;
 }
 
+/**
+ * One runtime pool: several anonymous zygotes any script can run in.
+ *
+ * `warm` and `paused` are zygotes that exist; `cold` is the room left between
+ * them and `maxWarm`. A pool has no single state — four zygotes of which two
+ * are frozen is working and idle at once — so the counts are what is reported.
+ */
+export interface RuntimePool {
+  name: string;
+  image: string;
+  /** What the agent announced, e.g. `python/3.12.4`. */
+  runtime: string;
+  warm: number;
+  paused: number;
+  cold: number;
+  min_warm: number;
+  max_warm: number;
+  in_flight: number;
+  queued: number;
+  requests: number;
+  failures: number;
+  rss_kb: number;
+  uptime_s: number;
+}
+
 /** A script the host holds, named by the SHA-256 of its bytes. */
 export interface Script {
   /** `sha256:…`, which is the script's name everywhere else. */
@@ -149,6 +174,10 @@ export interface Layer {
   cold_after?: string;
   workdir?: string;
   user?: string;
+  /** `[runtime.<name>]` only: which agent to warm, and how many zygotes. */
+  agent?: string | { agent: string };
+  min_warm?: number;
+  max_warm?: number;
   [key: string]: unknown;
 }
 
@@ -201,6 +230,18 @@ export declare class Client {
   stop(name: string): Promise<string[]>;
   /** Needs an API started with `--allow-deploy`. */
   run(image: string, cmd?: string[] | null, options?: Layer & { stdin?: string }): Promise<RunResult>;
+
+  /** Needs an API started with `--allow-deploy`. */
+  serveRuntime(name: string, layer: Layer, options?: { baseDir?: string }): Promise<Record<string, unknown>>;
+  runtimes(): Promise<RuntimePool[]>;
+  /** Needs an API started with `--allow-deploy`. */
+  stopRuntime(name: string): Promise<string[]>;
+  runScript<T = unknown>(
+    runtime: string,
+    script: string,
+    event?: unknown,
+    options?: { entryPoint?: string; timeout?: number }
+  ): Promise<Result<T>>;
 
   /** Needs an API started with `--allow-deploy`. */
   putScript(source: string): Promise<Script>;

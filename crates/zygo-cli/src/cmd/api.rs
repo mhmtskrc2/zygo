@@ -435,6 +435,23 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<Full<B
         }
         (&Method::GET, ["fn", name, "stats"]) => stats(api, name.to_string()).await,
         (&Method::POST, ["fn", name, "warm"]) => warm(api, name.to_string()).await,
+        (&Method::GET, ["runtimes"]) => runtimes(api).await,
+        (&Method::POST, ["runtimes"]) => {
+            deployable(api)?;
+            let body = read_body(req).await?;
+            serve_runtime(api, &body).await
+        }
+        (&Method::DELETE, ["runtimes", name]) => {
+            let name = name.to_string();
+            deployable(api)?;
+            stop_runtime(api, name).await
+        }
+        (&Method::POST, ["runtimes", name, "call"]) => {
+            let name = name.to_string();
+            let timeout_ms = timeout_header(&req)?;
+            let body = read_body(req).await?;
+            call_runtime(api, name, &body, timeout_ms).await
+        }
         (&Method::PUT, ["scripts"]) => {
             deployable(api)?;
             let body = read_body(req).await?;
@@ -450,6 +467,7 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<Full<B
         | (_, ["metrics"])
         | (_, ["version"])
         | (_, ["run"])
+        | (_, ["runtimes", ..])
         | (_, ["scripts", ..]) => Err(HttpError::new(
             StatusCode::METHOD_NOT_ALLOWED,
             format!("{} {}", req.method(), path),
@@ -723,6 +741,146 @@ async fn stats(api: &Arc<Api>, name: String) -> Result<Response<Full<Bytes>>, Ht
 
 async fn warm(api: &Arc<Api>, name: String) -> Result<Response<Full<Bytes>>, HttpError> {
     let reply = control(api, move |c| Ok(c.send(&Control::Warm { name })?)).await?;
+    Ok(reply_to_response(reply))
+}
+
+/// What `POST /runtimes` accepts: a `[runtime.<name>]` table as JSON.
+///
+/// The same shape as `PUT /fn/<name>`, minus the two things a pool cannot
+/// have. There are no `secrets`, because a secret belongs to a tenant's
+/// request and a pool's zygotes are shared; and `base_dir` is optional,
+/// because a pool names no files on the host — that is what makes it the
+/// route an embedder can build on without touching the Zygo host's disk.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServeRuntimeRequest {
+    name: String,
+    #[serde(default)]
+    layer: Layer,
+    /// Only needed when the table names a path — `requirements`, a mount.
+    #[serde(default)]
+    base_dir: Option<std::path::PathBuf>,
+}
+
+async fn serve_runtime(api: &Arc<Api>, body: &[u8]) -> Result<Response<Full<Bytes>>, HttpError> {
+    let request: ServeRuntimeRequest = serde_json::from_slice(body).map_err(|e| {
+        HttpError::new(
+            StatusCode::BAD_REQUEST,
+            format!("body is not a runtime definition: {e}"),
+        )
+    })?;
+    if let Some(base_dir) = &request.base_dir
+        && !base_dir.is_absolute()
+    {
+        return Err(HttpError::new(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "`base_dir` must be absolute, and `{}` is not\n  \
+                 → it names a directory on the host this API runs on",
+                base_dir.display()
+            ),
+        ));
+    }
+    // `/` is as good a default as any and is never used: a pool with no paths
+    // in it has nothing to resolve relative to, and one with paths has to say
+    // where they are.
+    let base_dir = request
+        .base_dir
+        .unwrap_or_else(|| std::path::PathBuf::from("/"));
+
+    let reply = control(api, move |c| {
+        Ok(c.send(&Control::ServeRuntime {
+            name: request.name,
+            spec: None,
+            layer: Box::new(request.layer),
+            base_dir,
+            // Never from a socket, for the reason `PUT /fn/<name>` gives.
+            allow_host_net: false,
+            allow_private_net: false,
+            allow_unlimited: false,
+        })?)
+    })
+    .await?;
+    Ok(reply_to_response(reply))
+}
+
+async fn runtimes(api: &Arc<Api>) -> Result<Response<Full<Bytes>>, HttpError> {
+    let reply = control(api, |c| Ok(c.send(&Control::Runtimes)?)).await?;
+    Ok(reply_to_response(reply))
+}
+
+async fn stop_runtime(api: &Arc<Api>, name: String) -> Result<Response<Full<Bytes>>, HttpError> {
+    let wanted = name.clone();
+    let reply = control(api, move |c| Ok(c.send(&Control::StopRuntime { name })?)).await?;
+    match reply {
+        Reply::Stopped { names } if names.is_empty() => Err(HttpError::new(
+            StatusCode::NOT_FOUND,
+            format!("no runtime named `{wanted}`"),
+        )),
+        other => Ok(reply_to_response(other)),
+    }
+}
+
+/// What `POST /runtimes/<name>/call` accepts.
+///
+/// `script` is either a digest the store holds — the embedder's usual case,
+/// registered once and called ten thousand times — or the code itself, for a
+/// one-off that is not worth registering.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CallRuntimeRequest {
+    script: ScriptRef,
+    #[serde(default)]
+    event: serde_json::Value,
+    /// The function to call, when it is not `handler`.
+    #[serde(default)]
+    entry_point: Option<String>,
+}
+
+/// `"sha256:…"` or `{"source": "…"}`.
+#[derive(Debug, serde::Deserialize)]
+#[serde(untagged)]
+enum ScriptRef {
+    Digest(String),
+    Source { source: String },
+}
+
+async fn call_runtime(
+    api: &Arc<Api>,
+    name: String,
+    body: &[u8],
+    timeout_ms: u64,
+) -> Result<Response<Full<Bytes>>, HttpError> {
+    let request: CallRuntimeRequest = serde_json::from_slice(body).map_err(|e| {
+        HttpError::new(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "body must be {{\"script\": \"sha256:…\" | {{\"source\": \"…\"}}, \
+                 \"event\": …}}: {e}"
+            ),
+        )
+    })?;
+
+    let mut script = match request.script {
+        ScriptRef::Digest(digest) => zygo_core::protocol::Script {
+            path: None,
+            source: None,
+            digest: Some(digest),
+            entry_point: None,
+        },
+        ScriptRef::Source { source } => zygo_core::protocol::Script::inline(source),
+    };
+    script.entry_point = request.entry_point;
+
+    let reply = control(api, move |c| {
+        Ok(c.send(&Control::ExecScript {
+            runtime: name,
+            script,
+            event: request.event,
+            timeout_ms,
+        })?)
+    })
+    .await?;
     Ok(reply_to_response(reply))
 }
 
@@ -1218,6 +1376,26 @@ fn reply_to_json(reply: Reply) -> (StatusCode, serde_json::Value) {
             StatusCode::OK,
             serde_json::json!({ "sha256": digest, "size": size, "existed": existed }),
         ),
+        Reply::RuntimeServed {
+            name,
+            runtime,
+            warm,
+            rss_kb,
+            imports_ms,
+            warm_ms,
+            warnings,
+            change,
+        } => (
+            StatusCode::OK,
+            serde_json::json!({
+                "name": name, "runtime": runtime, "warm": warm, "rss_kb": rss_kb,
+                "imports_ms": imports_ms, "warm_ms": warm_ms,
+                "warnings": warnings, "change": change,
+            }),
+        ),
+        Reply::Runtimes { runtimes } => {
+            (StatusCode::OK, serde_json::json!({ "runtimes": runtimes }))
+        }
         Reply::Logs {
             name,
             entries,

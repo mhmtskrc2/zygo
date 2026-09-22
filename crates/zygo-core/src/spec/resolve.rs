@@ -59,6 +59,13 @@ pub struct ResolveOptions {
     /// warning printed on every invocation of the default configuration is
     /// noise that trains people to ignore the ones that matter.
     pub one_shot: bool,
+    /// This is a `[runtime.<name>]` pool, not a function.
+    ///
+    /// The difference is what it is allowed to hold. A function *must* say
+    /// what to run — `entry` or `cmd` — and a pool must not: its zygotes are
+    /// an interpreter and a dependency set with no tenant code in them, which
+    /// is the only reason several tenants can share one.
+    pub pool: bool,
 }
 
 /// A fully resolved function: no optional fields, every limit decided.
@@ -101,9 +108,27 @@ pub struct ResolvedFn {
     pub idle_timeout: Duration,
     pub cold_after: Duration,
 
+    /// Zygotes kept warm whatever the load, and the ceiling under it.
+    ///
+    /// `1` and `1` for a function: a function is one warmed handler, and these
+    /// only take another value for a `[runtime.<name>]` pool. Carried on the
+    /// same type so one resolved shape reaches the launcher either way.
+    pub min_warm: u32,
+    pub max_warm: u32,
+
     /// Non-fatal problems worth telling the user about. The CLI prints these;
     /// they never block a run.
     pub warnings: Vec<String>,
+}
+
+impl ResolvedFn {
+    /// Whether this is a runtime pool rather than a function.
+    ///
+    /// An agent and no handler: the zygote holds an interpreter and its
+    /// dependency set, and every request brings the script it runs.
+    pub fn is_pool(&self) -> bool {
+        self.entry.is_none() && self.cmd.is_empty() && self.runtime.is_some()
+    }
 }
 
 /// Smallest memory limit that can start an interpreter. Below this the sandbox
@@ -123,6 +148,15 @@ const DEFAULT_SCRATCH: Bytes = Bytes(64 * 1024 * 1024);
 fn default_scratch(mem: Bytes) -> Bytes {
     Bytes(DEFAULT_SCRATCH.get().min(mem.get() / 2))
 }
+
+/// How far a runtime pool grows under load when nobody said.
+///
+/// Four, because a zygote is not a request: each one already serves
+/// `concurrency` requests at a time, so four is sixteen in flight at the
+/// default. Growing further is a decision about the host's memory — a warm
+/// zygote is about 10 MB of proportional memory (`docs/bench-embed.md`) — and
+/// that is the operator's to make rather than a default's.
+const DEFAULT_MAX_WARM: u32 = 4;
 
 /// Default image per built-in runtime, used when the spec names none.
 fn default_image_for(runtime: Option<&Runtime>) -> Option<&'static str> {
@@ -158,6 +192,35 @@ impl Spec {
         let base_dir = opts.base_dir.clone().unwrap_or_else(|| self.base_dir());
 
         resolve_layer(name.unwrap_or("run"), merged, &base_dir, opts)
+    }
+
+    /// Resolve a `[runtime.<name>]` pool.
+    ///
+    /// `[defaults]` applies, as it does to a function: an operator who set
+    /// `mem` for the project meant it for everything the project runs. What
+    /// the pool adds is `min_warm`/`max_warm` and the rule that it may not
+    /// name any code.
+    ///
+    /// A name the spec does not declare is not an error, for the same reason
+    /// [`Spec::resolve_for_serve`] allows one: `POST /runtimes` describes a
+    /// pool in the request, and there the name is a registration.
+    pub fn resolve_runtime(
+        &self,
+        name: &str,
+        overrides: &Layer,
+        opts: &ResolveOptions,
+    ) -> Result<ResolvedFn, SpecError> {
+        let table = self.runtimes.get(name).cloned().unwrap_or_default();
+        let merged = defaults()
+            .merge(&self.defaults)
+            .merge(&table)
+            .merge(overrides);
+        let base_dir = opts.base_dir.clone().unwrap_or_else(|| self.base_dir());
+        let opts = ResolveOptions {
+            pool: true,
+            ..opts.clone()
+        };
+        resolve_layer(name, merged, &base_dir, &opts)
     }
 
     /// Resolve for `zygo serve`, where the name is a registration rather than a
@@ -250,6 +313,29 @@ fn resolve_layer(
 
     let cmd = l.cmd.unwrap_or_default();
 
+    // A pool is defined by what it does *not* have. Its zygotes are shared
+    // between tenants, so anything the operator warms into one is code every
+    // tenant's request forks from — and a pool that could name an `entry`
+    // would be a function with several copies, which is not what this is for.
+    if opts.pool {
+        if entry.is_some() || !cmd.is_empty() {
+            return Err(SpecError::invalid_with(
+                format!("runtime.{name}"),
+                "a runtime pool cannot name code to run",
+                "its zygotes are shared, and every request brings its own \
+                 `script`. Use `[fn.<name>]` to warm one handler.",
+            ));
+        }
+        if runtime.is_none() {
+            return Err(SpecError::invalid_with(
+                format!("runtime.{name}.agent"),
+                "a runtime pool needs an agent",
+                "`agent = \"python\"`, `agent = \"node\"`, or \
+                 `agent = { agent = \"/path/to/your-agent\" }` for one of your own",
+            ));
+        }
+    }
+
     // A served function that says nothing about what to run is a spec bug, and
     // the earlier it is said the better. A one-shot `zygo run alpine:3` is the
     // opposite: an empty command means "whatever the image runs by default",
@@ -258,7 +344,7 @@ fn resolve_layer(
     // the empty command through and `zygo run` fills it in from the image's
     // entrypoint and cmd. An image that declares neither still fails there,
     // with the name of the image that let the user down.
-    if entry.is_none() && cmd.is_empty() && !opts.one_shot {
+    if entry.is_none() && cmd.is_empty() && !opts.one_shot && !opts.pool {
         return Err(SpecError::invalid_with(
             format!("fn.{name}"),
             "nothing to run",
@@ -273,8 +359,9 @@ fn resolve_layer(
         ));
     }
     // A built-in runtime needs a handler file to import; a third-party agent
-    // supplies its own entry point, so it is allowed to stand alone.
-    if entry.is_none() && matches!(runtime, Some(Runtime::Builtin(_))) {
+    // supplies its own entry point, so it is allowed to stand alone. A pool
+    // has no handler by construction, which is the whole point of one.
+    if entry.is_none() && !opts.pool && matches!(runtime, Some(Runtime::Builtin(_))) {
         return Err(SpecError::invalid_with(
             field("runtime"),
             "a built-in runtime needs a handler",
@@ -359,6 +446,34 @@ fn resolve_layer(
             "must be at least 1",
         ));
     }
+
+    // A function is one zygote: the handler was imported into it, and a second
+    // copy would be a second import of the same code for no gain the
+    // per-request fork does not already give. A pool's size is the pool's own
+    // question, so the keys are refused here rather than quietly ignored.
+    let (min_warm, max_warm) = if opts.pool {
+        let min = l.min_warm.unwrap_or(1).max(1);
+        let max = l.max_warm.unwrap_or_else(|| min.max(DEFAULT_MAX_WARM));
+        if max < min {
+            return Err(SpecError::invalid(
+                format!("runtime.{name}.max_warm"),
+                format!("max_warm ({max}) is below min_warm ({min})"),
+            ));
+        }
+        (min, max)
+    } else {
+        for (key, value) in [("min_warm", l.min_warm), ("max_warm", l.max_warm)] {
+            if value.is_some() {
+                return Err(SpecError::invalid_with(
+                    field(key),
+                    format!("`{key}` is a runtime pool's key, and this is a function"),
+                    "a function is one warm zygote with its handler imported; \
+                     several of them are a `[runtime.<name>]` pool",
+                ));
+            }
+        }
+        (1, 1)
+    };
 
     let idle_timeout = l.idle_timeout.expect("idle_timeout has a built-in default");
     let cold_after = l.cold_after.expect("cold_after has a built-in default");
@@ -555,6 +670,8 @@ fn resolve_layer(
         concurrency,
         idle_timeout,
         cold_after,
+        min_warm,
+        max_warm,
         warnings,
     })
 }
@@ -693,6 +810,136 @@ mod tests {
 
     fn opts() -> ResolveOptions {
         ResolveOptions::default()
+    }
+
+    // --- runtime pools ----------------------------------------------------
+
+    #[test]
+    fn a_runtime_pool_is_an_image_and_an_agent_and_no_code() {
+        let s = spec(
+            "[runtime.py312]\nimage = \"python:3.12-slim\"\nagent = \"python\"\n\
+             min_warm = 2\nmax_warm = 8\nmem = \"512M\"\n",
+        );
+        let r = s
+            .resolve_runtime("py312", &Layer::default(), &opts())
+            .expect("a pool");
+        assert!(r.is_pool(), "{r:?}");
+        assert_eq!(r.entry, None);
+        assert!(r.cmd.is_empty());
+        assert_eq!(r.runtime, Some(Runtime::Builtin(BuiltinRuntime::Python)));
+        assert_eq!((r.min_warm, r.max_warm), (2, 8));
+        assert_eq!(r.limits.mem, Bytes::from_mib(512));
+    }
+
+    #[test]
+    fn a_pool_inherits_the_projects_defaults_like_a_function_does() {
+        // An operator who set `mem` for the project meant it for everything
+        // the project runs, pools included.
+        let s = spec(
+            "[defaults]\nmem = \"128M\"\ntimeout = \"5s\"\n\
+             \n[runtime.js]\nimage = \"node:22-slim\"\nagent = \"node\"\n",
+        );
+        let r = s
+            .resolve_runtime("js", &Layer::default(), &opts())
+            .expect("a pool");
+        assert_eq!(r.limits.mem, Bytes::from_mib(128));
+        assert_eq!(r.limits.timeout.as_millis(), 5_000);
+        assert_eq!(r.runtime, Some(Runtime::Builtin(BuiltinRuntime::Node)));
+    }
+
+    #[test]
+    fn a_pool_that_names_code_is_refused_because_its_zygotes_are_shared() {
+        for table in [
+            "[runtime.p]\nimage = \"python:3.12-slim\"\nagent = \"python\"\nentry = \"h.py\"\n",
+            "[runtime.p]\nimage = \"alpine:3\"\nagent = \"python\"\ncmd = [\"true\"]\n",
+        ] {
+            let err = spec(table)
+                .resolve_runtime("p", &Layer::default(), &opts())
+                .expect_err("a pool cannot hold tenant code");
+            assert!(format!("{err}").contains("cannot name code"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_pool_without_an_agent_is_refused_and_told_which_ones_there_are() {
+        let err = spec("[runtime.p]\nimage = \"alpine:3\"\n")
+            .resolve_runtime("p", &Layer::default(), &opts())
+            .expect_err("a pool with no agent cannot serve anything");
+        let text = format!("{err}");
+        assert!(text.contains("needs an agent"), "{text}");
+        assert!(text.contains("python"), "{text}");
+    }
+
+    #[test]
+    fn a_pool_defaults_to_one_warm_zygote_growing_to_four() {
+        let s = spec("[runtime.p]\nimage = \"python:3.12-slim\"\nagent = \"python\"\n");
+        let r = s.resolve_runtime("p", &Layer::default(), &opts()).unwrap();
+        assert_eq!((r.min_warm, r.max_warm), (1, DEFAULT_MAX_WARM));
+
+        // And a `min_warm` above the default ceiling raises it rather than
+        // producing a pool that cannot reach its own floor.
+        let s =
+            spec("[runtime.p]\nimage = \"python:3.12-slim\"\nagent = \"python\"\nmin_warm = 9\n");
+        let r = s.resolve_runtime("p", &Layer::default(), &opts()).unwrap();
+        assert_eq!((r.min_warm, r.max_warm), (9, 9));
+    }
+
+    #[test]
+    fn a_ceiling_below_the_floor_is_refused() {
+        let s = spec(
+            "[runtime.p]\nimage = \"python:3.12-slim\"\nagent = \"python\"\n\
+             min_warm = 4\nmax_warm = 2\n",
+        );
+        let err = s
+            .resolve_runtime("p", &Layer::default(), &opts())
+            .expect_err("a pool cannot grow down");
+        assert!(format!("{err}").contains("below min_warm"), "{err}");
+    }
+
+    #[test]
+    fn a_function_is_one_zygote_and_says_so_when_asked_for_more() {
+        // Ignoring the key would leave someone believing they had four warm
+        // copies of a function. They would have one.
+        let s = spec("[fn.resize]\nimage = \"python:3.12-slim\"\nentry = \"r.py\"\nmin_warm = 4\n");
+        let err = s
+            .resolve_for_serve("resize", &Layer::default(), &opts())
+            .expect_err("min_warm is a pool's key");
+        assert!(format!("{err}").contains("runtime pool's key"), "{err}");
+
+        let s = spec("[fn.resize]\nimage = \"python:3.12-slim\"\nentry = \"r.py\"\n");
+        let r = s
+            .resolve_for_serve("resize", &Layer::default(), &opts())
+            .unwrap();
+        assert_eq!((r.min_warm, r.max_warm), (1, 1));
+        assert!(!r.is_pool(), "a function with a handler is not a pool");
+    }
+
+    #[test]
+    fn a_pool_can_be_described_entirely_in_the_request() {
+        // `POST /runtimes` has no spec file behind it: the name is a
+        // registration and the table arrives as the body.
+        let overrides = Layer {
+            image: Some("python:3.12-slim".into()),
+            runtime: Some(Runtime::Builtin(BuiltinRuntime::Python)),
+            min_warm: Some(2),
+            ..Default::default()
+        };
+        let r = Spec::default()
+            .resolve_runtime("from-the-api", &overrides, &opts())
+            .expect("a pool with no spec file");
+        assert!(r.is_pool());
+        assert_eq!(r.min_warm, 2);
+    }
+
+    #[test]
+    fn agent_and_runtime_are_the_same_key() {
+        let by_agent = spec("[runtime.p]\nimage = \"i:1\"\nagent = \"node\"\n")
+            .resolve_runtime("p", &Layer::default(), &opts())
+            .unwrap();
+        let by_runtime = spec("[runtime.p]\nimage = \"i:1\"\nruntime = \"node\"\n")
+            .resolve_runtime("p", &Layer::default(), &opts())
+            .unwrap();
+        assert_eq!(by_agent.runtime, by_runtime.runtime);
     }
 
     // --- resolve_for_serve ------------------------------------------------

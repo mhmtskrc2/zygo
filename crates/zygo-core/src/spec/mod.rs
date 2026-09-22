@@ -32,6 +32,19 @@ pub struct Spec {
     #[serde(default, rename = "fn")]
     pub functions: BTreeMap<String, Layer>,
 
+    /// Named **runtime pools**: an image, a dependency set and an agent, with
+    /// no tenant code at all.
+    ///
+    /// A `[fn.<name>]` is one script warmed into one zygote, which is the
+    /// right shape for a function that is called often. An embedder with ten
+    /// thousand scripts cannot have ten thousand zygotes — a warm one costs
+    /// about 10 MB of proportional memory, which is 97 GiB at that count
+    /// (`docs/bench-embed.md`). A `[runtime.<name>]` is the other shape: a few
+    /// anonymous zygotes that any script can run in, with the script arriving
+    /// in the request.
+    #[serde(default, rename = "runtime")]
+    pub runtimes: BTreeMap<String, Layer>,
+
     #[serde(default)]
     pub api: Option<ApiSpec>,
 
@@ -51,6 +64,10 @@ pub struct Layer {
     pub entry: Option<PathBuf>,
     pub cmd: Option<Vec<String>>,
     pub mode: Option<HandlerMode>,
+    /// Which warm process to build. `agent` is the same key under the name a
+    /// `[runtime.<name>]` table reads better with: there the whole table *is*
+    /// the runtime, so `runtime = "python"` inside it says it twice.
+    #[serde(alias = "agent")]
     pub runtime: Option<Runtime>,
     pub requirements: Option<PathBuf>,
     pub workdir: Option<PathBuf>,
@@ -92,6 +109,16 @@ pub struct Layer {
     pub concurrency: Option<u32>,
     pub idle_timeout: Option<Duration>,
     pub cold_after: Option<Duration>,
+
+    // --- runtime pools only -------------------------------------------------
+    /// Zygotes kept warm whatever the load. A `[runtime.<name>]` key.
+    pub min_warm: Option<u32>,
+    /// Zygotes this pool may grow to under load. A `[runtime.<name>]` key.
+    ///
+    /// Both are refused on a `[fn.<name>]` rather than ignored: a function is
+    /// one warm zygote by definition, so a number here is a misunderstanding
+    /// worth naming.
+    pub max_warm: Option<u32>,
 }
 
 /// `[api]` block: the local HTTP/Unix endpoint (design doc §4.6).
@@ -172,6 +199,8 @@ impl Layer {
             concurrency,
             idle_timeout,
             cold_after,
+            min_warm,
+            max_warm,
         )
     }
 }

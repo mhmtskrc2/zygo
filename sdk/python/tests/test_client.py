@@ -424,3 +424,55 @@ class AsyncTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RuntimePoolTests(unittest.TestCase):
+    """The embedder's path: one pool, one registered script, many calls."""
+
+    DIGEST = "sha256:" + "1" * 64
+
+    def test_a_pool_is_registered_listed_called_and_stopped(self) -> None:
+        with FakeApi() as api:
+            api.answer(
+                "POST",
+                "/runtimes",
+                200,
+                {"name": "py312", "runtime": "python/3.12.4", "warm": 2, "change": "started"},
+            )
+            api.answer(
+                "GET",
+                "/runtimes",
+                200,
+                {"runtimes": [{"name": "py312", "warm": 2, "cold": 2, "max_warm": 4}]},
+            )
+            api.answer(
+                "POST",
+                "/runtimes/py312/call",
+                200,
+                {"result": {"ok": True}, "stdout": "", "stderr": "", "metrics": {"wall_ms": 2.1}},
+            )
+            api.answer("DELETE", "/runtimes/py312", 200, {"stopped": ["py312"]})
+
+            with zygo.connect(api.url) as client:
+                served = client.serve_runtime(
+                    "py312", {"image": "python:3.12-slim", "agent": "python", "min_warm": 2}
+                )
+                self.assertEqual(served["warm"], 2)
+
+                pools = client.runtimes()
+                self.assertEqual(pools[0].max_warm, 4)
+                self.assertEqual(pools[0].name, "py312")
+
+                out = client.run_script("py312", self.DIGEST, {"n": 1})
+                self.assertEqual(out.result, {"ok": True})
+
+                # And a one-off, where there is nothing registered to name.
+                client.run_script("py312", "def handler(e):\n    return e\n")
+
+                self.assertEqual(client.stop_runtime("py312"), ["py312"])
+
+        self.assertEqual(api.requests[0]["body"]["layer"]["agent"], "python")
+        called = api.requests[2]["body"]
+        self.assertEqual(called["script"], self.DIGEST, "a digest goes as a string")
+        self.assertEqual(called["event"], {"n": 1})
+        self.assertTrue(api.requests[3]["body"]["script"]["source"].startswith("def handler"))
