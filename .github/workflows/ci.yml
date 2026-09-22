@@ -464,6 +464,125 @@ jobs:
           echo "$out" | grep -q "systempaths=unconfined" \
             || { echo "::error::doctor did not name the masked /proc"; exit 1; }
 
+  # The Kubernetes example, applied to a real cluster. A manifest nobody runs
+  # is a manifest that is wrong — the `securityContext` in this one is four
+  # specific things, and three of them are the difference between a pod that
+  # serves and a pod that fails at its first request.
+  #
+  # kind, because it is a real kubelet with a real container runtime on a
+  # runner that has neither. The check at the end is a **sandbox running
+  # inside the pod**, through the API, which is what the manifest is for.
+  kubernetes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    name: kubernetes (kind)
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Let unprivileged user namespaces mount
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
+      - run: cargo build --release --target x86_64-unknown-linux-musl || cargo build --release
+      - name: The image, from the binary this job built
+        run: |
+          binary=target/x86_64-unknown-linux-musl/release/zygo
+          [ -f "$binary" ] || binary=target/release/zygo
+          install -m 0755 "$binary" packaging/oci/zygo
+          docker build -f packaging/oci/Dockerfile -t zygo:ci packaging/oci
+
+      - uses: helm/kind-action@a1b0e391336a6ee6713a0583f8c6240d70863de3 # v1
+        with:
+          config: examples/kubernetes/kind.yaml
+          cluster_name: zygo
+
+      - run: kind load docker-image zygo:ci --name zygo
+
+      # The example, with two edits a cluster of one node needs: the image
+      # this job built, and one replica rather than two.
+      - name: Apply the example
+        run: |
+          sed -e 's|ghcr.io/zygo-dev/zygo:latest|zygo:ci|' \
+              -e 's|replicas: 2|replicas: 1|' \
+              examples/kubernetes/deployment.yaml > /tmp/zygo.yaml
+          kubectl apply -f /tmp/zygo.yaml
+          kubectl -n zygo rollout status deployment/zygo --timeout=5m
+
+      - name: What the pod says about its host
+        run: kubectl -n zygo exec deploy/zygo -- zygo doctor || true
+
+      # The check the manifest exists for. A warm-exec pool on `alpine:3`
+      # rather than an interpreter: it exercises the whole path — warm
+      # sandbox, script written in, request forked, cgroup per request — and
+      # needs a 3 MB image rather than a 45 MB one.
+      #
+      # `zygo agent test` would be the letter of the roadmap item and less of
+      # a check: the image ships no interpreter to run an agent with, and
+      # putting one in it to satisfy a test would be testing the test.
+      # The check the manifest exists for. A warm-exec pool on `alpine:3`
+      # rather than an interpreter: it exercises the whole path — warm
+      # sandbox, script written into it, request forked, cgroup per request —
+      # and needs a 3 MB image rather than a 45 MB one.
+      #
+      # `zygo agent test` would be the letter of the roadmap item and less of
+      # a check: the image ships no interpreter to run an agent with, and
+      # putting one in it to satisfy a test would be testing the test.
+      #
+      # Driven from outside through `port-forward`, because a check written
+      # as a shell string inside `kubectl exec` is three levels of quoting and
+      # one of them is always wrong.
+      - name: A sandbox, inside the pod
+        run: |
+          set -eux
+          kubectl -n zygo exec deploy/zygo -- zygo pull alpine:3
+          kubectl -n zygo port-forward svc/zygo 7700:7700 &
+          forward=$!
+          trap 'kill $forward' EXIT
+          for _ in $(seq 40); do
+            curl -fsS http://127.0.0.1:7700/healthz && break || sleep 0.5
+          done
+          token=$(kubectl -n zygo get secret zygo -o jsonpath='{.data.api-token}' | base64 -d)
+
+          # A pool with a `cmd` and no agent: warm-exec, where each request's
+          # script is the last word of the command line.
+          curl -fsS -X POST http://127.0.0.1:7700/runtimes \
+            -H "authorization: Bearer $token" -H 'content-type: application/json' \
+            -d '{"name":"sh","layer":{"image":"alpine:3","cmd":["/bin/sh"],"timeout":"20s"}}'
+
+          # In a quoted heredoc, so the shell touches none of it: the script
+          # is a JSON string containing a shell script containing quotes, and
+          # every level of that escaped inline is one somebody gets wrong.
+          cat > /tmp/request.json <<'JSON'
+          {"script": {"source": "read -r event\nprintf '{\"from\": \"the-pod\"}\\n'\n"}, "event": {}}
+          JSON
+          curl -fsS -X POST http://127.0.0.1:7700/runtimes/sh/call \
+            -H "authorization: Bearer $token" -H 'content-type: application/json' \
+            -d @/tmp/request.json | tee /tmp/call.json
+          grep -q 'the-pod' /tmp/call.json
+
+      # Readiness has to go red while a pod drains, or a rolling restart sends
+      # requests to a pod that is leaving. `POST /drain` is what `preStop`
+      # calls; this is the same call, watched from outside.
+      - name: Draining takes it out of the endpoints
+        run: |
+          kubectl -n zygo exec deploy/zygo -- sh -c '
+            wget -q -O- --post-data="" --header="Authorization: Bearer $ZYGO_API_TOKEN" \
+              "http://127.0.0.1:7700/drain?grace_ms=5000"' || true
+          sleep 8
+          kubectl -n zygo get endpoints zygo -o yaml
+          kubectl -n zygo rollout status deployment/zygo --timeout=3m
+
+      - name: What happened, if anything did not
+        if: failure()
+        run: |
+          kubectl -n zygo get pods -o wide
+          kubectl -n zygo describe pods
+          kubectl -n zygo logs deploy/zygo --tail=100 || true
+
   # The seccomp syscall numbers are generated from each architecture's headers.
   # A profile that gained a syscall without regenerating them would silently
   # drop it from the filter, so the committed tables are checked against a

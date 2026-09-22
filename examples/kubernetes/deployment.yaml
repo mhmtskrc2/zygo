@@ -1,0 +1,202 @@
+# Zygo on Kubernetes.
+#
+#   kubectl apply -f examples/kubernetes/
+#
+# Read `securityContext` first: it is the whole of what makes this work, and
+# the reasons are in `docs/guide.md` ("Inside a container"). Zygo builds
+# sandboxes, so the pod it runs in has to let it do three things — create a
+# user namespace, mount a fresh `/proc` inside one, and write a cgroup.
+#
+# The image store is an `emptyDir`, and no `hostPath` appears anywhere: a pod
+# that reached the node's filesystem would be one the node could not schedule
+# freely, and the store is a cache with a cold-start cost rather than state.
+# Swap it for a PVC if you would rather not re-pull on every reschedule — or
+# bake the images into a worker image (`packaging/oci/Dockerfile.worker`),
+# which costs nothing at run time.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: zygo
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: zygo
+  namespace: zygo
+stringData:
+  # The operator's token. Everything a customer can do comes from a token
+  # minted *from* this one (`zygo token mint --tenant acme`), so this is the
+  # only secret the platform holds.
+  api-token: "replace-me-with-32-random-bytes"
+  # What per-tenant secrets are sealed with. Without it Zygo refuses to store
+  # a secret rather than keeping it in the clear.
+  secrets-key: "replace-me-with-zygo-secrets-keygen"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: zygo
+  namespace: zygo
+spec:
+  selector:
+    app: zygo
+  ports:
+    - name: http
+      port: 7700
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zygo
+  namespace: zygo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: zygo
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # One pod at a time, and no pod goes before its replacement is ready:
+      # a warm pool is cold for as long as it takes to import, and a rollout
+      # that took both replicas down at once would be a cold start for every
+      # caller.
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: zygo
+    spec:
+      # A sandbox's deadline is the supervisor's to enforce, and `POST /drain`
+      # waits for what is running. Long enough for the longest request you
+      # allow, plus the grace below.
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: zygo
+          image: ghcr.io/zygo-dev/zygo:latest
+          args:
+            - api
+            - --listen
+            - 0.0.0.0:7700
+            # The thing in front of this API is your control plane rather
+            # than a customer, so it may declare pools and functions. Drop
+            # this and the API is call-only.
+            - --allow-deploy
+          ports:
+            - name: http
+              containerPort: 7700
+          env:
+            - name: ZYGO_API_TOKEN
+              valueFrom:
+                secretKeyRef: { name: zygo, key: api-token }
+            - name: ZYGO_SECRETS_KEY
+              valueFrom:
+                secretKeyRef: { name: zygo, key: secrets-key }
+            - name: ZYGO_DATA_HOME
+              value: /var/lib/zygo
+
+          # ---- what makes a sandbox possible -----------------------------
+          #
+          # `privileged` is buying **one** thing here, and it is worth naming
+          # which: a cgroup this pod can write. The other three are expressible
+          # on their own — `seccompProfile: Unconfined` and `procMount:
+          # Unmasked` below say them — but Kubernetes has no field for "give
+          # this pod a delegated cgroup subtree", so the only way to get one
+          # today is this. `zygo doctor` says so if you try without it.
+          #
+          # What that costs is smaller than it looks, and the reason is the
+          # product: the boundary Zygo enforces is the sandbox it builds
+          # *inside* this container — namespaces, seccomp, Landlock, a cgroup
+          # per request — not the container itself. A privileged pod running
+          # customer code directly is a different proposition from a
+          # privileged pod whose job is building boundaries around it. Run it
+          # on nodes of its own, and read `docs/threat-model.md`.
+          securityContext:
+            privileged: true
+            # Docker's and containerd's default profiles deny
+            # `unshare(CLONE_NEWUSER)`, which is what a sandbox does first.
+            seccompProfile:
+              type: Unconfined
+            # A masked `/proc` is not *fully visible*, and the kernel then
+            # refuses a fresh `proc` mount inside a user namespace. Without
+            # this every sandbox dies on "mounting /proc failed".
+            procMount: Unmasked
+            allowPrivilegeEscalation: true
+            readOnlyRootFilesystem: false
+
+          # ---- is it alive, and should it be sent work -------------------
+          #
+          # Two different questions, and Zygo answers them differently.
+          #
+          # `/healthz` is the second: it says whether this host should be sent
+          # work, and answers 503 while draining — so a pod that is finishing
+          # what it has stops receiving new requests without being killed.
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+            failureThreshold: 2
+          # And the first. A liveness probe that used `/healthz` would restart
+          # a pod that was draining on purpose, so it uses `zygo doctor`,
+          # which is a claim about the *host*: a kernel that stopped being
+          # able to build sandboxes is a pod that should go.
+          livenessProbe:
+            exec:
+              command: ["zygo", "doctor", "--json"]
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          # A warm pool takes as long as its interpreter does. Until this
+          # passes, neither probe above can fail the pod.
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 2
+            failureThreshold: 30
+
+          lifecycle:
+            preStop:
+              exec:
+                # Stop admitting, let what is running finish, then exit —
+                # rather than being killed with requests in flight. The API
+                # answers this *before* it leaves, with the number still
+                # running, so `in_flight: 0` is a clean drain and anything
+                # else is the grace running out.
+                command:
+                  - sh
+                  - -c
+                  - >-
+                    wget -q -O- --post-data=''
+                    --header="Authorization: Bearer $ZYGO_API_TOKEN"
+                    http://127.0.0.1:7700/drain?grace_ms=60000 || true
+
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              # No CPU limit on purpose: a tenant's own quota is a cgroup Zygo
+              # sets per request, and a ceiling here would throttle the
+              # supervisor's own scheduling along with it.
+              memory: 8Gi
+
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/zygo
+            - name: run
+              mountPath: /run/zygo
+
+      volumes:
+        # Images, scripts, blobs, tenants, tokens and sealed secrets. An
+        # `emptyDir` is a cache: a rescheduled pod re-pulls what it needs, and
+        # tenants registered through the API live in whatever database your
+        # control plane keeps. Make it a PVC if you would rather keep them.
+        - name: data
+          emptyDir:
+            sizeLimit: 20Gi
+        - name: run
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
