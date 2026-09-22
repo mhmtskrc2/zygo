@@ -45,6 +45,7 @@ cleanup() {
     [ -n "${API_PID:-}" ] && kill "$API_PID" 2>/dev/null
     [ -n "${API_CALL_ONLY_PID:-}" ] && kill "$API_CALL_ONLY_PID" 2>/dev/null
     [ -n "${API_TOKENS_PID:-}" ] && kill "$API_TOKENS_PID" 2>/dev/null
+    [ -n "${USAGE_PID:-}" ] && kill "$USAGE_PID" 2>/dev/null
     "$ZYGO" stop --all >/dev/null 2>&1
     rm -rf "$WORK"
 }
@@ -127,7 +128,21 @@ export ZYGO_SECRETS_KEY
 # script's fault rather than the code's.
 "$ZYGO" stop --all >/dev/null 2>&1
 
-API_TOKENS_PID=$(start_api "$SOCK_TOKENS" "" --allow-deploy)
+# A receiver for the usage webhook, so delivery is checked rather than assumed.
+# Twenty lines of Python appending one JSON line per batch: the claim is that
+# events arrive with the right outcomes, and a real HTTP receiver is the only
+# way to see that.
+ZYGO_USAGE_SINK=$WORK/usage.jsonl
+export ZYGO_USAGE_SINK
+python3 "$SRC/poc/usage_sink.py" "$WORK/usage.port" "$ZYGO_USAGE_SINK" \
+    >"$WORK/usage.log" 2>&1 &
+USAGE_PID=$!
+i=0
+while [ $i -lt 50 ] && [ ! -s "$WORK/usage.port" ]; do i=$((i + 1)); sleep 0.1; done
+USAGE_URL="http://127.0.0.1:$(cat "$WORK/usage.port" 2>/dev/null)/"
+
+API_TOKENS_PID=$(start_api "$SOCK_TOKENS" "" --allow-deploy \
+    --usage-webhook "$USAGE_URL" --usage-interval 2s)
 if wait_for "$SOCK_TOKENS"; then
     python3 "$SRC/poc/api_driver.py" --tokens "$SOCK_TOKENS" "$IMAGE" || status=1
 else

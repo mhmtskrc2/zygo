@@ -82,6 +82,28 @@ pub struct Snapshot {
     pub api_requests: u64,
     pub api_errors: u64,
     pub functions: Vec<Status>,
+    /// What each tenant has used since this API started.
+    ///
+    /// Per *tenant* rather than per function, because it is what an embedder
+    /// bills on and a function is the operator's own unit. Kept here rather
+    /// than read from the supervisor: a counter that resets when the
+    /// supervisor restarts and a counter that resets when the exporter does
+    /// would disagree, and only one of them is the one being scraped.
+    pub tenants: Vec<TenantUsage>,
+}
+
+/// One tenant's running totals.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TenantUsage {
+    pub tenant: String,
+    pub requests: u64,
+    pub failures: u64,
+    pub cpu_ms: f64,
+    pub wall_ms: f64,
+    /// Requests by how they ended: `ok`, `error`, `timeout`, `cancelled`,
+    /// `stuck`. Separate from `failures` because "somebody cancelled it" is
+    /// not a failure of anything and must not be counted as one.
+    pub by_outcome: std::collections::BTreeMap<String, u64>,
 }
 
 /// The `ExportMetricsServiceRequest`, in OTLP's JSON mapping.
@@ -137,7 +159,9 @@ pub fn payload(snapshot: &Snapshot, started: SystemTime, now: SystemTime) -> ser
     };
 
     let per_fn = |f: &Status| vec![attr("fn", &f.name)];
+    let per_tenant = |t: &TenantUsage| vec![attr("tenant", &t.tenant)];
     let functions = &snapshot.functions;
+    let tenants = &snapshot.tenants;
     let metrics = vec![
         sum(
             "zygo.api.requests",
@@ -189,6 +213,48 @@ pub fn payload(snapshot: &Snapshot, started: SystemTime, now: SystemTime) -> ser
                     attributes.push(attr("state", f.state.as_str()));
                     gauge_point(1, attributes)
                 })
+                .collect(),
+        ),
+        sum(
+            "zygo.tenant.requests",
+            "Requests served per tenant.",
+            "{request}",
+            tenants
+                .iter()
+                .map(|t| sum_point(t.requests, per_tenant(t)))
+                .collect(),
+        ),
+        sum(
+            "zygo.tenant.outcomes",
+            "Requests per tenant by how they ended.",
+            "{request}",
+            tenants
+                .iter()
+                .flat_map(|t| {
+                    t.by_outcome.iter().map(move |(outcome, count)| {
+                        let mut attributes = per_tenant(t);
+                        attributes.push(attr("outcome", outcome));
+                        sum_point(*count, attributes)
+                    })
+                })
+                .collect(),
+        ),
+        sum(
+            "zygo.tenant.cpu",
+            "CPU time used per tenant.",
+            "ms",
+            tenants
+                .iter()
+                .map(|t| sum_point(t.cpu_ms as u64, per_tenant(t)))
+                .collect(),
+        ),
+        sum(
+            "zygo.tenant.wall",
+            "Wall-clock time used per tenant.",
+            "ms",
+            tenants
+                .iter()
+                .map(|t| sum_point(t.wall_ms as u64, per_tenant(t)))
                 .collect(),
         ),
     ];
@@ -289,6 +355,16 @@ mod tests {
 
     fn snapshot() -> Snapshot {
         Snapshot {
+            tenants: vec![TenantUsage {
+                tenant: "acme".into(),
+                requests: 9,
+                failures: 1,
+                cpu_ms: 120.0,
+                wall_ms: 400.0,
+                by_outcome: [("ok".to_string(), 8), ("cancelled".to_string(), 1)]
+                    .into_iter()
+                    .collect(),
+            }],
             api_requests: 12,
             api_errors: 1,
             functions: vec![Status {
@@ -360,8 +436,33 @@ mod tests {
                 "zygo.function.failures",
                 "zygo.function.rss",
                 "zygo.function.state",
+                "zygo.tenant.requests",
+                "zygo.tenant.outcomes",
+                "zygo.tenant.cpu",
+                "zygo.tenant.wall",
             ]
         );
+
+        // Per tenant, and `outcomes` is one point per (tenant, outcome): a
+        // dashboard that wants "how many of acme's requests were cancelled"
+        // reads it directly rather than subtracting.
+        let outcomes = metrics
+            .iter()
+            .find(|m| m["name"] == "zygo.tenant.outcomes")
+            .expect("the outcomes metric");
+        let points = outcomes["sum"]["dataPoints"].as_array().unwrap();
+        assert_eq!(points.len(), 2, "one point per outcome");
+        let labelled: Vec<(&str, &str)> = points
+            .iter()
+            .map(|p| {
+                let a = p["attributes"].as_array().unwrap();
+                (
+                    a[0]["value"]["stringValue"].as_str().unwrap(),
+                    a[1]["value"]["stringValue"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert!(labelled.contains(&("acme", "cancelled")), "{labelled:?}");
 
         let requests = &metrics[0]["sum"];
         assert_eq!(requests["aggregationTemporality"], CUMULATIVE);

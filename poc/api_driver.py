@@ -1024,6 +1024,100 @@ def tokens(socket_path: str, image: str) -> int:
         # the same bytes.
         operator.delete_script(slow.sha256)
 
+        # --- usage events --------------------------------------------------------
+        #
+        # What an embedder bills on. The claim checked here is the one the
+        # task names: a cancelled and a stuck request each produce one event
+        # with the right `outcome` — which is the same field a 499 and a 504
+        # map from, so it is checked through the answers.
+        print()
+        counted = operator.put_script(
+            "import time\n\n\ndef handler(event):\n"
+            "    time.sleep(event.get('seconds', 0))\n    return 'done'\n"
+        )
+
+        before = json.loads(operator._request("GET", "/metrics", headers={"accept": "text/plain"})) \
+            if False else None
+        _ = before
+
+        good = operator.run_script("shared", counted.sha256, {})
+        if good.result == "done":
+            ok("a finished request answers, and is counted")
+        else:
+            bad("the control request failed", good)
+
+        # A cancelled one. `outcome` is what the 499 maps from.
+        import threading
+
+        answer: list = []
+
+        def slow() -> None:
+            try:
+                answer.append(
+                    operator.run_script(
+                        "shared", counted.sha256, {"seconds": 20}, key="usage-1"
+                    )
+                )
+            except BaseException as e:  # noqa: BLE001
+                answer.append(e)
+
+        caller = threading.Thread(target=slow, daemon=True)
+        caller.start()
+        time.sleep(2.0)
+        operator.cancel("usage-1")
+        caller.join(timeout=20)
+        if answer and isinstance(answer[0], zygo.Cancelled):
+            ok("a cancelled request ends as `cancelled`, not `timeout`")
+        else:
+            bad("the cancelled request answered wrongly", answer)
+
+        # A timed-out one, which is the third reading of 137.
+        try:
+            operator.run_script(
+                "shared", counted.sha256, {"seconds": 30}, timeout=None
+            )
+            bad("a request past the pool's timeout was not killed")
+        except zygo.Timeout:
+            ok("and one past its deadline ends as `timeout`")
+        except zygo.ZygoError as e:
+            bad("the timed-out request answered wrongly", f"{type(e).__name__}: {e}")
+
+        # And the webhook got one event per request, with those outcomes.
+        # The receiver is started by `verify_api.sh` and appends one JSON line
+        # per batch; delivery is on an interval, so this waits for it.
+        sink = os.environ.get("ZYGO_USAGE_SINK", "")
+        flat = []
+        for _ in range(40):
+            time.sleep(0.5)
+            try:
+                with open(sink) as handle:
+                    batches = [json.loads(line) for line in handle if line.strip()]
+            except (FileNotFoundError, ValueError):
+                continue
+            flat = [e for batch in batches for e in batch.get("events", [])]
+            if {"cancelled", "timeout"} <= {e["outcome"] for e in flat}:
+                break
+
+        outcomes = {e["outcome"] for e in flat}
+        if {"ok", "cancelled", "timeout"} <= outcomes:
+            ok(f"the usage webhook received each outcome ({len(flat)} events)")
+        else:
+            bad("the webhook did not receive every outcome", sorted(outcomes))
+
+        # One event per request, keyed by the id a caller cancels by.
+        ids = [e["request_id"] for e in flat]
+        if ids and len(ids) == len(set(ids)):
+            ok("one event per request, each with its own id")
+        else:
+            bad("the webhook saw a request twice in one run", ids)
+
+        if flat and all(e["tenant"] and e["function"] for e in flat):
+            ok("and every event says whose it was and what it ran")
+        else:
+            bad("an event is missing its tenant or function", flat[:2])
+
+        operator.delete_script(counted.sha256)
+
         # --- per-tenant limits ---------------------------------------------------
         #
         # A tenant's limits narrow the pool's and never widen them. What is

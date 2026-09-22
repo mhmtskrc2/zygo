@@ -238,6 +238,20 @@ pub struct Outcome {
     /// which is more moving parts than the encoding costs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
+    /// Who this request was for, and what it ran.
+    ///
+    /// Here rather than reconstructed by whoever wants to bill for it: the
+    /// supervisor is the only side that knows all three at once, and a
+    /// caller's own tenant and function are not facts it needs protecting
+    /// from. See [`Usage`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tenant: String,
+    /// The function or runtime pool the request ran in.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub function: String,
+    /// The script's digest, for a pool request that named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script: Option<String>,
     /// The request's own id, which is what `DELETE /requests/<id>` names.
     ///
     /// Returned with the answer as well as in a header, so a caller that kept
@@ -250,6 +264,73 @@ pub struct Outcome {
 impl Outcome {
     pub fn succeeded(&self) -> bool {
         self.exit_code == 0 && self.error.is_none()
+    }
+
+    /// One word for how this request ended.
+    ///
+    /// The four kills exit 137 can mean are already separate fields; this is
+    /// the single value something counting requests groups by, so that a
+    /// dashboard does not have to re-derive the precedence every time.
+    ///
+    /// Order matters and is the caller's: `cancelled` first, because a caller
+    /// who stopped their own request does not want to read "timeout".
+    pub fn outcome(&self) -> &'static str {
+        if self.cancelled {
+            "cancelled"
+        } else if self.stuck {
+            "stuck"
+        } else if self.timed_out {
+            "timeout"
+        } else if self.succeeded() {
+            "ok"
+        } else {
+            "error"
+        }
+    }
+}
+
+/// What one finished request cost, and for whom.
+///
+/// Built from an [`Outcome`] by whoever is counting. It exists as a type
+/// rather than a JSON literal in three places because an embedder bills from
+/// it, and a field that means one thing in the OTLP export and another in the
+/// webhook is a support question nobody can answer.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Usage {
+    pub tenant: String,
+    pub function: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub script: Option<String>,
+    pub request_id: String,
+    pub wall_ms: f64,
+    pub cpu_ms: f64,
+    pub peak_rss_kb: u64,
+    /// `ok`, `error`, `timeout`, `cancelled` or `stuck`. See
+    /// [`Outcome::outcome`].
+    pub outcome: String,
+    /// When the request finished, as milliseconds since the epoch.
+    ///
+    /// Wall-clock rather than a monotonic reading, because it leaves this
+    /// process and has to mean something to whoever receives it.
+    pub finished_ms: u64,
+}
+
+impl From<&Outcome> for Usage {
+    fn from(o: &Outcome) -> Usage {
+        Usage {
+            tenant: o.tenant.clone(),
+            function: o.function.clone(),
+            script: o.script.clone(),
+            request_id: o.id.clone(),
+            wall_ms: o.metrics.wall_ms,
+            cpu_ms: o.metrics.cpu_ms,
+            peak_rss_kb: o.metrics.peak_rss_kb,
+            outcome: o.outcome().to_string(),
+            finished_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        }
     }
 }
 
@@ -1686,6 +1767,10 @@ impl WarmFn {
         //
         // The lease lives until this function returns, by any route, which is
         // what takes the file away again.
+        // Kept before the script is placed, because placing it rewrites the
+        // struct — and a usage event that lost the digest would be a bill
+        // nobody could check.
+        let script_digest = script.as_ref().and_then(|s| s.digest.clone());
         let (script, _script) = self.place_script(script);
 
         // The caller's files, unpacked into a directory of this request's own
@@ -1967,6 +2052,10 @@ impl WarmFn {
                 stuck,
                 // Filled in below, once the handler has finished writing.
                 workspace: None,
+                // Who it was for and what it ran, for whoever is counting.
+                tenant: caller.unwrap_or(&self.tenant).to_string(),
+                function: self.name.clone(),
+                script: script_digest,
             }),
             Message::Error { code, message, .. } => {
                 Err(Error::from(ProtocolError::Agent { code, message }))
@@ -3338,6 +3427,9 @@ fn into_outcome(
         cancelled: false,
         stuck: false,
         workspace: None,
+        tenant: "default".into(),
+        function: "resize".into(),
+        script: None,
         exit_code,
         result,
         stdout: if error.is_some() {
@@ -4886,6 +4978,90 @@ mod tests {
         );
     }
 
+    /// One word for how a request ended, and the order it is decided in.
+    ///
+    /// The precedence is the caller's: somebody who cancelled their own
+    /// request does not want to read "timeout" because the deadline also
+    /// happened to pass while the kill landed.
+    #[test]
+    fn the_four_kills_are_told_apart_and_the_caller_comes_first() {
+        let base = Outcome {
+            tenant: "acme".into(),
+            function: "render".into(),
+            script: None,
+            id: "00000001".into(),
+            exit_code: 0,
+            result: serde_json::Value::Null,
+            stdout: String::new(),
+            stderr: String::new(),
+            error: None,
+            metrics: Metrics::default(),
+            timed_out: false,
+            cancelled: false,
+            stuck: false,
+            workspace: None,
+        };
+
+        assert_eq!(base.outcome(), "ok");
+        assert_eq!(
+            Outcome {
+                exit_code: 1,
+                error: Some("boom".into()),
+                ..base.clone()
+            }
+            .outcome(),
+            "error"
+        );
+        assert_eq!(
+            Outcome {
+                exit_code: 137,
+                timed_out: true,
+                ..base.clone()
+            }
+            .outcome(),
+            "timeout"
+        );
+        assert_eq!(
+            Outcome {
+                exit_code: 137,
+                stuck: true,
+                ..base.clone()
+            }
+            .outcome(),
+            "stuck"
+        );
+        assert_eq!(
+            Outcome {
+                exit_code: 137,
+                cancelled: true,
+                ..base.clone()
+            }
+            .outcome(),
+            "cancelled"
+        );
+
+        // A cancel that raced the deadline is still a cancel.
+        assert_eq!(
+            Outcome {
+                exit_code: 137,
+                cancelled: true,
+                timed_out: true,
+                stuck: true,
+                ..base.clone()
+            }
+            .outcome(),
+            "cancelled"
+        );
+
+        // And the event carries what somebody bills on.
+        let usage = Usage::from(&base);
+        assert_eq!(usage.tenant, "acme");
+        assert_eq!(usage.function, "render");
+        assert_eq!(usage.request_id, "00000001");
+        assert_eq!(usage.outcome, "ok");
+        assert!(usage.finished_ms > 1_700_000_000_000, "{usage:?}");
+    }
+
     #[test]
     fn per_request_cgroups_are_on_by_default() {
         // Measured at 97 µs of a 1.9 ms request; the design's open question A2
@@ -4900,6 +5076,9 @@ mod tests {
             cancelled: false,
             stuck: false,
             workspace: None,
+            tenant: "default".into(),
+            function: "resize".into(),
+            script: None,
             exit_code: 0,
             result: serde_json::Value::Null,
             stdout: String::new(),

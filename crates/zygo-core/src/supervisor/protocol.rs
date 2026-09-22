@@ -1047,6 +1047,9 @@ mod tests {
         // `zygo exec` prints this, so a field lost in transit is a wrong answer
         // rather than an error.
         let outcome = Outcome {
+            tenant: "default".into(),
+            function: "resize".into(),
+            script: None,
             id: "00000001".into(),
             cancelled: false,
             stuck: false,
@@ -1077,6 +1080,9 @@ mod tests {
     #[test]
     fn a_failed_outcome_keeps_its_error_across_the_wire() {
         let outcome = Outcome {
+            tenant: "acme".into(),
+            function: "py312".into(),
+            script: Some("sha256:abc".into()),
             id: "00000002".into(),
             cancelled: true,
             stuck: false,

@@ -345,6 +345,7 @@ impl Supervisor {
         drop(permit);
 
         if let Ok(outcome) = &outcome {
+            super::usage(outcome);
             self.logs_for(name).push(
                 crate::pool::LogKind::Request {
                     id: next_log_request_id(),

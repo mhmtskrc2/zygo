@@ -956,6 +956,9 @@ mod tests {
     #[test]
     fn exec_exits_with_the_request_s_own_status() {
         let outcome = |exit_code: i32, error: Option<&str>| Outcome {
+            tenant: "default".into(),
+            function: "resize".into(),
+            script: None,
             id: "00000001".into(),
             cancelled: false,
             stuck: false,

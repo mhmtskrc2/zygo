@@ -213,6 +213,40 @@ is what keeps one working across this change. On the host, `zygo token mint`,
 `zygo token ls` and `zygo token revoke <id>` do the same three things without
 an HTTP round trip.
 
+## Usage, for billing
+
+Every finished request produces one event, from the **supervisor** — which is
+the only process that sees all of them, whether they came over HTTP, from
+`zygo exec` at a terminal, or from an MCP tool:
+
+```json
+{"tenant": "acme", "function": "py312", "script": "sha256:…",
+ "request_id": "00000042", "wall_ms": 812.4, "cpu_ms": 740.1,
+ "peak_rss_kb": 48200, "outcome": "ok", "finished_ms": 1790000000000}
+```
+
+`outcome` is one word — `ok`, `error`, `timeout`, `cancelled`, `stuck` — so a
+dashboard groups by it instead of re-deriving the precedence from four boolean
+fields. A caller who cancelled their own request reads `cancelled`, even if the
+deadline happened to pass while the kill landed.
+
+Three ways to collect it:
+
+* **The supervisor's log**, under the `zygo::usage` target. Every deployment
+  already has somewhere logs go, so this needs no configuration.
+* **OTLP**, with `--otlp-endpoint`: `zygo.tenant.requests`, `.outcomes`,
+  `.cpu` and `.wall`, one series per tenant.
+* **A webhook**, with `--usage-webhook <url>`: batches of up to 256 events,
+  posted as `{"events": [...]}`.
+
+The webhook is **at least once**. A batch that fails goes back on the front of
+the queue, in order, and is retried — so a receiver may see an event twice and
+should key on `request_id`. The queue is bounded at 10 000: when a webhook has
+been down long enough to fill it, the oldest events are dropped and the count
+is logged. The alternative is the API process growing until it takes the
+*serving* path down to protect the billing path, which is the wrong way round —
+and the events are in the supervisor's log either way.
+
 ## Limiting a tenant
 
 A pool is declared once by the operator and called by every customer. One

@@ -973,6 +973,7 @@ impl Supervisor {
         entry.touch();
 
         if let Ok(outcome) = &outcome {
+            usage(outcome);
             self.logs_for(name).push(
                 crate::pool::LogKind::Request {
                     id: next_log_request_id(),
@@ -2226,6 +2227,35 @@ fn handle(supervisor: &Supervisor, stream: UnixStream) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Record what one finished request cost.
+///
+/// A structured `tracing` event, at `info`, with one field per column an
+/// embedder bills on. It goes out from the **supervisor**, which is the only
+/// process that sees every request — `zygo exec` at a terminal, an HTTP call,
+/// an MCP tool — so a host's usage is one stream rather than whatever each
+/// front end happened to notice.
+///
+/// Deliberately a log record and not a channel. Every deployment already has
+/// somewhere logs go; a second transport out of the supervisor would be a
+/// second thing to configure, secure and lose events to. The API layers its
+/// own delivery on top for the requests it made, which is where an embedder's
+/// billing actually sits.
+pub(super) fn usage(outcome: &crate::pool::Outcome) {
+    let usage = crate::pool::Usage::from(outcome);
+    tracing::info!(
+        target: "zygo::usage",
+        tenant = %usage.tenant,
+        function = %usage.function,
+        script = usage.script.as_deref().unwrap_or(""),
+        request_id = %usage.request_id,
+        wall_ms = usage.wall_ms,
+        cpu_ms = usage.cpu_ms,
+        peak_rss_kb = usage.peak_rss_kb,
+        outcome = %usage.outcome,
+        "request finished"
+    );
 }
 
 /// A sink that writes each chunk straight out as a `CHUNK` frame.

@@ -635,6 +635,25 @@ pub struct ApiArgs {
     /// How often to push to the OTLP collector.
     #[arg(long, value_name = "DURATION", default_value = "60s", value_parser = parse_duration)]
     pub otlp_interval: Duration,
+
+    /// POST one JSON batch of usage events to this URL as requests finish.
+    ///
+    /// `{"events": [{tenant, function, script, request_id, wall_ms, cpu_ms,
+    /// peak_rss_kb, outcome, finished_ms}, …]}`. For billing: it is what an
+    /// embedder charges on, and it is the same data the supervisor logs.
+    ///
+    /// **At least once.** A batch that fails is retried, so a receiver may
+    /// see an event twice and should key on `request_id`. The queue is
+    /// bounded: when a webhook has been down long enough to fill it, the
+    /// oldest events are dropped and the count is reported — the alternative
+    /// is the API process growing until it takes the serving path down to
+    /// protect the billing path, which is the wrong way round.
+    #[arg(long, value_name = "URL")]
+    pub usage_webhook: Option<String>,
+
+    /// How often to deliver queued usage events.
+    #[arg(long, value_name = "DURATION", default_value = "10s", value_parser = parse_duration)]
+    pub usage_interval: Duration,
 }
 
 #[derive(Debug, Args)]
