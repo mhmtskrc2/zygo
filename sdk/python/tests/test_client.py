@@ -372,6 +372,88 @@ class TokenTests(unittest.TestCase):
         self.assertEqual(api.requests[1]["headers"]["x-zygo-tenant"], "acme")
 
 
+class CancelTests(unittest.TestCase):
+    """Stopping a request, and what tells a caller that is what happened."""
+
+    def test_a_cancelled_request_is_its_own_exception(self) -> None:
+        with FakeApi() as api:
+            api.answer(
+                "POST",
+                "/fn/slow",
+                499,
+                {
+                    "error": "the request was cancelled",
+                    "cancelled": True,
+                    "request_id": "00000007",
+                    "stdout": "",
+                    "stderr": "",
+                    "metrics": {"wall_ms": 1200.0},
+                },
+            )
+            with zygo.connect(api.url) as client:
+                with self.assertRaises(zygo.Cancelled) as caught:
+                    client.call("slow", {})
+        # Not a Timeout: "too slow, raise the limit" is the wrong advice for
+        # a request somebody stopped on purpose.
+        self.assertNotIsInstance(caught.exception, zygo.Timeout)
+        self.assertEqual(caught.exception.request_id, "00000007")
+
+    def test_a_call_can_be_named_so_that_it_can_be_stopped(self) -> None:
+        with FakeApi() as api:
+            api.answer("POST", "/fn/slow", 200, {"result": None, "request_id": "00000008"})
+            api.answer(
+                "DELETE",
+                "/requests/job-4711",
+                200,
+                {"cancelled": True, "request_id": "00000008", "started": True},
+            )
+            with zygo.connect(api.url) as client:
+                out = client.call("slow", {}, key="job-4711")
+                self.assertEqual(out.request_id, "00000008")
+                answer = client.cancel("job-4711")
+
+        self.assertEqual(api.requests[0]["headers"]["x-zygo-request-key"], "job-4711")
+        self.assertTrue(answer["cancelled"])
+
+    def test_cancelling_the_task_cancels_the_request(self) -> None:
+        """The reason the key exists.
+
+        The server's own id arrives *with the answer*, so a caller that waits
+        for it can no longer stop the call it belongs to. The async client
+        names the request on the way in, and turns ``CancelledError`` into a
+        ``DELETE`` for that name before it propagates.
+        """
+        import asyncio
+
+        import zygo.aio
+
+        with FakeApi() as api:
+            # Long enough that the task is still waiting when it is cancelled.
+            api.recorder.delay = 2.0
+            api.answer("POST", "/fn/slow", 200, {"result": None})
+            api.answer("DELETE", "/requests/", 200, {"cancelled": True, "started": True})
+
+            async def main() -> None:
+                async with zygo.aio.connect(api.url) as client:
+                    task = asyncio.ensure_future(client.call("slow", {}))
+                    await asyncio.sleep(0.2)
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+
+            asyncio.run(main())
+
+        sent = [r for r in api.requests if r["method"] == "DELETE"]
+        self.assertTrue(sent, "the cancelled task sent no cancel")
+        key = api.requests[0]["headers"]["x-zygo-request-key"]
+        self.assertTrue(key.startswith("k-"), key)
+        self.assertEqual(
+            sent[0]["path"],
+            f"/requests/{key}",
+            "the cancel named a different request than the call did",
+        )
+
+
 class OutcomeTests(unittest.TestCase):
     """Why a one-shot sandbox ended, which the exit code cannot carry.
 

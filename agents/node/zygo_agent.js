@@ -587,6 +587,7 @@ class Agent {
 
   _dispatch(request, w) {
     w.request = request;
+    w.cancelled = false;
     this._inflight.set(request.id, w);
     // The process exists and has loaded the handler, but has not been given
     // the event: it does nothing until `GO`.
@@ -616,6 +617,7 @@ class Agent {
       wall_ms: result ? result.wall_ms : 0,
       cpu_ms: result ? result.cpu_ms : 0,
     };
+    if (w.cancelled) done.cancelled = true;
     if (result && !result.ok) done.error = result.error;
     // A worker that died without a result — killed by its deadline, out of
     // memory, or unable to install the filter it was told to — is still
@@ -654,6 +656,23 @@ class Agent {
         cpu_ms: done.cpu_ms,
       });
     }
+  }
+
+  /// `CANCEL`: remember why this request is about to die (proto 1.2).
+  ///
+  /// Deliberately not a kill. The supervisor writes `cgroup.kill` on the
+  /// request's own cgroup from outside the sandbox, which takes the worker and
+  /// anything it spawned and does not depend on the handler being in a state
+  /// where a signal helps. All that is left here is to say *why* on the way
+  /// out, so the caller reads `cancelled` rather than guessing between a
+  /// deadline and an out-of-memory kill at exit 137.
+  ///
+  /// An id that is not in flight is ignored: the request finished between the
+  /// supervisor deciding to cancel it and this arriving, which is a race with
+  /// no wrong outcome.
+  _onCancel(message) {
+    const w = this._inflight.get(message.id);
+    if (w) w.cancelled = true;
   }
 
   _onExec(message) {
@@ -696,6 +715,8 @@ class Agent {
         return this._onExec(message);
       case 'GO':
         return this._onGo(message);
+      case 'CANCEL':
+        return this._onCancel(message);
       case 'PING':
         return this.send({ type: 'PONG', seq: message.seq === undefined ? 0 : message.seq });
       case 'SHUTDOWN':

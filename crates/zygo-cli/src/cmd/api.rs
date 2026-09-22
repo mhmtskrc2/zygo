@@ -386,8 +386,8 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<Full<B
     match (req.method(), segments.as_slice()) {
         (&Method::GET, ["fn"]) => list(api, tenant).await,
         (&Method::POST, ["tenants"]) => {
-            actor.operator_only("creating a tenant")?;
             let body = read_body(req).await?;
+            actor.operator_only("creating a tenant")?;
             create_tenant(api, &body).await
         }
         (&Method::GET, ["tenants"]) => {
@@ -426,6 +426,12 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<Full<B
             actor.may_deploy()?;
             revoke_token(api, id).await
         }
+        // Not gated on deploy: stopping your own request is not a widened
+        // boundary, it is the narrowest thing a caller can ask for.
+        (&Method::DELETE, ["requests", id]) => {
+            let id = id.to_string();
+            cancel(api, id, tenant).await
+        }
         (&Method::GET, ["metrics"]) => metrics(api).await,
         (&Method::GET, ["version"]) => Ok(json(
             StatusCode::OK,
@@ -438,10 +444,17 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<Full<B
                 "deploy": actor.deploy && actor.is_operator(),
             }),
         )),
+        // The body is read *before* the gate, on every route that carries
+        // one. Refusing without reading leaves an unread body on the
+        // connection, hyper closes it, and the caller's *next* request on that
+        // pooled connection fails with a broken pipe — a 403 on one call
+        // turning into a transport error on an unrelated one. The body is
+        // bounded by `MAX_BODY_BYTES`, so reading one this API is about to
+        // throw away costs nothing worth saving.
         (&Method::PUT, ["fn", name]) => {
             let name = name.to_string();
-            actor.may_deploy()?;
             let body = read_body(req).await?;
+            actor.may_deploy()?;
             serve_fn(api, name, &body, tenant).await
         }
         (&Method::DELETE, ["fn", name]) => {
@@ -450,8 +463,8 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<Full<B
             stop(api, name).await
         }
         (&Method::POST, ["run"]) => {
-            actor.may_deploy()?;
             let body = read_body(req).await?;
+            actor.may_deploy()?;
             one_shot(api, &body).await
         }
         (&Method::GET, ["fn", name, "logs"]) => {
@@ -462,9 +475,10 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<Full<B
         (&Method::POST, ["fn", name]) => {
             let name = name.to_string();
             let timeout_ms = timeout_header(&req)?;
+            let key = request_key(&req)?;
             let body = read_body(req).await?;
             let event = parse_event(&body)?;
-            exec(api, name, event, timeout_ms, tenant).await
+            exec(api, name, event, timeout_ms, tenant, key).await
         }
         (&Method::POST, ["fn", name, "batch"]) => {
             let name = name.to_string();
@@ -482,8 +496,8 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<Full<B
         (&Method::POST, ["fn", name, "warm"]) => warm(api, name.to_string(), tenant).await,
         (&Method::GET, ["runtimes"]) => runtimes(api, tenant).await,
         (&Method::POST, ["runtimes"]) => {
-            actor.may_deploy()?;
             let body = read_body(req).await?;
+            actor.may_deploy()?;
             serve_runtime(api, &body, tenant).await
         }
         (&Method::DELETE, ["runtimes", name]) => {
@@ -494,8 +508,9 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<Full<B
         (&Method::POST, ["runtimes", name, "call"]) => {
             let name = name.to_string();
             let timeout_ms = timeout_header(&req)?;
+            let key = request_key(&req)?;
             let body = read_body(req).await?;
-            call_runtime(api, name, &body, timeout_ms, tenant).await
+            call_runtime(api, name, &body, timeout_ms, tenant, key).await
         }
         // Not gated on deploy, and this is the change tokens paid for:
         // registering a script for yourself is what a tenant token is *for*.
@@ -515,6 +530,7 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<Full<B
             delete_script(api, digest).await
         }
         (_, ["fn", ..])
+        | (_, ["requests", ..])
         | (_, ["metrics"])
         | (_, ["version"])
         | (_, ["run"])
@@ -561,6 +577,27 @@ struct Actor {
 
 /// The header an operator names a tenant with.
 const TENANT_HEADER: &str = "x-zygo-tenant";
+
+/// The header a caller names its own request with, so it can cancel it.
+///
+/// `X-Zygo-Request-Id` comes back *with the answer*, which is too late to stop
+/// the call it belongs to. A caller that wants to be able to stop its own
+/// request names it on the way in with this, and passes the same string to
+/// `DELETE /requests/<name>`.
+///
+/// Not unique and not checked for uniqueness: two calls sharing a key are two
+/// calls one cancel stops, which is what a caller who reused one meant. It is
+/// only ever matched against the caller's *own* requests, so one tenant's key
+/// cannot reach another's work.
+const REQUEST_KEY_HEADER: &str = "x-zygo-request-key";
+
+/// The header a request's own id comes back in.
+///
+/// What `DELETE /requests/<id>` names. Of no use to the caller of *this* call,
+/// which has already finished by the time a header arrives — that is what
+/// `X-Zygo-Request-Key` is for. It is here for anything joining a log line
+/// back to the request it describes, and for a proxy that tees the answer.
+const REQUEST_ID_HEADER: &str = "x-zygo-request-id";
 
 impl Actor {
     fn tenant(&self) -> Option<&str> {
@@ -719,6 +756,31 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// The caller's own name for this request, if they gave one.
+///
+/// Bounded and restricted to printable ASCII, because it is compared against
+/// request ids and appears in log lines: a key with a newline in it would be a
+/// caller writing into the supervisor's log.
+fn request_key(req: &Request<Incoming>) -> Result<Option<String>, HttpError> {
+    let Some(value) = req.headers().get(REQUEST_KEY_HEADER) else {
+        return Ok(None);
+    };
+    let key = value
+        .to_str()
+        .map(str::trim)
+        .ok()
+        .filter(|k| !k.is_empty())
+        .filter(|k| k.len() <= 128)
+        .filter(|k| k.bytes().all(|b| b.is_ascii_graphic()))
+        .ok_or_else(|| {
+            HttpError::new(
+                StatusCode::BAD_REQUEST,
+                "X-Zygo-Request-Key must be 1 to 128 printable ASCII characters",
+            )
+        })?;
+    Ok(Some(key.to_string()))
+}
+
 fn timeout_header(req: &Request<Incoming>) -> Result<u64, HttpError> {
     timeout_header_from(req.headers())
 }
@@ -822,6 +884,7 @@ async fn exec(
     event: serde_json::Value,
     timeout_ms: u64,
     tenant: Option<String>,
+    key: Option<String>,
 ) -> Result<Response<Full<Bytes>>, HttpError> {
     let reply = control(api, move |c| {
         Ok(c.send(&Control::Exec {
@@ -829,6 +892,7 @@ async fn exec(
             event,
             timeout_ms,
             tenant,
+            key,
         })?)
     })
     .await?;
@@ -880,6 +944,11 @@ async fn batch(
                     event,
                     timeout_ms,
                     tenant,
+                    // A batch is one HTTP request and many sandbox requests,
+                    // so one key would name all of them. Cancelling the batch
+                    // is cancelling the HTTP call; per-element cancellation
+                    // needs a name per element, which nothing has asked for.
+                    key: None,
                 })?)
             })
             .await;
@@ -1058,6 +1127,21 @@ async fn serve_runtime(
     Ok(reply_to_response(reply))
 }
 
+/// `DELETE /requests/<id>`: stop a request that is running.
+///
+/// Answers as soon as the kill has been sent, not when the request has
+/// stopped: the request's own caller is the one waiting for the outcome, and
+/// holding this connection open until they get it would make a cancel cost as
+/// long as the thing it cancelled.
+async fn cancel(
+    api: &Arc<Api>,
+    id: String,
+    tenant: Option<String>,
+) -> Result<Response<Full<Bytes>>, HttpError> {
+    let reply = control(api, move |c| Ok(c.send(&Control::Cancel { id, tenant })?)).await?;
+    Ok(reply_to_response(reply))
+}
+
 async fn runtimes(
     api: &Arc<Api>,
     tenant: Option<String>,
@@ -1117,6 +1201,7 @@ async fn call_runtime(
     body: &[u8],
     timeout_ms: u64,
     tenant: Option<String>,
+    key: Option<String>,
 ) -> Result<Response<Full<Bytes>>, HttpError> {
     let request: CallRuntimeRequest = serde_json::from_slice(body).map_err(|e| {
         HttpError::new(
@@ -1141,6 +1226,7 @@ async fn call_runtime(
 
     let reply = control(api, move |c| {
         Ok(c.send(&Control::ExecScript {
+            key,
             runtime: name,
             script,
             event: request.event,
@@ -1751,6 +1837,17 @@ fn reply_to_json(reply: Reply) -> (StatusCode, serde_json::Value) {
             }),
         ),
         Reply::Stopped { names } => (StatusCode::OK, serde_json::json!({ "stopped": names })),
+        Reply::Cancelled { id, started } => (
+            StatusCode::OK,
+            serde_json::json!({
+                "cancelled": true,
+                "request_id": id,
+                // `false` is the better outcome and worth saying: the child
+                // was still parked waiting to be let go, so no handler code
+                // ran at all.
+                "started": started,
+            }),
+        ),
         Reply::Script {
             digest,
             size,
@@ -1817,6 +1914,13 @@ fn reply_to_response(reply: Reply) -> Response<Full<Bytes>> {
             .headers_mut()
             .insert("retry-after", hyper::header::HeaderValue::from_static("1"));
     }
+    // In a header as well as the body, for the same reason `Retry-After` is:
+    // the caller who needs it is often the one not reading the body.
+    if let Some(id) = body.get("request_id").and_then(|v| v.as_str())
+        && let Ok(value) = hyper::header::HeaderValue::from_str(id)
+    {
+        response.headers_mut().insert(REQUEST_ID_HEADER, value);
+    }
     response
 }
 
@@ -1828,11 +1932,31 @@ fn outcome_to_json(outcome: Outcome) -> (StatusCode, serde_json::Value) {
         "cpu_ms": outcome.metrics.cpu_ms,
         "peak_rss_kb": outcome.metrics.peak_rss_kb,
     });
+    let id = outcome.id;
+    // Before the timeout, because a cancelled request is one whose caller
+    // already knows why it stopped, and telling them it "exceeded the
+    // function's timeout" would be a lie about their own action. `499` is
+    // nginx's for a client that went away, and the nearest thing to a
+    // registered code for this.
+    if outcome.cancelled {
+        return (
+            StatusCode::from_u16(499).expect("a valid status"),
+            serde_json::json!({
+                "error": "the request was cancelled",
+                "cancelled": true,
+                "request_id": id,
+                "stdout": outcome.stdout,
+                "stderr": outcome.stderr,
+                "metrics": metrics,
+            }),
+        );
+    }
     if outcome.timed_out {
         return (
             StatusCode::REQUEST_TIMEOUT,
             serde_json::json!({
                 "error": "the request exceeded the function's timeout and was killed",
+                "request_id": id,
                 "stderr": outcome.stderr,
                 "metrics": metrics,
             }),
@@ -1843,6 +1967,7 @@ fn outcome_to_json(outcome: Outcome) -> (StatusCode, serde_json::Value) {
             StatusCode::INTERNAL_SERVER_ERROR,
             serde_json::json!({
                 "error": error,
+                "request_id": id,
                 "stdout": outcome.stdout,
                 "stderr": outcome.stderr,
                 "exit_code": outcome.exit_code,
@@ -1854,6 +1979,7 @@ fn outcome_to_json(outcome: Outcome) -> (StatusCode, serde_json::Value) {
         StatusCode::OK,
         serde_json::json!({
             "result": outcome.result,
+            "request_id": id,
             "stdout": outcome.stdout,
             "stderr": outcome.stderr,
             "metrics": metrics,
@@ -1878,6 +2004,8 @@ mod tests {
 
     fn outcome(error: Option<&str>, timed_out: bool) -> Outcome {
         Outcome {
+            id: "00000001".into(),
+            cancelled: false,
             exit_code: if error.is_some() { 1 } else { 0 },
             result: serde_json::json!({ "ok": true }),
             stdout: "hi\n".into(),

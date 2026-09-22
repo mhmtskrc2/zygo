@@ -75,6 +75,35 @@ class Timeout(ZygoError):
         self.metrics = metrics or {}
 
 
+class Cancelled(ZygoError):
+    """Somebody stopped this request — usually the caller.
+
+    The third reading of exit 137. A cancel kill, a deadline kill and an
+    out-of-memory kill are one signal and three different things to tell a
+    caller, and only the side that sent the signal knows which it was: the
+    supervisor does, so this is never a guess either.
+
+    Distinct from :class:`Timeout` on purpose. A timeout says the work is too
+    slow or the limit is too tight; this says the answer stopped being wanted,
+    which needs no action at all.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        request_id: str = "",
+        stdout: str = "",
+        stderr: str = "",
+        metrics: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(message)
+        self.request_id = request_id
+        self.stdout = stdout
+        self.stderr = stderr
+        self.metrics = metrics or {}
+
+
 class HandlerError(ZygoError):
     """The handler raised. The exception text and both streams are attached."""
 
@@ -117,6 +146,16 @@ def from_response(status: int, body: Dict[str, Any], retry_after: float = 1.0) -
         return NotFound(message)
     if status == 408:
         return Timeout(message, stderr=str(body.get("stderr", "")), metrics=body.get("metrics"))
+    # 499 is nginx's for a client that went away, and the nearest thing to a
+    # registered code for a request the caller stopped.
+    if status == 499 or body.get("cancelled") is True:
+        return Cancelled(
+            message,
+            request_id=str(body.get("request_id", "")),
+            stdout=str(body.get("stdout", "")),
+            stderr=str(body.get("stderr", "")),
+            metrics=body.get("metrics"),
+        )
     if status == 429:
         return Busy(
             message,

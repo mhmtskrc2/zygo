@@ -253,6 +253,7 @@ impl Supervisor {
         event: serde_json::Value,
         timeout: Duration,
         tenant: Option<&str>,
+        key: Option<&str>,
     ) -> std::result::Result<Response, Response> {
         let script = self.script_for_request(script, tenant)?;
         let pool = self.runtime_named(name)?;
@@ -289,9 +290,11 @@ impl Supervisor {
             return Err(Response::error(ControlError::CallFailed, e));
         }
 
+        // `tenant`, not the pool's: a pool is shared, so the request's own
+        // owner is the only answer to "who may cancel this?".
         let outcome = zygote
             .function
-            .call_script_with_timeout(event, Some(script), timeout)
+            .call_script_as(event, Some(script), timeout, tenant, key)
             .map_err(|e| Response::error(ControlError::CallFailed, e));
         drop(permit);
 
@@ -455,6 +458,37 @@ impl Supervisor {
     /// actually experiencing rather than a rate this would have to smooth.
     ///
     /// [`tier_idle`]: Supervisor::tier_idle
+    /// Stop a request running in one of the pools.
+    ///
+    /// A pool's requests are spread across its zygotes, so this asks each in
+    /// turn. `None` means no pool holds the id. See [`Supervisor::cancel`],
+    /// which tries the functions first.
+    pub(super) fn cancel_in_pools(&self, id: &str, caller: Option<&str>) -> Option<bool> {
+        let pools: Vec<(String, Arc<RuntimePool>)> = self
+            .runtimes
+            .lock()
+            .expect("runtimes")
+            .iter()
+            .map(|(name, pool)| (name.clone(), Arc::clone(pool)))
+            .collect();
+
+        for (name, pool) in pools {
+            // A pool belongs to whoever declared it, but its *requests* belong
+            // to whoever sent them — and a pool is shared, which is the point
+            // of one. So the check cannot be on the pool's tenant: each
+            // request carries its own owner, and `Function::cancel` answers
+            // `None` for one that is not the caller's.
+            let zygotes: Vec<Arc<Zygote>> = pool.zygotes.lock().expect("zygotes").to_vec();
+            for zygote in zygotes {
+                if let Some(started) = zygote.function.cancel(id, caller) {
+                    tracing::info!(runtime = %name, request = %id, started, "cancelled");
+                    return Some(started);
+                }
+            }
+        }
+        None
+    }
+
     pub fn scale_runtimes(&self) -> Vec<String> {
         let pools: Vec<(String, Arc<RuntimePool>)> = self
             .runtimes

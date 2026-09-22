@@ -179,6 +179,35 @@ Sent once the supervisor has moved `pid` into the request's cgroup. Until then
 the child is still accounted to the *agent's* cgroup, so an allocation before
 `GO` would be billed to the wrong place and escape the request's limits.
 
+### `CANCEL` — supervisor → agent (1.2)
+
+```json
+{"type":"CANCEL","id":"01f3"}
+```
+
+Somebody has asked for this request to stop.
+
+**This is not how it stops.** Zygo's supervisor kills the request by writing
+`cgroup.kill` on the request's own cgroup, from outside the sandbox — which
+takes the child and everything it spawned, and does not require the handler to
+be at a point where a signal helps. Trusting the agent to stop tenant code on
+request is trusting the blast radius to contain itself, which is the same
+reason `timeout_ms` in `EXEC` is a courtesy rather than a control.
+
+What this frame is for is the **answer**. A request killed by a cancel, one
+killed by its deadline and one killed for running out of memory are the same
+signal and the same exit 137, and a caller told only the number cannot tell
+their own cancel from a limit they need to raise. An agent that receives this
+sets `cancelled` on the `DONE` it sends for that request.
+
+Implementing it is **optional**, like the `script` field: an agent that does
+not know this message answers `ERROR` / `bad_message` per §3.6 and carries on,
+the kill still lands, and the supervisor fills in `cancelled` itself — it is
+the side that sent the kill, so it already knows. An agent that *does*
+implement it must not treat an unknown id as an error: the request may have
+finished between the decision to cancel it and this frame arriving, and that
+race has no wrong outcome.
+
 ### `RESULT` — child → agent
 
 ```json
@@ -207,8 +236,14 @@ Either way it is exactly one answer per `EXEC` (§3.5).
 
 ### `DONE` — agent → supervisor
 
-The same payload as `RESULT`, forwarded upwards. The agent must not drop fields
-on the way.
+The same payload as `RESULT`, forwarded upwards, plus one field of the agent's
+own:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `cancelled` | bool | Optional (1.2). A `CANCEL` for this id is why it stopped. Absent means `false`. |
+
+The agent must not drop fields on the way.
 
 If the child dies without sending a `RESULT` — an OOM kill, a deadline kill, a
 segfault in a C extension — the agent synthesises a `DONE` with a non-zero
@@ -315,7 +350,15 @@ agent in POSIX sh, to check the suite against something that is not Python.
    native addons, no WASI — when the image has no such object; it says which
    in `READY`. The `sh` agent refuses every request instead, which is the
    other conforming answer.
-8. **A script's digest is checked, if there is one.** An agent that implements
+8. **`CANCEL` is answered, if it is implemented.** An agent that acts on the
+   1.2 `CANCEL` message sets `cancelled` on that request's `DONE` and ignores
+   an id it does not hold. It must **not** treat the message as a request to
+   stop the child by itself: the child may be blocked in a syscall that no
+   signal it can send will interrupt, and the supervisor's cgroup kill is what
+   actually ends it. An agent that does not implement the message answers
+   `ERROR` / `bad_message` and carries on, which is conforming — rule 6 is
+   what makes that safe.
+9. **A script's digest is checked, if there is one.** An agent that implements
    the 1.1 `script` field and is given a `digest` hashes the bytes it is about
    to load and refuses them with `ERROR` / `handler_load` unless they match.
    Hash *what was read*, not the file again: reading twice is a window for the
@@ -366,6 +409,26 @@ On timeout the supervisor writes `cgroup.kill`, which takes down the whole
 subtree; the agent observes the child's death and reports it as a `DONE` with
 `error`.
 
+A cancel is the same kill with one frame in front of it, so that the answer
+says which it was:
+
+```
+supervisor                agent                     child
+    |------- EXEC --------->|------ fork() ---------->|
+    |<------ FORKED --------|                         | (waiting)
+    |-------- GO ---------->|------------------------>| handler(event)
+    |                       |                         |
+    |----- CANCEL --------->| (marks the request)     |
+    |  [write cgroup.kill]  |                         X
+    |<-- DONE{cancelled} ---|
+```
+
+A `CANCEL` that arrives **before** `GO` is the best case: the child exists but
+has run nothing, so Zygo's supervisor kills it and never sends `GO` at all.
+The request is answered `cancelled` without one instruction of the handler
+having run, which is why `DELETE /requests/<id>` reports whether the work had
+started.
+
 ---
 
 ## 5. Versioning
@@ -378,6 +441,12 @@ That is why the script-carrying `EXEC` above is called 1.1 and still announces
 working, and a supervisor that sends one to such an agent gets the agent's own
 handler back rather than an error. The version number is for the day something
 *removes* or *changes the meaning of* a field, and nothing has.
+
+`CANCEL` and `DONE`'s `cancelled` are 1.2 on the same terms. The new message
+is one an older agent reports as `bad_message` and carries on from, and the new
+field is one an older agent never sets — and in both cases the supervisor's own
+answer is unchanged, because the kill it sends is what stops the request and it
+knows it sent it.
 
 Conformance fixtures live in `spec/fixtures/` and are exercised by both the Rust
 tests and `agents/python/test_zygo_agent.py`.

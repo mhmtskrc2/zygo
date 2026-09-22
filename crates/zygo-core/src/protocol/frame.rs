@@ -273,6 +273,7 @@ mod tests {
     fn large_but_legal_payloads_survive() {
         let big = "x".repeat(1 << 20);
         let msg = Message::Done {
+            cancelled: false,
             id: "a".into(),
             exit_code: 0,
             result: json!({ "blob": big }),

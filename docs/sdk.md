@@ -83,6 +83,7 @@ as.
 | Recent log | `client.logs(name)` | `client.logs(name)` | either | no |
 | Version | `client.version()` | `client.version()` | either | no |
 | Register a script | `client.put_script(source)` | `client.putScript(source)` | either | no |
+| Stop a running request | `client.cancel(id)` | `client.cancel(id)` | own, or operator | no |
 | Look a script up | `client.script(digest)` | `client.script(digest)` | either | no |
 | Run a script in a pool | `client.run_script(runtime, script)` | `client.runScript(runtime, script)` | either | no |
 | List runtime pools | `client.runtimes()` | `client.runtimes()` | either | no |
@@ -203,6 +204,57 @@ is what keeps one working across this change. On the host, `zygo token mint`,
 `zygo token ls` and `zygo token revoke <id>` do the same three things without
 an HTTP round trip.
 
+## Cancelling a request
+
+A request that is running can be stopped:
+
+```python
+out = client.call("render", event, key="job-4711")   # name it on the way in
+...
+client.cancel("job-4711")                            # from anywhere
+```
+
+```js
+const controller = new AbortController();
+const call = client.call('render', event, { signal: controller.signal });
+controller.abort();                                  // cancels it on the server too
+```
+
+The caller of the cancelled request gets `Cancelled`, which is deliberately
+**not** `Timeout`: a timeout says the work is too slow or the limit is too
+tight, and this says the answer stopped being wanted. Both arrive as exit 137
+from the kernel, and only the side that sent the signal can tell them apart —
+so the supervisor records which it was rather than guessing.
+
+Asynchronous Python needs no key at all:
+
+```python
+task = asyncio.ensure_future(client.call("render", event))
+task.cancel()          # sends the cancel before CancelledError propagates
+```
+
+Why a **key** and not the request id: the id is assigned by the host and
+arrives *with the answer*, which is too late to stop the call it belongs to.
+`X-Zygo-Request-Id` comes back on every response and in the body as
+`request_id`, and it is what joins a log line to the request it describes; the
+key is what a caller uses to name a request it is still waiting for. Reusing a
+key is allowed and means one cancel stops every call under it.
+
+What actually stops the work is the supervisor writing `cgroup.kill` on the
+request's own cgroup, from outside the sandbox. That reaches everything the
+handler spawned and does not depend on tenant code being in a state where a
+signal helps. The agent is *told*, so it can mark the answer — but an agent
+that ignores the message changes nothing about whether the request stops.
+
+A cancel that arrives before the request has been let go is the best case: the
+process exists and has run nothing, so it is stopped without a line of the
+handler having run. `started: false` in the answer says that is what happened.
+
+Cancelling something that has already finished, or that belongs to another
+tenant, is the same `NotFound`. Request ids are a counter rather than a secret,
+so ownership is what keeps a cancel honest — the same argument a script digest
+gets.
+
 ## Runtime pools
 
 A warm function is one script in one zygote. A **runtime pool** is the other
@@ -310,6 +362,7 @@ different about what to do next.
 |---|---|---|
 | `Busy` | the pool is full; **the request never ran** | retry after `retry_after` |
 | `Timeout` | the deadline killed the request | the work is too slow, or the limit is too tight |
+| `Cancelled` | somebody stopped the request | nothing: this is what was asked for |
 | `HandlerError` | the handler raised; carries both streams | fix the function |
 | `NotFound` | no function under that name | `serve` it |
 | `AuthError` | wrong token, or a deploy call on a call-only API | check the token or the flag |

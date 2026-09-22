@@ -24,6 +24,7 @@
  * this package create a sandbox at all.
  */
 
+import { randomBytes } from 'node:crypto';
 import http from 'node:http';
 import https from 'node:https';
 
@@ -31,6 +32,7 @@ import { DEFAULT_URL, parse, resolve } from './endpoint.js';
 import {
   AuthError,
   Busy,
+  Cancelled,
   HandlerError,
   NotFound,
   SpecError,
@@ -43,6 +45,7 @@ import {
 export {
   AuthError,
   Busy,
+  Cancelled,
   DEFAULT_URL,
   HandlerError,
   NotFound,
@@ -138,16 +141,70 @@ export class Client {
    * the deadline killed the request, and {@link Busy} when the function is at
    * its concurrency limit — the last of which means the request never ran.
    *
+   * `key` is a name *you* choose for this request, so that something else can
+   * stop it with {@link cancel} before it answers — the server's own id only
+   * arrives with the answer, which is too late to cancel the call it belongs
+   * to. `signal` does the same thing through an `AbortController`: aborting it
+   * sends the cancel for you.
+   *
    * @param {string} name
    * @param {unknown} [event]
-   * @param {{timeout?: number}} [options] `timeout` in seconds.
+   * @param {{timeout?: number, key?: string, signal?: AbortSignal}} [options]
+   *   `timeout` in seconds.
    */
   async call(name, event = null, options = {}) {
-    const body = await this.#request('POST', `/fn/${esc(name)}`, {
-      body: event,
-      headers: timeoutHeader(options.timeout),
-    });
-    return parseResult(body);
+    const key = options.key || (options.signal ? requestKey() : undefined);
+    const headers = timeoutHeader(options.timeout);
+    if (key) headers['x-zygo-request-key'] = key;
+    const stop = this.#onAbort(options.signal, key);
+    try {
+      const body = await this.#request('POST', `/fn/${esc(name)}`, { body: event, headers });
+      return parseResult(body);
+    } finally {
+      stop();
+    }
+  }
+
+  /**
+   * Stop a request that is running.
+   *
+   * `requestId` is either the server's own id — from `X-Zygo-Request-Id`, or
+   * from a result that has already come back — or the `key` the call was made
+   * with, which is the only name a caller has for a request that has not
+   * answered yet.
+   *
+   * Answers as soon as the kill has been sent, not when the request has
+   * stopped: whoever is waiting on that request gets the outcome, as a
+   * {@link Cancelled}. `started` says whether the handler had begun — `false`
+   * is the better outcome, because no handler code ran at all.
+   *
+   * Throws {@link NotFound} when nothing is running under that name, which
+   * includes a request that finished a moment ago and one belonging to another
+   * tenant.
+   */
+  async cancel(requestId) {
+    return this.#request('DELETE', `/requests/${esc(requestId)}`);
+  }
+
+  /**
+   * Send a cancel when `signal` aborts, and return a function that unsubscribes.
+   *
+   * The cancel is fire-and-forget: the caller is already unwinding with their
+   * own abort error, and a request that had finished — or a connection that has
+   * gone — is "nothing left to stop" rather than something to report over the
+   * top of it.
+   */
+  #onAbort(signal, key) {
+    if (!signal || !key) return () => {};
+    const send = () => {
+      this.cancel(key).catch(() => {});
+    };
+    if (signal.aborted) {
+      send();
+      return () => {};
+    }
+    signal.addEventListener('abort', send, { once: true });
+    return () => signal.removeEventListener('abort', send);
   }
 
   /**
@@ -389,17 +446,25 @@ export class Client {
    * host can put the file in the sandbox instead of sending it through the
    * zygote.
    */
-  async runScript(runtime, script, event = null, { entryPoint, timeout } = {}) {
+  async runScript(runtime, script, event = null, { entryPoint, timeout, key, signal } = {}) {
     const body = {
       script: script.startsWith('sha256:') ? script : { source: script },
       event,
     };
     if (entryPoint !== undefined) body.entry_point = entryPoint;
-    const answer = await this.#request('POST', `/runtimes/${esc(runtime)}/call`, {
-      body,
-      headers: timeoutHeader(timeout),
-    });
-    return parseResult(answer);
+    const name = key || (signal ? requestKey() : undefined);
+    const headers = timeoutHeader(timeout);
+    if (name) headers['x-zygo-request-key'] = name;
+    const stop = this.#onAbort(signal, name);
+    try {
+      const answer = await this.#request('POST', `/runtimes/${esc(runtime)}/call`, {
+        body,
+        headers,
+      });
+      return parseResult(answer);
+    } finally {
+      stop();
+    }
   }
 
   /**
@@ -544,9 +609,20 @@ function decode(status, raw, retryAfter) {
   throw fromResponse(status, typeof body === 'object' && body !== null ? body : { error: String(body) }, retryAfter);
 }
 
+/**
+ * A name for one request, unique enough that a cancel finds only it.
+ *
+ * 128 bits from the crypto source. The server checks ownership as well, so this
+ * is the second lock rather than the only one.
+ */
+function requestKey() {
+  return 'k-' + randomBytes(16).toString('hex');
+}
+
 function parseResult(raw) {
   return {
     result: raw.result ?? null,
+    requestId: String(raw.request_id ?? ''),
     stdout: String(raw.stdout ?? ''),
     stderr: String(raw.stderr ?? ''),
     metrics: {

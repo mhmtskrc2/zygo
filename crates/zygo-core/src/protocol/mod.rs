@@ -172,6 +172,23 @@ pub enum Message {
     #[serde(rename = "GO")]
     Go { id: String },
 
+    /// Supervisor → agent: stop this request (proto 1.2).
+    ///
+    /// **Not** how the request is killed. Zygo kills it by writing
+    /// `cgroup.kill` on the request's own cgroup, from outside the sandbox,
+    /// because trusting the agent to stop tenant code is trusting the blast
+    /// radius to contain itself — the same reason `timeout_ms` is a courtesy
+    /// rather than a control.
+    ///
+    /// What this frame is for is the *answer*: an agent that has been told
+    /// sets `cancelled` on the `DONE` it synthesises, so the caller learns
+    /// that their own cancel is why the request stopped rather than reading a
+    /// 137 and guessing between a deadline and an out-of-memory kill. An
+    /// agent that ignores it is still conforming, and the supervisor fills in
+    /// `cancelled` itself — it knows, because it is the one that asked.
+    #[serde(rename = "CANCEL")]
+    Cancel { id: String },
+
     /// Child → agent: the outcome.
     #[serde(rename = "RESULT")]
     Result {
@@ -203,6 +220,14 @@ pub enum Message {
         stderr: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        /// A `CANCEL` for this id is why it stopped (proto 1.2).
+        ///
+        /// Optional, and the supervisor does not depend on it: it knows
+        /// whether it cancelled this request. It is here so that an agent
+        /// which *does* track cancellation can say so, and so a third-party
+        /// supervisor reading this protocol has the fact on the wire.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        cancelled: bool,
         #[serde(flatten)]
         metrics: Metrics,
     },
@@ -271,6 +296,7 @@ impl Message {
             Message::Exec { id, .. }
             | Message::Forked { id, .. }
             | Message::Go { id }
+            | Message::Cancel { id }
             | Message::Result { id, .. }
             | Message::Done { id, .. } => Some(id),
             Message::Error { id, .. } => id.as_deref(),
@@ -285,6 +311,7 @@ impl Message {
             Message::Exec { .. } => "EXEC",
             Message::Forked { .. } => "FORKED",
             Message::Go { .. } => "GO",
+            Message::Cancel { .. } => "CANCEL",
             Message::Result { .. } => "RESULT",
             Message::Done { .. } => "DONE",
             Message::Ping { .. } => "PING",
@@ -314,6 +341,9 @@ impl Message {
                 stdout,
                 stderr,
                 error,
+                // A child's `RESULT` is a request that finished on its own.
+                // Cancellation is the agent's to add, or the supervisor's.
+                cancelled: false,
                 metrics,
             }),
             _ => None,

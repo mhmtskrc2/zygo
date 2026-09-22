@@ -27,6 +27,7 @@ from ._sync import (
     _decode,
     _escape,
     _escape_digest,
+    _request_key,
     _retry_after,
     _timeout_header,
 )
@@ -89,11 +90,58 @@ class AsyncClient:
     async def warm(self, name: str) -> Dict[str, Any]:
         return await self._request("POST", f"/fn/{_escape(name)}/warm")
 
-    async def call(self, name: str, event: Any = None, *, timeout: Optional[float] = None) -> Result:
-        body = await self._request(
-            "POST", f"/fn/{_escape(name)}", body=event, headers=_timeout_header(timeout)
-        )
+    async def call(
+        self,
+        name: str,
+        event: Any = None,
+        *,
+        timeout: Optional[float] = None,
+        key: Optional[str] = None,
+    ) -> Result:
+        """Call a warm function.
+
+        **Cancelling the task cancels the request.** ``asyncio.CancelledError`` —
+        from ``task.cancel()``, from a ``timeout`` block, from the loop
+        shutting down — sends ``DELETE /requests/<key>`` before it propagates,
+        so the sandbox stops rather than running on unread. That is the whole
+        reason the request carries a key: the server's own id only arrives
+        *with the answer*, which is too late to stop the call it belongs to.
+
+        Pass ``key`` to choose the name yourself; otherwise one is generated.
+        """
+        key = key or _request_key()
+        headers = _timeout_header(timeout)
+        headers["x-zygo-request-key"] = key
+        try:
+            body = await self._request(
+                "POST", f"/fn/{_escape(name)}", body=event, headers=headers
+            )
+        except asyncio.CancelledError:
+            await self._cancel_quietly(key)
+            raise
         return Result.parse(body)
+
+    async def cancel(self, request_id: str) -> Dict[str, Any]:
+        """Stop a request that is running. See :meth:`zygo.Client.cancel`."""
+        return await self._request("DELETE", f"/requests/{_escape(request_id)}")
+
+    async def _cancel_quietly(self, key: str) -> None:
+        """Send a cancel on the way out of a cancelled task.
+
+        Shielded, because the task is *already* being cancelled: an ordinary
+        await here would be cancelled too and the sandbox would keep running,
+        which is the failure this exists to prevent.
+
+        Every failure is swallowed. The caller is unwinding with
+        ``CancelledError`` and that is the exception they must see; a request
+        that had already finished, or a connection that has gone, are both
+        "there is nothing left to stop" rather than something to report over
+        the top of it.
+        """
+        try:
+            await asyncio.shield(self.cancel(key))
+        except BaseException:  # noqa: BLE001 - see the docstring
+            pass
 
     async def batch(
         self,
@@ -185,19 +233,29 @@ class AsyncClient:
         *,
         entry_point: Optional[str] = None,
         timeout: Optional[float] = None,
+        key: Optional[str] = None,
     ) -> Result:
+        """Run one script in a pool. Cancelling the task cancels the request;
+        see :meth:`call`."""
         payload: Dict[str, Any] = {
             "script": script if script.startswith("sha256:") else {"source": script},
             "event": event,
         }
         if entry_point is not None:
             payload["entry_point"] = entry_point
-        body = await self._request(
-            "POST",
-            f"/runtimes/{_escape(runtime)}/call",
-            body=payload,
-            headers=_timeout_header(timeout),
-        )
+        key = key or _request_key()
+        headers = _timeout_header(timeout)
+        headers["x-zygo-request-key"] = key
+        try:
+            body = await self._request(
+                "POST",
+                f"/runtimes/{_escape(runtime)}/call",
+                body=payload,
+                headers=headers,
+            )
+        except asyncio.CancelledError:
+            await self._cancel_quietly(key)
+            raise
         return Result.parse(body)
 
     async def put_script(self, source: str) -> Script:
@@ -257,6 +315,15 @@ class AsyncClient:
             status, response_headers, raw = await asyncio.wait_for(
                 _read_response(reader), timeout=self.timeout
             )
+        except asyncio.CancelledError:
+            # The exchange is half-finished: the request went out and the
+            # answer is still coming. The connection can neither be reused —
+            # the next request would read this one's response — nor left, which
+            # is what used to happen: a cancelled task leaked its socket, and
+            # the warning only appeared once cancelling became an ordinary
+            # thing to do. Close it and let the cancel propagate.
+            await _shut(writer)
+            raise
         except (OSError, asyncio.IncompleteReadError, asyncio.TimeoutError, ValueError) as e:
             await _shut(writer)
             raise TransportError(f"{method} {path} failed against {self.endpoint}: {e}") from e

@@ -458,6 +458,82 @@ def main() -> int:
         client.delete_tenant("globex")
         client.stop_runtime("shared")
 
+        # --- cancelling ------------------------------------------------------
+        #
+        # A request that has started is stopped from outside the sandbox. What
+        # is checked here is the *answer*: the caller of the cancelled call
+        # learns that it was cancelled rather than reading a 137 and guessing
+        # between a deadline and an out-of-memory kill.
+        print("\ncancel")
+
+        import threading
+
+        pool = client.serve_runtime(
+            "slow", {"image": image, "agent": "python", "timeout": "120s"}
+        )
+        if pool.get("warm", 0) >= 1:
+            ok("a pool for long requests is warm")
+        else:
+            bad("POST /runtimes", pool)
+
+        slow = client.put_script(
+            "import time\n\n\ndef handler(event):\n"
+            "    time.sleep(event.get('seconds', 30))\n"
+            "    return 'finished'\n"
+        )
+
+        def run_slow(key, out):
+            try:
+                out.append(("result", client.run_script("slow", slow.sha256, {}, key=key)))
+            except BaseException as e:  # noqa: BLE001 - the test is what it raised
+                out.append(("error", e))
+
+        answer: list = []
+        caller = threading.Thread(target=run_slow, args=("job-1", answer), daemon=True)
+        caller.start()
+        time.sleep(2.0)
+
+        stopped = client.cancel("job-1")
+        if stopped.get("cancelled") and stopped.get("started"):
+            ok("a running request is cancelled by the name its caller gave it")
+        else:
+            bad("DELETE /requests/<key>", stopped)
+
+        caller.join(timeout=20)
+        if caller.is_alive():
+            bad("the cancelled request never answered its caller")
+        else:
+            kind, what = answer[0]
+            if kind == "error" and isinstance(what, zygo.Cancelled):
+                ok("and its caller is told it was cancelled, not that it timed out")
+            else:
+                bad("the cancelled call answered with something else", f"{kind}: {what}")
+
+        # A request id is a counter, so the only thing keeping a cancel honest
+        # is ownership. A name nobody is running is a 404 either way.
+        try:
+            client.cancel("job-1")
+            bad("cancelling a request that had finished succeeded")
+        except zygo.NotFound:
+            ok("cancelling one that has already finished is a NotFound")
+
+        try:
+            client.cancel("00000001")
+            bad("an id nobody is running was accepted")
+        except zygo.NotFound:
+            ok("and so is an id nobody is running")
+
+        # The id comes back with every answer, which is what joins a log line
+        # to the request it describes.
+        quick = client.run_script("slow", slow.sha256, {"seconds": 0})
+        if quick.request_id:
+            ok(f"a result carries its own request id ({quick.request_id})")
+        else:
+            bad("the result has no request_id", quick)
+
+        client.delete_script(slow.sha256)
+        client.stop_runtime("slow")
+
         # --- the ceilings ----------------------------------------------------
         print("\nceilings")
 
@@ -658,6 +734,61 @@ def tokens(socket_path: str, image: str) -> int:
             bad("a tenant token ran another tenant's script by naming its digest")
         except zygo.NotFound:
             ok("another tenant's token naming that digest is refused as `not found`")
+
+        # --- and a request id is a counter, so ownership is the lock ------------
+        #
+        # Ids are `00000001`, `00000002`, … — a name, not a secret, on the
+        # same argument a script digest gets. So a tenant counting up must not
+        # be able to reach another tenant's work with a cancel.
+        import threading
+
+        slow = acme.put_script(
+            "import time\n\n\ndef handler(event):\n"
+            "    time.sleep(20)\n    return 'finished'\n"
+        )
+
+        answer: list = []
+
+        def run_slow() -> None:
+            try:
+                answer.append(("result", acme.run_script("shared", slow.sha256, {}, key="theirs")))
+            except BaseException as e:  # noqa: BLE001 - the test is what it raised
+                answer.append(("error", e))
+
+        caller = threading.Thread(target=run_slow, daemon=True)
+        caller.start()
+        time.sleep(2.0)
+
+        try:
+            other.cancel("theirs")
+            bad("a tenant cancelled another tenant's request by name")
+        except zygo.NotFound:
+            ok("a tenant cannot cancel another tenant's request")
+
+        # Every id the host could plausibly be running. If one of them is
+        # acme's, this is the hole that ownership is there to close.
+        stolen = False
+        for n in range(1, 40):
+            try:
+                other.cancel(f"{n:08x}")
+                stolen = True
+                break
+            except zygo.NotFound:
+                pass
+        if stolen:
+            bad("a tenant cancelled a request by counting ids up")
+        else:
+            ok("and cannot find one by counting ids up either")
+
+        if acme.cancel("theirs").get("cancelled"):
+            ok("while its own caller can stop it")
+        else:
+            bad("the owner could not cancel their own request")
+        caller.join(timeout=20)
+        # The operator's, not acme's: the store is shared by digest, so
+        # forgetting one script forgets it for every tenant that registered
+        # the same bytes.
+        operator.delete_script(slow.sha256)
 
         # --- revocation --------------------------------------------------------
 

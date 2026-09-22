@@ -42,7 +42,10 @@ use crate::spec::{Layer, Spec};
 /// - v6: `MINT_TOKEN`, `TOKENS`, `REVOKE_TOKEN` and their answer — API tokens
 ///   that say whose request this is, so the tenant comes from something the
 ///   caller cannot choose rather than from a header.
-pub const CONTROL_VERSION: u32 = 6;
+/// - v7: `CANCEL` and `CANCELLED` — stopping a request that is already
+///   running, and an `Outcome` that carries its own id so the caller has
+///   something to name.
+pub const CONTROL_VERSION: u32 = 7;
 
 /// CLI → supervisor.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -117,6 +120,15 @@ pub enum Request {
         timeout_ms: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tenant: Option<String>,
+        /// A name the caller chose for this request, so they can cancel it
+        /// before it answers (v7).
+        ///
+        /// The id is assigned by the supervisor and only reaches the caller
+        /// *with the answer*, which is too late to stop the call it belongs
+        /// to. Naming the request on the way in is the only way a caller can
+        /// cancel its own. See `crate::pool::InFlight`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
     },
 
     /// Run a one-shot sandbox here, on the client's behalf.
@@ -273,6 +285,9 @@ pub enum Request {
         /// Whose request this is. `None` is the operator's own.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tenant: Option<String>,
+        /// See `Exec::key`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
     },
 
     /// Everything `zygo top` shows about the pools.
@@ -316,6 +331,27 @@ pub enum Request {
 
     /// Revoke one by its public id. `not_found` if no token has that id.
     RevokeToken { id: String },
+
+    /// Stop a request that is running.
+    ///
+    /// `id` is what an `Outcome` carries and what `POST /fn/<name>` returns in
+    /// `X-Zygo-Request-Id`. Ids are unique across the host, so this names one
+    /// request and does not need to say which function it is on. A caller's
+    /// own `key` is accepted here too, and is the only name a caller has for a
+    /// request that has not answered yet.
+    ///
+    /// Answered as soon as the kill has been *sent*. The request's own
+    /// connection is what reports the outcome, and it is still waiting for the
+    /// agent — so a caller that wants to know what the cancelled request
+    /// produced reads the answer to its own call, not this one.
+    ///
+    /// `tenant` is who is asking, and a request belonging to somebody else is
+    /// `not_found` — the same answer an id that finished a second ago gets.
+    Cancel {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tenant: Option<String>,
+    },
 }
 
 fn default_log_limit() -> u32 {
@@ -466,6 +502,17 @@ pub enum Response {
         stopped: Vec<String>,
     },
 
+    /// Answer to `Cancel`: the kill was sent.
+    ///
+    /// `started` is whether the request had reached the handler. `false` means
+    /// the child was still parked waiting for `GO`, so it is cancelled without
+    /// having run one instruction of it — the better outcome, and worth
+    /// telling a caller apart from the other one.
+    Cancelled {
+        id: String,
+        started: bool,
+    },
+
     /// Answer to `MintToken`, `Tokens` and `RevokeToken`.
     ///
     /// One shape for all three, like `Tenants`. A mint answers with the one
@@ -606,6 +653,7 @@ mod tests {
                 event: serde_json::json!({ "url": "https://example.com" }),
                 timeout_ms: 30_000,
                 tenant: Some("acme".into()),
+                key: Some("job-4711".into()),
             },
             Request::List,
             Request::Run {
@@ -668,6 +716,7 @@ mod tests {
                 event: serde_json::json!({ "n": 1 }),
                 timeout_ms: 30_000,
                 tenant: Some("acme".into()),
+                key: None,
             },
             Request::CreateTenant { id: "acme".into() },
             Request::Tenants { id: None },
@@ -679,6 +728,10 @@ mod tests {
             Request::Tokens,
             Request::RevokeToken {
                 id: "tok_1a2b3c4d5e6f".into(),
+            },
+            Request::Cancel {
+                id: "r-0001".into(),
+                tenant: Some("acme".into()),
             },
             Request::Runtimes,
             Request::StopRuntime {
@@ -741,6 +794,10 @@ mod tests {
                 existed: true,
                 removed_scripts: vec!["sha256:abc".into()],
                 stopped: vec!["resize".into()],
+            },
+            Response::Cancelled {
+                id: "r-0001".into(),
+                started: true,
             },
             Response::Tokens {
                 tokens: vec![crate::tokens::Token {
@@ -833,6 +890,8 @@ mod tests {
         // `zygo exec` prints this, so a field lost in transit is a wrong answer
         // rather than an error.
         let outcome = Outcome {
+            id: "00000001".into(),
+            cancelled: false,
             exit_code: 0,
             result: serde_json::json!({ "ok": true, "n": 3 }),
             stdout: "hello\n".into(),
@@ -859,6 +918,8 @@ mod tests {
     #[test]
     fn a_failed_outcome_keeps_its_error_across_the_wire() {
         let outcome = Outcome {
+            id: "00000002".into(),
+            cancelled: true,
             exit_code: 1,
             result: serde_json::Value::Null,
             stdout: String::new(),

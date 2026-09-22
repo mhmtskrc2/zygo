@@ -505,7 +505,15 @@ pub fn test(
         script_before_filter_check(&mut agent, binary, args, spawning)
     );
 
-    // 12. Shutdown. Last, because it ends the agent.
+    // 12. Protocol 1.2: a request that is cancelled says so. Optional — an
+    // agent that does not know `CANCEL` answers `bad_message` and carries on,
+    // and the supervisor fills `cancelled` in itself.
+    step_or_skip!(
+        "a cancelled request comes back as DONE{cancelled} (proto 1.2)",
+        cancel_check(&mut agent)
+    );
+
+    // 13. Shutdown. Last, because it ends the agent.
     step!("SHUTDOWN makes the agent exit", shutdown_check(&mut agent));
 
     finish(cli, report)
@@ -1218,6 +1226,93 @@ fn one_script_request(
 }
 
 /// `EXEC` → `FORKED` → `GO` → `DONE`, the whole cycle for one request.
+/// How long the handler sleeps for, so a cancel lands while it is running.
+const CANCEL_SLEEP_MS: u64 = 5_000;
+
+/// How long the agent has to answer after the request has been killed.
+///
+/// The supervisor's own bound is the same shape: an agent that does not answer
+/// a killed request is one the supervisor marks broken and rewarms, because a
+/// caller is waiting on that `DONE` and silence is not an outcome.
+const CANCEL_GRACE: Duration = Duration::from_secs(5);
+
+/// Protocol 1.2: a request that was cancelled comes back saying so.
+///
+/// This plays the supervisor's whole part, because the frame on its own is not
+/// the cancel. A real supervisor writes `cgroup.kill`; here there is no
+/// cgroup, so the child is killed by pid — which is the same thing from the
+/// agent's side, and the *only* part an agent can be asked about. What is
+/// being checked is the answer: `DONE`, for the right id, with `cancelled`.
+///
+/// Skipped rather than failed when the agent does not know the message. That
+/// is conforming: rule 6 says an unknown message is an `ERROR` and not fatal,
+/// and the supervisor knows it sent the kill.
+fn cancel_check(agent: &mut Agent) -> anyhow::Result<Outcome> {
+    let id = "c9";
+    agent.send(&exec(
+        id,
+        serde_json::json!({ "sleep_ms": CANCEL_SLEEP_MS }),
+    ))?;
+
+    let forked = agent.recv_matching("FORKED", |m| matches!(m, Message::Forked { .. }))?;
+    let Message::Forked { pid, .. } = forked else {
+        anyhow::bail!("expected FORKED, got {}", forked.kind());
+    };
+    agent.send(&Message::Go { id: id.to_string() })?;
+
+    // Long enough that the handler is inside its sleep. A cancel that lands
+    // before `GO` is a different case and a better one — the supervisor
+    // handles it by never sending `GO` — but it is not what this checks.
+    std::thread::sleep(Duration::from_millis(200));
+    agent.send(&Message::Cancel { id: id.to_string() })?;
+
+    // The supervisor's half. `pid` is the agent's own child and this suite
+    // runs the agent as a plain process, so there is no namespace to
+    // translate through.
+    // SAFETY: signalling a process this suite's agent forked.
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+
+    let started = Instant::now();
+    loop {
+        match agent.recv()? {
+            done @ Message::Done { .. } if done.request_id() == Some(id) => {
+                let Message::Done { cancelled, .. } = done else {
+                    unreachable!("matched above")
+                };
+                anyhow::ensure!(
+                    started.elapsed() < CANCEL_GRACE,
+                    "the agent answered {:?} after the kill, past the {CANCEL_GRACE:?} bound",
+                    started.elapsed()
+                );
+                return Ok(match cancelled {
+                    true => Outcome::Pass("answered with `cancelled` after the kill".into()),
+                    // The request was answered, which is rule 5, and the kill
+                    // worked — so this is an agent that has not implemented
+                    // 1.2, not one that is wrong.
+                    false => Outcome::Skipped(
+                        "answered the killed request, but without `cancelled`: \
+                         CANCEL is not implemented"
+                            .into(),
+                    ),
+                });
+            }
+            // `bad_message` for the CANCEL itself is the documented answer
+            // from an agent that does not know it. Rule 6 says carry on, so
+            // this keeps waiting for the `DONE` the kill will produce.
+            Message::Error { code, message, .. }
+                if code != zygo_core::protocol::ErrorCode::BadMessage =>
+            {
+                anyhow::bail!("the agent reported {code:?}: {message}")
+            }
+            _ => {}
+        }
+        anyhow::ensure!(
+            started.elapsed() < CANCEL_GRACE,
+            "the agent {STALLED}: no DONE for a killed request within {CANCEL_GRACE:?}"
+        );
+    }
+}
+
 fn one_request(agent: &mut Agent, id: &str, event: serde_json::Value) -> anyhow::Result<Message> {
     agent.send(&exec(id, event))?;
     await_done(agent, id)

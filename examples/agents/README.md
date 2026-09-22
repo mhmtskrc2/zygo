@@ -51,7 +51,7 @@ lists. It runs on the host rather than in a sandbox: what is under test is the
 conversation, and a sandbox would add failure modes that are Zygo's rather than
 yours.
 
-The handler you start it with has to satisfy a four-line contract, or there is
+The handler you start it with has to satisfy a five-line contract, or there is
 nothing to assert about the answers:
 
 * return the event it was given, unchanged;
@@ -59,7 +59,10 @@ nothing to assert about the answers:
 * if `event.stderr` is a string, write it to stderr;
 * if `event.spawn` is a string, start a **program** that prints it — which is
   what the `strict` child filter takes away, and so what the suite has to be
-  able to attempt.
+  able to attempt;
+* if `event.sleep_ms` is a number, sleep for that long — so that the cancel
+  check has a request to arrive *during*, rather than racing one that is over
+  in a millisecond.
 
 ```bash
 # the reference Python agent

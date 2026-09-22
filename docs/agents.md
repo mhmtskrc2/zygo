@@ -37,7 +37,7 @@ that kills the whole process tree possible.
 zygo agent test /bin/sh -- examples/agents/sh/agent.sh examples/agents/sh/handler.sh
 ```
 
-Eleven checks, run against your agent over a real socket. The agent is started
+Twelve checks, run against your agent over a real socket. The agent is started
 with the control socket at descriptor 3, which is where a sandboxed agent finds
 it too, and everything after the binary is passed through as its arguments.
 
@@ -51,6 +51,16 @@ which is conforming. With it, the suite sends the script three ways: as
 runs the third has no defence against a tenant swapping the file it was about
 to load, and fails; one that manages `source` but not `path` is reported as
 **partial**, because `path` is what the supervisor actually sends.
+
+The **cancel** check (protocol 1.2) needs no flag, and it plays the
+supervisor's whole part: it sends `CANCEL`, then kills the child, then waits
+for the answer. What is being checked is the answer — `DONE` with `cancelled`
+— because the frame is not what stops the request. A real supervisor writes
+`cgroup.kill` from outside the sandbox, which reaches everything the handler
+spawned and does not need the handler to be somewhere a signal helps. An agent
+that does not know the message answers `ERROR`/`bad_message`, carries on, and
+is reported as not implementing 1.2 rather than failed; the `sh` agent is the
+worked example of that.
 
 ## What there is to read
 

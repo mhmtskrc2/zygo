@@ -38,7 +38,8 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::error::{Error, IoContext, Result};
@@ -206,11 +207,182 @@ pub struct Outcome {
     /// deadline knows which it was. The HTTP API's 408 depends on it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub timed_out: bool,
+    /// Somebody asked for this request to stop, and it did.
+    ///
+    /// The third reading of exit 137, and the same argument as `timed_out`:
+    /// a cancel kill, a deadline kill and an out-of-memory kill are one signal
+    /// and three different things to tell a caller. Only the side that sent
+    /// the signal knows which.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cancelled: bool,
+    /// The request's own id, which is what `DELETE /requests/<id>` names.
+    ///
+    /// Returned with the answer as well as in a header, so a caller that kept
+    /// the body has what it needs to cancel a *later* identical call — and so
+    /// a log line about a slow request can be joined to the request itself.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
 }
 
 impl Outcome {
     pub fn succeeded(&self) -> bool {
         self.exit_code == 0 && self.error.is_none()
+    }
+}
+
+/// One request that has been sent and not yet answered.
+///
+/// A cancel arrives on a different connection, on a different thread, while
+/// the request's own thread is blocked waiting for `DONE`. This is what the
+/// two share: a flag the waiting thread reads once it wakes, and where to kill
+/// the work.
+///
+/// **The kill is the cancel.** Writing `cgroup.kill` from outside the sandbox
+/// is what stops the request; the `CANCEL` frame only tells the agent why, and
+/// an agent that ignores it changes nothing. Trusting tenant code to stop
+/// itself on request is trusting the blast radius to contain itself — the same
+/// argument that makes `timeout_ms` a courtesy rather than a control.
+#[derive(Debug, Default)]
+pub struct InFlight {
+    /// A name the *caller* chose for this request, if they chose one.
+    ///
+    /// The id is assigned here and only reaches the caller with the answer,
+    /// which is too late to cancel the call it belongs to. A caller that wants
+    /// to be able to stop its own request before it finishes has to name it on
+    /// the way in, and this is that name.
+    ///
+    /// It is not an id and does not have to be unique: two requests sharing a
+    /// key are two requests one cancel stops, which is what a caller who
+    /// reused a key meant. Ownership is what keeps it safe — a key only ever
+    /// matches the requests of whoever sent it.
+    key: Option<String>,
+    /// Whose request this is, when it came from a tenant.
+    ///
+    /// Here because a request id is a **counter**, not a secret: anybody who
+    /// has seen one can count. That is fine for an id, which is a name rather
+    /// than a capability — the same argument a script digest gets — but it
+    /// means the owner has to be recorded, or a tenant sharing a pool could
+    /// cancel another tenant's request by counting up from their own.
+    owner: Option<String>,
+    /// Somebody asked for this request to stop.
+    cancelled: AtomicBool,
+    /// Where the work is, once there is any.
+    ///
+    /// `None` between the `EXEC` and the `GO`: the child exists but has run
+    /// nothing, and a cancel that lands in that window is answered by never
+    /// sending `GO` rather than by killing something that has not started.
+    target: Mutex<Option<Target>>,
+}
+
+#[derive(Debug)]
+struct Target {
+    cgroup: Option<PathBuf>,
+    host_pid: u32,
+}
+
+impl InFlight {
+    /// Whether `caller` may cancel this. The operator may cancel anything on
+    /// their own host; a tenant may cancel only their own.
+    fn is_for(&self, caller: Option<&str>) -> bool {
+        match (caller, self.owner.as_deref()) {
+            (None, _) => true,
+            (Some(caller), Some(owner)) => caller == owner,
+            (Some(_), None) => false,
+        }
+    }
+
+    /// Whether `name` is this request's key.
+    fn keyed(&self, name: &str) -> bool {
+        self.key.as_deref() == Some(name)
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Mark it cancelled and kill it if there is anything to kill.
+    ///
+    /// Returns whether the work had started. `false` means the child is still
+    /// parked waiting for `GO`, and the request's own thread will deal with it
+    /// — which is the better outcome, because then no tenant code ran at all.
+    fn cancel(&self) -> bool {
+        self.cancelled.store(true, Ordering::SeqCst);
+        match self.target.lock().expect("target").as_ref() {
+            Some(target) => {
+                kill_request(target.cgroup.as_deref(), target.host_pid);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn running_at(&self, cgroup: Option<&std::path::Path>, host_pid: u32) {
+        *self.target.lock().expect("target") = Some(Target {
+            cgroup: cgroup.map(PathBuf::from),
+            host_pid,
+        });
+    }
+}
+
+/// Every request this sandbox has sent and not yet answered.
+///
+/// Keyed by the request id, which is unique across the host, so the supervisor
+/// can ask each function and pool in turn whether an id is theirs rather than
+/// keeping a second index that could disagree with this one.
+#[derive(Debug, Default)]
+struct Requests(Mutex<BTreeMap<String, Arc<InFlight>>>);
+
+impl Requests {
+    fn start(&self, id: &str, owner: Option<&str>, key: Option<&str>) -> Arc<InFlight> {
+        let entry = Arc::new(InFlight {
+            owner: owner.map(str::to_string),
+            key: key.map(str::to_string),
+            ..InFlight::default()
+        });
+        self.0
+            .lock()
+            .expect("in flight")
+            .insert(id.to_string(), Arc::clone(&entry));
+        entry
+    }
+
+    fn finish(&self, id: &str) {
+        self.0.lock().expect("in flight").remove(id);
+    }
+
+    /// Find a request by its id, or by the key its caller gave it.
+    ///
+    /// The id first, because it is the unambiguous name. A key is searched for
+    /// only when no id matches, so a caller cannot shadow somebody's id with a
+    /// key — and could not reach it anyway, since a key only matches a request
+    /// they are allowed to cancel.
+    fn get(&self, name: &str) -> Option<Arc<InFlight>> {
+        let requests = self.0.lock().expect("in flight");
+        if let Some(entry) = requests.get(name) {
+            return Some(Arc::clone(entry));
+        }
+        requests.values().find(|e| e.keyed(name)).map(Arc::clone)
+    }
+
+    fn ids(&self) -> Vec<String> {
+        self.0.lock().expect("in flight").keys().cloned().collect()
+    }
+}
+
+/// Takes a request off the in-flight list however its thread leaves.
+///
+/// A `Drop` rather than a call at the end, because `call_script_timed` has
+/// eight early returns and the one that forgot would leave an id that a later
+/// cancel could find and kill somebody else's child with — the ids are not
+/// reused, but the entry would name a cgroup that is.
+struct RequestLease<'a> {
+    requests: &'a Requests,
+    id: &'a str,
+}
+
+impl Drop for RequestLease<'_> {
+    fn drop(&mut self) {
+        self.requests.finish(self.id);
     }
 }
 
@@ -755,6 +927,7 @@ impl Pool {
                     rss_kb,
                     imports_ms,
                     counters: Mutex::new(Counters::default()),
+                    in_flight: Requests::default(),
                     state: Mutex::new(SandboxState::Warm),
                     tenant_cgroup,
                     generation_cgroup: generation,
@@ -818,6 +991,7 @@ impl Pool {
             plan,
             sandbox: Mutex::new(sandbox),
             counters: Mutex::new(Counters::default()),
+            in_flight: Requests::default(),
             state: Mutex::new(SandboxState::Warm),
             tenant_cgroup,
             generation_cgroup: generation,
@@ -1057,6 +1231,9 @@ pub struct WarmFn {
     rss_kb: u64,
     imports_ms: f64,
     counters: Mutex<Counters>,
+    /// Requests sent and not yet answered, so a cancel on another thread can
+    /// find one. See [`InFlight`].
+    in_flight: Requests,
     /// `Warm` until something goes wrong. Behind a lock because a request that
     /// finds the agent wedged has to record that for every later caller.
     state: Mutex<SandboxState>,
@@ -1329,6 +1506,35 @@ impl WarmFn {
         script: Option<crate::protocol::Script>,
         timeout: std::time::Duration,
     ) -> Result<(Outcome, CallTiming)> {
+        self.call_script_for(event, script, timeout, None)
+    }
+
+    /// The same, for a named tenant.
+    ///
+    /// `caller` decides one thing and only one: who may cancel this request.
+    /// A pool is shared, so the pool's own tenant cannot answer that — the
+    /// request's can. Everything else about ownership was settled before the
+    /// request got here, by `script_for_request` refusing a digest that is not
+    /// the caller's.
+    pub fn call_script_for(
+        &self,
+        event: serde_json::Value,
+        script: Option<crate::protocol::Script>,
+        timeout: std::time::Duration,
+        caller: Option<&str>,
+    ) -> Result<(Outcome, CallTiming)> {
+        self.call_script_keyed(event, script, timeout, caller, None)
+    }
+
+    /// The same, under a name the caller chose. See [`InFlight::key`].
+    pub fn call_script_keyed(
+        &self,
+        event: serde_json::Value,
+        script: Option<crate::protocol::Script>,
+        timeout: std::time::Duration,
+        caller: Option<&str>,
+        key: Option<&str>,
+    ) -> Result<(Outcome, CallTiming)> {
         if let Some(s) = &script
             && !s.is_loadable()
         {
@@ -1340,6 +1546,16 @@ impl WarmFn {
         }
         let id = next_request_id();
         let started = Instant::now();
+
+        // Registered before the `EXEC` rather than after the fork, so a cancel
+        // that arrives in the first millisecond finds something. The guard
+        // takes it off the list on every path out of this function, including
+        // the early returns above the `DONE`.
+        let request = self.in_flight.start(&id, caller, key);
+        let _lease = RequestLease {
+            requests: &self.in_flight,
+            id: &id,
+        };
 
         // Before the `EXEC`, because the `EXEC` has to say where the script
         // is. The file only has to *exist* by `GO` — the child loads it after
@@ -1435,6 +1651,7 @@ impl WarmFn {
             &id,
             host_pid,
         );
+        request.running_at(request_cgroup.as_deref(), host_pid);
         let _secrets = match self.place_secrets() {
             Ok(lease) => lease,
             Err(e) => {
@@ -1447,7 +1664,14 @@ impl WarmFn {
         };
         let admitted = Instant::now();
 
-        if let Err(e) = self.conn.write(&Message::Go { id: id.clone() }) {
+        // A cancel that arrived while the child was being admitted is the best
+        // possible one: the child is parked waiting for `GO`, so killing it
+        // here means not one instruction of the handler ran. `GO` is simply
+        // never sent — the agent sees the child die and answers by itself,
+        // which is the same path a deadline kill takes.
+        if request.cancelled() {
+            self.enforce_deadline(request_cgroup.as_deref(), host_pid);
+        } else if let Err(e) = self.conn.write(&Message::Go { id: id.clone() }) {
             return self.broken(e);
         }
 
@@ -1499,6 +1723,11 @@ impl WarmFn {
         // the slowest counted as the quickest. The supervisor holds the only
         // clock that saw the whole of it.
         let measured = started.elapsed();
+        // The supervisor's own answer, not the agent's: it is the side that
+        // sent the kill, so it is the side that knows a cancel from a
+        // deadline. `DONE{cancelled}` from an agent that tracks it is taken as
+        // agreement rather than as the source.
+        let cancelled = request.cancelled();
         let outcome = match done_reply {
             Message::Done {
                 exit_code,
@@ -1509,12 +1738,17 @@ impl WarmFn {
                 metrics,
                 ..
             } => Ok(Outcome {
+                id: id.clone(),
                 exit_code,
                 result,
                 stdout,
                 stderr,
                 error,
-                metrics: if timed_out {
+                // A killed request's `DONE` reports the wall time of the
+                // agent noticing, which is near zero for something that ran
+                // for its whole deadline. The supervisor holds the only clock
+                // that saw the whole of it — see the note above.
+                metrics: if timed_out || cancelled {
                     Metrics {
                         wall_ms: measured.as_secs_f64() * 1000.0,
                         ..metrics
@@ -1523,6 +1757,7 @@ impl WarmFn {
                     metrics
                 },
                 timed_out,
+                cancelled,
             }),
             Message::Error { code, message, .. } => {
                 Err(Error::from(ProtocolError::Agent { code, message }))
@@ -1625,6 +1860,34 @@ impl WarmFn {
     /// nothing at all.
     fn enforce_deadline(&self, request_cgroup: Option<&std::path::Path>, host_pid: u32) {
         kill_request(request_cgroup, host_pid);
+    }
+
+    /// Stop a request this sandbox is running.
+    ///
+    /// `None` means the id is not here. `Some(started)` says whether the
+    /// handler had begun: `false` is the better outcome, because the child was
+    /// still parked waiting for `GO` and not one instruction of it ran.
+    ///
+    /// Safe to call on an id that has already finished, and on one that is
+    /// finishing as this runs: the entry is gone by then and the answer is
+    /// `None`, which is the truth — there was nothing left to cancel.
+    ///
+    /// Returns once the kill has been *sent*. The request's own thread is what
+    /// reports the outcome, and it is still waiting for the agent's `DONE`.
+    pub fn cancel(&self, id: &str, caller: Option<&str>) -> Option<bool> {
+        let request = self.in_flight.get(id)?;
+        if !request.is_for(caller) {
+            return None;
+        }
+        // Best effort and deliberately not checked: this is how the agent
+        // learns *why*, not how the request is stopped. See [`InFlight`].
+        let _ = self.conn.write(&Message::Cancel { id: id.to_string() });
+        Some(request.cancel())
+    }
+
+    /// Ids this sandbox is running, for `zygo ps` and for a drain.
+    pub fn in_flight_ids(&self) -> Vec<String> {
+        self.in_flight.ids()
     }
 
     /// Translate a pid the agent reported into the pid this process must use.
@@ -2312,6 +2575,9 @@ pub struct WarmExec {
     /// sandbox, which as pid 1's death takes every request in it along.
     sandbox: Mutex<Box<dyn crate::backend::Sandbox>>,
     counters: Mutex<Counters>,
+    /// See [`WarmFn`]'s field of the same name. A warm-exec request is a
+    /// process in a cgroup like any other, so a cancel is the same write.
+    in_flight: Requests,
     state: Mutex<SandboxState>,
     tenant_cgroup: Option<PathBuf>,
     /// The held sandbox's own generation, where its requests are admitted.
@@ -2330,6 +2596,22 @@ impl WarmExec {
     /// Host pid of the held init process. See [`WarmFn::init_pid`].
     pub fn init_pid(&self) -> u32 {
         self.init_pid
+    }
+
+    /// Stop a request this sandbox is running. See [`WarmFn::cancel`].
+    ///
+    /// There is no agent to tell, so this is only the kill — which is the
+    /// whole of a cancel anyway.
+    pub fn cancel(&self, id: &str, caller: Option<&str>) -> Option<bool> {
+        let request = self.in_flight.get(id)?;
+        if !request.is_for(caller) {
+            return None;
+        }
+        Some(request.cancel())
+    }
+
+    pub fn in_flight_ids(&self) -> Vec<String> {
+        self.in_flight.ids()
     }
 
     pub fn status(&self) -> Status {
@@ -2402,6 +2684,13 @@ impl WarmExec {
 
         let id = next_request_id();
         let started = Instant::now();
+        // A warm-exec function is one tenant's, and `owned_by` settled that
+        // before the request arrived, so the entry needs no owner of its own.
+        let request = self.in_flight.start(&id, None, None);
+        let _lease = RequestLease {
+            requests: &self.in_flight,
+            id: &id,
+        };
 
         let entered = {
             let sandbox = self.sandbox.lock().expect("sandbox");
@@ -2451,6 +2740,7 @@ impl WarmExec {
             // reachable for a function with no secrets to place.
             None => SecretsAt::Proc(self.init_pid),
         };
+        request.running_at(request_cgroup.as_deref(), entered.pid);
         let _secrets = match place_secrets(&self.secrets, at) {
             Ok(lease) => lease,
             Err(e) => {
@@ -2461,6 +2751,12 @@ impl WarmExec {
             }
         };
         let admitted = Instant::now();
+
+        // As on the agent path: a cancel that beat the `go` write means the
+        // request never starts, rather than starting and being killed.
+        if request.cancelled() {
+            kill_request(request_cgroup.as_deref(), entered.pid);
+        }
 
         let mut entered = entered;
         if let Some(go) = entered.go.take() {
@@ -2496,7 +2792,13 @@ impl WarmExec {
         }
         let cleaned = Instant::now();
 
-        let outcome = collected.and_then(|c| into_outcome(c, exit_status, done - admitted));
+        let outcome = collected
+            .and_then(|c| into_outcome(c, exit_status, done - admitted))
+            .map(|o| Outcome {
+                id: id.clone(),
+                cancelled: request.cancelled(),
+                ..o
+            });
         match &outcome {
             Ok(o) => self.record(o.succeeded()),
             Err(_) => self.record(false),
@@ -2743,6 +3045,10 @@ fn into_outcome(
     };
 
     Ok(Outcome {
+        // Filled in by the caller, which is the side that knows both: it
+        // assigned the id and it is holding the request's registry entry.
+        id: String::new(),
+        cancelled: false,
         exit_code,
         result,
         stdout: if error.is_some() {
@@ -2859,6 +3165,20 @@ impl Function {
         each!(self, f => f.cpu_accounting())
     }
 
+    /// Stop a request this function is running. `None` if it is not here.
+    ///
+    /// The supervisor asks every function and pool in turn, because request
+    /// ids are unique across the host and a second index of "which function
+    /// holds id X" would be a thing that could disagree with this one.
+    pub fn cancel(&self, id: &str, caller: Option<&str>) -> Option<bool> {
+        each!(self, f => f.cancel(id, caller))
+    }
+
+    /// Ids this function is running.
+    pub fn in_flight_ids(&self) -> Vec<String> {
+        each!(self, f => f.in_flight_ids())
+    }
+
     pub fn call(&self, event: serde_json::Value) -> Result<Outcome> {
         self.call_with_timeout(event, self.timeout())
     }
@@ -2869,6 +3189,27 @@ impl Function {
         timeout: std::time::Duration,
     ) -> Result<Outcome> {
         self.call_timed(event, timeout).map(|(o, _)| o)
+    }
+
+    /// The same, under a name the caller chose. See [`InFlight::key`].
+    ///
+    /// Only the agent shape carries one: a warm-exec function has no agent to
+    /// tell, and a caller who cancels one is cancelling by id. That is not a
+    /// limitation worth closing until something asks — the pool shape is what
+    /// an embedder's long requests run on.
+    pub fn call_keyed(
+        &self,
+        event: serde_json::Value,
+        timeout: std::time::Duration,
+        key: Option<&str>,
+    ) -> Result<Outcome> {
+        match (self, key) {
+            (Function::Agent(f), key) => f
+                .call_script_keyed(event, None, timeout, None, key)
+                .map(|(o, _)| o),
+            #[cfg(target_os = "linux")]
+            (Function::Exec(_), _) => self.call_with_timeout(event, timeout),
+        }
     }
 
     pub fn call_timed(
@@ -2891,7 +3232,22 @@ impl Function {
         script: Option<crate::protocol::Script>,
         timeout: std::time::Duration,
     ) -> Result<Outcome> {
-        self.call_script_timed(event, script, timeout)
+        self.call_script_for(event, script, timeout, None)
+            .map(|(outcome, _)| outcome)
+    }
+
+    /// The same, for a named tenant and under a name they chose.
+    ///
+    /// See [`WarmFn::call_script_for`] and [`InFlight::key`].
+    pub fn call_script_as(
+        &self,
+        event: serde_json::Value,
+        script: Option<crate::protocol::Script>,
+        timeout: std::time::Duration,
+        caller: Option<&str>,
+        key: Option<&str>,
+    ) -> Result<Outcome> {
+        self.call_script_keyed(event, script, timeout, caller, key)
             .map(|(outcome, _)| outcome)
     }
 
@@ -2906,8 +3262,32 @@ impl Function {
         script: Option<crate::protocol::Script>,
         timeout: std::time::Duration,
     ) -> Result<(Outcome, CallTiming)> {
+        self.call_script_for(event, script, timeout, None)
+    }
+
+    /// The same, recording who the request is for. See
+    /// [`WarmFn::call_script_for`].
+    pub fn call_script_for(
+        &self,
+        event: serde_json::Value,
+        script: Option<crate::protocol::Script>,
+        timeout: std::time::Duration,
+        caller: Option<&str>,
+    ) -> Result<(Outcome, CallTiming)> {
+        self.call_script_keyed(event, script, timeout, caller, None)
+    }
+
+    /// The same, under a name the caller chose. See [`InFlight::key`].
+    pub fn call_script_keyed(
+        &self,
+        event: serde_json::Value,
+        script: Option<crate::protocol::Script>,
+        timeout: std::time::Duration,
+        caller: Option<&str>,
+        key: Option<&str>,
+    ) -> Result<(Outcome, CallTiming)> {
         match self {
-            Function::Agent(f) => f.call_script_timed(event, script, timeout),
+            Function::Agent(f) => f.call_script_keyed(event, script, timeout, caller, key),
             #[cfg(target_os = "linux")]
             Function::Exec(f) => match script {
                 None => f.call_timed(event, timeout),
@@ -4098,6 +4478,87 @@ mod tests {
         }
     }
 
+    /// A request can be found by its id or by the name its caller gave it.
+    ///
+    /// The key exists because the id only reaches the caller *with the
+    /// answer*, which is too late to stop the call it belongs to.
+    #[test]
+    fn a_request_is_reachable_by_its_id_and_by_its_callers_own_key() {
+        let requests = Requests::default();
+        requests.start("00000001", None, Some("job-4711"));
+
+        assert!(requests.get("00000001").is_some(), "by id");
+        assert!(requests.get("job-4711").is_some(), "by key");
+        assert!(requests.get("job-0000").is_none(), "a key nobody used");
+
+        requests.finish("00000001");
+        assert!(requests.get("00000001").is_none());
+        assert!(
+            requests.get("job-4711").is_none(),
+            "the key outlived the request"
+        );
+    }
+
+    /// One cancel stops every request sharing a key, which is what a caller
+    /// who reused one meant.
+    #[test]
+    fn two_requests_under_one_key_are_two_requests_one_cancel_finds() {
+        let requests = Requests::default();
+        let a = requests.start("00000001", None, Some("batch"));
+        let b = requests.start("00000002", None, Some("batch"));
+
+        // One lookup finds one of them; the caller repeats until there is
+        // nothing left, which is the same shape as cancelling by id twice.
+        for _ in 0..2 {
+            let Some(found) = requests.get("batch") else {
+                panic!("a request under this key");
+            };
+            found.cancel();
+            requests.finish(if a.cancelled() && !b.cancelled() {
+                "00000001"
+            } else {
+                "00000002"
+            });
+        }
+        assert!(a.cancelled() && b.cancelled());
+    }
+
+    /// A request id is a counter, so ownership is what keeps a cancel honest.
+    #[test]
+    fn a_tenant_can_only_cancel_its_own_requests() {
+        let requests = Requests::default();
+        let theirs = requests.start("00000001", Some("acme"), None);
+        let operators = requests.start("00000002", None, None);
+
+        assert!(theirs.is_for(None), "the operator may cancel anything");
+        assert!(theirs.is_for(Some("acme")));
+        assert!(
+            !theirs.is_for(Some("globex")),
+            "another tenant reached it by counting"
+        );
+        assert!(
+            !operators.is_for(Some("acme")),
+            "a tenant reached the operator's own request"
+        );
+    }
+
+    /// Cancelling before the work starts is the better outcome, and is
+    /// reported as a different one.
+    #[test]
+    fn a_cancel_before_the_child_is_admitted_says_the_work_had_not_started() {
+        let requests = Requests::default();
+        let request = requests.start("00000001", None, None);
+
+        assert!(
+            !request.cancel(),
+            "nothing had started, so there was nothing to kill"
+        );
+        assert!(
+            request.cancelled(),
+            "and it is marked, which is what stops it"
+        );
+    }
+
     #[test]
     fn per_request_cgroups_are_on_by_default() {
         // Measured at 97 µs of a 1.9 ms request; the design's open question A2
@@ -4108,6 +4569,8 @@ mod tests {
     #[test]
     fn an_outcome_is_only_a_success_if_nothing_went_wrong() {
         let base = Outcome {
+            id: "00000001".into(),
+            cancelled: false,
             exit_code: 0,
             result: serde_json::Value::Null,
             stdout: String::new(),

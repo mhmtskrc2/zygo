@@ -787,6 +787,7 @@ impl Supervisor {
         name: &str,
         mut event: serde_json::Value,
         timeout: Duration,
+        key: Option<&str>,
     ) -> std::result::Result<Response, Response> {
         let mut entry = self.lookup(name)?;
 
@@ -805,7 +806,7 @@ impl Supervisor {
                 entry = self.rewarm(name, &entry)?;
             }
 
-            event = match self.attempt(&entry, name, event, timeout) {
+            event = match self.attempt(&entry, name, event, timeout, key) {
                 Attempt::Done(response) => return response,
                 Attempt::Closed(event) => event,
             };
@@ -839,6 +840,7 @@ impl Supervisor {
         name: &str,
         event: serde_json::Value,
         timeout: Duration,
+        key: Option<&str>,
     ) -> Attempt {
         let permit = match entry.gate.enter(QUEUE_WAIT) {
             Ok(permit) => permit,
@@ -872,7 +874,7 @@ impl Supervisor {
 
         let outcome = entry
             .function
-            .call_with_timeout(event, timeout)
+            .call_keyed(event, timeout, key)
             .map_err(|e| Response::error(ControlError::CallFailed, e));
         drop(permit);
         // After the call, not before: the clock should measure how long the
@@ -1114,6 +1116,64 @@ impl Supervisor {
             removed_scripts,
             stopped,
         })
+    }
+
+    /// Stop a request that is running.
+    ///
+    /// Ids are unique across the host, so this searches rather than indexing:
+    /// every function and every pool zygote is asked whether the id is theirs.
+    /// A second map from id to function would be faster and would be a thing
+    /// that could disagree with the lists it summarises — at the counts a
+    /// supervisor holds, a walk of a few dozen registry entries is not on any
+    /// path worth optimising.
+    ///
+    /// `caller` is the tenant asking, and a request belonging to somebody else
+    /// is `not_found`: the same answer an id that finished a second ago gets,
+    /// for the same reason a digest that is not yours is.
+    pub fn cancel(
+        &self,
+        id: &str,
+        caller: Option<&str>,
+    ) -> std::result::Result<Response, Response> {
+        let missing = || {
+            Response::error(
+                ControlError::NotFound,
+                format!("no request `{id}` is running"),
+            )
+        };
+
+        let functions: Vec<(String, Arc<Entry>)> = self
+            .functions
+            .lock()
+            .expect("registry")
+            .iter()
+            .map(|(name, entry)| (name.clone(), Arc::clone(entry)))
+            .collect();
+        for (name, entry) in functions {
+            if let Some(caller) = caller
+                && entry.resolved.tenant != caller
+            {
+                continue;
+            }
+            // `None`, not `caller`: a warm function belongs to one tenant and
+            // the loop above already skipped the ones that are not theirs, so
+            // a per-request owner would be the same fact twice.
+            if let Some(started) = entry.function.cancel(id, None) {
+                tracing::info!(function = %name, request = %id, started, "cancelled");
+                return Ok(Response::Cancelled {
+                    id: id.to_string(),
+                    started,
+                });
+            }
+        }
+
+        match self.cancel_in_pools(id, caller) {
+            Some(started) => Ok(Response::Cancelled {
+                id: id.to_string(),
+                started,
+            }),
+            None => Err(missing()),
+        }
     }
 
     /// Mint an API token, and answer with the secret exactly once.
@@ -1763,10 +1823,18 @@ fn dispatch(supervisor: &Supervisor, request: Request, greeted: &mut bool) -> Re
             event,
             timeout_ms,
             tenant,
+            key,
         } => merge(
             supervisor
                 .owned_by(&name, tenant.as_deref())
-                .and_then(|()| supervisor.exec(&name, event, Duration::from_millis(timeout_ms))),
+                .and_then(|()| {
+                    supervisor.exec(
+                        &name,
+                        event,
+                        Duration::from_millis(timeout_ms),
+                        key.as_deref(),
+                    )
+                }),
         ),
         Request::Stop { name } => merge(supervisor.stop(name.as_deref())),
         Request::Warm { name, tenant } => merge(
@@ -1813,12 +1881,14 @@ fn dispatch(supervisor: &Supervisor, request: Request, greeted: &mut bool) -> Re
             event,
             timeout_ms,
             tenant,
+            key,
         } => merge(supervisor.exec_script(
             &runtime,
             script,
             event,
             Duration::from_millis(timeout_ms),
             tenant.as_deref(),
+            key.as_deref(),
         )),
         Request::Runtimes => Response::Runtimes {
             runtimes: supervisor.runtimes(),
@@ -1833,6 +1903,7 @@ fn dispatch(supervisor: &Supervisor, request: Request, greeted: &mut bool) -> Re
         Request::MintToken { tenant } => merge(supervisor.mint_token(tenant.as_deref())),
         Request::Tokens => merge(supervisor.list_tokens()),
         Request::RevokeToken { id } => merge(supervisor.revoke_token(&id)),
+        Request::Cancel { id, tenant } => merge(supervisor.cancel(&id, tenant.as_deref())),
         Request::GetScript { digest } => merge(supervisor.get_script(&digest)),
         Request::DeleteScript { digest } => merge(supervisor.delete_script(&digest)),
         Request::Shutdown => Response::Ok,
@@ -2204,7 +2275,12 @@ mod tests {
             },
         );
         let response = supervisor
-            .exec("resize", serde_json::Value::Null, Duration::from_secs(1))
+            .exec(
+                "resize",
+                serde_json::Value::Null,
+                Duration::from_secs(1),
+                None,
+            )
             .expect_err("no image to wake it from");
         assert!(
             matches!(
@@ -2575,6 +2651,7 @@ mod tests {
                 event: serde_json::Value::Null,
                 timeout_ms: 1,
                 tenant: None,
+                key: None,
             },
         ] {
             let response = dispatch(&supervisor, request, &mut greeted);
@@ -3019,6 +3096,7 @@ mod tests {
                 event: serde_json::Value::Null,
                 timeout_ms: 1_000,
                 tenant: Some("b".into()),
+                key: None,
             },
             &mut greeted,
         );
@@ -3044,6 +3122,7 @@ mod tests {
                 event: serde_json::Value::Null,
                 timeout_ms: 1_000,
                 tenant: Some("a".into()),
+                key: None,
             },
             &mut greeted,
         );
@@ -3087,7 +3166,12 @@ mod tests {
         let supervisor = Supervisor::new(paths(&dir)).expect("supervisor");
 
         let response = supervisor
-            .exec("nope", serde_json::Value::Null, Duration::from_secs(1))
+            .exec(
+                "nope",
+                serde_json::Value::Null,
+                Duration::from_secs(1),
+                None,
+            )
             .expect_err("no such function");
         match response {
             Response::Error {

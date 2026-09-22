@@ -3,12 +3,13 @@
 The conformance suite cannot assert anything about an agent's answers unless it
 knows what the handler was supposed to do, so the contract is four lines:
 return the event unchanged, honour `stdout` and `stderr` when they are there,
-and start a program when `spawn` is. Every agent in this directory ships one of
-these.
+start a program when `spawn` is, and sleep for `sleep_ms` when it is a number.
+Every agent in this directory ships one of these.
 """
 
 import subprocess
 import sys
+import time
 
 
 def handler(event):
@@ -17,6 +18,11 @@ def handler(event):
             print(event["stdout"])
         if isinstance(event.get("stderr"), str):
             print(event["stderr"], file=sys.stderr)
+        # Something for a cancel to arrive *during*. Without it every request
+        # is over in a millisecond and the suite would be racing the handler
+        # rather than testing it.
+        if isinstance(event.get("sleep_ms"), (int, float)):
+            time.sleep(float(event["sleep_ms"]) / 1000.0)
         if isinstance(event.get("spawn"), str):
             # A *program*, not a function call: this is what the `strict`
             # child filter removes, so it is what the suite has to be able to

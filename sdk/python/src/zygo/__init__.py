@@ -30,6 +30,7 @@ from ._endpoint import DEFAULT_URL, Endpoint
 from ._errors import (
     AuthError,
     Busy,
+    Cancelled,
     HandlerError,
     NotFound,
     SpecError,
@@ -77,6 +78,7 @@ __all__ = [
     # failures
     "AuthError",
     "Busy",
+    "Cancelled",
     "HandlerError",
     "NotFound",
     "SpecError",

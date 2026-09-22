@@ -42,6 +42,13 @@ class Result:
     stdout: str = ""
     stderr: str = ""
     metrics: Metrics = field(default_factory=Metrics)
+    #: The request's own id, which :meth:`~zygo.Client.cancel` names.
+    #:
+    #: Of no use for *this* call, which has already finished. It is here so
+    #: that a log line about a slow request can be joined back to the request,
+    #: and because the same id arrives in the ``X-Zygo-Request-Id`` header of a
+    #: call that is still in flight.
+    request_id: str = ""
 
     @classmethod
     def parse(cls, raw: Dict[str, Any]) -> "Result":
@@ -50,6 +57,7 @@ class Result:
             stdout=str(raw.get("stdout", "")),
             stderr=str(raw.get("stderr", "")),
             metrics=Metrics.parse(raw.get("metrics")),
+            request_id=str(raw.get("request_id", "")),
         )
 
 

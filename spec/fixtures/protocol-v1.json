@@ -45,6 +45,12 @@
       "message": {"type": "GO", "id": "01f3"}
     },
     {
+      "name": "cancel",
+      "direction": "supervisor -> agent",
+      "canonical": true,
+      "message": {"type": "CANCEL", "id": "01f3"}
+    },
+    {
       "name": "result",
       "direction": "child -> agent",
       "canonical": true,
@@ -61,6 +67,12 @@
       "direction": "agent -> supervisor",
       "canonical": true,
       "message": {"type": "DONE", "id": "01f3", "exit_code": 1, "result": null, "stdout": "", "stderr": "Traceback (most recent call last):\n", "error": "ZeroDivisionError: division by zero", "peak_rss_kb": 0, "wall_ms": 0.5, "cpu_ms": 0.4}
+    },
+    {
+      "name": "done-cancelled",
+      "direction": "agent -> supervisor",
+      "canonical": true,
+      "message": {"type": "DONE", "id": "01f3", "exit_code": 137, "result": null, "stdout": "", "stderr": "", "error": "the request process exited with SIGKILL before producing a result", "cancelled": true, "peak_rss_kb": 0, "wall_ms": 0.0, "cpu_ms": 0.0}
     },
     {
       "name": "ping",
@@ -103,6 +115,11 @@
       "name": "go-frame",
       "message": {"type": "GO", "id": "01f3"},
       "hex": "000000197b2274797065223a22474f222c226964223a2230316633227d"
+    },
+    {
+      "name": "cancel-frame",
+      "message": {"type": "CANCEL", "id": "01f3"},
+      "hex": "0000001d7b2274797065223a2243414e43454c222c226964223a2230316633227d"
     }
   ]
 }

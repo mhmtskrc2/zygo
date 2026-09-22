@@ -596,6 +596,9 @@ pub fn exec(cli: &Cli, args: &ExecArgs) -> anyhow::Result<u8> {
         .map_or(DEFAULT_EXEC_TIMEOUT_MS, |t| t.as_millis());
     let request = match &args.runtime {
         Some(runtime) => Request::ExecScript {
+            // `zygo exec` is one shot at a terminal: Ctrl-C ends the client,
+            // and the supervisor's own deadline ends the request.
+            key: None,
             runtime: runtime.clone(),
             script: script_for(args)?,
             event,
@@ -605,6 +608,7 @@ pub fn exec(cli: &Cli, args: &ExecArgs) -> anyhow::Result<u8> {
             tenant: None,
         },
         None => Request::Exec {
+            key: None,
             name: args
                 .name
                 .clone()
@@ -946,6 +950,8 @@ mod tests {
     #[test]
     fn exec_exits_with_the_request_s_own_status() {
         let outcome = |exit_code: i32, error: Option<&str>| Outcome {
+            id: "00000001".into(),
+            cancelled: false,
             exit_code,
             result: serde_json::Value::Null,
             stdout: String::new(),

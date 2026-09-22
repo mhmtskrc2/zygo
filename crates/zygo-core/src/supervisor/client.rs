@@ -360,6 +360,7 @@ fn name_of(request: &Request) -> &'static str {
         Request::MintToken { .. } => "minting a token",
         Request::Tokens => "listing the tokens",
         Request::RevokeToken { .. } => "revoking a token",
+        Request::Cancel { .. } => "cancelling a request",
     }
 }
 
@@ -543,6 +544,7 @@ mod tests {
             event: serde_json::Value::Null,
             timeout_ms: 5_000,
             tenant: None,
+            key: None,
         });
         assert_eq!(exec, Duration::from_secs(5) + REPLY_GRACE);
 
@@ -635,6 +637,7 @@ mod tests {
                 event: serde_json::Value::Null,
                 timeout_ms: 1_000,
                 tenant: None,
+                key: None,
             })
             .expect("a response, whatever it says");
         assert!(matches!(

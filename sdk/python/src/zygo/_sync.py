@@ -144,15 +144,31 @@ class Client:
         """
         return self._request("POST", f"/fn/{_escape(name)}/warm")
 
-    def call(self, name: str, event: Any = None, *, timeout: Optional[float] = None) -> Result:
+    def call(
+        self,
+        name: str,
+        event: Any = None,
+        *,
+        timeout: Optional[float] = None,
+        key: Optional[str] = None,
+    ) -> Result:
         """Call a warm function and return what its handler returned.
 
         Raises :class:`~zygo.HandlerError` when the handler raised,
-        :class:`~zygo.Timeout` when the deadline killed the request, and
+        :class:`~zygo.Timeout` when the deadline killed the request,
+        :class:`~zygo.Cancelled` when somebody stopped it, and
         :class:`~zygo.Busy` when the function is at its concurrency limit —
         the last of which means the request never ran and is worth retrying.
+
+        ``key`` is a name *you* choose for this request, so that another
+        thread or process can stop it with :meth:`cancel` before it answers.
+        The server's own id only arrives with the answer, which is too late to
+        cancel the call it belongs to. Reusing a key is allowed and means one
+        cancel stops every call under it.
         """
         headers = _timeout_header(timeout)
+        if key is not None:
+            headers["x-zygo-request-key"] = key
         body = self._request("POST", f"/fn/{_escape(name)}", body=event, headers=headers)
         return Result.parse(body)
 
@@ -279,6 +295,25 @@ class Client:
         """
         return self._request("DELETE", f"/tenants/{_escape(id)}")
 
+    def cancel(self, request_id: str) -> Dict[str, Any]:
+        """Stop a request that is running.
+
+        ``request_id`` comes from the ``X-Zygo-Request-Id`` header of the call
+        in flight, or from a :class:`~zygo._models.Result` that has already
+        come back. Answers as soon as the kill has been sent, not when the
+        request has stopped — the caller waiting on that request is the one who
+        gets the outcome, and they get :class:`~zygo.Cancelled`.
+
+        ``started`` in the answer says whether the handler had begun. ``False``
+        is the better outcome: the request's process existed but had not been
+        let go, so no handler code ran at all.
+
+        Raises :class:`~zygo.NotFound` when nothing is running under that id —
+        which includes a request that finished a moment ago, and one belonging
+        to another tenant.
+        """
+        return self._request("DELETE", f"/requests/{_escape(request_id)}")
+
     def mint_token(self, tenant: Optional[str] = None) -> Minted:
         """Mint an API token, and get its secret — once.
 
@@ -365,6 +400,7 @@ class Client:
         *,
         entry_point: Optional[str] = None,
         timeout: Optional[float] = None,
+        key: Optional[str] = None,
     ) -> Result:
         """Run one script in a pool.
 
@@ -374,6 +410,8 @@ class Client:
         every call, and the host can put the file in the sandbox instead of
         sending it through the zygote.
 
+        ``key`` names the request so it can be cancelled; see :meth:`call`.
+
         Raises the same exceptions :meth:`call` does.
         """
         payload: Dict[str, Any] = {
@@ -382,11 +420,14 @@ class Client:
         }
         if entry_point is not None:
             payload["entry_point"] = entry_point
+        headers = _timeout_header(timeout)
+        if key is not None:
+            headers["x-zygo-request-key"] = key
         body = self._request(
             "POST",
             f"/runtimes/{_escape(runtime)}/call",
             body=payload,
-            headers=_timeout_header(timeout),
+            headers=headers,
         )
         return Result.parse(body)
 
@@ -580,6 +621,17 @@ def _escape_digest(digest: str) -> str:
             "expected sha256: followed by 64 lowercase hex digits"
         )
     return digest
+
+
+def _request_key() -> str:
+    """A name for one request, unique enough that a cancel finds only it.
+
+    128 bits from ``os.urandom``. Not a counter and not a UUID library call:
+    the only thing this has to be is unguessable by anybody who might want to
+    stop somebody else's work — and the server checks ownership as well, so
+    this is the second lock rather than the only one.
+    """
+    return "k-" + os.urandom(16).hex()
 
 
 def _timeout_header(timeout: Optional[float]) -> Dict[str, str]:

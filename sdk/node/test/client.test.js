@@ -14,6 +14,7 @@ import { FakeApi } from './fake-api.js';
 import {
   AuthError,
   Busy,
+  Cancelled,
   HandlerError,
   NotFound,
   Timeout,
@@ -426,6 +427,53 @@ test('acting for a tenant is a header on the same connection', async () => {
     await client.forTenant('acme').functions();
     assert.equal(api.requests[0].headers['x-zygo-tenant'], undefined);
     assert.equal(api.requests[1].headers['x-zygo-tenant'], 'acme');
+  } finally {
+    client.close();
+    await api.close();
+  }
+});
+
+test('a cancelled request is its own error, not a Timeout', async () => {
+  const api = await FakeApi.start();
+  api.answer('POST', '/fn/slow', 499, {
+    error: 'the request was cancelled',
+    cancelled: true,
+    request_id: '00000007',
+    metrics: { wall_ms: 1200 },
+  });
+  const client = connect(api.url, { token: null });
+  try {
+    await assert.rejects(() => client.call('slow', {}), Cancelled);
+    // "too slow, raise the limit" is the wrong advice for a request somebody
+    // stopped on purpose.
+    await assert.rejects(() => client.call('slow', {}), (e) => !(e instanceof Timeout));
+  } finally {
+    client.close();
+    await api.close();
+  }
+});
+
+test('aborting the signal cancels the request on the server', async () => {
+  const api = await FakeApi.start();
+  // Long enough that the call is still waiting when the signal aborts.
+  api.delay = 500;
+  api.answer('POST', '/fn/slow', 200, { result: null });
+  api.answer('DELETE', '/requests/', 200, { cancelled: true, started: true });
+  const client = connect(api.url, { token: null });
+  const controller = new AbortController();
+  try {
+    const call = client.call('slow', {}, { signal: controller.signal });
+    await new Promise((r) => setTimeout(r, 50));
+    controller.abort();
+    await call.catch(() => {});
+    // The cancel is fire-and-forget, so give it a moment to land.
+    await new Promise((r) => setTimeout(r, 200));
+
+    const key = api.requests[0].headers['x-zygo-request-key'];
+    assert.ok(key && key.startsWith('k-'), `no key on the call: ${key}`);
+    const cancels = api.requests.filter((r) => r.method === 'DELETE');
+    assert.equal(cancels.length, 1, 'the aborted call sent no cancel');
+    assert.equal(cancels[0].path, `/requests/${key}`);
   } finally {
     client.close();
     await api.close();

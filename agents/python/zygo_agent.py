@@ -72,7 +72,7 @@ class InFlight:
     the loop knows whether a request that is finishing was ever released.
     """
 
-    __slots__ = ("request_id", "pid", "result_fd", "go_fd", "chunks")
+    __slots__ = ("request_id", "pid", "result_fd", "go_fd", "chunks", "cancelled")
 
     def __init__(self, request_id: str, pid: int, result_fd: int, go_fd: int) -> None:
         self.request_id = request_id
@@ -80,6 +80,14 @@ class InFlight:
         self.result_fd = result_fd
         self.go_fd: int | None = go_fd
         self.chunks: list[bytes] = []
+        #: A `CANCEL` arrived for this request (proto 1.2).
+        #:
+        #: Only ever read on the way out, to set `cancelled` on the `DONE`.
+        #: The agent does not stop the child itself: the supervisor kills the
+        #: request's cgroup from outside the sandbox, which reaches
+        #: grandchildren an agent cannot see and does not depend on tenant
+        #: code cooperating.
+        self.cancelled = False
 
 
 class BadFrame(Exception):
@@ -745,6 +753,8 @@ class Agent:
             self._exec(message)
         elif kind == "GO":
             self._release(message.get("id", ""))
+        elif kind == "CANCEL":
+            self._cancel(message.get("id", ""))
         elif kind == "PING":
             self._wire.send({"type": "PONG", "seq": message.get("seq", 0)})
         elif kind == "SHUTDOWN":
@@ -771,6 +781,24 @@ class Agent:
             pass
         os.close(request.go_fd)
         request.go_fd = None
+
+    def _cancel(self, request_id: str) -> None:
+        """`CANCEL`: remember why this request is about to die (proto 1.2).
+
+        Deliberately not a kill. The supervisor writes `cgroup.kill` on the
+        request's own cgroup from outside the sandbox — which takes the child
+        and everything it spawned, and does not require the handler to be in a
+        state where a signal helps. All that is left for the agent is to say
+        *why* on the way out, so the caller reads `cancelled` instead of
+        guessing between a deadline and an out-of-memory kill at exit 137.
+
+        An unknown id is ignored: the request finished between the supervisor
+        deciding to cancel it and this arriving, which is a race with no
+        wrong outcome.
+        """
+        request = self._inflight.get(request_id)
+        if request is not None:
+            request.cancelled = True
 
     def _collect(self, request: InFlight) -> None:
         """A result pipe is readable: take what is there, answer at end of file."""
@@ -820,6 +848,8 @@ class Agent:
         # a request that produced a result.
         if result.get("type") != "ERROR":
             result["type"] = "DONE"
+            if request.cancelled:
+                result["cancelled"] = True
         self._send_result(result)
         self._reap_finished()
 

@@ -27,6 +27,19 @@ export declare class Busy extends ZygoError {
   retryAfter: number;
 }
 
+/**
+ * Somebody stopped this request — usually the caller.
+ *
+ * Deliberately not a {@link Timeout}: "too slow, raise the limit" is the wrong
+ * advice for a request somebody stopped on purpose.
+ */
+export declare class Cancelled extends ZygoError {
+  requestId: string;
+  stdout: string;
+  stderr: string;
+  metrics: Metrics;
+}
+
 /** The request exceeded the function's timeout and was killed. */
 export declare class Timeout extends ZygoError {
   stderr: string;

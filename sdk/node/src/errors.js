@@ -67,6 +67,26 @@ export class Timeout extends ZygoError {
   }
 }
 
+/**
+ * Somebody stopped this request — usually the caller.
+ *
+ * The third reading of exit 137. A cancel kill, a deadline kill and an
+ * out-of-memory kill are one signal and three different things to tell a
+ * caller, and only the side that sent the signal knows which it was.
+ *
+ * Distinct from {@link Timeout} on purpose: a timeout says the work is too slow
+ * or the limit is too tight, and this says the answer stopped being wanted.
+ */
+export class Cancelled extends ZygoError {
+  constructor(message, { requestId = '', stdout = '', stderr = '', metrics = {} } = {}) {
+    super(message);
+    this.requestId = requestId;
+    this.stdout = stdout;
+    this.stderr = stderr;
+    this.metrics = metrics;
+  }
+}
+
 /** The handler threw. Its message and both streams are attached. */
 export class HandlerError extends ZygoError {
   constructor(message, { stdout = '', stderr = '', exitCode = 1, metrics = {} } = {}) {
@@ -97,6 +117,16 @@ export function fromResponse(status, body, retryAfter = 1) {
   if (status === 400) return new SpecError(message);
   if (status === 408) {
     return new Timeout(message, { stderr: String(body?.stderr ?? ''), metrics: body?.metrics ?? {} });
+  }
+  // 499 is nginx's for a client that went away, and the nearest thing to a
+  // registered code for a request its caller stopped.
+  if (status === 499 || body?.cancelled === true) {
+    return new Cancelled(message, {
+      requestId: String(body?.request_id ?? ''),
+      stdout: String(body?.stdout ?? ''),
+      stderr: String(body?.stderr ?? ''),
+      metrics: body?.metrics ?? {},
+    });
   }
   if (status === 429) {
     return new Busy(message, {
