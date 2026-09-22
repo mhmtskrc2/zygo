@@ -2,7 +2,7 @@
         verify-mcp check check-linux test-linux \
         verify-linux verify-supervisor-linux escape-linux dist-linux \
         fuzz-linux gvisor-linux verify-login-linux verify-shim \
-        repro-blue-green-linux verify-api-linux vm-build vm-probe vm-kernel \
+        repro-blue-green-linux verify-api-linux verify-plugin-host vm-build vm-probe vm-kernel \
         verify-vm-pi use-cases-linux vm-use-cases-linux \
         syscall-tables conformance conformance-node conformance-node-seccomp \
         examples-go-linux \
@@ -14,6 +14,7 @@ help:
 	@echo "test-sdk     the Python and Node clients, against a stand-in API"
 	@echo "verify-mcp   drive the MCP server over a pipe, as an agent host does"
 	@echo "verify-api-linux  the HTTP API end to end, through the Python client"
+	@echo "verify-plugin-host  a plugin host on the API alone — the embedder exit criterion"
 	@echo "vm-build     build the vm-capable binary (libkrun linked in)"
 	@echo "vm-kernel    build the guest kernel and check its config"
 	@echo "vm-probe     ask whether libkrun links against musl (the vm plan V1)"
@@ -219,6 +220,13 @@ verify-api-linux: poc/zygo-linux-musl
 	docker run --rm --privileged -v "$(PWD):/src:ro" \
 		-e ZYGO_DATA_HOME=/tmp/zdata-api python:3.12-slim \
 		sh /src/poc/verify_api.sh
+
+# The embedder API's exit criterion: a plugin host on the API alone. If it
+# needs a spec file or a file on the Zygo host, the API is missing a route.
+verify-plugin-host: poc/zygo-linux-musl
+	docker run --rm --privileged -v "$(PWD):/src:ro" \
+		-e ZYGO_DATA_HOME=/tmp/zdata-plugin python:3.12-slim \
+		sh /src/poc/verify_plugin_host.sh
 
 # V1, the question the whole `vm` plan rests on: does libkrun build and link
 # against musl? `dist-linux` ships one static binary under 15 MB, and if the

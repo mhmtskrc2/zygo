@@ -691,6 +691,20 @@ Both clients pool connections and are safe to share between threads or tasks.
 That is not an optimisation detail: one connection would serialise concurrent
 callers behind a socket, and the warm path is measured in milliseconds.
 
+## A worked example
+
+[`examples/plugin-host/`](../examples/plugin-host) is a plugin host in about a
+hundred lines, built on this API alone — no `sandbox.toml`, no file on the Zygo
+machine, no shelling out to `zygo`. It onboards customers, gives each their own
+token, limits and secrets, declares **one** runtime they all share, installs
+their code by digest, runs it with files in and out, streams the long ones,
+stops them, and offboards.
+
+`make verify-plugin-host` runs it against a real kernel, including the two
+checks the whole layer exists for: one customer cannot run another's plugin by
+naming its digest, and a customer is held to their own memory limit rather than
+the runtime's.
+
 ## The document
 
 ```bash
