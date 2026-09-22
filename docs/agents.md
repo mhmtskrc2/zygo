@@ -189,6 +189,20 @@ fallback passes `--allow-worker` for exactly that reason. What would reopen it
 is a measurement showing an agent going quiet with a thread pool absent — the
 one above shows the opposite.
 
+## The runtimes that have no agent
+
+Deno and Bun do not have one, and are not waiting for one:
+[ADR 0003](adr/0003-no-deno-or-bun-agent.md) records why and what would change
+it. Both start in a few milliseconds, so a **warm-exec pool** serves them with
+no protocol at all — `cmd = ["deno", "run", "--allow-none"]` and each
+request's script as the last argument. What that gives up is streaming,
+`progress()`, workspaces and per-request tenant limits; see
+[`examples/warm-exec/`](../examples/warm-exec).
+
+The same is true of anything that starts fast: Go, Rust, C, `bash`. Write an
+agent when there is something expensive to keep warm, not because the runtime
+is popular.
+
 ## Four rules an agent has to keep
 
 Each one is in the protocol document with the reason. They are here because

@@ -1,0 +1,79 @@
+# ADR 0003 — No Deno or Bun agent until an embedder asks
+
+**Status:** accepted, 2026-09-22. Records the roadmap decision in
+[`script_runtime.md`](../../script_runtime.md) §3.5 and what would reopen it.
+
+## Context
+
+Zygo ships two runtime agents, Python and Node, and a third-party agent can be
+dropped in with `agent = { agent = "/path/in/sandbox" }`. Deno and Bun are the
+obvious next two: both are popular, both start fast, and both would look good
+in a table.
+
+Neither has an agent, and the reason is what an agent costs to *keep*. The
+protocol is only the beginning of it:
+
+* Each agent is a fork boundary that has to be got exactly right — the child
+  never returns to the parent's loop, nothing runs before `GO`, a malformed
+  frame is reported rather than fatal, every `EXEC` gets exactly one answer.
+  Each of those four rules has been got wrong at least once in this
+  repository, in a language whose semantics its author knew well.
+* Each needs its own answer to `ZYGO_CHILD_SECCOMP`. Node's is a forty-line
+  shared object plus a fallback to Node's permission model, and that fallback
+  was once *stricter* than the filter it stood in for — a bug the seccomp
+  compatibility matrix caught. Deno has a permission model of its own with
+  different edges; Bun has neither a permission model nor a documented way to
+  reach `prctl`.
+* Each needs a place in `make conformance`, the seccomp matrix, and the image
+  matrix — which is where the real cost is. A test that is not run is a claim,
+  and a claim about a runtime nobody is using is a claim nobody checks.
+
+Set against that: **Deno and Bun both run JavaScript**, and the Node agent
+already serves it. An embedder who wants Deno usually wants a specific thing —
+its permission model, its standard library, `deno.json` — rather than "not
+V8".
+
+There is also a shape that costs nothing. Deno and Bun both start in a few
+milliseconds, so a **warm-exec pool** (Phase 3.4) serves them today with no
+agent at all:
+
+```toml
+[runtime.deno]
+image = "denoland/deno:alpine"
+cmd   = ["deno", "run", "--allow-none"]
+```
+
+Each request's script is written into the sandbox and named on the command
+line, with the event on stdin. What that gives up is streaming, `progress()`,
+workspaces and per-request tenant limits — and for a runtime with nothing to
+amortise, an agent would be buying those four things rather than warmth.
+
+## Decision
+
+No Deno or Bun agent. Anyone who wants either has two supported paths: a
+warm-exec pool, or their own agent against `spec/protocol.md`, checked with
+`zygo agent test`.
+
+## Consequences
+
+* The comparison table says two agents rather than four, which is the honest
+  number.
+* `make conformance`, the seccomp matrix and the image matrix stay at a size
+  where they are all run on every change.
+* A Deno user's first experience is a `cmd`, which is three lines and no
+  protocol — and slower per request than a fork from a warm heap, by the cost
+  of an `execve` rather than the cost of an interpreter start-up.
+
+## Reopening it
+
+Any one of these, and none of them is a guess about the future:
+
+* **An embedder asks**, with a workload where the warm-exec pool's per-request
+  `execve` is measurably too slow for them. That measurement is the argument,
+  not the runtime's popularity.
+* **A dependency set needs it**: `deno.json` or `bun.lockb` support in
+  `POST /deps` is a reason to have a runtime that understands them, and that
+  is a smaller piece of work than an agent.
+* **Someone writes one and it passes.** A third-party agent that clears
+  `zygo agent test` — including the child-filter checks, which are the hard
+  part — is an agent this project would rather link to than reimplement.
