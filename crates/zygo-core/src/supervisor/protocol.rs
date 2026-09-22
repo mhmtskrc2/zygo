@@ -925,6 +925,7 @@ mod tests {
         let outcome = Outcome {
             id: "00000001".into(),
             cancelled: false,
+            stuck: false,
             exit_code: 0,
             result: serde_json::json!({ "ok": true, "n": 3 }),
             stdout: "hello\n".into(),
@@ -953,6 +954,7 @@ mod tests {
         let outcome = Outcome {
             id: "00000002".into(),
             cancelled: true,
+            stuck: false,
             exit_code: 1,
             result: serde_json::Value::Null,
             stdout: String::new(),

@@ -77,6 +77,24 @@ export class Timeout extends ZygoError {
  * Distinct from {@link Timeout} on purpose: a timeout says the work is too slow
  * or the limit is too tight, and this says the answer stopped being wanted.
  */
+/**
+ * The sandbox stopped reporting this request, and it was killed.
+ *
+ * Deliberately not a {@link Timeout}: a timeout says the work is too slow or
+ * the limit is too tight, and both are about numbers you chose. This says the
+ * sandbox went quiet with budget left, so the thing to look at is the
+ * function rather than its `timeout`.
+ */
+export class Stuck extends ZygoError {
+  constructor(message, { requestId = '', stdout = '', stderr = '', metrics = {} } = {}) {
+    super(message);
+    this.requestId = requestId;
+    this.stdout = stdout;
+    this.stderr = stderr;
+    this.metrics = metrics;
+  }
+}
+
 export class Cancelled extends ZygoError {
   constructor(message, { requestId = '', stdout = '', stderr = '', metrics = {} } = {}) {
     super(message);
@@ -117,6 +135,14 @@ export function fromResponse(status, body, retryAfter = 1) {
   if (status === 400) return new SpecError(message);
   if (status === 408) {
     return new Timeout(message, { stderr: String(body?.stderr ?? ''), metrics: body?.metrics ?? {} });
+  }
+  if (status === 504 || body?.stuck === true) {
+    return new Stuck(message, {
+      requestId: String(body?.request_id ?? ''),
+      stdout: String(body?.stdout ?? ''),
+      stderr: String(body?.stderr ?? ''),
+      metrics: body?.metrics ?? {},
+    });
   }
   // 499 is nginx's for a client that went away, and the nearest thing to a
   // registered code for a request its caller stopped.

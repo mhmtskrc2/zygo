@@ -608,6 +608,53 @@ def main() -> int:
         client.delete_script(chatty.sha256)
         client.stop_runtime("watch")
 
+        # --- long requests ---------------------------------------------------
+        #
+        # The idle policy freezes a zygote nobody has called for
+        # `idle_timeout`. A request that runs for longer than that must not be
+        # frozen *while it is running* — the freeze would stop the request it
+        # is serving, and a caller would wait out its whole deadline for an
+        # answer that was never coming.
+        print("\nlong requests")
+
+        client.serve_runtime(
+            "patient",
+            {
+                "image": image,
+                "agent": "python",
+                "timeout": "120s",
+                # Far shorter than the request below, so the policy has every
+                # chance to fire during it.
+                "idle_timeout": "2s",
+                "cold_after": "3s",
+            },
+        )
+        patient = client.put_script(
+            "import time\n\n\ndef handler(event):\n"
+            "    time.sleep(12)\n    return 'finished'\n"
+        )
+
+        began = time.time()
+        out = client.run_script("patient", patient.sha256, {}, timeout=120)
+        took = time.time() - began
+        if out.result == "finished" and took >= 12:
+            ok(f"a request outliving `idle_timeout` still finishes ({took:.0f}s)")
+        else:
+            bad("a long request did not complete", f"{out.result!r} after {took:.1f}s")
+
+        # And the heartbeat is why the ceiling could be raised at all: a
+        # timeout of hours is accepted rather than refused as it used to be.
+        long_call = client.run_script(
+            "patient", "def handler(event):\n    return 'quick'\n", {}, timeout=6 * 3600
+        )
+        if long_call.result == "quick":
+            ok("and a caller may wait hours, which the old one-hour ceiling refused")
+        else:
+            bad("a multi-hour timeout was refused", long_call)
+
+        client.delete_script(patient.sha256)
+        client.stop_runtime("patient")
+
         # --- the ceilings ----------------------------------------------------
         print("\nceilings")
 

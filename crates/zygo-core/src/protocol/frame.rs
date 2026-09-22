@@ -184,7 +184,7 @@ mod tests {
 
     #[test]
     fn header_is_four_byte_big_endian_length() {
-        let bytes = encode(&Message::Ping { seq: 1 }).unwrap();
+        let bytes = encode(&Message::Ping { seq: 1, id: None }).unwrap();
         let declared = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
         assert_eq!(declared, bytes.len() - HEADER_BYTES);
         // Big-endian: a small frame has zeros first, which is what a Python
@@ -198,11 +198,11 @@ mod tests {
         let mut stream = Vec::new();
         let mut w = FrameWriter::new(&mut stream);
         w.write(&ready()).unwrap();
-        w.write(&Message::Ping { seq: 9 }).unwrap();
+        w.write(&Message::Ping { seq: 9, id: None }).unwrap();
 
         let mut r: FrameReader<_, Message> = FrameReader::new(std::io::Cursor::new(stream));
         assert_eq!(r.read().unwrap(), Some(ready()));
-        assert_eq!(r.read().unwrap(), Some(Message::Ping { seq: 9 }));
+        assert_eq!(r.read().unwrap(), Some(Message::Ping { seq: 9, id: None }));
         assert_eq!(r.read().unwrap(), None, "clean EOF");
     }
 

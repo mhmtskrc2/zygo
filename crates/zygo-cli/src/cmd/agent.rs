@@ -522,7 +522,15 @@ pub fn test(
         stream_check(&mut agent)
     );
 
-    // 14. Shutdown. Last, because it ends the agent.
+    // 14. Protocol 1.4: a long request is reported alive while it runs.
+    // Optional — an agent that sends no heartbeat is bounded by the request's
+    // own deadline, which is what bounded it before this existed.
+    step_or_skip!(
+        "a long request is reported alive with PING{id} (proto 1.4)",
+        heartbeat_check(&mut agent)
+    );
+
+    // 15. Shutdown. Last, because it ends the agent.
     step!("SHUTDOWN makes the agent exit", shutdown_check(&mut agent));
 
     finish(cli, report)
@@ -617,7 +625,7 @@ fn ready_check(agent: &mut Agent) -> anyhow::Result<String> {
 }
 
 fn ping_check(agent: &mut Agent) -> anyhow::Result<String> {
-    agent.send(&Message::Ping { seq: 7 })?;
+    agent.send(&Message::Ping { seq: 7, id: None })?;
     let reply = agent.recv_matching("PONG", |m| matches!(m, Message::Pong { .. }))?;
     match reply {
         Message::Pong { seq } => {
@@ -798,7 +806,7 @@ fn bad_message_check(agent: &mut Agent) -> anyhow::Result<String> {
                 "reported {code:?} rather than `bad_message`"
             );
             // And it is still alive afterwards.
-            agent.send(&Message::Ping { seq: 9 })?;
+            agent.send(&Message::Ping { seq: 9, id: None })?;
             agent.recv_matching("PONG", |m| matches!(m, Message::Pong { seq: 9 }))?;
             Ok("reported, and the agent is still serving".into())
         }
@@ -1237,6 +1245,70 @@ fn one_script_request(
 }
 
 /// `EXEC` → `FORKED` → `GO` → `DONE`, the whole cycle for one request.
+/// How long the suite waits for a heartbeat before deciding there is none.
+///
+/// The reference agents beat every two seconds. Generous against that, and
+/// short enough that an agent which does not implement 1.4 is not a ten-second
+/// pause in a suite that otherwise runs in three.
+const HEARTBEAT_WAIT: Duration = Duration::from_secs(6);
+
+/// Protocol 1.4: a request that runs for a while is reported alive.
+///
+/// The supervisor raised its timeout ceiling to a day, which makes the
+/// deadline a poor backstop on its own: a request wedged in the first minute
+/// of a six-hour budget would hold its slot for the rest of it. A heartbeat is
+/// what tells a request that is working from one that is not, and this checks
+/// that an agent sends one — for the *request*, with its id, not the bare
+/// `PING` that says only that the agent is alive.
+///
+/// Skipped when none arrives. An agent without heartbeats is bounded by the
+/// request's own deadline, which is what bounded it before 1.4 existed.
+fn heartbeat_check(agent: &mut Agent) -> anyhow::Result<Outcome> {
+    let id = "c11";
+    // Long enough that a two-second heartbeat lands well inside it, and the
+    // check never waits for the handler.
+    agent.send(&exec(id, serde_json::json!({ "sleep_ms": 30_000 })))?;
+
+    let forked = agent.recv_matching("FORKED", |m| matches!(m, Message::Forked { .. }))?;
+    let Message::Forked { pid, .. } = forked else {
+        anyhow::bail!("expected FORKED, got {}", forked.kind());
+    };
+    agent.send(&Message::Go { id: id.to_string() })?;
+
+    let started = Instant::now();
+    let mut beat = None;
+    while started.elapsed() < HEARTBEAT_WAIT {
+        let left = HEARTBEAT_WAIT.saturating_sub(started.elapsed());
+        match agent.quiet_for(left)? {
+            Some(Message::Ping {
+                id: Some(pinged), ..
+            }) if pinged == id => {
+                beat = Some(started.elapsed());
+                break;
+            }
+            // Anything else is this request talking, which is not what is
+            // being checked — a heartbeat is what an agent sends when there
+            // is *nothing* to say.
+            Some(_) => continue,
+            None => break,
+        }
+    }
+
+    // Tidy up either way: the handler is sleeping for thirty seconds and the
+    // suite has eleven more checks to run.
+    // SAFETY: signalling a process this suite's agent forked.
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    let _ = agent.recv_matching("DONE", |m| matches!(m, Message::Done { .. }));
+
+    Ok(match beat {
+        Some(at) => Outcome::Pass(format!("a heartbeat for this request after {at:?}")),
+        None => Outcome::Skipped(format!(
+            "nothing for {HEARTBEAT_WAIT:?} while a request ran: heartbeats are \
+             not implemented"
+        )),
+    })
+}
+
 /// Protocol 1.3: a request that asked to stream gets its output early.
 ///
 /// The check that matters is **order**, not content: the same text arrives in

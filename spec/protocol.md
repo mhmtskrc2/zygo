@@ -312,6 +312,35 @@ outcome: the supervisor has a request waiting on it.
 
 Liveness. An agent that stops answering is restarted.
 
+#### `PING` with an `id` — a request's heartbeat (1.4)
+
+```json
+{"type":"PING","seq":0,"id":"01f3"}
+```
+
+Agent → supervisor, unanswered, while a request is still running.
+
+It exists because a long timeout is a poor backstop on its own. A request
+wedged in the first minute of a six-hour budget holds its slot for the rest of
+it, and the deadline is the only thing that would ever notice. A supervisor
+that has heard nothing about a request for its grace period kills it as
+**stuck**, which is a different fact from "too slow" and earns a different
+answer.
+
+Send one per in-flight request, on an interval well inside whatever grace the
+supervisor gives — the reference agents use two seconds against Zygo's minute.
+Anything else the agent sends about a request counts as well: a `CHUNK` is as
+good a sign of life as a heartbeat, so a chatty handler needs no other.
+
+**Do not make it conditional on the child looking busy.** An agent cannot tell
+a child that is computing from one that is blocked, and a heartbeat that tried
+to would be reporting a guess. What an agent can say honestly is that the child
+exists and it is still scheduling — which is exactly what going quiet denies.
+
+Implementing this is **optional**. An agent that sends none is bounded by the
+request's own deadline, which is what bounded it before 1.4 existed, and
+`zygo agent test` reports that rather than failing it.
+
 ### `SHUTDOWN` — supervisor → agent
 
 ```json
@@ -419,7 +448,11 @@ agent in POSIX sh, to check the suite against something that is not Python.
    would have added a message type for nothing. An `EXEC` without `stream` must
    produce no `CHUNK` at all: that is the path everybody else is on and it must
    stay the one that was measured. `RESULT` carries the full output either way.
-10. **A script's digest is checked, if there is one.** An agent that implements
+10. **A heartbeat is not a guess, if there is one.** An agent that implements
+    1.4 sends `PING` with a request's id while that request runs, and does not
+    withhold it because the child *looks* idle — it cannot tell. An agent that
+    sends none is conforming.
+11. **A script's digest is checked, if there is one.** An agent that implements
    the 1.1 `script` field and is given a `digest` hashes the bytes it is about
    to load and refuses them with `ERROR` / `handler_load` unless they match.
    Hash *what was read*, not the file again: reading twice is a window for the
@@ -514,6 +547,10 @@ That is why the script-carrying `EXEC` above is called 1.1 and still announces
 working, and a supervisor that sends one to such an agent gets the agent's own
 handler back rather than an error. The version number is for the day something
 *removes* or *changes the meaning of* a field, and nothing has.
+
+`PING`'s `id` is 1.4 on the same terms: a supervisor that does not know it
+sees the `PING` it always saw, and an agent that does not send one is bounded
+by the deadline as before.
 
 `CHUNK` and `EXEC`'s `stream` are 1.3 on the same terms: the field is one an
 older agent ignores, and the message is one it never sends, so a supervisor

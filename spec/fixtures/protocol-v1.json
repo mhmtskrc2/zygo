@@ -99,6 +99,12 @@
       "message": {"type": "PING", "seq": 7}
     },
     {
+      "name": "ping-for-a-request",
+      "direction": "agent -> supervisor",
+      "canonical": true,
+      "message": {"type": "PING", "seq": 0, "id": "01f3"}
+    },
+    {
       "name": "pong",
       "direction": "agent -> supervisor",
       "canonical": true,

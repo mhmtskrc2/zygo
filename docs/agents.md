@@ -37,7 +37,7 @@ that kills the whole process tree possible.
 zygo agent test /bin/sh -- examples/agents/sh/agent.sh examples/agents/sh/handler.sh
 ```
 
-Thirteen checks, run against your agent over a real socket. The agent is started
+Fourteen checks, run against your agent over a real socket. The agent is started
 with the control socket at descriptor 3, which is where a sandboxed agent finds
 it too, and everything after the binary is passed through as its arguments.
 
@@ -68,6 +68,13 @@ streams or not, so an implementation that buffered every `CHUNK` and sent them
 at the end would satisfy any check that looked only at what arrived. So the
 handler prints, sleeps for a second and a half, and the first chunk has to be
 in hand while it is still sleeping.
+
+The **heartbeat** check (protocol 1.4) starts a long request and waits for a
+`PING` carrying its id. That is how a supervisor tells a request that is
+working from one that is wedged, which matters because Zygo's timeout ceiling
+is a day: without it, a request stuck in the first minute of a six-hour budget
+would hold its slot for the rest of it. An agent that sends none is bounded by
+the deadline as before, and is skipped rather than failed.
 
 ## What there is to read
 

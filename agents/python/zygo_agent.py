@@ -59,6 +59,13 @@ MAX_FRAME_BYTES = 32 * 1024 * 1024
 # Per-request stdout/stderr capture, truncated past this (design doc §3.12).
 RING_BUFFER_BYTES = 256 * 1024
 
+# How often the agent says a request in flight is still alive (proto 1.4).
+#
+# Well inside the supervisor's grace so that one late wake-up is not a killed
+# request, and long enough that an idle agent is not a process that wakes
+# constantly for nothing.
+HEARTBEAT_SECONDS = 2.0
+
 
 # --------------------------------------------------------------------------
 # Framing
@@ -761,11 +768,19 @@ class Agent:
                 break
 
             try:
-                ready, _, _ = select.select(watch, [], [])
+                # A bounded wait rather than an indefinite one, so the loop
+                # wakes often enough to send heartbeats for the requests it is
+                # carrying (proto 1.4). With nothing in flight the timeout
+                # costs one wake-up every few seconds and nothing else.
+                ready, _, _ = select.select(watch, [], [], HEARTBEAT_SECONDS)
             except InterruptedError:
                 continue
             except OSError:
                 return
+
+            if not ready:
+                self._heartbeat()
+                continue
 
             for fd in ready:
                 if fd == wire_fd:
@@ -778,6 +793,25 @@ class Agent:
                     self._collect(self._by_result_fd[fd])
 
         self._reap_all()
+
+    def _heartbeat(self) -> None:
+        """Say that every request still in flight is still alive (proto 1.4).
+
+        A `PING` carrying a request id, which is how a supervisor tells a
+        request that is *working* from one that is wedged. It exists because a
+        long timeout is a poor backstop on its own: a request stuck in the
+        first minute of a six-hour budget would hold its slot for the rest of
+        it, and the deadline is the only thing that would ever notice.
+
+        Deliberately not conditional on the child looking busy. The agent
+        cannot tell a child that is computing from one that is blocked, and a
+        heartbeat that tried to would be reporting a guess. What it can say
+        honestly is that the child exists and this agent is still scheduling,
+        which is exactly what going quiet would deny.
+        """
+        for request in list(self._inflight.values()):
+            if request.go_fd is None:
+                self._wire.send({"type": "PING", "seq": 0, "id": request.request_id})
 
     def _handle_message(self) -> bool:
         """Read and act on one control message. `False` means stop accepting."""

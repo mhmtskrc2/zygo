@@ -373,6 +373,32 @@ class TokenTests(unittest.TestCase):
         self.assertEqual(api.requests[1]["headers"]["x-zygo-tenant"], "acme")
 
 
+class StuckTests(unittest.TestCase):
+    """A sandbox that went quiet, which is not the same as slow."""
+
+    def test_a_stuck_request_is_not_a_timeout(self) -> None:
+        with FakeApi() as api:
+            api.answer(
+                "POST",
+                "/fn/render",
+                504,
+                {
+                    "error": "the sandbox stopped reporting this request",
+                    "stuck": True,
+                    "request_id": "00000009",
+                    "metrics": {"wall_ms": 61000.0},
+                },
+            )
+            with zygo.connect(api.url) as client:
+                with self.assertRaises(zygo.Stuck) as caught:
+                    client.call("render", {})
+
+        # "too slow, raise the limit" is the wrong advice for a request that
+        # still had budget when the sandbox stopped answering.
+        self.assertNotIsInstance(caught.exception, zygo.Timeout)
+        self.assertEqual(caught.exception.request_id, "00000009")
+
+
 class StreamTests(unittest.TestCase):
     """Output that arrives while the request is still running."""
 

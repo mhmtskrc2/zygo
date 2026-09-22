@@ -40,6 +40,19 @@ export declare class Cancelled extends ZygoError {
   metrics: Metrics;
 }
 
+/**
+ * The sandbox stopped reporting this request, and it was killed.
+ *
+ * Not a {@link Timeout}: the work had budget left, so the thing to look at is
+ * the function rather than its `timeout`.
+ */
+export declare class Stuck extends ZygoError {
+  requestId: string;
+  stdout: string;
+  stderr: string;
+  metrics: Metrics;
+}
+
 /** The request exceeded the function's timeout and was killed. */
 export declare class Timeout extends ZygoError {
   stderr: string;

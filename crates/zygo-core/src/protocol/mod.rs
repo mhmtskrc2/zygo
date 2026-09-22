@@ -266,8 +266,24 @@ pub enum Message {
         metrics: Metrics,
     },
 
+    /// Liveness, both ways.
+    ///
+    /// Without `id` it is the supervisor asking whether the *agent* is alive,
+    /// which is what it has always been.
+    ///
+    /// With one it is the agent saying that a *request* is alive (proto 1.4):
+    /// a heartbeat on behalf of a child that is still running. It exists
+    /// because raising the timeout ceiling to hours made the deadline a poor
+    /// backstop — a request wedged in the first minute of a six-hour budget
+    /// holds its slot for the rest of it. A supervisor that has heard nothing
+    /// for its grace period kills the request as **stuck**, which is a
+    /// different fact from "too slow" and gets a different answer.
     #[serde(rename = "PING")]
-    Ping { seq: u64 },
+    Ping {
+        seq: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
 
     #[serde(rename = "PONG")]
     Pong { seq: u64 },
@@ -360,6 +376,10 @@ impl Message {
             | Message::Result { id, .. }
             | Message::Done { id, .. } => Some(id),
             Message::Error { id, .. } => id.as_deref(),
+            // A heartbeat *for a request* belongs to that request, which is
+            // what gets it routed to the thread waiting on it. A bare `PING`
+            // belongs to nobody, as it always has.
+            Message::Ping { id, .. } => id.as_deref(),
             _ => None,
         }
     }
@@ -610,7 +630,7 @@ mod tests {
     #[test]
     fn request_ids_are_exposed_for_correlation() {
         assert_eq!(Message::Go { id: "x".into() }.request_id(), Some("x"));
-        assert_eq!(Message::Ping { seq: 1 }.request_id(), None);
+        assert_eq!(Message::Ping { seq: 1, id: None }.request_id(), None);
         assert_eq!(
             Message::Error {
                 id: None,

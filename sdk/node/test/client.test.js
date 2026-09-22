@@ -17,6 +17,7 @@ import {
   Cancelled,
   HandlerError,
   NotFound,
+  Stuck,
   Timeout,
   TransportError,
   ZygoError,
@@ -492,6 +493,25 @@ test('a failed request throws after its output has been seen', async () => {
       for await (const event of client.stream('render', {})) kinds.push(event.kind);
     }, HandlerError);
     assert.deepEqual(kinds, ['stdout', 'result'], 'the output was not delivered first');
+  } finally {
+    client.close();
+    await api.close();
+  }
+});
+
+test('a stuck request is its own error, not a Timeout', async () => {
+  const api = await FakeApi.start();
+  api.answer('POST', '/fn/render', 504, {
+    error: 'the sandbox stopped reporting this request',
+    stuck: true,
+    request_id: '00000009',
+  });
+  const client = connect(api.url, { token: null });
+  try {
+    await assert.rejects(() => client.call('render', {}), Stuck);
+    // "too slow, raise the limit" is the wrong advice for a request that
+    // still had budget when the sandbox stopped answering.
+    await assert.rejects(() => client.call('render', {}), (e) => !(e instanceof Timeout));
   } finally {
     client.close();
     await api.close();

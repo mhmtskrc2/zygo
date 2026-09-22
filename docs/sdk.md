@@ -420,6 +420,7 @@ different about what to do next.
 | `Busy` | the pool is full; **the request never ran** | retry after `retry_after` |
 | `Timeout` | the deadline killed the request | the work is too slow, or the limit is too tight |
 | `Cancelled` | somebody stopped the request | nothing: this is what was asked for |
+| `Stuck` | the sandbox went quiet with budget left | look at the function, not at its `timeout` |
 | `HandlerError` | the handler raised; carries both streams | fix the function |
 | `NotFound` | no function under that name | `serve` it |
 | `AuthError` | wrong token, or a deploy call on a call-only API | check the token or the flag |
@@ -432,7 +433,27 @@ retrying is correct; a handler that raised will raise again.
 
 `Timeout` is not a guess. The supervisor records that *it* killed the request,
 because a deadline kill and an out-of-memory kill both arrive as exit 137, and
-only the side that enforced the deadline can tell them apart.
+only the side that enforced the deadline can tell them apart. The same argument
+gives exit 137 four readings in all — a deadline, an out-of-memory kill, a
+cancel, and a sandbox that went quiet — and the supervisor is the only side
+that knows which, so it says.
+
+## Long requests
+
+A function's `timeout` may be hours, and a caller may wait up to a day
+(`X-Zygo-Timeout-Ms`). Two things make that safe rather than a way to hold a
+slot for ever:
+
+* **A heartbeat.** The agent says every second or two that a request is still
+  alive. A request the supervisor has heard nothing about for a minute is
+  killed and raises `Stuck` — whatever its budget said. So a wedged request
+  costs a minute rather than its whole timeout, and "your code is slow" stays
+  distinct from "the sandbox stopped answering".
+* **The idle policy leaves working zygotes alone.** A zygote nobody has called
+  for `idle_timeout` is frozen; one with a request in flight is not, whatever
+  the clock says, because freezing it would stop the request it is serving.
+  A request that runs for an hour under a two-second `idle_timeout` still
+  finishes.
 
 A `batch` is the exception to all of this: each element is a result *or* an
 error, returned rather than raised, because one refused event must not hide the

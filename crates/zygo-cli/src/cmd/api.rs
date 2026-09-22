@@ -118,7 +118,15 @@ const MAX_IDLE_CLIENTS: usize = 32;
 /// it; this header only says how long the caller will wait. Unbounded, it is a
 /// way to hold a connection and a supervisor thread for as long as you like
 /// (S-08).
-const MAX_TIMEOUT_MS: u64 = 3_600_000;
+///
+/// A day rather than the hour it was. An embedder's long jobs — a render, a
+/// migration, a model run — are hours, and an hour was a ceiling they hit for
+/// no reason this API had: the *function's* `timeout` was always the limit
+/// that mattered. What made an hour safe to raise is the heartbeat
+/// (`pool::HEARTBEAT_GRACE`): a wedged request is now killed in a minute
+/// whatever its budget says, so the ceiling no longer doubles as the only
+/// backstop against holding a slot for ever.
+const MAX_TIMEOUT_MS: u64 = 24 * 3_600_000;
 
 /// How long a connection has to send its request headers.
 ///
@@ -2123,6 +2131,23 @@ fn outcome_to_json(outcome: Outcome) -> (StatusCode, serde_json::Value) {
             }),
         );
     }
+    // Not a 408. A timeout says the work is too slow or the limit is too
+    // tight, and both are about the caller's own numbers. This says the
+    // sandbox went quiet with budget left — a `504`, because from the
+    // caller's side the thing behind this API stopped answering.
+    if outcome.stuck {
+        return (
+            StatusCode::GATEWAY_TIMEOUT,
+            serde_json::json!({
+                "error": "the sandbox stopped reporting this request and it was killed",
+                "stuck": true,
+                "request_id": id,
+                "stdout": outcome.stdout,
+                "stderr": outcome.stderr,
+                "metrics": metrics,
+            }),
+        );
+    }
     if let Some(error) = outcome.error {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2167,6 +2192,7 @@ mod tests {
         Outcome {
             id: "00000001".into(),
             cancelled: false,
+            stuck: false,
             exit_code: if error.is_some() { 1 } else { 0 },
             result: serde_json::json!({ "ok": true }),
             stdout: "hi\n".into(),

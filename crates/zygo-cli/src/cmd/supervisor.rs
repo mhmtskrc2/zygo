@@ -956,6 +956,7 @@ mod tests {
         let outcome = |exit_code: i32, error: Option<&str>| Outcome {
             id: "00000001".into(),
             cancelled: false,
+            stuck: false,
             exit_code,
             result: serde_json::Value::Null,
             stdout: String::new(),

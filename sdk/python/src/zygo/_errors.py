@@ -75,6 +75,35 @@ class Timeout(ZygoError):
         self.metrics = metrics or {}
 
 
+class Stuck(ZygoError):
+    """The sandbox stopped reporting this request, and it was killed.
+
+    Deliberately not a :class:`Timeout`. A timeout says the work is too slow or
+    the limit is too tight, and both are about numbers you chose. This says the
+    sandbox went quiet with budget left — an agent that stopped scheduling, a
+    child wedged where no signal it can send will reach it — so the thing to
+    look at is the function, not its `timeout`.
+
+    Only reachable for a request long enough to miss a heartbeat. A short one
+    that wedges is killed by its own deadline and raises :class:`Timeout`.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        request_id: str = "",
+        stdout: str = "",
+        stderr: str = "",
+        metrics: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(message)
+        self.request_id = request_id
+        self.stdout = stdout
+        self.stderr = stderr
+        self.metrics = metrics or {}
+
+
 class Cancelled(ZygoError):
     """Somebody stopped this request — usually the caller.
 
@@ -148,6 +177,14 @@ def from_response(status: int, body: Dict[str, Any], retry_after: float = 1.0) -
         return Timeout(message, stderr=str(body.get("stderr", "")), metrics=body.get("metrics"))
     # 499 is nginx's for a client that went away, and the nearest thing to a
     # registered code for a request the caller stopped.
+    if status == 504 or body.get("stuck") is True:
+        return Stuck(
+            message,
+            request_id=str(body.get("request_id", "")),
+            stdout=str(body.get("stdout", "")),
+            stderr=str(body.get("stderr", "")),
+            metrics=body.get("metrics"),
+        )
     if status == 499 or body.get("cancelled") is True:
         return Cancelled(
             message,

@@ -207,6 +207,21 @@ pub struct Outcome {
     /// deadline knows which it was. The HTTP API's 408 depends on it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub timed_out: bool,
+    /// The agent stopped saying this request was alive, and it was killed.
+    ///
+    /// The fourth reading of exit 137, and the one that is not about the
+    /// caller's limits at all. A deadline says the work is too slow; an
+    /// out-of-memory kill says it is too big; a cancel says somebody changed
+    /// their mind. This says the *sandbox* went quiet — an agent that stopped
+    /// scheduling, a child wedged where no signal it can send will reach it —
+    /// and the advice that follows is about the function, not about the
+    /// number in its spec.
+    ///
+    /// Only reachable for a request long enough to miss a heartbeat. A short
+    /// one that wedges is killed by its own deadline, which is the older
+    /// backstop and is still the right one when the budget is seconds.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stuck: bool,
     /// Somebody asked for this request to stop, and it did.
     ///
     /// The third reading of exit 137, and the same argument as `timed_out`:
@@ -376,6 +391,18 @@ impl Requests {
 /// holding up the request that is writing to it. The supervisor's own
 /// implementation writes one control frame and returns.
 pub type ChunkSink<'a> = &'a (dyn Fn(crate::protocol::Stream, &str) + Send + Sync);
+
+/// How long a request may go without the agent saying it is still alive.
+///
+/// Only consulted for a request whose budget is longer than this, so nothing
+/// with an ordinary timeout is affected: a thirty-second request is bounded by
+/// thirty seconds, and a heartbeat that adds a second bound to it would only
+/// be a second thing to get wrong.
+///
+/// Generous against the agents' own interval, because a missed heartbeat kills
+/// a request that may have been running for hours. The reference agents beat
+/// once every five seconds.
+pub const HEARTBEAT_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The most output one streaming request may send, in bytes.
 ///
@@ -1732,9 +1759,30 @@ impl WarmFn {
         let waiting_from = Instant::now();
         let mut streamed = 0usize;
         let mut timed_out = false;
+        let mut stuck = false;
+        // Only for a request whose budget outlives the grace period. A
+        // thirty-second request is bounded by thirty seconds; a second bound
+        // shorter than the first would be a second thing to get wrong and
+        // would never be the one that fired.
+        let heartbeat = deadline > HEARTBEAT_GRACE;
+        let mut heard = Instant::now();
         let done_reply = loop {
             let left = deadline.saturating_sub(waiting_from.elapsed());
-            match reply.next(left) {
+            // Whichever runs out first. `heard` moves on every frame the agent
+            // sends about this request — a chunk is as good a sign of life as
+            // a heartbeat, so a chatty handler needs no other.
+            let left = match heartbeat {
+                true => left.min(HEARTBEAT_GRACE.saturating_sub(heard.elapsed())),
+                false => left,
+            };
+            let next = reply.next(left);
+            if next.is_ok() {
+                heard = Instant::now();
+            }
+            match next {
+                // A heartbeat for this request: the agent says the child is
+                // still there. Nothing else to do — the wait has restarted.
+                Ok(Message::Ping { .. }) => continue,
                 Ok(Message::Chunk { stream, data, .. }) => {
                     // Past the cap the stream stops and the request carries
                     // on: `RESULT` still brings the captured output, so a
@@ -1752,7 +1800,12 @@ impl WarmFn {
                     return self.broken(agent_gone(&self.name, &reason));
                 }
                 Err(ReplyError::TimedOut) => {
-                    timed_out = true;
+                    // Which clock ran out. A request that still had budget
+                    // left was killed for going quiet rather than for being
+                    // slow, and the caller is told which — they are different
+                    // facts with different answers.
+                    stuck = waiting_from.elapsed() < deadline;
+                    timed_out = !stuck;
                     self.enforce_deadline(request_cgroup.as_deref(), host_pid);
                     // The child is dead, so the agent sees end of file on the
                     // result pipe and sends `DONE` by itself. Waiting for it
@@ -1763,7 +1816,7 @@ impl WarmFn {
                     break loop {
                         let left = KILL_GRACE.saturating_sub(killed_at.elapsed());
                         match reply.next(left) {
-                            Ok(Message::Chunk { .. }) => continue,
+                            Ok(Message::Chunk { .. } | Message::Ping { .. }) => continue,
                             Ok(message) => break message,
                             Err(_) => {
                                 return self.broken(Error::BackendUnavailable {
@@ -1818,7 +1871,7 @@ impl WarmFn {
                 // agent noticing, which is near zero for something that ran
                 // for its whole deadline. The supervisor holds the only clock
                 // that saw the whole of it — see the note above.
-                metrics: if timed_out || cancelled {
+                metrics: if timed_out || cancelled || stuck {
                     Metrics {
                         wall_ms: measured.as_secs_f64() * 1000.0,
                         ..metrics
@@ -1828,6 +1881,7 @@ impl WarmFn {
                 },
                 timed_out,
                 cancelled,
+                stuck,
             }),
             Message::Error { code, message, .. } => {
                 Err(Error::from(ProtocolError::Agent { code, message }))
@@ -3119,6 +3173,7 @@ fn into_outcome(
         // assigned the id and it is holding the request's registry entry.
         id: String::new(),
         cancelled: false,
+        stuck: false,
         exit_code,
         result,
         stdout: if error.is_some() {
@@ -4659,6 +4714,7 @@ mod tests {
         let base = Outcome {
             id: "00000001".into(),
             cancelled: false,
+            stuck: false,
             exit_code: 0,
             result: serde_json::Value::Null,
             stdout: String::new(),

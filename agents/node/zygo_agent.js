@@ -540,6 +540,7 @@ class Agent {
       (message, bad) => (bad === null ? this._onMessage(message) : this._error(null, 'bad_message', bad)),
       () => this._stop()
     );
+    this._heartbeat = this._startHeartbeat();
   }
 
   send(message) {
@@ -626,6 +627,31 @@ class Agent {
       if (!this._shuttingDown) this.spawnWorker();
     });
     return w;
+  }
+
+  /// Say that every request still in flight is still alive (proto 1.4).
+  ///
+  /// A `PING` carrying a request id, which is how a supervisor tells a request
+  /// that is *working* from one that is wedged: a long timeout is a poor
+  /// backstop on its own, because a request stuck in the first minute of a
+  /// six-hour budget would hold its slot for the rest of it.
+  ///
+  /// Deliberately not conditional on the worker looking busy. The agent cannot
+  /// tell a worker that is computing from one that is blocked, and a heartbeat
+  /// that tried to would be reporting a guess. What it can say honestly is
+  /// that the worker exists and this agent is still scheduling, which is
+  /// exactly what going quiet would deny.
+  ///
+  /// `unref`, so an agent with nothing in flight is still a process Node will
+  /// let exit.
+  _startHeartbeat() {
+    const timer = setInterval(() => {
+      for (const [id, w] of this._inflight) {
+        if (w.started) this.send({ type: 'PING', seq: 0, id });
+      }
+    }, HEARTBEAT_MS);
+    if (typeof timer.unref === 'function') timer.unref();
+    return timer;
   }
 
   _dispatch(request, w) {
@@ -774,6 +800,7 @@ class Agent {
   /// Stop taking work, but finish what is already dispatched.
   _stop() {
     this._shuttingDown = true;
+    clearInterval(this._heartbeat);
     for (const w of this._idle) w.child.kill();
     this._idle.length = 0;
     // Nothing left to wait for, and the queue can never drain now.
@@ -784,6 +811,12 @@ class Agent {
     if (this._inflight.size === 0) process.exit(0);
   }
 }
+
+/// How often the agent says a request in flight is still alive (proto 1.4).
+///
+/// Well inside the supervisor's grace, so one late tick is not a killed
+/// request.
+const HEARTBEAT_MS = 2_000;
 
 /// A signal's number, for the shell's `128 + n`.
 ///
