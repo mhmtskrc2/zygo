@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -370,6 +371,82 @@ class TokenTests(unittest.TestCase):
 
         self.assertNotIn("x-zygo-tenant", api.requests[0]["headers"])
         self.assertEqual(api.requests[1]["headers"]["x-zygo-tenant"], "acme")
+
+
+class StreamTests(unittest.TestCase):
+    """Output that arrives while the request is still running."""
+
+    LINES = [
+        {"stream": "stdout", "data": "page 1\n"},
+        {"stream": "progress", "data": "halfway"},
+        {"stream": "stderr", "data": "a warning\n"},
+        {"status": 200, "result": {"pages": 2}, "stdout": "page 1\n", "stderr": "a warning\n"},
+    ]
+
+    def test_a_stream_yields_its_lines_then_exactly_one_result(self) -> None:
+        with FakeApi() as api:
+            api.stream("POST", "/fn/render", self.LINES)
+            with zygo.connect(api.url) as client:
+                events = list(client.stream("render", {"pages": 2}))
+
+        self.assertEqual(
+            [e.kind for e in events],
+            ["stdout", "progress", "stderr", "result"],
+        )
+        # `progress` is its own kind, not a line of stdout: a caller that had
+        # to parse the output to find it would be parsing log messages.
+        self.assertEqual(events[1].data, "halfway")
+        self.assertTrue(events[-1].is_result)
+        self.assertEqual(events[-1].result.result, {"pages": 2})
+
+    def test_lines_are_yielded_as_they_arrive_not_at_the_end(self) -> None:
+        """The claim streaming makes, and the only one worth testing.
+
+        The same lines arrive either way; what a stream promises is *when*. So
+        the server pauses between them, and the first line has to be in hand
+        before the last one has been sent.
+        """
+        with FakeApi() as api:
+            api.stream("POST", "/fn/render", self.LINES, gap=0.3)
+            with zygo.connect(api.url) as client:
+                began = time.monotonic()
+                first = None
+                for event in client.stream("render", {}):
+                    if first is None:
+                        first = time.monotonic() - began
+                whole = time.monotonic() - began
+
+        self.assertIsNotNone(first)
+        self.assertLess(
+            first, whole / 2, f"the first line took {first:.2f}s of {whole:.2f}s"
+        )
+
+    def test_a_failed_request_raises_after_its_output_has_been_seen(self) -> None:
+        # A handler that printed and then raised produced both, and a caller
+        # that is streaming asked to see the first part.
+        with FakeApi() as api:
+            api.stream(
+                "POST",
+                "/fn/render",
+                [
+                    {"stream": "stdout", "data": "starting\n"},
+                    {"status": 500, "error": "boom", "exit_code": 1, "stdout": "starting\n"},
+                ],
+            )
+            with zygo.connect(api.url) as client:
+                seen = []
+                with self.assertRaises(zygo.HandlerError):
+                    for event in client.stream("render", {}):
+                        seen.append(event.kind)
+
+        self.assertEqual(seen, ["stdout", "result"], "the output was not delivered first")
+
+    def test_a_refusal_is_raised_rather_than_streamed(self) -> None:
+        with FakeApi() as api:
+            api.answer("POST", "/fn/render", 404, {"error": "no function"})
+            with zygo.connect(api.url) as client:
+                with self.assertRaises(zygo.NotFound):
+                    list(client.stream("render", {}))
 
 
 class CancelTests(unittest.TestCase):

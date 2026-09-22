@@ -84,6 +84,8 @@ as.
 | Version | `client.version()` | `client.version()` | either | no |
 | Register a script | `client.put_script(source)` | `client.putScript(source)` | either | no |
 | Stop a running request | `client.cancel(id)` | `client.cancel(id)` | own, or operator | no |
+| Watch a call's output | `client.stream(name, event)` | `client.stream(name, event)` | either | no |
+| The same, for a pool | `client.stream_script(rt, script)` | `client.streamScript(rt, script)` | either | no |
 | Look a script up | `client.script(digest)` | `client.script(digest)` | either | no |
 | Run a script in a pool | `client.run_script(runtime, script)` | `client.runScript(runtime, script)` | either | no |
 | List runtime pools | `client.runtimes()` | `client.runtimes()` | either | no |
@@ -203,6 +205,61 @@ existing deployment already sets, with the same rights it already had, which
 is what keeps one working across this change. On the host, `zygo token mint`,
 `zygo token ls` and `zygo token revoke <id>` do the same three things without
 an HTTP round trip.
+
+## Watching a request
+
+A call that takes a minute has something to say before it finishes:
+
+```python
+for event in client.stream("render", {"pages": 400}):
+    if event.is_result:
+        print(event.result.result)
+    else:
+        print(event.kind, event.data, end="")      # stdout, stderr, progress
+```
+
+```js
+for await (const event of client.stream('render', { pages: 400 })) {
+  if (event.kind === 'result') console.log(event.result.result);
+  else process.stdout.write(event.data);
+}
+```
+
+Each item is a piece of the request's output, and the last one is the result —
+exactly what the non-streaming call would have returned, or what it would have
+raised. A handler that printed and then failed produced both, so the output is
+delivered *first* and the exception comes when you iterate past the result.
+
+Three kinds arrive. `stdout` and `stderr` are what the request's process wrote,
+kept apart as everywhere else. **`progress` is its own kind**, not a line of
+stdout: a long request has two things to say — what it printed, and how far it
+has got — and a caller that had to parse the first to find the second would be
+parsing a handler's log messages. The handler reports it by calling
+`event.progress(...)`, which is there whether or not anybody is listening, so a
+handler does not break depending on who called it:
+
+```python
+def handler(event):
+    for n, page in enumerate(event["pages"]):
+        event.progress(f"{n} of {len(event['pages'])}")
+    return {"done": True}
+```
+
+The result still carries the whole of `stdout` and `stderr`, bounded as always.
+So a caller that streamed and one that did not see the same text; what
+streaming changes is when.
+
+**It is per request, not per function.** A `CHUNK` per `print()` is a syscall
+per `print()` on a path measured in milliseconds, so a caller that wants to
+watch pays for it and everybody else keeps the shape that was measured — the
+request does not even carry the flag. Over HTTP it is `?stream=1`, and the
+answer is newline-delimited JSON rather than server-sent events: every client
+in every language can read a line and parse JSON, and SSE's framing buys
+nothing here.
+
+The streaming connection is held for the whole request and is not pooled.
+Abandoning the iterator closes it, which does **not** cancel the request —
+pass a `key` and use `cancel` for that.
 
 ## Cancelling a request
 

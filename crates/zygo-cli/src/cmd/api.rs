@@ -21,6 +21,43 @@ use std::time::Instant;
 use anyhow::Context;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
+
+/// Every answer this API sends.
+///
+/// Boxed rather than `Full<Bytes>` because one route streams: `?stream=1`
+/// answers with newline-delimited JSON, a line at a time, while the request is
+/// still running. Everything else is still one buffer — `ok()` wraps it — so
+/// the cost of the box is one allocation per response and no change to how any
+/// of them are built.
+type ApiBody = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
+
+/// One whole body, as every non-streaming route answers.
+fn whole(bytes: Bytes) -> ApiBody {
+    Full::new(bytes).map_err(|never| match never {}).boxed()
+}
+
+/// A body whose bytes arrive from somewhere else, while the response is open.
+///
+/// Twenty lines rather than a `tokio-stream` dependency for its `StreamBody`
+/// adapter: this is the whole of what that would do, and a crate added for a
+/// wrapper is a crate to keep up with.
+struct Streamed(tokio::sync::mpsc::Receiver<Bytes>);
+
+impl hyper::body::Body for Streamed {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<std::result::Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        // The sender going away ends the body, which is how the request's own
+        // thread says it has finished: it drops its half.
+        self.0
+            .poll_recv(cx)
+            .map(|frame| frame.map(|bytes| Ok(hyper::body::Frame::data(bytes))))
+    }
+}
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -318,10 +355,7 @@ where
 /// One HTTP request → one answer. Never fails the connection: every problem is
 /// a status code with a JSON body, because the caller is a webhook or a script
 /// and a dropped connection tells it nothing.
-async fn handle(
-    req: Request<Incoming>,
-    api: Arc<Api>,
-) -> Result<Response<Full<Bytes>>, Infallible> {
+async fn handle(req: Request<Incoming>, api: Arc<Api>) -> Result<Response<ApiBody>, Infallible> {
     api.requests.fetch_add(1, Ordering::Relaxed);
     let response = match route(req, &api).await {
         Ok(response) => response,
@@ -341,6 +375,17 @@ async fn handle(
 struct HttpError {
     status: StatusCode,
     body: serde_json::Value,
+    /// End the connection with this answer.
+    ///
+    /// For a refusal decided **before the request body was read** — a bad
+    /// token, a header that does not parse. HTTP/1.1 gives a server two
+    /// choices there: read the body it is about to throw away, or close. What
+    /// it may not do is leave the body on the wire and keep the connection,
+    /// which is what this used to do: hyper closed it anyway, the client had
+    /// already put it back in its pool, and that caller's *next* request —
+    /// often an unrelated one — failed with a broken pipe. Intermittently,
+    /// because it depended on which pooled connection came out next.
+    close: bool,
 }
 
 impl HttpError {
@@ -348,11 +393,26 @@ impl HttpError {
         HttpError {
             status,
             body: serde_json::json!({ "error": message.to_string() }),
+            close: false,
         }
     }
 
-    fn into_response(self) -> Response<Full<Bytes>> {
-        json(self.status, &self.body)
+    /// The same, for a refusal decided before the body was read.
+    fn closing(status: StatusCode, message: impl std::fmt::Display) -> HttpError {
+        HttpError {
+            close: true,
+            ..HttpError::new(status, message)
+        }
+    }
+
+    fn into_response(self) -> Response<ApiBody> {
+        let mut response = json(self.status, &self.body);
+        if self.close {
+            response
+                .headers_mut()
+                .insert(hyper::header::CONNECTION, HeaderValue::from_static("close"));
+        }
+        response
     }
 }
 
@@ -362,7 +422,9 @@ impl From<anyhow::Error> for HttpError {
     }
 }
 
-async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<Full<Bytes>>, HttpError> {
+use hyper::header::HeaderValue;
+
+async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<ApiBody>, HttpError> {
     // `/healthz` is deliberately unauthenticated: a load balancer probing it
     // has no business holding the token, and it reveals nothing but "up".
     if req.method() == Method::GET && req.uri().path() == "/healthz" {
@@ -509,8 +571,9 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<Full<B
             let name = name.to_string();
             let timeout_ms = timeout_header(&req)?;
             let key = request_key(&req)?;
+            let streaming = Query::parse(req.uri().query().unwrap_or("")).flag("stream")?;
             let body = read_body(req).await?;
-            call_runtime(api, name, &body, timeout_ms, tenant, key).await
+            call_runtime(api, name, &body, timeout_ms, tenant, key, streaming).await
         }
         // Not gated on deploy, and this is the change tokens paid for:
         // registering a script for yourself is what a tenant token is *for*.
@@ -670,14 +733,14 @@ fn authorise(req: &Request<Incoming>, api: &Api) -> Result<Actor, HttpError> {
         let id = value
             .to_str()
             .map_err(|_| {
-                HttpError::new(
+                HttpError::closing(
                     StatusCode::BAD_REQUEST,
                     "X-Zygo-Tenant must be ASCII: it is an id, not a name",
                 )
             })?
             .trim();
         zygo_core::tenants::valid_id(id)
-            .map_err(|e| HttpError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
+            .map_err(|e| HttpError::closing(StatusCode::BAD_REQUEST, e.to_string()))?;
         Ok(Some(id.to_string()))
     };
 
@@ -696,7 +759,7 @@ fn authorise(req: &Request<Incoming>, api: &Api) -> Result<Actor, HttpError> {
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::trim)
-        .ok_or_else(|| HttpError::new(StatusCode::UNAUTHORIZED, "missing bearer token"))?;
+        .ok_or_else(|| HttpError::closing(StatusCode::UNAUTHORIZED, "missing bearer token"))?;
 
     // The bootstrap token first, and with a comparison that does not stop at
     // the first differing byte. On loopback the timing side channel is
@@ -711,9 +774,9 @@ fn authorise(req: &Request<Incoming>, api: &Api) -> Result<Actor, HttpError> {
 
     let token = zygo_core::tokens::Tokens::new(&api.paths)
         .resolve(presented)
-        .map_err(|e| HttpError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
+        .map_err(|e| HttpError::closing(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
         .ok_or_else(|| {
-            HttpError::new(
+            HttpError::closing(
                 StatusCode::UNAUTHORIZED,
                 "wrong or revoked bearer token".to_string(),
             )
@@ -732,7 +795,7 @@ fn authorise(req: &Request<Incoming>, api: &Api) -> Result<Actor, HttpError> {
             if let Some(named) = header()?
                 && named != id
             {
-                return Err(HttpError::new(
+                return Err(HttpError::closing(
                     StatusCode::FORBIDDEN,
                     format!(
                         "this token is tenant `{id}`'s and the request names `{named}`\n  \
@@ -773,7 +836,7 @@ fn request_key(req: &Request<Incoming>) -> Result<Option<String>, HttpError> {
         .filter(|k| k.len() <= 128)
         .filter(|k| k.bytes().all(|b| b.is_ascii_graphic()))
         .ok_or_else(|| {
-            HttpError::new(
+            HttpError::closing(
                 StatusCode::BAD_REQUEST,
                 "X-Zygo-Request-Key must be 1 to 128 printable ASCII characters",
             )
@@ -799,7 +862,7 @@ fn timeout_header_from(headers: &hyper::HeaderMap) -> Result<u64, HttpError> {
                 .and_then(|s| s.trim().parse::<u64>().ok())
                 .filter(|ms| *ms > 0)
                 .ok_or_else(|| {
-                    HttpError::new(
+                    HttpError::closing(
                         StatusCode::BAD_REQUEST,
                         "X-Zygo-Timeout-Ms must be a positive integer",
                     )
@@ -808,7 +871,7 @@ fn timeout_header_from(headers: &hyper::HeaderMap) -> Result<u64, HttpError> {
             // day and was given an hour would report the wrong thing when the
             // wait ended.
             if ms > MAX_TIMEOUT_MS {
-                return Err(HttpError::new(
+                return Err(HttpError::closing(
                     StatusCode::BAD_REQUEST,
                     format!(
                         "X-Zygo-Timeout-Ms is {ms}, over this API's ceiling of \
@@ -878,6 +941,98 @@ where
     .context("the control request panicked")?
 }
 
+/// `?stream=1`: newline-delimited JSON, a line per event, as they happen.
+///
+/// One object per line — `{"stream":"stdout","data":"…"}` while the request
+/// runs, then one final `{"result":…}` or `{"error":…}` carrying exactly what
+/// the non-streaming answer would have been, plus its status. The status *code*
+/// is 200 as soon as the first byte goes out, because it has to be: a response
+/// cannot be given a status after its body has started. The last line is where
+/// the outcome is.
+///
+/// NDJSON rather than server-sent events: every client in every language can
+/// read a line and parse JSON, and SSE's framing buys nothing here — there is
+/// one stream, no reconnection, and no last-event id to resume from.
+const STREAM_CONTENT_TYPE: &str = "application/x-ndjson";
+
+/// How many lines may be waiting to be written before the request's own thread
+/// is held up.
+///
+/// Small on purpose. The point of a stream is that the reader sees output
+/// early, and a deep buffer between the handler and the socket is a way to
+/// arrive at the same time as `RESULT` would have. When it fills, the
+/// supervisor's sink blocks — which is backpressure reaching the handler,
+/// which is the correct place for it to reach.
+const STREAM_BACKLOG: usize = 64;
+
+/// Run a request and answer with its output as it is produced.
+async fn exec_streaming(api: &Arc<Api>, request: Control) -> Result<Response<ApiBody>, HttpError> {
+    let (lines, rx) = tokio::sync::mpsc::channel::<Bytes>(STREAM_BACKLOG);
+    let api = Arc::clone(api);
+
+    // The control call is blocking and lives on its own thread for the whole
+    // request; the body is whatever it has sent so far. Nothing here awaits
+    // the end, which is the point.
+    tokio::task::spawn_blocking(move || {
+        let mut client = match api.clients.lock().expect("clients").pop() {
+            Some(client) => client,
+            None => match Client::connect_or_start(&api.paths, &api.exe) {
+                Ok(client) => client,
+                Err(e) => {
+                    let _ = lines.blocking_send(line(&serde_json::json!({
+                        "status": 500,
+                        "error": format!("{e:#}"),
+                    })));
+                    return;
+                }
+            },
+        };
+
+        let answer = client.send_streaming(&request, |stream, data| {
+            // A full channel blocks this thread, which is the supervisor
+            // connection, which is the request. That is backpressure arriving
+            // where it can do something: the handler waits for its reader.
+            let _ = lines.blocking_send(line(&serde_json::json!({
+                "stream": stream.as_str(),
+                "data": data,
+            })));
+        });
+
+        let last = match answer {
+            Ok(reply) => {
+                let (status, mut body) = reply_to_json(reply);
+                body["status"] = status.as_u16().into();
+                body
+            }
+            Err(e) => serde_json::json!({ "status": 500, "error": format!("{e:#}") }),
+        };
+        let _ = lines.blocking_send(line(&last));
+
+        let mut idle = api.clients.lock().expect("clients");
+        if idle.len() < MAX_IDLE_CLIENTS {
+            idle.push(client);
+        }
+    });
+
+    let body = Streamed(rx).boxed();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", STREAM_CONTENT_TYPE)
+        // Nothing between here and the client may hold a line back waiting for
+        // more: a proxy that buffers turns a stream into a slow whole answer.
+        .header("cache-control", "no-store")
+        .header("x-accel-buffering", "no")
+        .body(body)
+        .map_err(|e| HttpError::new(StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+/// One NDJSON line: the object, then a newline.
+fn line(value: &serde_json::Value) -> Bytes {
+    let mut out = serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec());
+    out.push(b'\n');
+    Bytes::from(out)
+}
+
 async fn exec(
     api: &Arc<Api>,
     name: String,
@@ -885,7 +1040,7 @@ async fn exec(
     timeout_ms: u64,
     tenant: Option<String>,
     key: Option<String>,
-) -> Result<Response<Full<Bytes>>, HttpError> {
+) -> Result<Response<ApiBody>, HttpError> {
     let reply = control(api, move |c| {
         Ok(c.send(&Control::Exec {
             name,
@@ -893,6 +1048,7 @@ async fn exec(
             timeout_ms,
             tenant,
             key,
+            stream: false,
         })?)
     })
     .await?;
@@ -910,7 +1066,7 @@ async fn batch(
     events: Vec<serde_json::Value>,
     timeout_ms: u64,
     tenant: Option<String>,
-) -> Result<Response<Full<Bytes>>, HttpError> {
+) -> Result<Response<ApiBody>, HttpError> {
     if events.len() > MAX_BATCH {
         return Err(HttpError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -949,6 +1105,10 @@ async fn batch(
                     // is cancelling the HTTP call; per-element cancellation
                     // needs a name per element, which nothing has asked for.
                     key: None,
+                    // And `?stream=1` on a batch would interleave several
+                    // requests' output on one connection with nothing to tell
+                    // them apart. Call them one at a time to watch them.
+                    stream: false,
                 })?)
             })
             .await;
@@ -1011,7 +1171,7 @@ fn mine(
     }
 }
 
-async fn list(api: &Arc<Api>, tenant: Option<String>) -> Result<Response<Full<Bytes>>, HttpError> {
+async fn list(api: &Arc<Api>, tenant: Option<String>) -> Result<Response<ApiBody>, HttpError> {
     let reply = control(api, |c| Ok(c.send(&Control::List)?)).await?;
     match reply {
         Reply::Functions { functions } => {
@@ -1029,7 +1189,7 @@ async fn stats(
     api: &Arc<Api>,
     name: String,
     tenant: Option<String>,
-) -> Result<Response<Full<Bytes>>, HttpError> {
+) -> Result<Response<ApiBody>, HttpError> {
     let reply = control(api, |c| Ok(c.send(&Control::List)?)).await?;
     match reply {
         Reply::Functions { functions } => {
@@ -1057,7 +1217,7 @@ async fn warm(
     api: &Arc<Api>,
     name: String,
     tenant: Option<String>,
-) -> Result<Response<Full<Bytes>>, HttpError> {
+) -> Result<Response<ApiBody>, HttpError> {
     let reply = control(api, move |c| Ok(c.send(&Control::Warm { name, tenant })?)).await?;
     Ok(reply_to_response(reply))
 }
@@ -1084,7 +1244,7 @@ async fn serve_runtime(
     api: &Arc<Api>,
     body: &[u8],
     tenant: Option<String>,
-) -> Result<Response<Full<Bytes>>, HttpError> {
+) -> Result<Response<ApiBody>, HttpError> {
     let request: ServeRuntimeRequest = serde_json::from_slice(body).map_err(|e| {
         HttpError::new(
             StatusCode::BAD_REQUEST,
@@ -1137,15 +1297,12 @@ async fn cancel(
     api: &Arc<Api>,
     id: String,
     tenant: Option<String>,
-) -> Result<Response<Full<Bytes>>, HttpError> {
+) -> Result<Response<ApiBody>, HttpError> {
     let reply = control(api, move |c| Ok(c.send(&Control::Cancel { id, tenant })?)).await?;
     Ok(reply_to_response(reply))
 }
 
-async fn runtimes(
-    api: &Arc<Api>,
-    tenant: Option<String>,
-) -> Result<Response<Full<Bytes>>, HttpError> {
+async fn runtimes(api: &Arc<Api>, tenant: Option<String>) -> Result<Response<ApiBody>, HttpError> {
     let reply = control(api, |c| Ok(c.send(&Control::Runtimes)?)).await?;
     match (reply, tenant) {
         (Reply::Runtimes { runtimes }, Some(id)) => {
@@ -1159,7 +1316,7 @@ async fn runtimes(
     }
 }
 
-async fn stop_runtime(api: &Arc<Api>, name: String) -> Result<Response<Full<Bytes>>, HttpError> {
+async fn stop_runtime(api: &Arc<Api>, name: String) -> Result<Response<ApiBody>, HttpError> {
     let wanted = name.clone();
     let reply = control(api, move |c| Ok(c.send(&Control::StopRuntime { name })?)).await?;
     match reply {
@@ -1195,6 +1352,7 @@ enum ScriptRef {
     Source { source: String },
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn call_runtime(
     api: &Arc<Api>,
     name: String,
@@ -1202,7 +1360,8 @@ async fn call_runtime(
     timeout_ms: u64,
     tenant: Option<String>,
     key: Option<String>,
-) -> Result<Response<Full<Bytes>>, HttpError> {
+    streaming: bool,
+) -> Result<Response<ApiBody>, HttpError> {
     let request: CallRuntimeRequest = serde_json::from_slice(body).map_err(|e| {
         HttpError::new(
             StatusCode::BAD_REQUEST,
@@ -1224,17 +1383,19 @@ async fn call_runtime(
     };
     script.entry_point = request.entry_point;
 
-    let reply = control(api, move |c| {
-        Ok(c.send(&Control::ExecScript {
-            key,
-            runtime: name,
-            script,
-            event: request.event,
-            timeout_ms,
-            tenant,
-        })?)
-    })
-    .await?;
+    let call = Control::ExecScript {
+        key,
+        runtime: name,
+        script,
+        event: request.event,
+        timeout_ms,
+        tenant,
+        stream: streaming,
+    };
+    if streaming {
+        return exec_streaming(api, call).await;
+    }
+    let reply = control(api, move |c| Ok(c.send(&call)?)).await?;
     Ok(reply_to_response(reply))
 }
 
@@ -1250,7 +1411,7 @@ async fn call_runtime(
 /// Idempotent — `201` when it was created, `200` when it was already there —
 /// for the same reason `PUT /scripts` is: an embedder that creates a customer
 /// they already have has not made a mistake worth failing a deploy over.
-async fn create_tenant(api: &Arc<Api>, body: &[u8]) -> Result<Response<Full<Bytes>>, HttpError> {
+async fn create_tenant(api: &Arc<Api>, body: &[u8]) -> Result<Response<ApiBody>, HttpError> {
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
     struct CreateTenantRequest {
@@ -1282,7 +1443,7 @@ async fn create_tenant(api: &Arc<Api>, body: &[u8]) -> Result<Response<Full<Byte
     }
 }
 
-async fn tenants(api: &Arc<Api>, id: Option<String>) -> Result<Response<Full<Bytes>>, HttpError> {
+async fn tenants(api: &Arc<Api>, id: Option<String>) -> Result<Response<ApiBody>, HttpError> {
     let one = id.is_some();
     let reply = control(api, move |c| Ok(c.send(&Control::Tenants { id })?)).await?;
     match reply {
@@ -1298,7 +1459,7 @@ async fn tenants(api: &Arc<Api>, id: Option<String>) -> Result<Response<Full<Byt
     }
 }
 
-async fn delete_tenant(api: &Arc<Api>, id: String) -> Result<Response<Full<Bytes>>, HttpError> {
+async fn delete_tenant(api: &Arc<Api>, id: String) -> Result<Response<ApiBody>, HttpError> {
     let reply = control(api, move |c| Ok(c.send(&Control::DeleteTenant { id })?)).await?;
     match reply {
         Reply::Tenants {
@@ -1326,7 +1487,7 @@ async fn delete_tenant(api: &Arc<Api>, id: String) -> Result<Response<Full<Bytes
 async fn mint_token(
     api: &Arc<Api>,
     tenant: Option<String>,
-) -> Result<Response<Full<Bytes>>, HttpError> {
+) -> Result<Response<ApiBody>, HttpError> {
     let reply = control(api, move |c| Ok(c.send(&Control::MintToken { tenant })?)).await?;
     match reply {
         Reply::Tokens { tokens, secret } => Ok(json(
@@ -1338,7 +1499,7 @@ async fn mint_token(
 }
 
 /// `GET /tokens`: every token, hashes and all, never a secret.
-async fn list_tokens(api: &Arc<Api>) -> Result<Response<Full<Bytes>>, HttpError> {
+async fn list_tokens(api: &Arc<Api>) -> Result<Response<ApiBody>, HttpError> {
     let reply = control(api, |c| Ok(c.send(&Control::Tokens)?)).await?;
     match reply {
         Reply::Tokens { tokens, .. } => Ok(json(
@@ -1350,7 +1511,7 @@ async fn list_tokens(api: &Arc<Api>) -> Result<Response<Full<Bytes>>, HttpError>
 }
 
 /// `DELETE /tokens/<id>`: revoke one, from the next request onwards.
-async fn revoke_token(api: &Arc<Api>, id: String) -> Result<Response<Full<Bytes>>, HttpError> {
+async fn revoke_token(api: &Arc<Api>, id: String) -> Result<Response<ApiBody>, HttpError> {
     let wanted = id.clone();
     let reply = control(api, move |c| Ok(c.send(&Control::RevokeToken { id })?)).await?;
     match reply {
@@ -1369,7 +1530,7 @@ async fn put_script(
     api: &Arc<Api>,
     body: &[u8],
     tenant: Option<String>,
-) -> Result<Response<Full<Bytes>>, HttpError> {
+) -> Result<Response<ApiBody>, HttpError> {
     let source = std::str::from_utf8(body)
         .map_err(|e| {
             HttpError::new(
@@ -1413,7 +1574,7 @@ async fn put_script(
 /// readable by every other tenant that knows what it is looking for. What this
 /// answers is the question a caller actually has: do I need to upload it
 /// again?
-async fn get_script(api: &Arc<Api>, digest: String) -> Result<Response<Full<Bytes>>, HttpError> {
+async fn get_script(api: &Arc<Api>, digest: String) -> Result<Response<ApiBody>, HttpError> {
     let reply = control(api, move |c| Ok(c.send(&Control::GetScript { digest })?)).await?;
     match reply {
         Reply::Script { digest, size, .. } => Ok(json(
@@ -1424,7 +1585,7 @@ async fn get_script(api: &Arc<Api>, digest: String) -> Result<Response<Full<Byte
     }
 }
 
-async fn delete_script(api: &Arc<Api>, digest: String) -> Result<Response<Full<Bytes>>, HttpError> {
+async fn delete_script(api: &Arc<Api>, digest: String) -> Result<Response<ApiBody>, HttpError> {
     let reply = control(api, move |c| Ok(c.send(&Control::DeleteScript { digest })?)).await?;
     match reply {
         Reply::Ok => Ok(json(
@@ -1470,7 +1631,7 @@ async fn serve_fn(
     name: String,
     body: &[u8],
     tenant: Option<String>,
-) -> Result<Response<Full<Bytes>>, HttpError> {
+) -> Result<Response<ApiBody>, HttpError> {
     let request: ServeRequest = serde_json::from_slice(body).map_err(|e| {
         HttpError::new(
             StatusCode::BAD_REQUEST,
@@ -1509,7 +1670,7 @@ async fn serve_fn(
     Ok(reply_to_response(reply))
 }
 
-async fn stop(api: &Arc<Api>, name: String) -> Result<Response<Full<Bytes>>, HttpError> {
+async fn stop(api: &Arc<Api>, name: String) -> Result<Response<ApiBody>, HttpError> {
     let wanted = name.clone();
     let reply = control(api, move |c| {
         Ok(c.send(&Control::Stop { name: Some(name) })?)
@@ -1534,7 +1695,7 @@ async fn logs(
     name: String,
     query: &str,
     tenant: Option<String>,
-) -> Result<Response<Full<Bytes>>, HttpError> {
+) -> Result<Response<ApiBody>, HttpError> {
     let params = Query::parse(query);
     let after = params.number("after")?.unwrap_or(0);
     let limit = params.number("limit")?.unwrap_or(50);
@@ -1620,7 +1781,7 @@ struct RunRequest {
 /// captures its streams; the reasoning for a child rather than an in-process
 /// launch is documented there. Here it runs on a blocking thread, because it
 /// is synchronous and the runtime this API uses is not.
-async fn one_shot(api: &Arc<Api>, body: &[u8]) -> Result<Response<Full<Bytes>>, HttpError> {
+async fn one_shot(api: &Arc<Api>, body: &[u8]) -> Result<Response<ApiBody>, HttpError> {
     let request: RunRequest = serde_json::from_slice(body).map_err(|e| {
         HttpError::new(
             StatusCode::BAD_REQUEST,
@@ -1720,7 +1881,7 @@ async fn snapshot(api: &Arc<Api>) -> anyhow::Result<super::otlp::Snapshot> {
 }
 
 /// Prometheus text exposition, from what the supervisor reports.
-async fn metrics(api: &Arc<Api>) -> Result<Response<Full<Bytes>>, HttpError> {
+async fn metrics(api: &Arc<Api>) -> Result<Response<ApiBody>, HttpError> {
     let snapshot = snapshot(api).await?;
     let functions = &snapshot.functions;
 
@@ -1792,7 +1953,7 @@ async fn metrics(api: &Arc<Api>) -> Result<Response<Full<Bytes>>, HttpError> {
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
-        .body(Full::new(Bytes::from(out)))
+        .body(whole(Bytes::from(out)))
         .expect("a valid response"))
 }
 
@@ -1906,7 +2067,7 @@ fn reply_to_json(reply: Reply) -> (StatusCode, serde_json::Value) {
     }
 }
 
-fn reply_to_response(reply: Reply) -> Response<Full<Bytes>> {
+fn reply_to_response(reply: Reply) -> Response<ApiBody> {
     let (status, body) = reply_to_json(reply);
     let mut response = json(status, &body);
     if status == StatusCode::TOO_MANY_REQUESTS {
@@ -1987,11 +2148,11 @@ fn outcome_to_json(outcome: Outcome) -> (StatusCode, serde_json::Value) {
     )
 }
 
-fn json(status: StatusCode, body: &serde_json::Value) -> Response<Full<Bytes>> {
+fn json(status: StatusCode, body: &serde_json::Value) -> Response<ApiBody> {
     Response::builder()
         .status(status)
         .header("content-type", "application/json")
-        .body(Full::new(Bytes::from(
+        .body(whole(Bytes::from(
             serde_json::to_vec(body).unwrap_or_else(|_| b"{}".to_vec()),
         )))
         .expect("a valid response")

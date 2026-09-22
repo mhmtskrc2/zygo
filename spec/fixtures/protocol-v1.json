@@ -45,6 +45,24 @@
       "message": {"type": "GO", "id": "01f3"}
     },
     {
+      "name": "exec-streaming",
+      "direction": "supervisor -> agent",
+      "canonical": true,
+      "message": {"type": "EXEC", "id": "01f7", "event": {"pages": 400}, "timeout_ms": 600000, "stream": true}
+    },
+    {
+      "name": "chunk-stdout",
+      "direction": "child -> agent -> supervisor",
+      "canonical": true,
+      "message": {"type": "CHUNK", "id": "01f7", "stream": "stdout", "data": "page 1 of 400\n"}
+    },
+    {
+      "name": "chunk-progress",
+      "direction": "child -> agent -> supervisor",
+      "canonical": true,
+      "message": {"type": "CHUNK", "id": "01f7", "stream": "progress", "data": "halfway"}
+    },
+    {
       "name": "cancel",
       "direction": "supervisor -> agent",
       "canonical": true,

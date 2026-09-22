@@ -211,6 +211,64 @@ impl Client {
 }
 
 impl Client {
+    /// Send a streaming request, handing each `CHUNK` to `on_chunk` as it
+    /// arrives, and return the answer that ends it.
+    ///
+    /// The one call that reads more than one frame for one request, which is
+    /// what a streaming `EXEC` answers with. `RUN` established the shape; this
+    /// differs only in that the number of frames before the last is unknown,
+    /// so the loop ends on the first frame that is not a `CHUNK`.
+    ///
+    /// The budget is per *frame*, not for the request: a stream is alive while
+    /// it is producing, and a handler that prints every second for an hour is
+    /// working rather than wedged. What bounds the request is the supervisor's
+    /// own deadline, which it enforces through the cgroup.
+    pub fn send_streaming(
+        &mut self,
+        request: &Request,
+        mut on_chunk: impl FnMut(crate::protocol::Stream, &str),
+    ) -> Result<Response> {
+        self.writer
+            .write(request)
+            .map_err(|e| Error::primitive("write", "control socket", std::io::Error::other(e)))?;
+
+        let budget = Client::budget(request);
+        loop {
+            let _ = self.deadline.set_read_timeout(Some(budget));
+            let answer = self.reader.read();
+            let _ = self.deadline.set_read_timeout(None);
+            match answer {
+                Ok(Some(Response::Chunk { stream, data })) => on_chunk(stream, &data),
+                Ok(Some(response)) => return Ok(response),
+                Ok(None) => {
+                    return Err(Error::BackendUnavailable {
+                        backend: "supervisor",
+                        reason: "the supervisor closed the connection mid-stream".into(),
+                        remedy: "check `zygo logs` for why it exited".into(),
+                    });
+                }
+                Err(e) if is_timeout(&e) => {
+                    return Err(Error::BackendUnavailable {
+                        backend: "supervisor",
+                        reason: format!(
+                            "the supervisor stopped sending for {}s during {}",
+                            budget.as_secs(),
+                            name_of(request)
+                        ),
+                        remedy: "it is running but not replying — check `zygo logs`".into(),
+                    });
+                }
+                Err(e) => {
+                    return Err(Error::primitive(
+                        "read",
+                        "control socket",
+                        std::io::Error::other(e),
+                    ));
+                }
+            }
+        }
+    }
+
     /// Ask the supervisor to run a one-shot sandbox with *this* process's
     /// standard streams, and return its pid once it exists.
     ///
@@ -545,6 +603,7 @@ mod tests {
             timeout_ms: 5_000,
             tenant: None,
             key: None,
+            stream: false,
         });
         assert_eq!(exec, Duration::from_secs(5) + REPLY_GRACE);
 
@@ -638,6 +697,7 @@ mod tests {
                 timeout_ms: 1_000,
                 tenant: None,
                 key: None,
+                stream: false,
             })
             .expect("a response, whatever it says");
         assert!(matches!(

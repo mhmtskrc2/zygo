@@ -597,8 +597,11 @@ pub fn exec(cli: &Cli, args: &ExecArgs) -> anyhow::Result<u8> {
     let request = match &args.runtime {
         Some(runtime) => Request::ExecScript {
             // `zygo exec` is one shot at a terminal: Ctrl-C ends the client,
-            // and the supervisor's own deadline ends the request.
+            // and the supervisor's own deadline ends the request. It prints
+            // the request's output when the answer arrives, which is what a
+            // command that also prints the result has to do anyway.
             key: None,
+            stream: false,
             runtime: runtime.clone(),
             script: script_for(args)?,
             event,
@@ -609,6 +612,7 @@ pub fn exec(cli: &Cli, args: &ExecArgs) -> anyhow::Result<u8> {
         },
         None => Request::Exec {
             key: None,
+            stream: false,
             name: args
                 .name
                 .clone()

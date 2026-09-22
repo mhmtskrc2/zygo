@@ -233,6 +233,7 @@ impl Harness {
                 event: serde_json::Value::Null,
                 timeout_ms: 30_000,
                 env_overrides: Default::default(),
+                stream: false,
             })
             .expect("EXEC");
 

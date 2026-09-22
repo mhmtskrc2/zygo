@@ -62,6 +62,58 @@ class Result:
 
 
 @dataclass(frozen=True)
+class Event:
+    """One line of a streaming call.
+
+    Either a piece of the request's output — ``kind`` is ``stdout``,
+    ``stderr`` or ``progress``, and ``data`` is the text — or the end of the
+    stream, where ``is_result`` is true and ``result`` carries what the
+    non-streaming call would have returned.
+
+    ``progress`` is deliberately its own kind rather than a line of stdout: a
+    long request has two things to say, what it printed and how far it has
+    got, and a caller that had to parse the first to find the second would be
+    parsing a handler's log messages.
+    """
+
+    kind: str
+    data: str = ""
+    #: The whole final answer, for the result line. ``None`` otherwise.
+    result: Optional["Result"] = None
+    #: HTTP status the non-streaming call would have had, on the result line.
+    status: int = 0
+    raw: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def is_result(self) -> bool:
+        return self.kind == "result"
+
+    def raise_for_status(self) -> None:
+        """Raise what :meth:`~zygo.Client.call` would have raised, if anything.
+
+        Called after the result line has been yielded, never before: a handler
+        that printed and then failed produced both, and a caller that is
+        streaming has asked to see the first part.
+        """
+        from ._errors import from_response
+
+        if self.is_result and not (200 <= self.status < 300):
+            raise from_response(self.status, self.raw)
+
+    @classmethod
+    def parse(cls, raw: Dict[str, Any]) -> "Event":
+        stream = raw.get("stream")
+        if isinstance(stream, str):
+            return cls(kind=stream, data=str(raw.get("data", "")), raw=raw)
+        return cls(
+            kind="result",
+            result=Result.parse(raw),
+            status=int(raw.get("status", 200)),
+            raw=raw,
+        )
+
+
+@dataclass(frozen=True)
 class Function:
     """One warm function, as ``zygo ps`` shows it."""
 

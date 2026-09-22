@@ -785,9 +785,25 @@ impl Supervisor {
     pub fn exec(
         &self,
         name: &str,
+        event: serde_json::Value,
+        timeout: Duration,
+        key: Option<&str>,
+    ) -> std::result::Result<Response, Response> {
+        self.exec_streaming(name, event, timeout, key, None)
+    }
+
+    /// The same, with output delivered as it is produced (v8).
+    ///
+    /// `sink` is called on this thread, between the `EXEC` and the `DONE`, so
+    /// whatever it writes to must not block for long: the request that is
+    /// producing the output is what waits.
+    pub fn exec_streaming(
+        &self,
+        name: &str,
         mut event: serde_json::Value,
         timeout: Duration,
         key: Option<&str>,
+        sink: Option<crate::pool::ChunkSink<'_>>,
     ) -> std::result::Result<Response, Response> {
         let mut entry = self.lookup(name)?;
 
@@ -806,7 +822,7 @@ impl Supervisor {
                 entry = self.rewarm(name, &entry)?;
             }
 
-            event = match self.attempt(&entry, name, event, timeout, key) {
+            event = match self.attempt(&entry, name, event, timeout, key, sink) {
                 Attempt::Done(response) => return response,
                 Attempt::Closed(event) => event,
             };
@@ -841,6 +857,7 @@ impl Supervisor {
         event: serde_json::Value,
         timeout: Duration,
         key: Option<&str>,
+        sink: Option<crate::pool::ChunkSink<'_>>,
     ) -> Attempt {
         let permit = match entry.gate.enter(QUEUE_WAIT) {
             Ok(permit) => permit,
@@ -874,7 +891,7 @@ impl Supervisor {
 
         let outcome = entry
             .function
-            .call_keyed(event, timeout, key)
+            .call_keyed(event, timeout, key, sink)
             .map_err(|e| Response::error(ControlError::CallFailed, e));
         drop(permit);
         // After the call, not before: the clock should measure how long the
@@ -1743,6 +1760,59 @@ fn handle(supervisor: &Supervisor, stream: UnixStream) -> Result<()> {
                     ),
                 }
             }
+            // A streaming request is answered many times: a `CHUNK` per piece
+            // of output, then the `EXECUTED`. Intercepted here rather than in
+            // `dispatch` for the same reason `RUN` is — this is the scope
+            // that has the socket, and `dispatch` returns one response by
+            // construction.
+            Request::Exec {
+                name,
+                event,
+                timeout_ms,
+                tenant,
+                key,
+                stream: true,
+            } if greeted => {
+                // Borrowed for the length of the call and released before the
+                // final answer is written. One thread, so uncontended: the
+                // lock is what lets a `Fn` closure reach a `&mut` writer, not
+                // a synchronisation point.
+                let out = std::sync::Mutex::new(&mut writer);
+                let sink = chunk_sink(&out);
+                let answered = supervisor
+                    .owned_by(&name, tenant.as_deref())
+                    .and_then(|()| {
+                        supervisor.exec_streaming(
+                            &name,
+                            event,
+                            Duration::from_millis(timeout_ms),
+                            key.as_deref(),
+                            Some(&sink),
+                        )
+                    });
+                merge(answered)
+            }
+            Request::ExecScript {
+                runtime,
+                script,
+                event,
+                timeout_ms,
+                tenant,
+                key,
+                stream: true,
+            } if greeted => {
+                let out = std::sync::Mutex::new(&mut writer);
+                let sink = chunk_sink(&out);
+                merge(supervisor.exec_script_streaming(
+                    &runtime,
+                    script,
+                    event,
+                    Duration::from_millis(timeout_ms),
+                    tenant.as_deref(),
+                    key.as_deref(),
+                    Some(&sink),
+                ))
+            }
             other => dispatch(supervisor, other, &mut greeted),
         };
         writer
@@ -1756,6 +1826,23 @@ fn handle(supervisor: &Supervisor, stream: UnixStream) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A sink that writes each chunk straight out as a `CHUNK` frame.
+///
+/// Write errors are dropped on purpose. The client going away mid-stream is
+/// ordinary — somebody closed a terminal — and it is not a reason to fail the
+/// request, which is still running and whose `EXECUTED` will fail to write for
+/// the same reason a moment later. That is where the connection ends.
+fn chunk_sink<'a, W: std::io::Write + Send>(
+    out: &'a std::sync::Mutex<&'a mut crate::protocol::frame::FrameWriter<W, Response>>,
+) -> impl Fn(crate::protocol::Stream, &str) + Send + Sync + use<'a, W> {
+    move |stream, data| {
+        let _ = out.lock().expect("writer").write(&Response::Chunk {
+            stream,
+            data: data.to_string(),
+        });
+    }
 }
 
 /// Answer one request.
@@ -1818,12 +1905,15 @@ fn dispatch(supervisor: &Supervisor, request: Request, greeted: &mut bool) -> Re
                 if_changed,
             ))
         }
+        // A streaming `EXEC` is intercepted in `handle`, which has the socket
+        // the chunks go out on. One that reaches here asked for none.
         Request::Exec {
             name,
             event,
             timeout_ms,
             tenant,
             key,
+            stream: _,
         } => merge(
             supervisor
                 .owned_by(&name, tenant.as_deref())
@@ -1882,6 +1972,7 @@ fn dispatch(supervisor: &Supervisor, request: Request, greeted: &mut bool) -> Re
             timeout_ms,
             tenant,
             key,
+            stream: _,
         } => merge(supervisor.exec_script(
             &runtime,
             script,
@@ -2652,6 +2743,7 @@ mod tests {
                 timeout_ms: 1,
                 tenant: None,
                 key: None,
+                stream: false,
             },
         ] {
             let response = dispatch(&supervisor, request, &mut greeted);
@@ -3097,6 +3189,7 @@ mod tests {
                 timeout_ms: 1_000,
                 tenant: Some("b".into()),
                 key: None,
+                stream: false,
             },
             &mut greeted,
         );
@@ -3123,6 +3216,7 @@ mod tests {
                 timeout_ms: 1_000,
                 tenant: Some("a".into()),
                 key: None,
+                stream: false,
             },
             &mut greeted,
         );

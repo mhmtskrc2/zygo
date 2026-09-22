@@ -21,6 +21,14 @@ from http.server import BaseHTTPRequestHandler
 from typing import Any, Dict, List, Optional, Tuple
 
 
+class _Ndjson:
+    """An answer that is a stream of lines rather than one body."""
+
+    def __init__(self, lines: List[Any], gap: float) -> None:
+        self.lines = lines
+        self.gap = gap
+
+
 class Recorder:
     """What the server was asked, and what it should answer."""
 
@@ -33,6 +41,14 @@ class Recorder:
 
     def answer(self, method: str, path: str, status: int, body: Any) -> None:
         self.answers[(method, path)] = (status, body)
+
+    def stream(self, method: str, path: str, lines: List[Any], gap: float = 0.0) -> None:
+        """Answer this route with NDJSON, one object per line.
+
+        `gap` is the pause between lines: with one, a test can tell a client
+        that yields as lines arrive from one that waits for the last.
+        """
+        self.answers[(method, path)] = (200, _Ndjson(lines, gap))
 
 
 def _handler(recorder: Recorder):
@@ -70,6 +86,27 @@ def _handler(recorder: Recorder):
 
             key = (method, self.path.split("?", 1)[0])
             status, body = recorder.answers.get(key, (404, {"error": f"no route {self.path}"}))
+
+            # A stream is chunked and written a line at a time, like the real
+            # API's: a test that received one whole buffer could not tell a
+            # client that yields as lines arrive from one that waits.
+            if isinstance(body, _Ndjson):
+                import time as _time
+
+                self.send_response(status)
+                self.send_header("content-type", "application/x-ndjson")
+                self.send_header("transfer-encoding", "chunked")
+                self.end_headers()
+                for i, item in enumerate(body.lines):
+                    if i and body.gap:
+                        _time.sleep(body.gap)
+                    piece = (json.dumps(item) + "\n").encode()
+                    self.wfile.write(b"%x\r\n" % len(piece) + piece + b"\r\n")
+                    self.wfile.flush()
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+                return
+
             payload = json.dumps(body).encode()
             self.send_response(status)
             self.send_header("content-type", "application/json")
@@ -142,6 +179,9 @@ class FakeApi:
 
     def answer(self, method: str, path: str, status: int, body: Any) -> None:
         self.recorder.answer(method, path, status, body)
+
+    def stream(self, method: str, path: str, lines: List[Any], gap: float = 0.0) -> None:
+        self.recorder.stream(method, path, lines, gap)
 
     @property
     def requests(self) -> List[Dict[str, Any]]:

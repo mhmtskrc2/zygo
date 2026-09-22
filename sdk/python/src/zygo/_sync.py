@@ -14,11 +14,12 @@ import os
 import re
 import socket
 import threading
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence
 
 from ._endpoint import Endpoint, resolve
 from ._errors import NotFound, SpecError, TransportError, ZygoError, from_response
 from ._models import (
+    Event,
     Function,
     LogPage,
     Minted,
@@ -295,6 +296,63 @@ class Client:
         """
         return self._request("DELETE", f"/tenants/{_escape(id)}")
 
+    def stream(
+        self,
+        name: str,
+        event: Any = None,
+        *,
+        timeout: Optional[float] = None,
+        key: Optional[str] = None,
+    ) -> "Iterator[Event]":
+        """Call a function and yield its output as it is produced.
+
+        Each item is an :class:`~zygo._models.Event`: ``stdout``, ``stderr`` or
+        ``progress`` while the request runs, then exactly one ``result`` —
+        which carries what :meth:`call` would have returned, or raises what it
+        would have raised.
+
+        ::
+
+            for event in client.stream("render", {"pages": 400}):
+                if event.is_result:
+                    print(event.result.result)
+                else:
+                    print(event.kind, event.data, end="")
+
+        The connection is held for the whole request and is **not** pooled:
+        it is in use for as long as the handler runs. Abandoning the iterator
+        closes it, which the server sees — but does not cancel the request.
+        Cancelling is :meth:`cancel`, and this takes a ``key`` so you can.
+        """
+        headers = _timeout_header(timeout)
+        if key is not None:
+            headers["x-zygo-request-key"] = key
+        return self._stream("POST", f"/fn/{_escape(name)}?stream=1", event, headers)
+
+    def stream_script(
+        self,
+        runtime: str,
+        script: str,
+        event: Any = None,
+        *,
+        entry_point: Optional[str] = None,
+        timeout: Optional[float] = None,
+        key: Optional[str] = None,
+    ) -> "Iterator[Event]":
+        """Run a script in a pool, yielding its output. See :meth:`stream`."""
+        payload: Dict[str, Any] = {
+            "script": script if script.startswith("sha256:") else {"source": script},
+            "event": event,
+        }
+        if entry_point is not None:
+            payload["entry_point"] = entry_point
+        headers = _timeout_header(timeout)
+        if key is not None:
+            headers["x-zygo-request-key"] = key
+        return self._stream(
+            "POST", f"/runtimes/{_escape(runtime)}/call?stream=1", payload, headers
+        )
+
     def cancel(self, request_id: str) -> Dict[str, Any]:
         """Stop a request that is running.
 
@@ -468,6 +526,58 @@ class Client:
 
     # ---- transport ----------------------------------------------------
 
+    def _stream(
+        self,
+        method: str,
+        path: str,
+        body: Any,
+        headers: Dict[str, str],
+    ) -> Iterator[Event]:
+        """One request whose answer arrives a line at a time.
+
+        Deliberately outside the connection pool. A pooled connection is one
+        that is finished with; this one is in use for as long as the handler
+        runs, and returning it when the generator is abandoned would hand the
+        next caller a socket with somebody else's request still on it.
+        """
+        if self._closed:
+            raise ZygoError("this client has been closed")
+
+        sent = {"accept": "application/x-ndjson", "content-type": "application/json"}
+        if self.token:
+            sent["authorization"] = f"Bearer {self.token}"
+        if getattr(self, "_tenant", None):
+            sent["x-zygo-tenant"] = self._tenant
+        sent.update(headers)
+
+        connection = self._open()
+        try:
+            connection.request(method, path, body=json.dumps(body).encode(), headers=sent)
+            response = connection.getresponse()
+            # A refusal — a bad token, no such function — is an ordinary JSON
+            # answer with a status, not a stream. Raise it the usual way
+            # rather than yielding a line that says the same thing.
+            if response.status >= 400:
+                raise from_response(
+                    response.status,
+                    _body(response.read(MAX_BODY)),
+                    _retry_after(response.getheader("retry-after")),
+                )
+            for line in _stream_lines(response):
+                event = Event.parse(_body(line))
+                yield event
+                if event.is_result:
+                    # The stream ends with the result, and raising has to
+                    # happen after the caller has seen it: a handler that
+                    # printed and then failed produced both.
+                    event.raise_for_status()
+                    return
+        finally:
+            try:
+                connection.close()
+            except Exception:  # noqa: BLE001 - closing must not raise
+                pass
+
     def _request(
         self,
         method: str,
@@ -623,6 +733,22 @@ def _escape_digest(digest: str) -> str:
     return digest
 
 
+def _stream_lines(response: "http.client.HTTPResponse") -> "Iterator[bytes]":
+    """Newline-delimited JSON, a line at a time, as it arrives.
+
+    `readline` rather than iterating the response: a buffered iterator reads
+    ahead, which on a stream means waiting for output that has not been
+    produced yet — the one thing this exists not to do.
+    """
+    while True:
+        line = response.readline(MAX_BODY)
+        if not line:
+            return
+        line = line.strip()
+        if line:
+            yield line
+
+
 def _request_key() -> str:
     """A name for one request, unique enough that a cancel finds only it.
 
@@ -646,6 +772,15 @@ def _retry_after(header: Optional[str]) -> float:
         return float(header) if header else 1.0
     except ValueError:
         return 1.0
+
+
+def _body(raw: bytes) -> Dict[str, Any]:
+    """One JSON object, or a transport error naming what came instead."""
+    try:
+        value = json.loads(raw) if raw else {}
+    except ValueError as e:
+        raise TransportError("the API sent something that is not JSON") from e
+    return value if isinstance(value, dict) else {"error": str(value)}
 
 
 def _decode(status: int, raw: bytes, retry_after: float) -> Any:

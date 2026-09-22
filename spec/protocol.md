@@ -179,6 +179,60 @@ Sent once the supervisor has moved `pid` into the request's cgroup. Until then
 the child is still accounted to the *agent's* cgroup, so an allocation before
 `GO` would be billed to the wrong place and escape the request's limits.
 
+#### `stream` — output as it is produced (1.3)
+
+```json
+{"type":"EXEC","id":"01f3","event":{…},"timeout_ms":30000,"stream":true}
+```
+
+Absent or `false` is the original shape and the fast path: the child captures
+its output and it arrives once, in `RESULT`. Present is a request that has
+asked to be watched, and the child sends `CHUNK` frames as it writes.
+
+Per **request**, not per function, and that is the point: a `CHUNK` per
+`print()` is a syscall per `print()` on a path measured in milliseconds. A
+caller that wants to watch a long request pays for it; everybody else keeps the
+shape that was measured. An `EXEC` that did not ask does not carry the field at
+all, so an agent written before 1.3 sees exactly the bytes it always did.
+
+Implementing this is **optional**, like `script`. An agent that ignores the
+field answers the `DONE` it always did, and `zygo agent test` reports that as
+not implementing 1.3 rather than as a failure.
+
+### `CHUNK` — child → agent → supervisor (1.3)
+
+```json
+{"type":"CHUNK","id":"01f3","stream":"stdout","data":"halfway through\n"}
+```
+
+One piece of a streaming request's output, sent before its `RESULT`.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `stream` | string | `stdout`, `stderr` or `progress`. |
+| `data` | string | The text. Not framed by line: a handler that writes half a line and then blocks should have that half line delivered. |
+
+`progress` is deliberately **not** a line of stdout. A long request has two
+things to say — what it printed, and how far it has got — and a caller that had
+to parse the first to find the second would be parsing a handler's log
+messages. An agent exposes it to the handler as a *call* rather than as a
+stream to write to; the reference agents attach `progress()` to the event
+object, and attach it whether or not anybody is listening, so that a handler
+which reports progress does not break depending on who called it.
+
+**The agent forwards without buffering.** The whole value of a stream is that
+a caller sees the first line before the last one exists; an agent that
+accumulated would deliver the same bytes at the same moment `RESULT` does,
+which is what it did before this message existed.
+
+`RESULT` still carries the whole of `stdout` and `stderr` afterwards, bounded
+as always. So a caller that streamed and one that did not see the same text,
+and neither has to reassemble anything to know what the request printed.
+
+There is no per-chunk sequence number and none is needed: one request's frames
+travel in order on one connection, and a caller that has to reorder them has a
+transport problem rather than a protocol one.
+
 ### `CANCEL` — supervisor → agent (1.2)
 
 ```json
@@ -358,7 +412,14 @@ agent in POSIX sh, to check the suite against something that is not Python.
    actually ends it. An agent that does not implement the message answers
    `ERROR` / `bad_message` and carries on, which is conforming — rule 6 is
    what makes that safe.
-9. **A script's digest is checked, if there is one.** An agent that implements
+9. **`CHUNK` is sent only when it was asked for, if it is implemented.** An
+   agent that implements the 1.3 `stream` field sends output on as it is
+   produced, and forwards it rather than accumulating it — an implementation
+   that buffered would satisfy any check that looked only at what arrived, and
+   would have added a message type for nothing. An `EXEC` without `stream` must
+   produce no `CHUNK` at all: that is the path everybody else is on and it must
+   stay the one that was measured. `RESULT` carries the full output either way.
+10. **A script's digest is checked, if there is one.** An agent that implements
    the 1.1 `script` field and is given a `digest` hashes the bytes it is about
    to load and refuses them with `ERROR` / `handler_load` unless they match.
    Hash *what was read*, not the file again: reading twice is a window for the
@@ -405,6 +466,18 @@ supervisor                agent                     child
     |  [remove cgroup]      |
 ```
 
+A streaming request adds frames in the middle and changes nothing else:
+
+```
+    |------- EXEC{stream} ->|                         |
+    |<------ FORKED --------|                         |
+    |-------- GO ---------->|------------------------>| handler(event)
+    |                       |<------ CHUNK -----------|   print(…)
+    |<------ CHUNK ---------|                         |
+    |                       |<------ RESULT ----------|
+    |<------- DONE ---------|
+```
+
 On timeout the supervisor writes `cgroup.kill`, which takes down the whole
 subtree; the agent observes the child's death and reports it as a `DONE` with
 `error`.
@@ -441,6 +514,10 @@ That is why the script-carrying `EXEC` above is called 1.1 and still announces
 working, and a supervisor that sends one to such an agent gets the agent's own
 handler back rather than an error. The version number is for the day something
 *removes* or *changes the meaning of* a field, and nothing has.
+
+`CHUNK` and `EXEC`'s `stream` are 1.3 on the same terms: the field is one an
+older agent ignores, and the message is one it never sends, so a supervisor
+that asked for a stream simply does not get one and the `RESULT` is unchanged.
 
 `CANCEL` and `DONE`'s `cancelled` are 1.2 on the same terms. The new message
 is one an older agent reports as `bad_message` and carries on from, and the new

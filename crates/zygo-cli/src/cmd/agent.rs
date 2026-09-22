@@ -386,6 +386,7 @@ fn exec(id: &str, event: serde_json::Value) -> Message {
         event,
         timeout_ms: 30_000,
         env_overrides: Default::default(),
+        stream: false,
     }
 }
 
@@ -513,7 +514,15 @@ pub fn test(
         cancel_check(&mut agent)
     );
 
-    // 13. Shutdown. Last, because it ends the agent.
+    // 13. Protocol 1.3: output as it is produced. Optional — an agent that
+    // ignores `stream` answers the same `DONE` it always did, which is
+    // conforming and is what every 1.2 agent does.
+    step_or_skip!(
+        "output arrives in CHUNKs before the DONE (proto 1.3)",
+        stream_check(&mut agent)
+    );
+
+    // 14. Shutdown. Last, because it ends the agent.
     step!("SHUTDOWN makes the agent exit", shutdown_check(&mut agent));
 
     finish(cli, report)
@@ -931,6 +940,7 @@ fn ran_the_script(
         timeout_ms: 30_000,
         env_overrides: Default::default(),
         script: Some(script),
+        stream: false,
     })?;
 
     let done = loop {
@@ -1221,11 +1231,93 @@ fn one_script_request(
         timeout_ms: 30_000,
         env_overrides: Default::default(),
         script: Some(script),
+        stream: false,
     })?;
     await_done(agent, id)
 }
 
 /// `EXEC` → `FORKED` → `GO` → `DONE`, the whole cycle for one request.
+/// Protocol 1.3: a request that asked to stream gets its output early.
+///
+/// The check that matters is **order**, not content: the same text arrives in
+/// `DONE` either way, and an agent that buffered every `CHUNK` and sent them
+/// all at the end would pass any test that only looked at what was received.
+/// So the handler prints, sleeps, and prints again, and the first chunk has to
+/// arrive while it is still sleeping.
+///
+/// Skipped rather than failed when no chunk arrives at all: `stream` is an
+/// optional field, and §5 says an agent ignores fields it does not know.
+fn stream_check(agent: &mut Agent) -> anyhow::Result<Outcome> {
+    let id = "c10";
+    let early = "first";
+    agent.send(&Message::Exec {
+        id: id.to_string(),
+        event: serde_json::json!({ "stdout": early, "sleep_ms": 1_500 }),
+        timeout_ms: 30_000,
+        env_overrides: Default::default(),
+        script: None,
+        stream: true,
+    })?;
+
+    let forked = agent.recv_matching("FORKED", |m| matches!(m, Message::Forked { .. }))?;
+    anyhow::ensure!(
+        matches!(forked, Message::Forked { .. }),
+        "expected FORKED, got {}",
+        forked.kind()
+    );
+    agent.send(&Message::Go { id: id.to_string() })?;
+
+    let started = Instant::now();
+    let mut first: Option<Duration> = None;
+    let mut streamed = String::new();
+    loop {
+        match agent.recv()? {
+            Message::Chunk {
+                stream: zygo_core::protocol::Stream::Stdout,
+                data,
+                ..
+            } => {
+                first.get_or_insert_with(|| started.elapsed());
+                streamed.push_str(&data);
+            }
+            done @ Message::Done { .. } if done.request_id() == Some(id) => {
+                let Message::Done { stdout, .. } = done else {
+                    unreachable!("matched above")
+                };
+                let Some(at) = first else {
+                    return Ok(Outcome::Skipped(
+                        "the request was answered, but nothing arrived before \
+                         the DONE: `stream` is not implemented"
+                            .into(),
+                    ));
+                };
+                anyhow::ensure!(
+                    streamed.contains(early),
+                    "what the handler printed first is not in the chunks: {streamed:?}"
+                );
+                // The handler sleeps for 1.5 s after printing. A chunk that
+                // arrives after that was buffered and sent with the result,
+                // which is the thing streaming exists not to do.
+                anyhow::ensure!(
+                    at < Duration::from_millis(1_200),
+                    "the first chunk arrived after {at:?}, so it waited for the                      handler to finish rather than being forwarded"
+                );
+                anyhow::ensure!(
+                    stdout.contains(early),
+                    "DONE no longer carries the output it always did: {stdout:?}"
+                );
+                return Ok(Outcome::Pass(format!(
+                    "the first chunk arrived after {at:?}"
+                )));
+            }
+            Message::Error { code, message, .. } => {
+                anyhow::bail!("the agent reported {code:?}: {message}")
+            }
+            _ => {}
+        }
+    }
+}
+
 /// How long the handler sleeps for, so a cancel lands while it is running.
 const CANCEL_SLEEP_MS: u64 = 5_000;
 

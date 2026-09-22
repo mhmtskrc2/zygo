@@ -433,6 +433,71 @@ test('acting for a tenant is a header on the same connection', async () => {
   }
 });
 
+const STREAM_LINES = [
+  { stream: 'stdout', data: 'page 1\n' },
+  { stream: 'progress', data: 'halfway' },
+  { stream: 'stderr', data: 'a warning\n' },
+  { status: 200, result: { pages: 2 }, stdout: 'page 1\n', stderr: 'a warning\n' },
+];
+
+test('a stream yields its lines, then exactly one result', async () => {
+  const api = await FakeApi.start();
+  api.stream('POST', '/fn/render', STREAM_LINES);
+  const client = connect(api.url, { token: null });
+  try {
+    const kinds = [];
+    let last = null;
+    for await (const event of client.stream('render', { pages: 2 })) {
+      kinds.push(event.kind);
+      last = event;
+    }
+    assert.deepEqual(kinds, ['stdout', 'progress', 'stderr', 'result']);
+    // `progress` is its own kind, not a line of stdout.
+    assert.equal(last.result.result.pages, 2);
+  } finally {
+    client.close();
+    await api.close();
+  }
+});
+
+test('lines are yielded as they arrive, not at the end', async () => {
+  // The same lines arrive either way; what a stream promises is *when*.
+  const api = await FakeApi.start();
+  api.stream('POST', '/fn/render', STREAM_LINES, 300);
+  const client = connect(api.url, { token: null });
+  try {
+    const began = Date.now();
+    let first = null;
+    for await (const _event of client.stream('render', {})) {
+      if (first === null) first = Date.now() - began;
+    }
+    const whole = Date.now() - began;
+    assert.ok(first !== null && first < whole / 2, `first line took ${first}ms of ${whole}ms`);
+  } finally {
+    client.close();
+    await api.close();
+  }
+});
+
+test('a failed request throws after its output has been seen', async () => {
+  const api = await FakeApi.start();
+  api.stream('POST', '/fn/render', [
+    { stream: 'stdout', data: 'starting\n' },
+    { status: 500, error: 'boom', exit_code: 1, stdout: 'starting\n' },
+  ]);
+  const client = connect(api.url, { token: null });
+  try {
+    const kinds = [];
+    await assert.rejects(async () => {
+      for await (const event of client.stream('render', {})) kinds.push(event.kind);
+    }, HandlerError);
+    assert.deepEqual(kinds, ['stdout', 'result'], 'the output was not delivered first');
+  } finally {
+    client.close();
+    await api.close();
+  }
+});
+
 test('a cancelled request is its own error, not a Timeout', async () => {
   const api = await FakeApi.start();
   api.answer('POST', '/fn/slow', 499, {

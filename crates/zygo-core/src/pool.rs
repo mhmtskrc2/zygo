@@ -369,6 +369,25 @@ impl Requests {
     }
 }
 
+/// Where a streaming request's output goes as it is produced.
+///
+/// Called on the thread serving the request, between the `EXEC` and the
+/// `DONE`, so it must not block for long: whatever is on the other end is
+/// holding up the request that is writing to it. The supervisor's own
+/// implementation writes one control frame and returns.
+pub type ChunkSink<'a> = &'a (dyn Fn(crate::protocol::Stream, &str) + Send + Sync);
+
+/// The most output one streaming request may send, in bytes.
+///
+/// A cap rather than backpressure, because the two ends are a handler and an
+/// HTTP client and there is nothing useful to do with a handler that outruns
+/// its reader: slowing it down turns a chatty request into a slow one, and
+/// buffering it turns the supervisor into the place the memory goes. Past the
+/// cap the stream stops and the request carries on — `RESULT` still carries
+/// the (separately bounded) captured output, so nothing is lost that was not
+/// already going to be truncated.
+pub const STREAM_BYTES: usize = 4 * 1024 * 1024;
+
 /// Takes a request off the in-flight list however its thread leaves.
 ///
 /// A `Drop` rather than a call at the end, because `call_script_timed` has
@@ -1535,6 +1554,25 @@ impl WarmFn {
         caller: Option<&str>,
         key: Option<&str>,
     ) -> Result<(Outcome, CallTiming)> {
+        self.call_streaming(event, script, timeout, caller, key, None)
+    }
+
+    /// The same, with output delivered as it is produced (proto 1.3).
+    ///
+    /// `sink` is called for every `CHUNK` the agent forwards. Passing `None`
+    /// is the ordinary path and is what everything that is not streaming
+    /// does: the `EXEC` then does not ask for chunks, the child captures its
+    /// output the way it always has, and not one extra frame crosses the
+    /// socket.
+    pub fn call_streaming(
+        &self,
+        event: serde_json::Value,
+        script: Option<crate::protocol::Script>,
+        timeout: std::time::Duration,
+        caller: Option<&str>,
+        key: Option<&str>,
+        sink: Option<ChunkSink<'_>>,
+    ) -> Result<(Outcome, CallTiming)> {
         if let Some(s) = &script
             && !s.is_loadable()
         {
@@ -1578,6 +1616,7 @@ impl WarmFn {
                 timeout_ms: timeout.as_millis() as u64,
                 env_overrides: BTreeMap::new(),
                 script,
+                stream: sink.is_some(),
             },
         ) {
             Ok(reply) => reply,
@@ -1685,32 +1724,63 @@ impl WarmFn {
         let budget = timeout.min(self.timeout);
         let deadline = budget.saturating_sub(admitted - started);
 
+        // Chunks arrive on the same channel as the `DONE`, because the reply
+        // router keys on the request id and a `CHUNK` carries one. So the wait
+        // is a loop, and the deadline is measured from *here* rather than
+        // renewed per message: a handler that printed in a loop would
+        // otherwise extend its own deadline for as long as it kept talking.
+        let waiting_from = Instant::now();
+        let mut streamed = 0usize;
         let mut timed_out = false;
-        let done_reply = match reply.next(deadline) {
-            Ok(message) => message,
-            Err(ReplyError::Gone(reason)) => return self.broken(agent_gone(&self.name, &reason)),
-            Err(ReplyError::TimedOut) => {
-                timed_out = true;
-                self.enforce_deadline(request_cgroup.as_deref(), host_pid);
-                // The child is dead, so the agent sees end of file on the
-                // result pipe and sends `DONE` by itself. Waiting for it is
-                // what keeps this request's reply from arriving later with
-                // nobody expecting it.
-                match reply.next(KILL_GRACE) {
-                    Ok(message) => message,
-                    Err(_) => {
-                        return self.broken(Error::BackendUnavailable {
-                            backend: "pool",
-                            reason: format!(
-                                "`{}` did not answer after its request was killed; \
-                                 the agent is not responding",
-                                self.name
-                            ),
-                            remedy: "the function will be rewarmed; check the handler \
-                                     for something that blocks uninterruptibly"
-                                .into(),
-                        });
+        let done_reply = loop {
+            let left = deadline.saturating_sub(waiting_from.elapsed());
+            match reply.next(left) {
+                Ok(Message::Chunk { stream, data, .. }) => {
+                    // Past the cap the stream stops and the request carries
+                    // on: `RESULT` still brings the captured output, so a
+                    // caller loses the live view and nothing else.
+                    if let Some(sink) = sink
+                        && streamed < STREAM_BYTES
+                    {
+                        streamed += data.len();
+                        sink(stream, &data);
                     }
+                    continue;
+                }
+                Ok(message) => break message,
+                Err(ReplyError::Gone(reason)) => {
+                    return self.broken(agent_gone(&self.name, &reason));
+                }
+                Err(ReplyError::TimedOut) => {
+                    timed_out = true;
+                    self.enforce_deadline(request_cgroup.as_deref(), host_pid);
+                    // The child is dead, so the agent sees end of file on the
+                    // result pipe and sends `DONE` by itself. Waiting for it
+                    // is what keeps this request's reply from arriving later
+                    // with nobody expecting it. Chunks already in flight are
+                    // drained on the way, for the same reason.
+                    let killed_at = Instant::now();
+                    break loop {
+                        let left = KILL_GRACE.saturating_sub(killed_at.elapsed());
+                        match reply.next(left) {
+                            Ok(Message::Chunk { .. }) => continue,
+                            Ok(message) => break message,
+                            Err(_) => {
+                                return self.broken(Error::BackendUnavailable {
+                                    backend: "pool",
+                                    reason: format!(
+                                        "`{}` did not answer after its request was \
+                                         killed; the agent is not responding",
+                                        self.name
+                                    ),
+                                    remedy: "the function will be rewarmed; check the \
+                                             handler for something that blocks \
+                                             uninterruptibly"
+                                        .into(),
+                                });
+                            }
+                        }
+                    };
                 }
             }
         };
@@ -3191,24 +3261,26 @@ impl Function {
         self.call_timed(event, timeout).map(|(o, _)| o)
     }
 
-    /// The same, under a name the caller chose. See [`InFlight::key`].
+    /// The same, under a name the caller chose, streaming if asked.
     ///
-    /// Only the agent shape carries one: a warm-exec function has no agent to
-    /// tell, and a caller who cancels one is cancelling by id. That is not a
-    /// limitation worth closing until something asks — the pool shape is what
-    /// an embedder's long requests run on.
+    /// See [`InFlight::key`] and [`WarmFn::call_streaming`]. Only the agent
+    /// shape carries either: a warm-exec function has no agent to tell, and
+    /// its output is collected from pipes at the end. That is not a limitation
+    /// worth closing until something asks — the pool shape is what an
+    /// embedder's long requests run on, and it is the one with an agent.
     pub fn call_keyed(
         &self,
         event: serde_json::Value,
         timeout: std::time::Duration,
         key: Option<&str>,
+        sink: Option<ChunkSink<'_>>,
     ) -> Result<Outcome> {
-        match (self, key) {
-            (Function::Agent(f), key) => f
-                .call_script_keyed(event, None, timeout, None, key)
+        match self {
+            Function::Agent(f) => f
+                .call_streaming(event, None, timeout, None, key, sink)
                 .map(|(o, _)| o),
             #[cfg(target_os = "linux")]
-            (Function::Exec(_), _) => self.call_with_timeout(event, timeout),
+            Function::Exec(_) => self.call_with_timeout(event, timeout),
         }
     }
 
@@ -3246,8 +3318,9 @@ impl Function {
         timeout: std::time::Duration,
         caller: Option<&str>,
         key: Option<&str>,
+        sink: Option<ChunkSink<'_>>,
     ) -> Result<Outcome> {
-        self.call_script_keyed(event, script, timeout, caller, key)
+        self.call_script_streaming(event, script, timeout, caller, key, sink)
             .map(|(outcome, _)| outcome)
     }
 
@@ -3286,8 +3359,23 @@ impl Function {
         caller: Option<&str>,
         key: Option<&str>,
     ) -> Result<(Outcome, CallTiming)> {
+        self.call_script_streaming(event, script, timeout, caller, key, None)
+    }
+
+    /// The same, streaming output as it is produced.
+    ///
+    /// See [`WarmFn::call_streaming`].
+    pub fn call_script_streaming(
+        &self,
+        event: serde_json::Value,
+        script: Option<crate::protocol::Script>,
+        timeout: std::time::Duration,
+        caller: Option<&str>,
+        key: Option<&str>,
+        sink: Option<ChunkSink<'_>>,
+    ) -> Result<(Outcome, CallTiming)> {
         match self {
-            Function::Agent(f) => f.call_script_keyed(event, script, timeout, caller, key),
+            Function::Agent(f) => f.call_streaming(event, script, timeout, caller, key, sink),
             #[cfg(target_os = "linux")]
             Function::Exec(f) => match script {
                 None => f.call_timed(event, timeout),

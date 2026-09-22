@@ -37,7 +37,7 @@ that kills the whole process tree possible.
 zygo agent test /bin/sh -- examples/agents/sh/agent.sh examples/agents/sh/handler.sh
 ```
 
-Twelve checks, run against your agent over a real socket. The agent is started
+Thirteen checks, run against your agent over a real socket. The agent is started
 with the control socket at descriptor 3, which is where a sandboxed agent finds
 it too, and everything after the binary is passed through as its arguments.
 
@@ -61,6 +61,13 @@ spawned and does not need the handler to be somewhere a signal helps. An agent
 that does not know the message answers `ERROR`/`bad_message`, carries on, and
 is reported as not implementing 1.2 rather than failed; the `sh` agent is the
 worked example of that.
+
+The **stream** check (protocol 1.3) needs no flag either, and what it asserts
+is *order* rather than content: the same text is in `DONE` whether an agent
+streams or not, so an implementation that buffered every `CHUNK` and sent them
+at the end would satisfy any check that looked only at what arrived. So the
+handler prints, sleeps for a second and a half, and the first chunk has to be
+in hand while it is still sleeping.
 
 ## What there is to read
 

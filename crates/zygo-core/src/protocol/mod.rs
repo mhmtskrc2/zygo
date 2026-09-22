@@ -162,6 +162,15 @@ pub enum Message {
         /// all of them.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         script: Option<Script>,
+        /// Send output as it is produced, in `CHUNK` frames (proto 1.3).
+        ///
+        /// Off by default and asked for per request, not per function: a
+        /// `CHUNK` per `print()` is a syscall per `print()`, and the warm path
+        /// is measured in milliseconds. A caller that wants to watch a long
+        /// request pays for it; everybody else keeps the path that was
+        /// measured.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        stream: bool,
     },
 
     /// Agent → supervisor: the child exists but has not started work.
@@ -188,6 +197,31 @@ pub enum Message {
     /// `cancelled` itself — it knows, because it is the one that asked.
     #[serde(rename = "CANCEL")]
     Cancel { id: String },
+
+    /// Child → agent → supervisor: output, as it is produced (proto 1.3).
+    ///
+    /// Only sent when the `EXEC` asked for it. Without `stream`, output is
+    /// captured in the child and arrives once, in `RESULT` — which is the
+    /// cheaper path and stays the default, because a `CHUNK` per `print()` is
+    /// a syscall per `print()` on a request measured in milliseconds.
+    ///
+    /// The agent **forwards without buffering**: the value of a stream is that
+    /// a caller sees the first line before the last one exists, and an agent
+    /// that accumulated would deliver the same bytes at the same time as
+    /// `RESULT` does.
+    ///
+    /// `RESULT` still carries the whole of `stdout` and `stderr` afterwards,
+    /// bounded as always. A caller that streamed has seen it; one that did not
+    /// gets it the usual way; and neither has to reassemble anything to know
+    /// what the request printed.
+    #[serde(rename = "CHUNK")]
+    Chunk {
+        id: String,
+        stream: Stream,
+        /// The text itself. Not framed by line: a handler that writes half a
+        /// line and then blocks should have that half line delivered.
+        data: String,
+    },
 
     /// Child → agent: the outcome.
     #[serde(rename = "RESULT")]
@@ -255,6 +289,31 @@ pub enum Message {
     },
 }
 
+/// Which of a request's streams a `CHUNK` belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Stream {
+    Stdout,
+    Stderr,
+    /// The handler's own progress reports, which are not output.
+    ///
+    /// A long request has two things to say — what it printed, and how far it
+    /// has got — and conflating them means a caller has to parse the first to
+    /// find the second. This is the second, and an agent exposes it to the
+    /// handler as a call rather than as a stream to write to.
+    Progress,
+}
+
+impl Stream {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Stream::Stdout => "stdout",
+            Stream::Stderr => "stderr",
+            Stream::Progress => "progress",
+        }
+    }
+}
+
 /// Per-request measurements. Flattened into `RESULT`/`DONE`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Metrics {
@@ -297,6 +356,7 @@ impl Message {
             | Message::Forked { id, .. }
             | Message::Go { id }
             | Message::Cancel { id }
+            | Message::Chunk { id, .. }
             | Message::Result { id, .. }
             | Message::Done { id, .. } => Some(id),
             Message::Error { id, .. } => id.as_deref(),
@@ -312,6 +372,7 @@ impl Message {
             Message::Forked { .. } => "FORKED",
             Message::Go { .. } => "GO",
             Message::Cancel { .. } => "CANCEL",
+            Message::Chunk { .. } => "CHUNK",
             Message::Result { .. } => "RESULT",
             Message::Done { .. } => "DONE",
             Message::Ping { .. } => "PING",
@@ -455,9 +516,13 @@ mod tests {
             event: json!({"url": "https://example.com"}),
             timeout_ms: 30_000,
             env_overrides: BTreeMap::new(),
+            stream: false,
         };
         let text = serde_json::to_string(&m).unwrap();
         assert!(!text.contains("env_overrides"), "{text}");
+        // And an `EXEC` that did not ask to stream does not say so: an agent
+        // that predates 1.3 sees exactly the bytes it always did.
+        assert!(!text.contains("stream"), "{text}");
         assert_eq!(serde_json::from_str::<Message>(&text).unwrap(), m);
     }
 

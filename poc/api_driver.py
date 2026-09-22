@@ -534,6 +534,80 @@ def main() -> int:
         client.delete_script(slow.sha256)
         client.stop_runtime("slow")
 
+        # --- streaming -------------------------------------------------------
+        #
+        # The claim is about *when*, not what: the same text is in the result
+        # either way, and an implementation that buffered every chunk and sent
+        # them all at the end would pass any check that only looked at what
+        # arrived. So the script prints, sleeps, and the first line has to be
+        # in hand while it is still sleeping.
+        print("\nstreaming")
+
+        client.serve_runtime(
+            "watch", {"image": image, "agent": "python", "timeout": "60s"}
+        )
+        chatty = client.put_script(
+            "import sys, time\n\n\ndef handler(event):\n"
+            "    print('first')\n"
+            "    sys.stdout.flush()\n"
+            "    event.progress('halfway')\n"
+            "    time.sleep(3)\n"
+            "    print('last', file=sys.stderr)\n"
+            "    return {'done': True}\n"
+        )
+
+        began = time.time()
+        seen = []
+        first_at = None
+        for ev in client.stream_script("watch", chatty.sha256, {}):
+            seen.append(ev)
+            if first_at is None and not ev.is_result:
+                first_at = time.time() - began
+
+        kinds = [e.kind for e in seen]
+        if kinds and kinds[-1] == "result" and kinds.count("result") == 1:
+            ok("a stream ends with exactly one result")
+        else:
+            bad("the stream did not end with one result", kinds)
+
+        if first_at is not None and first_at < 2.0:
+            ok(f"and the first line arrived after {first_at:.2f}s, while the handler slept 3s")
+        else:
+            bad("nothing arrived before the handler finished", first_at)
+
+        text = "".join(e.data for e in seen if e.kind == "stdout")
+        if "first" in text:
+            ok("stdout is streamed as it is printed")
+        else:
+            bad("the handler's output is not in the stream", text)
+
+        if any(e.kind == "progress" and "halfway" in e.data for e in seen):
+            ok("and `progress` is its own kind, not a line of stdout")
+        else:
+            bad("no progress event", kinds)
+
+        if any(e.kind == "stderr" and "last" in e.data for e in seen):
+            ok("stderr is streamed and kept separate")
+        else:
+            bad("no stderr event", kinds)
+
+        answer = seen[-1].result
+        if answer.result == {"done": True} and "first" in answer.stdout:
+            ok("and the result still carries the whole of what was printed")
+        else:
+            bad("the final result lost something", answer)
+
+        # A caller that did not ask for a stream must see exactly what it
+        # always did — the flag is per request, and this is the control.
+        plain = client.run_script("watch", chatty.sha256, {})
+        if plain.result == {"done": True} and "first" in plain.stdout:
+            ok("a caller that did not ask for a stream is unaffected")
+        else:
+            bad("the non-streaming answer changed", plain)
+
+        client.delete_script(chatty.sha256)
+        client.stop_runtime("watch")
+
         # --- the ceilings ----------------------------------------------------
         print("\nceilings")
 

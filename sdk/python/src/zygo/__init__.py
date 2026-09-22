@@ -39,6 +39,7 @@ from ._errors import (
     ZygoError,
 )
 from ._models import (
+    Event,
     Function,
     LogEntry,
     LogPage,
@@ -63,6 +64,7 @@ __all__ = [
     "DEFAULT_URL",
     "Endpoint",
     # results
+    "Event",
     "Function",
     "LogEntry",
     "LogPage",

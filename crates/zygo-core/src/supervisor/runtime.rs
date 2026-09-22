@@ -255,6 +255,21 @@ impl Supervisor {
         tenant: Option<&str>,
         key: Option<&str>,
     ) -> std::result::Result<Response, Response> {
+        self.exec_script_streaming(name, script, event, timeout, tenant, key, None)
+    }
+
+    /// The same, with output delivered as it is produced (v8).
+    #[allow(clippy::too_many_arguments)]
+    pub fn exec_script_streaming(
+        &self,
+        name: &str,
+        script: Script,
+        event: serde_json::Value,
+        timeout: Duration,
+        tenant: Option<&str>,
+        key: Option<&str>,
+        sink: Option<crate::pool::ChunkSink<'_>>,
+    ) -> std::result::Result<Response, Response> {
         let script = self.script_for_request(script, tenant)?;
         let pool = self.runtime_named(name)?;
 
@@ -294,7 +309,7 @@ impl Supervisor {
         // owner is the only answer to "who may cancel this?".
         let outcome = zygote
             .function
-            .call_script_as(event, Some(script), timeout, tenant, key)
+            .call_script_as(event, Some(script), timeout, tenant, key, sink)
             .map_err(|e| Response::error(ControlError::CallFailed, e));
         drop(permit);
 

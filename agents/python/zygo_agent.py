@@ -372,7 +372,22 @@ def run_request(
     # Set when the request was refused rather than run: the answer is then an
     # `ERROR` frame rather than a `RESULT`. See `_check_digest`.
     refused = None
-    out, err = _Ring(), _Ring()
+
+    # Proto 1.3: the request asked to watch its own output. The frames go on
+    # the same pipe the `RESULT` does, ahead of it, and the agent forwards
+    # them as they arrive.
+    streaming = bool(request.get("stream"))
+
+    def chunk(stream: str, text: str) -> None:
+        _write_frame(result_fd, {
+            "type": "CHUNK",
+            "id": request.get("id", ""),
+            "stream": stream,
+            "data": text,
+        })
+
+    out = _Ring(tee=(lambda t: chunk("stdout", t)) if streaming else None)
+    err = _Ring(tee=(lambda t: chunk("stderr", t)) if streaming else None)
     started = time.monotonic()
 
     try:
@@ -419,6 +434,26 @@ def run_request(
                 "carry a `script`"
             )
 
+        # The handler's own progress reports, which are not its output. A
+        # long request has two things to say — what it printed, and how far it
+        # has got — and a caller that had to parse the first to find the
+        # second would be parsing a handler's log messages.
+        #
+        # Attached **whether or not anybody is listening**. A handler that
+        # calls `event.progress(...)` must not break because this particular
+        # caller did not ask for a stream: whether there is a reader is not
+        # the handler's business, and a method that exists only sometimes is a
+        # method every handler has to guard. Without a stream it is a no-op.
+        #
+        # The cost is one `dict` copy per request, for an event that is a
+        # dict. Measured against a 1.9 ms p50 that is a fraction of a percent,
+        # and the alternative is handlers that work on one call and not the
+        # next.
+        event = _StreamingEvent(
+            request.get("event"),
+            (lambda value: chunk("progress", value)) if streaming else None,
+        )
+
         os.environ["ZYGO_REQUEST_ID"] = request.get("id", "")
         os.environ["ZYGO_DEADLINE_MS"] = str(request.get("timeout_ms", 0))
         for key, val in (request.get("env_overrides") or {}).items():
@@ -426,7 +461,7 @@ def run_request(
 
         started = time.monotonic()
         with _captured(out, err):
-            value = handler(request.get("event"))
+            value = handler(event)
             if _is_awaitable(value):
                 import asyncio
 
@@ -474,8 +509,7 @@ def run_request(
         if error is not None:
             message["error"] = error
 
-    body = json.dumps(message, default=_json_default, separators=(",", ":")).encode()
-    os.write(result_fd, HEADER.pack(len(body)) + body)
+    _write_frame(result_fd, message)
     os.close(result_fd)
 
     # Straight out: no atexit handlers, no interpreter teardown, no flushing of
@@ -594,15 +628,29 @@ def _peak_rss_kb(usage) -> int:
 
 
 class _Ring:
-    """Capture that keeps the first `limit` bytes and counts the rest."""
+    """Capture that keeps the first `limit` bytes and counts the rest.
 
-    def __init__(self, limit: int = RING_BUFFER_BYTES) -> None:
+    With a `tee`, every write is *also* handed on as it happens — which is how
+    a streaming request (proto 1.3) gets its output to the caller before it
+    finishes. The capture still happens: `RESULT` carries the whole of stdout
+    and stderr either way, so a caller that streamed and one that did not see
+    the same text, and neither has to reassemble anything.
+
+    Without a `tee` this is exactly what it was, which is the point: a `CHUNK`
+    per `print()` is a syscall per `print()`, and a request that did not ask
+    for a stream must not pay for one.
+    """
+
+    def __init__(self, limit: int = RING_BUFFER_BYTES, tee=None) -> None:
         self._parts: list[str] = []
         self._size = 0
         self._dropped = 0
         self._limit = limit
+        self._tee = tee
 
     def write(self, text: str) -> int:
+        if self._tee is not None and text:
+            self._tee(text)
         room = self._limit - self._size
         if room > 0:
             piece = text[:room]
@@ -801,16 +849,50 @@ class Agent:
             request.cancelled = True
 
     def _collect(self, request: InFlight) -> None:
-        """A result pipe is readable: take what is there, answer at end of file."""
+        """A result pipe is readable: take what is there, answer at end of file.
+
+        A streaming request's pipe carries several frames — a `CHUNK` per piece
+        of output, then the `RESULT` — so whole frames are decoded and
+        forwarded **as they arrive**. That is the whole value of a stream: an
+        agent that accumulated would deliver the same bytes at the same moment
+        `RESULT` does, which is what it already did before this existed.
+        """
         try:
             chunk = os.read(request.result_fd, 64 * 1024)
         except OSError:
             chunk = b""
         if chunk:
             request.chunks.append(chunk)
+            self._forward_chunks(request)
             return
 
         self._finish(request)
+
+    def _forward_chunks(self, request: InFlight) -> None:
+        """Send on every complete `CHUNK` the child has written so far.
+
+        Anything that is not a `CHUNK` — the `RESULT`, or an `ERROR` — is left
+        where it is for `_finish`, which is the one place that decides what a
+        request's answer was. So this only ever moves output, never outcomes.
+        """
+        buffer = b"".join(request.chunks)
+        at = 0
+        while True:
+            if len(buffer) - at < HEADER.size:
+                break
+            (size,) = HEADER.unpack(buffer[at : at + HEADER.size])
+            end = at + HEADER.size + size
+            if len(buffer) < end or size > MAX_FRAME_BYTES:
+                break
+            try:
+                message = json.loads(buffer[at + HEADER.size : end])
+            except (ValueError, UnicodeDecodeError):
+                break
+            if not isinstance(message, dict) or message.get("type") != "CHUNK":
+                break
+            self._wire.send(message)
+            at = end
+        request.chunks = [buffer[at:]] if at else [buffer]
 
     def _finish(self, request: InFlight) -> None:
         os.close(request.result_fd)
@@ -1145,6 +1227,52 @@ class Agent:
                 break
             chunks.append(chunk)
         return _decode_result_frame(b"".join(chunks), request_id)
+
+
+def _write_frame(fd: int, message: dict) -> None:
+    """One framed message to the agent, header first.
+
+    The same framing the control socket uses, so the agent can decode the
+    child's pipe with the same reader — which is what lets a `CHUNK` and a
+    `RESULT` share it.
+    """
+    body = json.dumps(message, default=_json_default, separators=(",", ":")).encode()
+    os.write(fd, HEADER.pack(len(body)) + body)
+
+
+class _StreamingEvent(dict):
+    """The event, with a `progress()` the handler can call (proto 1.3).
+
+    A `dict` subclass rather than a wrapper: handlers do `event["x"]` and
+    `isinstance(event, dict)`, and a wrapper would break both to add one
+    method. A non-dict event — a list, a string, `None` — is passed through
+    unchanged, because there is nothing to attach to.
+
+    `send` is `None` when nobody is streaming, and `progress()` is then a
+    no-op. That is deliberate: a handler reports progress, and whether anyone
+    is listening is not its problem.
+    """
+
+    __slots__ = ("_send",)
+
+    def __new__(cls, event, send):
+        if not isinstance(event, dict):
+            return event
+        return super().__new__(cls, event)
+
+    def __init__(self, event, send) -> None:
+        super().__init__(event)
+        self._send = send
+
+    def progress(self, message) -> None:
+        """Report progress. Delivered before the result, if anyone is reading."""
+        if self._send is None:
+            return
+        self._send(
+            message
+            if isinstance(message, str)
+            else json.dumps(message, default=_json_default)
+        )
 
 
 def _decode_result_frame(raw: bytes, request_id: str) -> dict | None:

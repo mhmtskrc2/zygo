@@ -41,6 +41,20 @@ export class FakeApi {
 
       const key = `${request.method} ${request.url.split('?')[0]}`;
       const answer = this.answers.get(key) ?? { status: 404, body: { error: `no route ${request.url}` } };
+
+      // A stream is written a line at a time, like the real API's: a test
+      // that received one whole buffer could not tell a client that yields as
+      // lines arrive from one that waits for the last.
+      if (answer.lines) {
+        response.writeHead(answer.status, { 'content-type': 'application/x-ndjson' });
+        for (const [i, item] of answer.lines.entries()) {
+          if (i && answer.gap) await new Promise((r) => setTimeout(r, answer.gap));
+          response.write(JSON.stringify(item) + '\n');
+        }
+        response.end();
+        return;
+      }
+
       const payload = Buffer.from(JSON.stringify(answer.body));
       const headers = { 'content-type': 'application/json', 'content-length': String(payload.length) };
       if (answer.status === 429) headers['retry-after'] = '3';
@@ -54,6 +68,12 @@ export class FakeApi {
 
   answer(method, path, status, body) {
     this.answers.set(`${method} ${path}`, { status, body });
+  }
+
+  /// Answer this route with NDJSON, one object per line. `gap` is the pause
+  /// between them, so a test can tell early delivery from buffering.
+  stream(method, path, lines, gap = 0) {
+    this.answers.set(`${method} ${path}`, { status: 200, lines, gap });
   }
 
   /** @param {{unix?: boolean}} options */

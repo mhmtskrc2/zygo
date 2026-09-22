@@ -412,6 +412,27 @@ function runStdinScript(scriptPath, event) {
 /// says which happened.
 const EXIT_NO_CHILD_FILTER = 121;
 
+/// Attach a `progress()` to the event, if there is anything to attach it to.
+///
+/// Non-enumerable, so a handler that returns the event it was given — which
+/// the conformance contract asks for — does not accidentally return a
+/// function, and `JSON.stringify` does not trip over it.
+function withProgress(event, id, streaming) {
+  if (!event || typeof event !== 'object') return event;
+  Object.defineProperty(event, 'progress', {
+    enumerable: false,
+    value(message) {
+      if (!streaming) return;
+      process.send({
+        type: 'progress',
+        id,
+        data: typeof message === 'string' ? message : JSON.stringify(message),
+      });
+    },
+  });
+  return event;
+}
+
 function worker(argv) {
   const filterArg = argv.indexOf(CHILD_FILTER_ARG);
   if (filterArg >= 0) {
@@ -461,7 +482,18 @@ function worker(argv) {
             'carry a `script`'
         );
       }
-      const result = await run(message.event);
+      // Proto 1.3: the handler's own progress reports, which are not its
+      // output. A long request has two things to say — what it printed, and
+      // how far it has got — and a caller that had to parse the first to find
+      // the second would be parsing log messages.
+      //
+      // `stdout` and `stderr` need nothing here: they are real pipes and the
+      // agent is already reading them, so it forwards what it sees.
+      // Attached whether or not anybody is listening: a handler that calls
+      // `event.progress(...)` must not break because this caller did not ask
+      // for a stream. Without one it is a no-op.
+      const event = withProgress(message.event, message.id, Boolean(message.stream));
+      const result = await run(event);
       // A value that cannot cross the IPC channel is the request's failure,
       // not the worker's: found here rather than as a silent `undefined`.
       JSON.stringify(result === undefined ? null : result);
@@ -556,8 +588,17 @@ class Agent {
     });
 
     const w = { child, stdout: new Ring(), stderr: new Ring(), request: null, started: false, result: null };
-    child.stdout.on('data', (d) => w.stdout.write(d));
-    child.stderr.on('data', (d) => w.stderr.write(d));
+    // Forwarded *and* buffered. The `DONE` carries the whole of stdout and
+    // stderr either way, so a caller that streamed and one that did not see
+    // the same text; what streaming adds is when they see it.
+    child.stdout.on('data', (d) => {
+      w.stdout.write(d);
+      if (w.request && w.request.stream) this.send({ type: 'CHUNK', id: w.request.id, stream: 'stdout', data: String(d) });
+    });
+    child.stderr.on('data', (d) => {
+      w.stderr.write(d);
+      if (w.request && w.request.stream) this.send({ type: 'CHUNK', id: w.request.id, stream: 'stderr', data: String(d) });
+    });
     child.on('message', (message) => {
       if (message.type === 'ready') {
         const next = this._waiting.shift();
@@ -565,6 +606,8 @@ class Agent {
         else this._idle.push(w);
       } else if (message.type === 'result' && w.request) {
         w.result = message;
+      } else if (message.type === 'progress' && w.request && w.request.stream) {
+        this.send({ type: 'CHUNK', id: w.request.id, stream: 'progress', data: message.data });
       }
     });
     // `close`, not `exit`, for the request's answer. `exit` fires when the
@@ -682,6 +725,7 @@ class Agent {
       timeout_ms: message.timeout_ms,
       env_overrides: message.env_overrides,
       script: message.script,
+      stream: Boolean(message.stream),
     };
     const w = this._idle.shift();
     if (w) return this._dispatch(request, w);
@@ -706,6 +750,7 @@ class Agent {
       timeout_ms: w.request.timeout_ms,
       env_overrides: w.request.env_overrides,
       script: w.request.script,
+      stream: w.request.stream,
     });
   }
 

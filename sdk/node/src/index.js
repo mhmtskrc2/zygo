@@ -166,6 +166,68 @@ export class Client {
   }
 
   /**
+   * Call a function and yield its output as it is produced.
+   *
+   * An async iterator. Each item is either a piece of the request's output —
+   * `{ kind: 'stdout' | 'stderr' | 'progress', data }` — or, exactly once and
+   * last, `{ kind: 'result', result, status }` carrying what {@link call}
+   * would have returned. If the request failed, iterating past the result
+   * throws what {@link call} would have thrown.
+   *
+   * ```js
+   * for await (const event of client.stream('render', { pages: 400 })) {
+   *   if (event.kind === 'result') console.log(event.result.result);
+   *   else process.stdout.write(event.data);
+   * }
+   * ```
+   *
+   * The connection is held for the whole request and is not pooled: it is in
+   * use for as long as the handler runs. Breaking out of the loop closes it,
+   * which does **not** cancel the request — pass a `key` or a `signal` and use
+   * {@link cancel} for that.
+   */
+  stream(name, event = null, options = {}) {
+    return this.#streamed(`/fn/${esc(name)}?stream=1`, event, options);
+  }
+
+  /** Run a script in a pool, yielding its output. See {@link stream}. */
+  streamScript(runtime, script, event = null, options = {}) {
+    const body = {
+      script: script.startsWith('sha256:') ? script : { source: script },
+      event,
+    };
+    if (options.entryPoint !== undefined) body.entry_point = options.entryPoint;
+    return this.#streamed(`/runtimes/${esc(runtime)}/call?stream=1`, body, options);
+  }
+
+  async *#streamed(path, body, options) {
+    const key = options.key || (options.signal ? requestKey() : undefined);
+    const headers = timeoutHeader(options.timeout);
+    headers.accept = 'application/x-ndjson';
+    if (key) headers['x-zygo-request-key'] = key;
+    const stop = this.#onAbort(options.signal, key);
+    try {
+      const response = await this.#open('POST', path, body, headers);
+      if ((response.statusCode ?? 0) >= 400) {
+        throw fromResponse(response.statusCode ?? 0, await readJson(response), 1);
+      }
+      for await (const line of lines(response)) {
+        const raw = JSON.parse(line);
+        const event = parseEvent(raw);
+        yield event;
+        if (event.kind === 'result') {
+          if (!(event.status >= 200 && event.status < 300)) {
+            throw fromResponse(event.status, raw, 1);
+          }
+          return;
+        }
+      }
+    } finally {
+      stop();
+    }
+  }
+
+  /**
    * Stop a request that is running.
    *
    * `requestId` is either the server's own id — from `X-Zygo-Request-Id`, or
@@ -519,6 +581,41 @@ export class Client {
 
   // ---- transport ----------------------------------------------------
 
+  /**
+   * Send a request and resolve with the *response object*, unread.
+   *
+   * What {@link stream} needs and {@link #request} does not: a stream's body
+   * has no end to wait for, so the caller reads it a line at a time. A fresh
+   * agent rather than the pooled one, because this connection is in use for
+   * as long as the handler runs and a pooled connection is one that is
+   * finished with.
+   */
+  #open(method, path, body, headers) {
+    const payload = Buffer.from(JSON.stringify(body === undefined ? null : body));
+    const sent = {
+      'content-type': 'application/json',
+      'content-length': String(payload.length),
+      ...headers,
+    };
+    if (this.token) sent.authorization = `Bearer ${this.token}`;
+    if (this._tenantId) sent['x-zygo-tenant'] = this._tenantId;
+
+    const options = { method, path, headers: sent, agent: false, timeout: this.timeout };
+    if (this.endpoint.isUnix) options.socketPath = this.endpoint.socketPath;
+    else {
+      options.host = this.endpoint.host;
+      options.port = this.endpoint.port;
+    }
+
+    return new Promise((resolvePromise, reject) => {
+      const request = this._transport.request(options, resolvePromise);
+      request.on('error', (e) =>
+        reject(new TransportError(`${method} ${path} failed against ${this.endpoint.url}: ${e.message}`))
+      );
+      request.end(payload);
+    });
+  }
+
   #request(method, path, { body = undefined, headers = {}, authenticated = true, rawBody = undefined } = {}) {
     // `rawBody` is for the one route whose body is not JSON: a script is a
     // file, and wrapping its bytes in a JSON string to unwrap them again is a
@@ -617,6 +714,41 @@ function decode(status, raw, retryAfter) {
  */
 function requestKey() {
   return 'k-' + randomBytes(16).toString('hex');
+}
+
+/// One line of a streaming call. See {@link Client#stream}.
+function parseEvent(raw) {
+  if (typeof raw.stream === 'string') {
+    return { kind: raw.stream, data: String(raw.data ?? '') };
+  }
+  return { kind: 'result', result: parseResult(raw), status: Number(raw.status ?? 200) };
+}
+
+/// Newline-delimited JSON off a response, a line at a time as it arrives.
+async function* lines(response) {
+  let buffer = '';
+  for await (const chunk of response) {
+    buffer += chunk.toString('utf8');
+    let at;
+    while ((at = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0, at).trim();
+      buffer = buffer.slice(at + 1);
+      if (line) yield line;
+    }
+  }
+  const last = buffer.trim();
+  if (last) yield last;
+}
+
+/// The whole of a response as JSON. For the refusal that is not a stream.
+async function readJson(response) {
+  const parts = [];
+  for await (const chunk of response) parts.push(chunk);
+  try {
+    return JSON.parse(Buffer.concat(parts).toString('utf8') || '{}');
+  } catch {
+    return {};
+  }
 }
 
 function parseResult(raw) {

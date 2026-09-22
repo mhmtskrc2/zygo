@@ -447,8 +447,10 @@ impl Server {
             timeout_ms,
             tenant: None,
             // An MCP call is synchronous to the model; there is nothing here
-            // that could send a cancel while it runs.
+            // that could send a cancel while it runs, and nothing that could
+            // show it output before it finishes.
             key: None,
+            stream: false,
         })? {
             Reply::Executed { outcome } => {
                 let mut out = String::new();

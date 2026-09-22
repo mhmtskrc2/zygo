@@ -19,11 +19,12 @@ import os
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from ._endpoint import Endpoint, resolve
-from ._errors import TransportError, ZygoError
-from ._models import Function, LogPage, Result, Run, Runtime, Script, Served
+from ._errors import TransportError, ZygoError, from_response
+from ._models import Event, Function, LogPage, Result, Run, Runtime, Script, Served
 from ._sync import (
     MAX_BODY,
     _batch_element,
+    _body,
     _decode,
     _escape,
     _escape_digest,
@@ -124,6 +125,98 @@ class AsyncClient:
     async def cancel(self, request_id: str) -> Dict[str, Any]:
         """Stop a request that is running. See :meth:`zygo.Client.cancel`."""
         return await self._request("DELETE", f"/requests/{_escape(request_id)}")
+
+    async def stream(
+        self,
+        name: str,
+        event: Any = None,
+        *,
+        timeout: Optional[float] = None,
+        key: Optional[str] = None,
+    ):
+        """Call a function and yield its output as it is produced.
+
+        An async iterator of :class:`~zygo._models.Event`; see
+        :meth:`zygo.Client.stream` for what the items are.
+
+        Cancelling the task cancels the request, like :meth:`call` — the key
+        is generated for you when you do not pass one.
+        """
+        key = key or _request_key()
+        headers = _timeout_header(timeout)
+        headers["x-zygo-request-key"] = key
+        path = f"/fn/{_escape(name)}?stream=1"
+        async for item in self._stream(path, event, headers, key):
+            yield item
+
+    async def stream_script(
+        self,
+        runtime: str,
+        script: str,
+        event: Any = None,
+        *,
+        entry_point: Optional[str] = None,
+        timeout: Optional[float] = None,
+        key: Optional[str] = None,
+    ):
+        """Run a script in a pool, yielding its output. See :meth:`stream`."""
+        payload: Dict[str, Any] = {
+            "script": script if script.startswith("sha256:") else {"source": script},
+            "event": event,
+        }
+        if entry_point is not None:
+            payload["entry_point"] = entry_point
+        key = key or _request_key()
+        headers = _timeout_header(timeout)
+        headers["x-zygo-request-key"] = key
+        path = f"/runtimes/{_escape(runtime)}/call?stream=1"
+        async for item in self._stream(path, payload, headers, key):
+            yield item
+
+    async def _stream(self, path: str, body: Any, headers: Dict[str, str], key: str):
+        """One request whose answer arrives a line at a time.
+
+        Outside the connection pool, for the reason the synchronous client
+        gives: this connection is in use for as long as the handler runs, and
+        a pooled one is a connection that is finished with.
+        """
+        if self._closed:
+            raise ZygoError("this client has been closed")
+
+        payload = json.dumps(body).encode()
+        sent = {
+            "host": "localhost"
+            if self.endpoint.is_unix
+            else f"{self.endpoint.host}:{self.endpoint.port}",
+            "accept": "application/x-ndjson",
+            "content-type": "application/json",
+            "content-length": str(len(payload)),
+        }
+        if self.token:
+            sent["authorization"] = f"Bearer {self.token}"
+        sent.update(headers)
+        head = f"POST {path} HTTP/1.1\r\n"
+        head += "".join(f"{k}: {v}\r\n" for k, v in sent.items())
+        head += "\r\n"
+
+        reader, writer = await self._open()
+        try:
+            writer.write(head.encode("latin-1") + payload)
+            await writer.drain()
+            status, response_headers = await _read_head(reader)
+            if status >= 400:
+                raise from_response(status, _body(await _read_body(reader, response_headers)))
+            async for line in _ndjson(reader, response_headers):
+                event = Event.parse(_body(line))
+                yield event
+                if event.is_result:
+                    event.raise_for_status()
+                    return
+        except asyncio.CancelledError:
+            await self._cancel_quietly(key)
+            raise
+        finally:
+            await _shut(writer)
 
     async def _cancel_quietly(self, key: str) -> None:
         """Send a cancel on the way out of a cancelled task.
@@ -412,7 +505,13 @@ def connect(url: Optional[str] = None, *, token: Optional[str] = None, timeout: 
 # ---- a small HTTP/1.1 reader -----------------------------------------
 
 
-async def _read_response(reader: asyncio.StreamReader) -> Tuple[int, Dict[str, str], bytes]:
+async def _read_head(reader: asyncio.StreamReader) -> Tuple[int, Dict[str, str]]:
+    """The status line and headers, stopping before the body.
+
+    Split out from reading the whole answer because a stream's body has no end
+    to wait for: the point is to look at the status, decide, and then read the
+    body a piece at a time.
+    """
     status_line = await reader.readline()
     if not status_line:
         raise TransportError("the API closed the connection without answering")
@@ -428,15 +527,68 @@ async def _read_response(reader: asyncio.StreamReader) -> Tuple[int, Dict[str, s
             break
         name, _, value = line.decode("latin-1").partition(":")
         headers[name.strip().lower()] = value.strip()
+    return status, headers
 
+
+async def _read_response(reader: asyncio.StreamReader) -> Tuple[int, Dict[str, str], bytes]:
+    status, headers = await _read_head(reader)
+    return status, headers, await _read_body(reader, headers)
+
+
+async def _read_body(reader: asyncio.StreamReader, headers: Dict[str, str]) -> bytes:
     if "chunked" in headers.get("transfer-encoding", "").lower():
-        body = await _read_chunked(reader)
-    else:
-        length = int(headers.get("content-length", "0") or 0)
-        if length > MAX_BODY:
-            raise TransportError(f"the API answered with {length} bytes, over this client's limit")
-        body = await reader.readexactly(length) if length else b""
-    return status, headers, body
+        return await _read_chunked(reader)
+    length = int(headers.get("content-length", "0") or 0)
+    if length > MAX_BODY:
+        raise TransportError(f"the API answered with {length} bytes, over this client's limit")
+    return await reader.readexactly(length) if length else b""
+
+
+async def _ndjson(reader: asyncio.StreamReader, headers: Dict[str, str]):
+    """Yield newline-delimited JSON lines **as they arrive**.
+
+    A stream's body is chunked, and the ordinary reader waits for the last
+    chunk — which on a request that runs for a minute is the whole minute.
+    This decodes the chunked framing a piece at a time and yields every
+    complete line it uncovers, which is what makes a stream a stream.
+    """
+    chunked = "chunked" in headers.get("transfer-encoding", "").lower()
+    buffer = bytearray()
+    while True:
+        if chunked:
+            header = (await reader.readline()).strip()
+            if not header:
+                piece, ended = b"", True
+            else:
+                size = int(header.split(b";", 1)[0] or b"0", 16)
+                if size == 0:
+                    while True:
+                        trailer = await reader.readline()
+                        if trailer in (b"\r\n", b"\n", b""):
+                            break
+                    piece, ended = b"", True
+                else:
+                    piece = await reader.readexactly(size)
+                    await reader.readexactly(2)
+                    ended = False
+        else:
+            piece = await reader.read(64 * 1024)
+            ended = not piece
+
+        buffer += piece
+        while True:
+            at = buffer.find(b"\n")
+            if at < 0:
+                break
+            line = bytes(buffer[:at]).strip()
+            del buffer[: at + 1]
+            if line:
+                yield line
+        if ended:
+            last = bytes(buffer).strip()
+            if last:
+                yield last
+            return
 
 
 async def _read_chunked(reader: asyncio.StreamReader) -> bytes:

@@ -45,7 +45,11 @@ use crate::spec::{Layer, Spec};
 /// - v7: `CANCEL` and `CANCELLED` — stopping a request that is already
 ///   running, and an `Outcome` that carries its own id so the caller has
 ///   something to name.
-pub const CONTROL_VERSION: u32 = 7;
+/// - v8: `CHUNK`, and a `stream` on `EXEC` and `EXEC_SCRIPT`. A streaming
+///   request is answered many times — chunks as they are produced, then the
+///   `EXECUTED` — which `RUN` already established as a shape this protocol
+///   allows.
+pub const CONTROL_VERSION: u32 = 8;
 
 /// CLI → supervisor.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -129,6 +133,15 @@ pub enum Request {
         /// cancel its own. See `crate::pool::InFlight`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         key: Option<String>,
+        /// Answer with `CHUNK` frames as output is produced, then `EXECUTED`
+        /// (v8).
+        ///
+        /// The one place this protocol's "exactly one response per request"
+        /// rule bends, and `RUN` bent it first: a caller that asked to watch
+        /// a request gets what it asked for, and one that did not is
+        /// byte-for-byte unaffected — the `EXEC` does not even carry the flag.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        stream: bool,
     },
 
     /// Run a one-shot sandbox here, on the client's behalf.
@@ -288,6 +301,9 @@ pub enum Request {
         /// See `Exec::key`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         key: Option<String>,
+        /// See `Exec::stream`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        stream: bool,
     },
 
     /// Everything `zygo top` shows about the pools.
@@ -502,6 +518,17 @@ pub enum Response {
         stopped: Vec<String>,
     },
 
+    /// One piece of a streaming request's output (v8).
+    ///
+    /// Sent before the `EXECUTED` it belongs to, and only when the request
+    /// asked. The connection carries nothing else in the meantime — a control
+    /// connection serves one request at a time — so there is no id to
+    /// correlate on.
+    Chunk {
+        stream: crate::protocol::Stream,
+        data: String,
+    },
+
     /// Answer to `Cancel`: the kill was sent.
     ///
     /// `started` is whether the request had reached the handler. `false` means
@@ -654,6 +681,7 @@ mod tests {
                 timeout_ms: 30_000,
                 tenant: Some("acme".into()),
                 key: Some("job-4711".into()),
+                stream: true,
             },
             Request::List,
             Request::Run {
@@ -717,6 +745,7 @@ mod tests {
                 timeout_ms: 30_000,
                 tenant: Some("acme".into()),
                 key: None,
+                stream: false,
             },
             Request::CreateTenant { id: "acme".into() },
             Request::Tenants { id: None },
@@ -798,6 +827,10 @@ mod tests {
             Response::Cancelled {
                 id: "r-0001".into(),
                 started: true,
+            },
+            Response::Chunk {
+                stream: crate::protocol::Stream::Stdout,
+                data: "halfway\n".into(),
             },
             Response::Tokens {
                 tokens: vec![crate::tokens::Token {
@@ -1057,6 +1090,7 @@ mod tests {
             event: serde_json::Value::Null,
             timeout_ms: 1000,
             env_overrides: Default::default(),
+            stream: false,
         };
         let bytes = crate::protocol::frame::encode(&exec).expect("encode");
         assert!(
