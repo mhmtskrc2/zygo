@@ -391,7 +391,7 @@ case "$out" in
     *) bad "the secret did not reach the handler: $(printf '%s' "$out" | head -1)" ;;
 esac
 
-agent=$(cat "$CG"/launch/zygo.slice/tenants/pay/*/zygote/cgroup.procs 2>/dev/null | head -1)
+agent=$(cat "$CG"/launch/zygo.slice/tenants/default/pay/*/zygote/cgroup.procs 2>/dev/null | head -1)
 if [ -n "$agent" ]; then
     if [ -e "/proc/$agent/root/run/secrets/STRIPE_KEY" ]; then
         bad "the secret file is still there after the request finished"
@@ -412,7 +412,7 @@ fi
 # While a request runs, the file exists; the probe looks from the host side.
 STRIPE_KEY=sk_test_zygo_42 "$ZYGO" serve slowsecret.py --name slowpay --secret STRIPE_KEY >/dev/null 2>&1
 ( sleep 0.6
-  a=$(cat "$CG"/launch/zygo.slice/tenants/slowpay/*/zygote/cgroup.procs 2>/dev/null | head -1)
+  a=$(cat "$CG"/launch/zygo.slice/tenants/default/slowpay/*/zygote/cgroup.procs 2>/dev/null | head -1)
   if [ -n "$a" ] && [ "$(cat "/proc/$a/root/run/secrets/STRIPE_KEY" 2>/dev/null)" = sk_test_zygo_42 ]; then
       echo present > /tmp/secret-probe
   else
@@ -464,7 +464,7 @@ runtime=$("$ZYGO" ps 2>/dev/null | awk '$1 == "echo" { print $3 }')
 [ "$runtime" = exec ] && ok "\`ps\` shows the function as exec, not an agent runtime" || bad "runtime column: '$runtime'"
 
 # The init is Zygo's own hold process; nothing from the image is running.
-init=$(cat "$CG"/launch/zygo.slice/tenants/echo/*/zygote/cgroup.procs 2>/dev/null | head -1)
+init=$(cat "$CG"/launch/zygo.slice/tenants/default/echo/*/zygote/cgroup.procs 2>/dev/null | head -1)
 comm=$(cat "/proc/$init/comm" 2>/dev/null)
 case "$comm" in
     zygo*) ok "the held sandbox's init is Zygo's own process, not an agent" ;;
@@ -501,7 +501,7 @@ fi
 # Requests are entered by the supervisor, not forked by an agent, so between
 # requests the sandbox holds exactly one process.
 sleep 0.3
-count=$(cat "$CG"/launch/zygo.slice/tenants/pyexec/*/zygote/cgroup.procs 2>/dev/null | wc -l)
+count=$(cat "$CG"/launch/zygo.slice/tenants/default/pyexec/*/zygote/cgroup.procs 2>/dev/null | wc -l)
 [ "$count" -eq 1 ] && ok "between requests the sandbox holds only its init" || bad "$count processes in the sandbox at rest"
 
 started=$(date +%s%N)
@@ -1590,7 +1590,7 @@ printf 'import time\n\n\ndef handler(event):\n    time.sleep(1.5)\n    return {"
 served nap naptime.py --name nap || true
 ( sleep 0.7
   found=empty
-  for d in "$CG"/launch/zygo.slice/tenants/nap/*/req-*; do
+  for d in "$CG"/launch/zygo.slice/tenants/default/nap/*/req-*; do
       [ -d "$d" ] || continue
       # `-s` is useless here: cgroupfs reports st_size 0 for every file,
       # populated or not. The content is the only evidence.
@@ -2034,13 +2034,16 @@ say "surviving a restart"
 # `rmdir` on a cgroup succeeds with its control files in place, which an
 # ordinary filesystem does not allow — so this half of the cleanup cannot be
 # unit tested and is checked here instead. A supervisor that died leaves its
-# tenant cgroups behind; the next one must not inherit them.
+# cgroups behind; the next one must not inherit them.
+#
+# `tenants/default/<name>`: a function served from a terminal belongs to the
+# operator's own tenant, which is a real tenant rather than a special case.
 "$ZYGO" serve handler.py --name leftover >/dev/null 2>&1
-stale="$CG/launch/zygo.slice/tenants/leftover"
+stale="$CG/launch/zygo.slice/tenants/default/leftover"
 if [ -d "$stale" ]; then
-    ok "a served function has a tenant cgroup"
+    ok "a served function has a cgroup under its tenant"
 else
-    bad "no tenant cgroup was created for a served function"
+    bad "no cgroup was created for a served function"
 fi
 
 kill -9 "$SUPERVISOR" 2>/dev/null
@@ -2056,7 +2059,7 @@ if ! start_supervisor; then
     bad "the supervisor did not come back after being killed"
 fi
 if [ -d "$stale" ]; then
-    bad "the restarted supervisor inherited a dead tenant's cgroup"
+    bad "the restarted supervisor inherited a dead function's cgroup"
 else
     ok "a restarted supervisor cleans up what the dead one left"
 fi

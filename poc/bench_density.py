@@ -80,12 +80,12 @@ def zygote_pids() -> list[int]:
     Read from the cgroup tree rather than from `zygo ps`, which reports the
     resident size at warm-up and not a pid.
 
-    The whole subtree under `tenants/`, not `tenants/<name>/cgroup.procs`: a
-    zygote lives at `tenants/<name>/<generation>/zygote`, two levels further
-    down, because a tenant cgroup that held processes could not delegate
-    controllers to the per-request cgroups beneath it. Reading only the top
-    level found nothing and reported 0.00 MB per script, which is the shape
-    of an answer and not one.
+    The whole subtree under `tenants/`, not one level of it: a zygote lives at
+    `tenants/<tenant>/<function>/<generation>/zygote`, three levels further
+    down, because a cgroup that held processes could not delegate controllers
+    to the per-request cgroups beneath it. Reading only the top level found
+    nothing and reported 0.00 MB per script, which is the shape of an answer
+    and not one.
     """
     pids = []
     for root, _, _ in os.walk("/sys/fs/cgroup"):
