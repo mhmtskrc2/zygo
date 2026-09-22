@@ -83,6 +83,13 @@ impl Drop for Busy<'_> {
 pub(super) struct RuntimePool {
     /// The pool's shape: image, dependency set, agent, limits. No code.
     pub(super) resolved: ResolvedFn,
+    /// The dependency set this pool was built on, if it named one (v13).
+    ///
+    /// Kept as the id rather than inferred from the mount, because that is
+    /// what a `DELETE /deps/<id>` has to compare against — and a pool holding
+    /// a read-only mount of a directory somebody just removed would serve
+    /// requests whose imports fail one at a time.
+    pub(super) deps: Option<String>,
     /// Admission for the pool as a whole. Its ceiling is every zygote's
     /// `concurrency` at `max_warm`, so a caller is told `BUSY` only when the
     /// pool cannot grow its way out of the load.
@@ -143,6 +150,7 @@ impl Supervisor {
         spec: Option<&crate::spec::Spec>,
         layer: &crate::spec::Layer,
         options: &crate::spec::ResolveOptions,
+        deps: Option<&str>,
     ) -> std::result::Result<Response, Response> {
         let owned;
         let spec = match spec {
@@ -152,9 +160,23 @@ impl Supervisor {
                 &owned
             }
         };
-        let resolved = spec
+        let mut resolved = spec
             .resolve_runtime(name, layer, options)
             .map_err(|e| Response::error(ControlError::BadSpec, e))?;
+
+        // Before the first zygote, not after: a pool whose dependencies are
+        // still building must not exist half-warmed, and the answer to that is
+        // an error the caller retries rather than a pool they have to stop.
+        let mut warnings = Vec::new();
+        if let Some(id) = deps {
+            let status = self.apply_deps(&mut resolved, id)?;
+            warnings.push(format!(
+                "built on {} ({}, {} files)",
+                status.id,
+                status.kind.as_str(),
+                status.files.len()
+            ));
+        }
 
         let started = Instant::now();
         let mut zygotes = Vec::new();
@@ -175,10 +197,11 @@ impl Supervisor {
                 requests: 0,
                 failures: 0,
             });
-        let warnings = resolved.warnings.clone();
+        warnings.extend(resolved.warnings.iter().cloned());
         let warm = zygotes.len() as u32;
 
         let pool = Arc::new(RuntimePool {
+            deps: deps.map(str::to_string),
             gate: Gate::named(
                 &format!("runtime.{name}"),
                 resolved.concurrency.saturating_mul(resolved.max_warm),

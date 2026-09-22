@@ -58,6 +58,15 @@ pub const INSTANCE: &str = "zygo";
 /// * `doctor` answers about the host it runs on. On macOS the useful answer
 ///   is about both, so it runs here and reports the VM as one of its checks.
 pub fn runs_on_the_host(command: &Command) -> bool {
+    // `zygo api --openapi` prints a document compiled into *this* binary and
+    // exits. Forwarding it answered with the VM's copy of Zygo instead, which
+    // is a different build whenever one is mid-upgrade — so a freshly added
+    // route was missing from `zygo api --openapi > spec/openapi.json` on a Mac
+    // while `--help` on the same binary listed it. Nothing was broken except
+    // which binary answered.
+    if let Command::Api(args) = command {
+        return args.openapi;
+    }
     matches!(
         command,
         Command::Completion { .. }

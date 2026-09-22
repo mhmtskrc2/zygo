@@ -103,7 +103,7 @@ API_PID=
 
 API_CALL_ONLY_PID=$(start_api "$SOCK_CALL_ONLY" --no-auth)
 if wait_for "$SOCK_CALL_ONLY"; then
-    python3 "$SRC/poc/api_driver.py" --call-only "$SOCK_CALL_ONLY" || status=1
+    python3 "$SRC/poc/api_driver.py" --call-only "$SOCK_CALL_ONLY" "$IMAGE" || status=1
 else
     echo "  FAIL  the call-only API did not come up" >&2
     tail -10 "$WORK/api.log" >&2

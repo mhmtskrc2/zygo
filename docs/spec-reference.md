@@ -18,7 +18,7 @@ an error, not a warning.
 | `cmd` | list | image's `CMD` | The program to run. With no `runtime`, sets *warm-exec* mode: a fresh process per request, event on stdin, JSON on stdout. |
 | `mode` | `function` \| `stdin` | `function` | How an agent calls the handler: `handler(event)` returning the result, or the event on stdin and the result from stdout. |
 | `runtime` | `python`, `node` | inferred from `entry` extension | Which agent lives in the sandbox. Two ship built in; anything else runs as warm-exec, or brings its own agent (`runtime = { agent = "/path/in/sandbox" }`). |
-| `requirements` | path | — | A `requirements.txt`, installed once into a venv *inside the image* and mounted read-only at `/venv`. Keyed on the image digest and the file's bytes. |
+| `requirements` | path | — | A `requirements.txt`, installed once into a venv *inside the image* and mounted read-only at `/venv`. Keyed on the image digest and the file's bytes. Names a file on **this host**; an embedder with no shell here sends the lockfile itself to `POST /deps` instead (`docs/sdk.md`). |
 | `system` | list | `[]` | apt packages, installed once into a derived layer of the image. Debian package names, optionally `=version`. |
 | `nix` | list | `[]` | Declared, not implemented. |
 | `workdir` | path | `/app` | Working directory inside the sandbox. Falls back to `/` if the image lacks it. |

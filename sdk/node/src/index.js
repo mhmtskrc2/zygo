@@ -575,15 +575,66 @@ export class Client {
    * warm zygotes. `layer` is a `[runtime.<name>]` table as an object —
    * `image`, `agent`, `min_warm`, `max_warm` and the limits.
    *
+   * `deps` is an id from {@link putDeps}. A pool named against one that is
+   * still building **throws** rather than starting: a zygote warmed without
+   * the dependencies it was promised serves requests that fail at import. The
+   * right reaction is to wait and send the same call again.
+   *
    * Needs an API started with `--allow-deploy`.
    */
-  async serveRuntime(name, layer, { baseDir } = {}) {
+  async serveRuntime(name, layer, { baseDir, deps } = {}) {
     const body = { name, layer: { ...layer } };
     if (baseDir !== undefined) {
       const { resolve: resolvePath } = await import('node:path');
       body.base_dir = resolvePath(baseDir);
     }
+    if (deps !== undefined) body.deps = deps;
     return this.#request('POST', '/runtimes', { body });
+  }
+
+  /**
+   * Build a dependency set from a lockfile, inside `image`.
+   *
+   * The API-native half of the spec's `requirements`, which names a file on
+   * the Zygo host — the one thing an embedder has none of. Send the files
+   * themselves: `{ 'package.json': …, 'package-lock.json': … }` for Node, or
+   * `{ 'requirements.txt': … }` for Python.
+   *
+   * **Answers before the build finishes.** An `npm ci` is minutes, so this
+   * returns as soon as the files are on disk, with `state === 'building'`.
+   * Idempotent by content: the same files against the same image are the same
+   * id, however many callers send them.
+   *
+   * The build runs in a sandbox that can reach the package registries and
+   * nothing else, because installing a package runs that package's code.
+   */
+  async putDeps(image, files) {
+    const encoded = {};
+    for (const [name, content] of Object.entries(files)) {
+      encoded[name] = Buffer.from(content).toString('base64');
+    }
+    return depsOf(await this.#request('POST', '/deps', { body: { image, files: encoded } }));
+  }
+
+  /** One dependency set with its build log, or every one you can see. */
+  async deps(id) {
+    if (id === undefined) {
+      const body = await this.#request('GET', '/deps');
+      return (body.deps ?? []).map(depsOf);
+    }
+    return depsOf(await this.#request('GET', `/deps/${esc(id)}`));
+  }
+
+  /**
+   * Forget a dependency set.
+   *
+   * Refused while a pool is built on it: the pool holds a read-only mount of
+   * the directory, and removing it under a warm zygote would leave the pool
+   * serving requests whose imports fail one at a time. Stop the pool first.
+   */
+  async deleteDeps(id) {
+    const body = await this.#request('DELETE', `/deps/${esc(id)}`);
+    return Boolean(body.deleted ?? false);
   }
 
   /** Every runtime pool this host holds. */
@@ -920,6 +971,32 @@ function batchElement(answer) {
 
 function esc(name) {
   return encodeURIComponent(name);
+}
+
+/**
+ * One dependency set as a caller reads it.
+ *
+ * `ready` and `building` as booleans beside the string, because every caller
+ * writes one of those two comparisons and a typo in `'buidling'` is a
+ * condition that is silently never true.
+ */
+function depsOf(raw) {
+  const state = String(raw.state ?? 'building');
+  return {
+    id: String(raw.id ?? ''),
+    state,
+    ready: state === 'ready',
+    building: state === 'building',
+    kind: String(raw.kind ?? ''),
+    image: String(raw.image ?? ''),
+    error: raw.error ?? null,
+    log: String(raw.log ?? ''),
+    files: raw.files ?? {},
+    // A dependency set is shared by content, so two customers who send the
+    // same lockfile share one build and both are listed. Empty is the
+    // operator's own.
+    tenants: raw.tenants ?? [],
+  };
 }
 
 /**

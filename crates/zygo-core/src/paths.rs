@@ -172,6 +172,17 @@ impl Paths {
     pub fn venv_cache(&self) -> PathBuf {
         self.data.join("cache/venvs")
     }
+    /// Dependency sets built from files that arrived over the API.
+    ///
+    /// Beside the venv cache and not in it, because the two are not the same
+    /// thing. A venv is keyed on a requirements file *on this host* and can be
+    /// rebuilt from it at any time, so losing the cache costs time. A
+    /// dependency set is keyed on bytes an embedder sent once and may no
+    /// longer have; it carries a build log somebody is entitled to read, and a
+    /// pool may be referencing it. See [`crate::deps`].
+    pub fn deps(&self) -> PathBuf {
+        self.data.join("deps")
+    }
     pub fn flat_cache(&self) -> PathBuf {
         self.data.join("cache/flat")
     }

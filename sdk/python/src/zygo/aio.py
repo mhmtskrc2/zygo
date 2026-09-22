@@ -14,13 +14,14 @@ assuming it will never see one.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 from ._endpoint import Endpoint, resolve
 from ._errors import TransportError, ZygoError, from_response
-from ._models import Event, Function, LogPage, Result, Run, Runtime, Script, Served
+from ._models import Deps, Event, Function, LogPage, Result, Run, Runtime, Script, Served
 from ._sync import (
     MAX_BODY,
     _batch_element,
@@ -304,10 +305,13 @@ class AsyncClient:
         layer: Mapping[str, Any],
         *,
         base_dir: Optional[str] = None,
+        deps: Optional[str] = None,
     ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {"name": name, "layer": dict(layer)}
         if base_dir is not None:
             payload["base_dir"] = os.path.abspath(base_dir)
+        if deps is not None:
+            payload["deps"] = deps
         return await self._request("POST", "/runtimes", body=payload)
 
     async def runtimes(self) -> List[Runtime]:
@@ -353,6 +357,31 @@ class AsyncClient:
 
     async def put_script(self, source: str) -> Script:
         return Script.parse(await self._request("PUT", "/scripts", raw_body=source.encode()))
+
+    async def put_deps(
+        self,
+        image: str,
+        files: Mapping[str, Union[str, bytes]],
+    ) -> Deps:
+        encoded = {
+            name: base64.b64encode(
+                content.encode() if isinstance(content, str) else content
+            ).decode()
+            for name, content in files.items()
+        }
+        return Deps.parse(
+            await self._request("POST", "/deps", body={"image": image, "files": encoded})
+        )
+
+    async def deps(self, id: Optional[str] = None) -> Union[Deps, List[Deps]]:
+        if id is None:
+            body = await self._request("GET", "/deps")
+            return [Deps.parse(d) for d in body.get("deps", [])]
+        return Deps.parse(await self._request("GET", f"/deps/{_escape(id)}"))
+
+    async def delete_deps(self, id: str) -> bool:
+        body = await self._request("DELETE", f"/deps/{_escape(id)}")
+        return bool(body.get("deleted", False))
 
     async def script(self, digest: str) -> Script:
         return Script.parse(await self._request("GET", f"/scripts/{_escape_digest(digest)}"))

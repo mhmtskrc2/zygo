@@ -46,6 +46,7 @@ extern crate krun;
 pub mod backend;
 pub mod blobs;
 pub mod cgroup;
+pub mod deps;
 pub mod derive;
 pub mod doctor;
 pub mod error;

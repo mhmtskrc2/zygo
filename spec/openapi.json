@@ -122,6 +122,116 @@
         "x-zygo-who": "any"
       }
     },
+    "/deps": {
+      "get": {
+        "operationId": "getDeps",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "Every dependency set you can see.",
+        "x-zygo-deploy": false,
+        "x-zygo-who": "any"
+      },
+      "post": {
+        "operationId": "postDeps",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "Build a dependency set from a lockfile. Answers `building`; poll it.",
+        "x-zygo-deploy": false,
+        "x-zygo-who": "any"
+      }
+    },
+    "/deps/{id}": {
+      "delete": {
+        "operationId": "deleteDepsId",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "Forget a dependency set. Refused while a pool is built on it.",
+        "x-zygo-deploy": true,
+        "x-zygo-who": "operator"
+      },
+      "get": {
+        "operationId": "getDepsId",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "One dependency set: building, ready or failed, with its build log.",
+        "x-zygo-deploy": false,
+        "x-zygo-who": "any"
+      }
+    },
     "/drain": {
       "post": {
         "operationId": "postDrain",

@@ -57,7 +57,10 @@ use crate::spec::{Layer, Spec};
 ///   the function or pool was declared with.
 /// - v12: `DRAIN` and `DRAINED` — stop admitting, finish what is running, and
 ///   say whether anything was still going when the grace ran out.
-pub const CONTROL_VERSION: u32 = 12;
+/// - v13: `PUT_DEPS`, `DEPS`, `DELETE_DEPS`, their `DEPENDENCIES` answer, and
+///   a `deps` on `SERVE_RUNTIME` — a dependency set built from files that
+///   arrived over the API rather than from a path on this host.
+pub const CONTROL_VERSION: u32 = 13;
 
 /// The files one request brings with it and takes away (v9).
 ///
@@ -241,6 +244,39 @@ pub enum Request {
         grace_ms: u64,
     },
 
+    /// Build a dependency set from files that came over the API (v13).
+    ///
+    /// Answered as soon as the files are on disk, with `building`: a `pip
+    /// install` is minutes and a control connection is not the place to spend
+    /// them. The same files against the same image are the same id, so a
+    /// second caller joins the first one's build rather than starting another.
+    PutDeps {
+        /// The image the dependencies are built *inside*. Part of the key: a
+        /// wheel built for one interpreter fails at import in another.
+        image: String,
+        /// File name to base64 of its bytes. JSON cannot carry bytes, and a
+        /// lockfile is not always UTF-8.
+        files: std::collections::BTreeMap<String, String>,
+        /// Whose dependency set this is. `None` is the operator's own.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tenant: Option<String>,
+    },
+
+    /// One dependency set, with its build log (v13).
+    ///
+    /// `id` absent lists them, which is the same shape `Tenants` and `Tokens`
+    /// use: one request type, one response type, and a caller that reads a
+    /// list either way.
+    Deps {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tenant: Option<String>,
+    },
+
+    /// Forget a dependency set (v13). Refused while a pool names it.
+    DeleteDeps { id: String },
+
     /// Liveness probe, used by the client to decide whether an existing socket
     /// belongs to a supervisor that is actually running.
     Ping,
@@ -343,6 +379,15 @@ pub enum Request {
         /// Whose pool this is. See `Serve::tenant`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tenant: Option<String>,
+        /// A dependency set this pool's zygotes are built with (v13).
+        ///
+        /// Named rather than sent: the files were uploaded once and built
+        /// once, and a pool that carried them would rebuild on every deploy.
+        /// One that is still building is **refused**, not queued — a zygote
+        /// warmed without the dependencies it was promised serves requests
+        /// that fail at `import`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        deps: Option<String>,
     },
 
     /// Run one script in a pool.
@@ -676,6 +721,26 @@ pub enum Response {
         secret: Option<String>,
     },
 
+    /// Answer to `PutDeps`, `Deps` and `DeleteDeps` (v13).
+    ///
+    /// One shape for all three, like `Tenants` and `Tokens`. A `PutDeps`
+    /// answers with the one it made or found; a list answers with all of them
+    /// and no log, because a list of build logs is a response nobody wanted.
+    Dependencies {
+        deps: Vec<crate::deps::Status>,
+        /// The build's output, on the one frame that carries it: the answer to
+        /// a request that named a single id. Empty for a list.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        log: String,
+        /// This host already had this dependency set.
+        ///
+        /// The observable half of the content-addressed key, as `Script` has:
+        /// two embedders who send identical files against identical images
+        /// share one build, and the second is told rather than left to assume.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        existed: bool,
+    },
+
     /// Answer to `PutScript` and `GetScript`.
     Script {
         /// `sha256:…`, which is the script's name everywhere else.
@@ -736,6 +801,13 @@ pub enum ControlError {
     /// formed* and the answer is "not that much", which an API maps to `422`
     /// rather than `400`.
     AboveCeiling,
+    /// A pool named a dependency set that is still being built (v13).
+    ///
+    /// Its own code because the caller's correct reaction is unlike every
+    /// other failure here: wait and send the same request again. An API maps
+    /// it to `503` with a `Retry-After`, and nothing about the request needs
+    /// changing.
+    DepsBuilding,
 }
 
 impl ControlError {
@@ -749,6 +821,7 @@ impl ControlError {
             ControlError::BadMessage => "bad_message",
             ControlError::Unauthorised => "unauthorised",
             ControlError::AboveCeiling => "above_ceiling",
+            ControlError::DepsBuilding => "deps_building",
         }
     }
 }
@@ -867,6 +940,7 @@ mod tests {
                 allow_private_net: false,
                 allow_unlimited: false,
                 tenant: Some("acme".into()),
+                deps: Some(format!("deps_{}", "a".repeat(32))),
             },
             Request::ExecScript {
                 runtime: "py312".into(),

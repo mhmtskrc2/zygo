@@ -330,6 +330,54 @@ class Script:
 
 
 @dataclass(frozen=True)
+class Deps:
+    """A dependency set built from a lockfile you uploaded.
+
+    ``state`` is ``building``, ``ready`` or ``failed``. A build is minutes, so
+    ``put_deps`` answers as soon as the files are on disk and the work happens
+    on the host — poll :meth:`~zygo.Client.deps`, or just send the
+    ``serve_runtime`` and read the ``Retry-After`` on the 503.
+
+    ``log`` is the build's own output, and it is on this object rather than at
+    a second URL because the caller looking at ``failed`` is the caller who
+    needs it.
+    """
+
+    id: str
+    state: str = "building"
+    kind: str = ""
+    image: str = ""
+    error: Optional[str] = None
+    log: str = ""
+    files: Dict[str, int] = field(default_factory=dict)
+    #: Which tenants have uploaded these files. A dependency set is shared by
+    #: content, so two customers who send the same lockfile share one build
+    #: and both are listed. Empty is the operator's own.
+    tenants: List[str] = field(default_factory=list)
+
+    @property
+    def ready(self) -> bool:
+        return self.state == "ready"
+
+    @property
+    def building(self) -> bool:
+        return self.state == "building"
+
+    @classmethod
+    def parse(cls, raw: Dict[str, Any]) -> "Deps":
+        return cls(
+            id=str(raw.get("id", "")),
+            state=str(raw.get("state", "building")),
+            kind=str(raw.get("kind", "")),
+            image=str(raw.get("image", "")),
+            error=raw.get("error"),
+            log=str(raw.get("log") or ""),
+            files={str(k): int(v) for k, v in (raw.get("files") or {}).items()},
+            tenants=[str(t) for t in (raw.get("tenants") or [])],
+        )
+
+
+@dataclass(frozen=True)
 class Run:
     """What a one-shot sandbox said.
 

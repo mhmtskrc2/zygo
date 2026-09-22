@@ -841,6 +841,24 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<ApiBod
             actor.may_deploy()?;
             delete_blob(api, digest).await
         }
+        // Dependency sets, on the same terms scripts are: uploading a
+        // lockfile is a tenant's own business, and what it builds is theirs.
+        // Building one *runs code* — a `setup.py`, an npm lifecycle script —
+        // which is why the build sandbox reaches the registries and nothing
+        // else; see `zygo_core::deps`.
+        (&Method::POST, ["deps"]) => {
+            let body = read_body(req).await?;
+            put_deps(api, &body, tenant).await
+        }
+        (&Method::GET, ["deps"]) => deps(api, None, tenant).await,
+        (&Method::GET, ["deps", id]) => deps(api, Some(id.to_string()), tenant).await,
+        // The operator's: a dependency set is shared by id, so forgetting one
+        // forgets it for every pool that was built on the same files.
+        (&Method::DELETE, ["deps", id]) => {
+            let id = id.to_string();
+            actor.may_deploy()?;
+            delete_deps(api, id).await
+        }
         (&Method::GET, ["scripts", digest]) => get_script(api, digest.to_string()).await,
         // Still the operator's: the store is shared by digest, so forgetting
         // one byte-identical script forgets it for every tenant that
@@ -860,6 +878,7 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<ApiBod
         | (_, ["tenants", ..])
         | (_, ["tokens", ..])
         | (_, ["blobs", ..])
+        | (_, ["deps", ..])
         | (_, ["scripts", ..]) => Err(HttpError::new(
             StatusCode::METHOD_NOT_ALLOWED,
             format!("{} {}", req.method(), path),
@@ -1605,6 +1624,13 @@ struct ServeRuntimeRequest {
     /// Only needed when the table names a path — `requirements`, a mount.
     #[serde(default)]
     base_dir: Option<std::path::PathBuf>,
+    /// A dependency set from `POST /deps`, built inside this pool's image.
+    ///
+    /// The API-native half of `requirements`: that one names a file on the
+    /// Zygo host, which is exactly what an embedder does not have. One that is
+    /// still building answers `503` with a `Retry-After` and starts nothing.
+    #[serde(default)]
+    deps: Option<String>,
 }
 
 async fn serve_runtime(
@@ -1637,6 +1663,7 @@ async fn serve_runtime(
         .base_dir
         .unwrap_or_else(|| std::path::PathBuf::from("/"));
 
+    let deps = request.deps;
     let reply = control(api, move |c| {
         Ok(c.send(&Control::ServeRuntime {
             tenant,
@@ -1644,6 +1671,7 @@ async fn serve_runtime(
             spec: None,
             layer: Box::new(request.layer),
             base_dir,
+            deps,
             // Never from a socket, for the reason `PUT /fn/<name>` gives.
             allow_host_net: false,
             allow_private_net: false,
@@ -1830,6 +1858,123 @@ async fn call_runtime(
     let reply = control(api, move |c| Ok(c.send(&call)?)).await?;
     count_usage(api, &reply);
     Ok(reply_to_response(reply))
+}
+
+/// `POST /deps`: build a dependency set from files in the request.
+///
+/// The API-native half of the spec's `requirements`, which names a path on the
+/// Zygo host — the one thing an embedder has no way to produce. Here the
+/// lockfile is in the request, the build happens on this host, and what comes
+/// back is an id a pool can be built on.
+///
+/// **Answers before the build finishes**, with `building`. A `pip install` is
+/// minutes; an HTTP request that waited for one would time out in every proxy
+/// between here and the caller. Poll `GET /deps/<id>`, or send the same
+/// `POST /runtimes` again and read the `Retry-After`.
+///
+/// Idempotent by content, like `PUT /scripts`: the same files against the same
+/// image are the same id, and `200` rather than `201` says this host already
+/// had it.
+async fn put_deps(
+    api: &Arc<Api>,
+    body: &[u8],
+    tenant: Option<String>,
+) -> Result<Response<ApiBody>, HttpError> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct PutDepsRequest {
+        /// The image the dependencies are built *inside*, and part of the id:
+        /// a wheel built for one interpreter fails at import in another.
+        image: String,
+        /// File name to base64 of its bytes. Base64 because a lockfile is not
+        /// always UTF-8 and JSON has no other way to carry bytes.
+        files: std::collections::BTreeMap<String, String>,
+    }
+    let request: PutDepsRequest = serde_json::from_slice(body).map_err(|e| {
+        HttpError::new(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "body must be {{\"image\": \"…\", \"files\": {{\"requirements.txt\": \"<base64>\"}}}}: {e}"
+            ),
+        )
+    })?;
+
+    let reply = control(api, move |c| {
+        Ok(c.send(&Control::PutDeps {
+            image: request.image,
+            files: request.files,
+            tenant,
+        })?)
+    })
+    .await?;
+    match reply {
+        Reply::Dependencies { deps, existed, .. } => {
+            let status = if existed {
+                StatusCode::OK
+            } else {
+                StatusCode::ACCEPTED
+            };
+            Ok(json(status, &deps_json(deps.first(), "")))
+        }
+        other => Ok(reply_to_response(other)),
+    }
+}
+
+/// `GET /deps` and `GET /deps/<id>`: how a build went, with its log.
+async fn deps(
+    api: &Arc<Api>,
+    id: Option<String>,
+    tenant: Option<String>,
+) -> Result<Response<ApiBody>, HttpError> {
+    let one = id.is_some();
+    let reply = control(api, move |c| Ok(c.send(&Control::Deps { id, tenant })?)).await?;
+    match reply {
+        Reply::Dependencies { deps, log, .. } if one => {
+            Ok(json(StatusCode::OK, &deps_json(deps.first(), &log)))
+        }
+        Reply::Dependencies { deps, .. } => Ok(json(
+            StatusCode::OK,
+            &serde_json::json!({
+                "deps": deps.iter().map(|d| deps_json(Some(d), "")).collect::<Vec<_>>(),
+            }),
+        )),
+        other => Ok(reply_to_response(other)),
+    }
+}
+
+/// `DELETE /deps/<id>`: forget one, unless a pool is built on it.
+async fn delete_deps(api: &Arc<Api>, id: String) -> Result<Response<ApiBody>, HttpError> {
+    let reply = control(api, move |c| Ok(c.send(&Control::DeleteDeps { id })?)).await?;
+    match reply {
+        Reply::Ok => Ok(json(
+            StatusCode::OK,
+            &serde_json::json!({ "deleted": true }),
+        )),
+        other => Ok(reply_to_response(other)),
+    }
+}
+
+/// One dependency set as a caller reads it.
+///
+/// The log is in the same object as the state rather than at a second URL: a
+/// caller looking at `failed` wants the reason, and making them ask twice for
+/// it is how a client ends up not showing it at all.
+fn deps_json(status: Option<&zygo_core::deps::Status>, log: &str) -> serde_json::Value {
+    let Some(status) = status else {
+        return serde_json::json!({});
+    };
+    serde_json::json!({
+        "id": status.id,
+        "kind": status.kind.as_str(),
+        "state": status.state.as_str(),
+        "image": status.image,
+        "files": status.files,
+        "error": status.error,
+        "started_ms": status.started_ms,
+        "finished_ms": status.finished_ms,
+        "tenants": status.tenants,
+        "log": log,
+    })
 }
 
 /// `PUT /scripts`: the body **is** the script, and the answer is its name.
@@ -2674,6 +2819,10 @@ fn reply_to_json(reply: Reply) -> (StatusCode, serde_json::Value) {
                 ControlError::Unauthorised => StatusCode::FORBIDDEN,
                 // Well formed, and the answer is "not that much".
                 ControlError::AboveCeiling => StatusCode::UNPROCESSABLE_ENTITY,
+                // Well formed, and the answer is "not yet". `reply_to_response`
+                // puts a `Retry-After` on it: nothing about the request needs
+                // changing, so the caller's correct move is to send it again.
+                ControlError::DepsBuilding => StatusCode::SERVICE_UNAVAILABLE,
                 ControlError::VersionMismatch
                 | ControlError::CallFailed
                 | ControlError::BadMessage => StatusCode::INTERNAL_SERVER_ERROR,
@@ -2697,6 +2846,15 @@ fn reply_to_response(reply: Reply) -> Response<ApiBody> {
         response
             .headers_mut()
             .insert("retry-after", hyper::header::HeaderValue::from_static("1"));
+    }
+    // A pool that named a dependency set still being built. Seconds rather
+    // than the one second a `BUSY` gets: a build is minutes, and a caller
+    // retrying every second for four minutes is a caller this host has to
+    // answer four hundred times to say the same thing.
+    if body.get("code") == Some(&serde_json::json!("deps_building")) {
+        response
+            .headers_mut()
+            .insert("retry-after", hyper::header::HeaderValue::from_static("5"));
     }
     // In a header as well as the body, for the same reason `Retry-After` is:
     // the caller who needs it is often the one not reading the body.

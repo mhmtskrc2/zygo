@@ -1,7 +1,7 @@
 .PHONY: help build test test-rust test-agent test-sdk test-sdk-python test-sdk-node \
         verify-mcp check check-linux test-linux \
         verify-linux verify-supervisor-linux escape-linux dist-linux \
-        fuzz-linux gvisor-linux verify-login-linux verify-shim \
+        fuzz-linux gvisor-linux verify-login-linux verify-shim verify-deps-linux \
         repro-blue-green-linux verify-api-linux verify-plugin-host vm-build vm-probe vm-kernel \
         verify-vm-pi use-cases-linux vm-use-cases-linux \
         syscall-tables conformance conformance-node conformance-node-seccomp \
@@ -30,6 +30,7 @@ help:
 	@echo "repro-blue-green-linux   the one open supervisor question, five times"
 	@echo "escape-linux attempt every known escape vector against a real kernel"
 	@echo "landlock-net-linux  Landlock's bind/connect rules, on a 6.7+ kernel"
+	@echo "verify-deps-linux   a dependency set built from a lockfile, over the API"
 	@echo "fuzz-linux   sweep every syscall number against all three seccomp profiles"
 	@echo "gvisor-linux the gvisor backend against a real runsc, compared with ns"
 	@echo "bench        reproduce every published number on this host"
@@ -349,6 +350,19 @@ gvisor-linux: poc/zygo-linux-musl
 # Landlock's network rules, which need ABI v4 (kernel 6.7). The container
 # shares the host kernel, so this only runs where the *host* is new enough —
 # it says so and passes otherwise. CI runs it on ubuntu-24.04, which is 6.8.
+# Dependency sets over the API, built for real. Needs `passt` and `nftables`,
+# because the build sandbox reaches the package registries through
+# `network = "egress"` and nothing else — a lockfile arrives from whoever holds
+# a token, and installing a package runs that package's code. Its own target
+# rather than part of `verify-api-linux` for that reason: the rest of that
+# suite needs no network at all.
+verify-deps-linux: poc/zygo-linux-musl
+	docker run --rm --privileged -v "$(PWD):/src:ro" \
+		-e ZYGO_DATA_HOME=/tmp/zdata-deps python:3.12-slim \
+		sh -c 'apt-get -qq update >/dev/null 2>&1 && \
+		apt-get -qq install -y passt nftables >/dev/null 2>&1; \
+		sh /src/poc/deps_probe.sh'
+
 landlock-net-linux: poc/zygo-linux-musl
 	docker run --rm --privileged -v "$(PWD):/src:ro" \
 		-e ZYGO_DATA_HOME=/tmp/zdata-landlock python:3.12-slim \

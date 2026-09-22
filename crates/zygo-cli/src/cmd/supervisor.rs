@@ -236,6 +236,10 @@ fn serve_runtime(cli: &Cli, args: &ServeArgs, name: &str) -> anyhow::Result<u8> 
         allow_host_net: options.allow_host_net,
         allow_private_net: options.allow_private_net,
         allow_unlimited: options.allow_unlimited,
+        // An id from `POST /deps`, and there is nothing to name from here: an
+        // operator at a shell has the lockfile on disk, which is what
+        // `requirements` is for.
+        deps: None,
     })?;
 
     let style = Style::stdout();

@@ -8,17 +8,19 @@ dependency tree of its own.
 
 from __future__ import annotations
 
+import base64
 import http.client
 import json
 import os
 import re
 import socket
 import threading
-from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Union
 
 from ._endpoint import Endpoint, resolve
 from ._errors import NotFound, SpecError, TransportError, ZygoError, from_response
 from ._models import (
+    Deps,
     Event,
     Function,
     LogPage,
@@ -524,6 +526,7 @@ class Client:
         layer: Mapping[str, Any],
         *,
         base_dir: Optional[str] = None,
+        deps: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Register a **runtime pool**: an image, a dependency set, an agent.
 
@@ -533,10 +536,18 @@ class Client:
         — ``image``, ``agent``, ``min_warm``, ``max_warm`` and the limits.
 
         Needs an API started with ``--allow-deploy``.
+
+        ``deps`` is an id from :meth:`put_deps`. A pool named against one that
+        is still building raises :class:`~zygo.Unavailable` rather than
+        starting: a zygote warmed without the dependencies it was promised
+        serves requests that fail at ``import``. Retry — the exception carries
+        the ``Retry-After`` the host suggested.
         """
         payload: Dict[str, Any] = {"name": name, "layer": dict(layer)}
         if base_dir is not None:
             payload["base_dir"] = os.path.abspath(base_dir)
+        if deps is not None:
+            payload["deps"] = deps
         return self._request("POST", "/runtimes", body=payload)
 
     def runtimes(self) -> List[Runtime]:
@@ -603,6 +614,54 @@ class Client:
         Needs an API started with ``--allow-deploy``.
         """
         return Script.parse(self._request("PUT", "/scripts", raw_body=source.encode()))
+
+    def put_deps(
+        self,
+        image: str,
+        files: Mapping[str, Union[str, bytes]],
+    ) -> Deps:
+        """Build a dependency set from a lockfile, inside `image`.
+
+        The API-native half of the spec's ``requirements``, which names a file
+        on the Zygo host — the one thing an embedder has none of. Send the
+        files themselves: ``{"requirements.txt": ...}`` for Python, or
+        ``{"package.json": ..., "package-lock.json": ...}`` for Node.
+
+        **Answers before the build finishes.** A ``pip install`` is minutes,
+        so this returns as soon as the files are on disk, with
+        ``state == "building"``. Idempotent by content: the same files against
+        the same image are the same id, however many callers send them.
+
+        The build runs in a sandbox that can reach the package registries and
+        nothing else, because installing a package runs that package's code.
+        """
+        encoded = {
+            name: base64.b64encode(
+                content.encode() if isinstance(content, str) else content
+            ).decode()
+            for name, content in files.items()
+        }
+        return Deps.parse(
+            self._request("POST", "/deps", body={"image": image, "files": encoded})
+        )
+
+    def deps(self, id: Optional[str] = None) -> Union[Deps, List[Deps]]:
+        """One dependency set with its build log, or every one you can see."""
+        if id is None:
+            body = self._request("GET", "/deps")
+            return [Deps.parse(d) for d in body.get("deps", [])]
+        return Deps.parse(self._request("GET", f"/deps/{_escape(id)}"))
+
+    def delete_deps(self, id: str) -> bool:
+        """Forget a dependency set.
+
+        Refused while a pool is built on it: the pool holds a read-only mount
+        of the directory, and removing it under a warm zygote would leave the
+        pool serving requests whose imports fail one at a time. Stop the pool
+        first.
+        """
+        body = self._request("DELETE", f"/deps/{_escape(id)}")
+        return bool(body.get("deleted", False))
 
     def script(self, digest: str) -> Script:
         """Whether this host holds a script, and how big it is.

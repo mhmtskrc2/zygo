@@ -376,6 +376,75 @@ test('a script is sent as itself, and its digest comes back', async () => {
   }
 });
 
+test('a lockfile goes up as base64 and the answer is an id to poll', async () => {
+  // Base64 because a lockfile is not always UTF-8, and JSON has no other way
+  // to carry bytes. `202` rather than `201`: the build has not happened yet.
+  const api = await FakeApi.start();
+  const id = 'deps_' + 'a'.repeat(32);
+  api.answer('POST', '/deps', 202, {
+    id,
+    state: 'building',
+    kind: 'node',
+    image: 'node:22-slim',
+    files: { 'package.json': 18, 'package-lock.json': 24 },
+  });
+  api.answer('GET', `/deps/${id}`, 200, {
+    id,
+    state: 'failed',
+    error: 'npm exited 1',
+    log: 'npm error 404 Not Found - GET https://registry.npmjs.org/nosuchpkg',
+  });
+  const client = connect(api.url, { token: null });
+  try {
+    const deps = await client.putDeps('node:22-slim', {
+      'package.json': '{"name":"x"}',
+      'package-lock.json': '{"lockfileVersion":3}',
+    });
+    assert.equal(deps.id, id);
+    assert.equal(deps.building, true);
+    assert.equal(deps.ready, false);
+
+    const sent = JSON.parse(api.requests[0].raw);
+    assert.equal(sent.image, 'node:22-slim');
+    assert.equal(
+      Buffer.from(sent.files['package.json'], 'base64').toString(),
+      '{"name":"x"}'
+    );
+
+    // The reason is on the same object as the state: a caller looking at
+    // `failed` wants it, and asking twice is how a client ends up not
+    // showing it at all.
+    const after = await client.deps(id);
+    assert.equal(after.state, 'failed');
+    assert.match(after.log, /nosuchpkg/);
+  } finally {
+    client.close();
+    await api.close();
+  }
+});
+
+test('a pool on a dependency set that is still building is told to retry', async () => {
+  // Not queued and not started: a zygote warmed without the dependencies it
+  // was promised serves requests that fail at import.
+  const api = await FakeApi.start();
+  const id = 'deps_' + 'b'.repeat(32);
+  api.answer('POST', '/runtimes', 503, {
+    error: `${id} is still building`,
+    code: 'deps_building',
+  });
+  const client = connect(api.url, { token: null });
+  try {
+    await assert.rejects(
+      () => client.serveRuntime('pool', { image: 'node:22-slim' }, { deps: id }),
+      /still building/
+    );
+    assert.equal(JSON.parse(api.requests[0].raw).deps, id);
+  } finally {
+    client.close();
+    await api.close();
+  }
+});
+
 test('a secret arrives once, and the listing never carries one', async () => {
   const api = await FakeApi.start();
   api.answer('POST', '/tenants/acme/tokens', 201, {

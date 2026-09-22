@@ -270,6 +270,63 @@ def main() -> int:
             ok("and is gone afterwards")
         client.delete_script(other.sha256)
 
+        # --- dependency sets --------------------------------------------------
+        #
+        # The build itself needs `passt`, `nftables` and a route to the
+        # registries, which this harness deliberately does not have; the
+        # working path is `make verify-deps-linux`. What is checked here is
+        # everything around it, and one thing that matters more than the rest:
+        # **a host that cannot restrict the build refuses it** rather than
+        # falling back to host networking. The lockfile came from whoever holds
+        # a token and installing a package runs that package's code.
+        print("\ndependency sets")
+
+        try:
+            client.put_deps("ghcr.io/zygo/never-pulled:1", {"requirements.txt": "six\n"})
+            bad("POST /deps with an image this host does not have")
+        except zygo.ZygoError as e:
+            if "pull it first" in str(e):
+                ok("a dependency set names an image, and it has to be one this host has")
+            else:
+                bad("the refusal did not say what to do", e)
+
+        try:
+            client.put_deps(image, {"Gemfile": "source 'https://rubygems.org'\n"})
+            bad("POST /deps with files that are neither a requirements.txt nor a package.json")
+        except zygo.ZygoError as e:
+            if "Gemfile" in str(e):
+                ok("and files that are neither language are refused by name")
+            else:
+                bad("the refusal did not name the file", e)
+
+        deps = client.put_deps(image, {"requirements.txt": "six==1.16.0\n"})
+        if deps.building:
+            ok(f"POST /deps answers `building` and names it ({deps.id})")
+        else:
+            bad("POST /deps did not answer `building`", deps.state)
+
+        if any(d.id == deps.id for d in client.deps()):
+            ok("GET /deps lists it")
+        else:
+            bad("GET /deps did not list the dependency set just created")
+
+        waited = 0.0
+        while client.deps(deps.id).building and waited < 60:
+            time.sleep(0.5)
+            waited += 0.5
+        after = client.deps(deps.id)
+        if after.state == "failed" and ("passt" in (after.error or "") or "nft" in (after.error or "")):
+            ok("and on a host that cannot restrict the build, the build is refused, not run")
+        elif after.state == "ready":
+            ok("and on a host that can, it builds (this host has egress)")
+        else:
+            bad("the build ended somewhere else", f"{after.state}: {after.error}")
+
+        if client.delete_deps(deps.id):
+            ok("DELETE /deps/<id> forgets one nothing is built on")
+        else:
+            bad("DELETE /deps/<id>")
+
         # --- runtime pools ---------------------------------------------------
         #
         # The embedder's whole path, and the reason the rest of this exists:
@@ -790,7 +847,7 @@ def main() -> int:
     return 1 if FAIL else 0
 
 
-def call_only(socket_path: str) -> int:
+def call_only(socket_path: str, image: str = "python:3.12-slim") -> int:
     """The same API without `--allow-deploy`: the deploy routes, all refused."""
     import zygo
 
@@ -820,11 +877,20 @@ def call_only(socket_path: str) -> int:
         except zygo.ZygoError as e:
             bad("PUT /scripts was refused on a call-only API", f"{type(e).__name__}: {e}")
 
+        # Same reasoning for a lockfile: a dependency set nobody can name in a
+        # pool runs nothing, and the pool is still the operator's to declare.
+        try:
+            client.put_deps(image, {"requirements.txt": "six==1.16.0\n"})
+            ok("POST /deps is allowed: a dependency set is not a pool")
+        except zygo.ZygoError as e:
+            bad("POST /deps was refused on a call-only API", f"{type(e).__name__}: {e}")
+
         for what, call in (
             ("POST /run", lambda: client.run("alpine:3", ["true"])),
             ("PUT /fn/<name>", lambda: client.serve("x", {"image": "alpine:3", "cmd": ["true"]}, base_dir="/tmp")),
             ("DELETE /fn/<name>", lambda: client.stop("x")),
             ("DELETE /scripts/<hash>", lambda: client.delete_script("sha256:" + "c" * 64)),
+            ("DELETE /deps/<id>", lambda: client.delete_deps("deps_" + "c" * 32)),
             (
                 "POST /runtimes",
                 lambda: client.serve_runtime("x", {"image": "alpine:3", "agent": "python"}),
@@ -1008,6 +1074,35 @@ def tokens(socket_path: str, image: str) -> int:
                 ok(f"a tenant token cannot {what}")
             except zygo.ZygoError as e:
                 bad(f"`{what}` failed with the wrong kind of error", f"{type(e).__name__}: {e}")
+
+        # A dependency set belongs to the tenant whose token uploaded it. Not
+        # a secret — the id is a hash of a lockfile — but a list that showed
+        # every customer's would tell each of them what the others run.
+        mine = acme.put_deps(image, {"requirements.txt": "six==1.16.0\n"})
+        if [d.id for d in acme.deps()] == [mine.id]:
+            ok("a dependency set is listed for the tenant that uploaded it")
+        else:
+            bad("GET /deps with a tenant token", [d.id for d in acme.deps()])
+        # Shared by content, like a script: the same lockfile from a second
+        # customer is the same id and one build, and both of them can see it —
+        # recording only the first uploader would mean the second sent
+        # something they cannot find afterwards.
+        theirs_too = other.put_deps(image, {"requirements.txt": "six==1.16.0\n"})
+        if theirs_too.id == mine.id and [d.id for d in other.deps()] == [mine.id]:
+            ok("and a second tenant who uploads the same lockfile joins it")
+        else:
+            bad("the same lockfile built twice", f"{mine.id} then {theirs_too.id}")
+        # And one nobody else uploaded stays invisible, named directly or not.
+        only_acme = acme.put_deps(image, {"requirements.txt": "six==1.15.0\n"})
+        if only_acme.id not in [d.id for d in other.deps()]:
+            ok("a dependency set another tenant never uploaded is not in their list")
+        else:
+            bad("another tenant saw it", [d.id for d in other.deps()])
+        try:
+            other.deps(only_acme.id)
+            bad("another tenant read a dependency set by naming its id")
+        except zygo.NotFound:
+            ok("and naming its id directly is a not-found, not a forbidden")
 
         # A token names its tenant; a header that disagrees is refused rather
         # than ignored, so a client that thinks it is somebody else is told.
@@ -1336,7 +1431,9 @@ def tokens(socket_path: str, image: str) -> int:
 
 if __name__ == "__main__":
     if sys.argv[1] == "--call-only":
-        status = call_only(sys.argv[2])
+        status = call_only(
+            sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else "python:3.12-slim"
+        )
     elif sys.argv[1] == "--tokens":
         status = tokens(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else "python:3.12-slim")
     elif sys.argv[1] == "--drain":

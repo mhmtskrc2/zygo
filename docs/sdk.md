@@ -83,6 +83,8 @@ as.
 | Recent log | `client.logs(name)` | `client.logs(name)` | either | no |
 | Version | `client.version()` | `client.version()` | either | no |
 | Register a script | `client.put_script(source)` | `client.putScript(source)` | either | no |
+| Build a dependency set | `client.put_deps(image, files)` | `client.putDeps(image, files)` | either | no |
+| How a build went | `client.deps(id)` | `client.deps(id)` | own, or operator | no |
 | Stop a running request | `client.cancel(id)` | `client.cancel(id)` | own, or operator | no |
 | Limit a tenant | `client.set_limits(id, **keys)` | `client.setLimits(id, keys)` | operator | **yes** |
 | A tenant's secret names | `client.secrets(id)` | `client.secrets(id)` | own, or operator | no |
@@ -104,6 +106,7 @@ as.
 | Stop one | `client.stop(name)` | `client.stop(name)` | operator | **yes** |
 | One-shot sandbox | `client.run(image, cmd)` | `client.run(image, cmd)` | operator | **yes** |
 | Forget a script | `client.delete_script(digest)` | `client.deleteScript(digest)` | operator | **yes** |
+| Forget a dependency set | `client.delete_deps(id)` | `client.deleteDeps(id)` | operator | **yes** |
 | Delete a tenant | `client.delete_tenant(id)` | `client.deleteTenant(id)` | operator | **yes** |
 | Serve a runtime pool | `client.serve_runtime(name, layer)` | `client.serveRuntime(name, layer)` | operator | **yes** |
 | Stop one | `client.stop_runtime(name)` | `client.stopRuntime(name)` | operator | **yes** |
@@ -559,6 +562,71 @@ the sandbox and the forked child loads it, after the child's seccomp filter is
 installed. That is what makes it safe for two tenants to share a pool, and it
 is checked rather than asserted — `poc/verify_api.sh` asks a script where it
 was loaded from and whether it can list what else is in flight.
+
+## Dependency sets
+
+A pool's `requirements` names a file **on the Zygo host**, which is the one
+thing an embedder does not have. `POST /deps` is the other half: send the
+lockfile itself, and get back an id a pool can be built on.
+
+```python
+deps = client.put_deps("python:3.12-slim", {        # POST /deps
+    "requirements.txt": open("requirements.txt").read(),
+})
+deps.id        # 'deps_3f1c…' — its name from now on
+deps.state     # 'building'
+
+while client.deps(deps.id).building:                # GET /deps/<id>
+    time.sleep(2)
+
+client.serve_runtime(
+    "py312",
+    {"image": "python:3.12-slim", "agent": "python"},
+    deps=deps.id,
+)
+```
+
+```js
+const deps = await client.putDeps('node:22-slim', {
+  'package.json': manifest,
+  'package-lock.json': lockfile,      // `npm ci` needs it, so this does too
+});
+await client.serveRuntime('node22', { image: 'node:22-slim', agent: 'node' },
+                          { deps: deps.id });
+```
+
+Python takes a `requirements.txt` and gets a venv; Node takes a `package.json`
+**and its lockfile** and gets `npm ci`. Either way the result is mounted
+read-only at `/venv` and the environment points at it — `PATH` for Python,
+`NODE_PATH` for Node — so a script just imports what the lockfile named.
+
+Five things worth knowing:
+
+* **It answers before the build finishes.** A `pip install` is minutes, and an
+  HTTP request that waited for one would time out in every proxy between you
+  and the host. Poll `deps(id)`, or send the `serve_runtime` and retry on the
+  503 — it carries a `Retry-After`.
+* **A pool named against one that is still building is refused, not queued.**
+  Nothing is started. A zygote warmed without the dependencies it was promised
+  serves requests that fail at `import`, and a caller's retry would then be a
+  code change rather than a retry.
+* **The id is a hash of the files and the image.** The same lockfile against
+  the same image is one build however many customers send it, and both of them
+  see it in `deps()`. A different image is a different id, because a wheel
+  built for one interpreter fails at import in another.
+* **The build reaches the package registries and nothing else.** Installing a
+  package runs that package's code — a `setup.py`, an npm lifecycle script —
+  and the lockfile came from whoever holds a token. The build sandbox has
+  `network = "egress"` with the registries allowed, and a host that cannot
+  enforce that (no `passt`, no `nftables`) **refuses the build** rather than
+  falling back to host networking.
+* **A failed build keeps its log**, on the same object as the state:
+  `client.deps(id).log` is the resolver's own words.
+
+`client.delete_deps(id)` forgets one, and is refused while a pool is built on
+it — the pool holds a read-only mount of that directory, and removing it under
+a warm zygote would leave the pool serving requests whose imports fail one at
+a time.
 
 ## The script store
 

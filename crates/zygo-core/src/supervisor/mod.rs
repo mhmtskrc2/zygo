@@ -20,6 +20,7 @@
 //! reattaching to sandboxes whose state nobody can vouch for.
 
 pub mod client;
+pub mod deps;
 pub mod gate;
 pub mod protocol;
 pub mod runtime;
@@ -333,6 +334,12 @@ pub struct Supervisor {
     started: Instant,
     /// Set by `SHUTDOWN`; the accept loop notices and stops.
     stopping: AtomicBool,
+    /// Held for the length of one dependency-set build.
+    ///
+    /// One at a time: two `pip install`s at two CPUs each, on a host that is
+    /// also serving requests, is a host that stops serving them. Builds queue
+    /// here in the order their threads reach it. See [`deps`].
+    deps_build: Arc<Mutex<()>>,
 }
 
 impl Supervisor {
@@ -353,6 +360,17 @@ impl Supervisor {
             }
         }
 
+        // A build belongs to the supervisor that started it. If that process
+        // is gone, nothing is going to finish this one, and a pool naming it
+        // would wait for ever on a `503` telling it to try again.
+        let interrupted = crate::deps::fail_interrupted(&paths);
+        if interrupted > 0 {
+            tracing::info!(
+                count = interrupted,
+                "dependency builds left unfinished by a previous supervisor were marked failed"
+            );
+        }
+
         Ok(Supervisor {
             pool,
             launcher: Launcher::new()?,
@@ -370,6 +388,7 @@ impl Supervisor {
             logs: Mutex::new(BTreeMap::new()),
             started: Instant::now(),
             stopping: AtomicBool::new(false),
+            deps_build: Arc::new(Mutex::new(())),
         })
     }
 
@@ -2535,6 +2554,7 @@ fn dispatch(supervisor: &Supervisor, request: Request, greeted: &mut bool) -> Re
             allow_private_net,
             allow_unlimited,
             tenant,
+            deps,
         } => {
             let options = ResolveOptions {
                 allow_host_net,
@@ -2545,8 +2565,21 @@ fn dispatch(supervisor: &Supervisor, request: Request, greeted: &mut bool) -> Re
                 pool: true,
                 tenant,
             };
-            merge(supervisor.serve_runtime(&name, spec.as_deref(), &layer, &options))
+            merge(supervisor.serve_runtime(
+                &name,
+                spec.as_deref(),
+                &layer,
+                &options,
+                deps.as_deref(),
+            ))
         }
+        Request::PutDeps {
+            image,
+            files,
+            tenant,
+        } => merge(supervisor.put_deps(&image, &files, tenant.as_deref())),
+        Request::Deps { id, tenant } => merge(supervisor.deps(id.as_deref(), tenant.as_deref())),
+        Request::DeleteDeps { id } => merge(supervisor.delete_deps(&id)),
         Request::ExecScript {
             runtime,
             script,

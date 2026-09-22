@@ -9,7 +9,9 @@ one platform.
 from __future__ import annotations
 
 import asyncio
+import base64
 import concurrent.futures
+import json
 import sys
 import time
 import unittest
@@ -268,6 +270,72 @@ class DeployTests(unittest.TestCase):
         self.assertEqual(sent["image"], "alpine:3")
         self.assertEqual(sent["mem"], "64M")
         self.assertEqual(sent["network"], "none")
+
+
+class DepsTests(unittest.TestCase):
+    ID = "deps_" + "a" * 32
+
+    def test_the_files_go_up_as_base64_and_the_answer_is_an_id(self) -> None:
+        # Base64 because a lockfile is not always UTF-8, and JSON has no other
+        # way to carry bytes.
+        with FakeApi() as api:
+            api.answer(
+                "POST",
+                "/deps",
+                202,
+                {"id": self.ID, "state": "building", "kind": "python",
+                 "image": "python:3.12-slim", "files": {"requirements.txt": 15}},
+            )
+            with zygo.connect(api.url) as client:
+                deps = client.put_deps(
+                    "python:3.12-slim", {"requirements.txt": "requests==2.32\n"}
+                )
+                self.assertEqual(deps.id, self.ID)
+                self.assertTrue(deps.building)
+                self.assertFalse(deps.ready)
+
+        sent = json.loads(api.requests[0]["raw"])
+        self.assertEqual(sent["image"], "python:3.12-slim")
+        self.assertEqual(
+            base64.b64decode(sent["files"]["requirements.txt"]).decode(),
+            "requests==2.32\n",
+        )
+
+    def test_a_failed_build_carries_its_log(self) -> None:
+        # The reason is on the same object as the state: a caller looking at
+        # `failed` wants it, and asking twice is how a client ends up not
+        # showing it at all.
+        with FakeApi() as api:
+            api.answer(
+                "GET",
+                f"/deps/{self.ID}",
+                200,
+                {"id": self.ID, "state": "failed", "error": "pip exited 1",
+                 "log": "ERROR: No matching distribution found for nosuchpkg"},
+            )
+            with zygo.connect(api.url) as client:
+                deps = client.deps(self.ID)
+                self.assertEqual(deps.state, "failed")
+                self.assertIn("nosuchpkg", deps.log)
+                self.assertFalse(deps.ready)
+
+    def test_a_pool_on_a_dependency_set_that_is_still_building_is_told_to_retry(self) -> None:
+        # Not queued and not started: a zygote warmed without the dependencies
+        # it was promised serves requests that fail at import.
+        with FakeApi() as api:
+            api.answer(
+                "POST",
+                "/runtimes",
+                503,
+                {"error": "deps_xyz is still building", "code": "deps_building"},
+            )
+            with zygo.connect(api.url) as client:
+                with self.assertRaises(zygo.ZygoError) as raised:
+                    client.serve_runtime("pool", {"image": "x"}, deps=self.ID)
+                self.assertIn("still building", str(raised.exception))
+
+        sent = json.loads(api.requests[0]["raw"])
+        self.assertEqual(sent["deps"], self.ID)
 
 
 class ScriptTests(unittest.TestCase):
