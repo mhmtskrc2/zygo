@@ -27,7 +27,7 @@ else's.
 | Onboard a customer | `POST /tenants`, `POST /tenants/<id>/tokens` |
 | Decide what they may use | `PATCH /tenants/<id>/limits` |
 | Give them a key | `PUT /tenants/<id>/secrets/<name>` |
-| Declare one runtime for everybody | `POST /runtimes` |
+| Declare a runtime per language | `POST /runtimes` |
 | Install a plugin | `PUT /scripts`, as that customer |
 | Run one, with files in and out | `POST /runtimes/<r>/call`, `?out=1` |
 | Watch a long one | the same, `?stream=1` |
@@ -37,11 +37,19 @@ else's.
 
 ## The shape that makes it work
 
-**One runtime, many customers.** The pool holds an interpreter and a dependency
-set and *no code at all* — the script arrives with the request and is loaded in
-the forked child, after its seccomp filter. That is what makes it safe for
-several customers to share one, and it is why ten thousand plugins do not mean
-ten thousand warm processes.
+**One runtime per language, many customers in each.** A pool holds an
+interpreter and a dependency set and *no code at all* — the script arrives with
+the request and is loaded in the forked child, after its seccomp filter. That
+is what makes it safe for several customers to share one, and it is why ten
+thousand plugins do not mean ten thousand warm processes.
+
+**A second language is a second pool and nothing else.** `host.py` declares
+`plugins-python` and `plugins-javascript` from one dictionary; a plugin's row
+records which one it belongs to, because a digest names bytes and Zygo has no
+opinion about what they are written in. Onboarding, tokens, secrets, limits,
+streaming, cancelling and offboarding are untouched by the addition — which is
+the claim Phase 3 exits on, and `demo.py` checks it by holding the *same*
+customer's Python and JavaScript plugins to the *same* 64 MiB.
 
 **A token is the whole of a customer's authority.** `onboard` returns one, and
 everything that customer's code can reach follows from it. Nothing else the

@@ -22,7 +22,7 @@ sys.path.insert(0, os.environ.get("ZYGO_SDK", "/src/sdk/python/src"))
 
 import zygo  # noqa: E402
 
-from host import RUNTIME, PluginHost  # noqa: E402
+from host import PluginHost  # noqa: E402
 
 PASS = 0
 FAIL = 0
@@ -46,11 +46,11 @@ def bad(what: str, detail: object = "") -> None:
 # Two customers' plugins. Ordinary Python, written by somebody who has never
 # heard of Zygo — which is the point.
 GREETER = """
-import os
+import platform
 
 
 def handler(event):
-    return {"hello": event["name"], "from": os.environ.get("ZYGO_TENANT", "?")}
+    return {"hello": event["name"], "python": platform.python_version()}
 """
 
 COUNTER = """
@@ -93,6 +93,32 @@ def handler(event):
     return {"reached": True}
 """
 
+# The same customer's other plugin, in the other language. Ordinary JavaScript,
+# written by somebody who has never heard of Zygo — which is again the point.
+GREETER_JS = """
+module.exports = function handler(event) {
+  return { hello: event.name, node: process.versions.node };
+};
+"""
+
+# And one that asks for more memory than its customer is allowed. The Python
+# twin of this is below; the two together are what "the same tenant limits"
+# means — the limit is on the customer, not on the pool they happen to be in.
+HUNGRY_JS = """
+module.exports = function handler(event) {
+  const chunks = [];
+  for (let i = 0; i < 96; i += 1) chunks.push(Buffer.alloc(1024 * 1024, 1));
+  return chunks.length;
+};
+"""
+
+HUNGRY_PY = """
+def handler(event):
+    b = bytearray(96 * 1024 * 1024)
+    b[::4096] = b'x' * len(b[::4096])
+    return len(b)
+"""
+
 
 def main() -> int:
     url = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("ZYGO_API_URL", "")
@@ -103,7 +129,7 @@ def main() -> int:
     with zygo.connect(url, token=token, timeout=600) as operator:
         host = PluginHost(operator)
         host.start()
-        ok("the host declares one runtime, naming no path on the Zygo machine")
+        ok("the host declares a runtime per language, naming no path on the Zygo machine")
 
         acme = host.onboard("acme", mem="128M", secrets={"API_KEY": "acme-key"})
         globex = host.onboard("globex", mem="64M", secrets={"API_KEY": "globex-key"})
@@ -114,8 +140,8 @@ def main() -> int:
 
         greeter = host.install("acme", GREETER)
         out = host.run("acme", greeter, {"name": "world"})
-        if out.result["hello"] == "world":
-            ok("a customer's plugin is installed and called")
+        if out.result["hello"] == "world" and out.result.get("python"):
+            ok(f"a customer's plugin is installed and called (python {out.result['python']})")
         else:
             bad("the plugin did not run", out.result)
 
@@ -168,13 +194,34 @@ def main() -> int:
         except zygo.NotFound:
             ok("and one customer cannot run another's plugin, digest or not")
 
-        # Limits are the customer's, not the runtime's.
-        hungry = host.install("globex", "def handler(e):\n    b = bytearray(96 * 1024 * 1024)\n    b[::4096] = b'x' * len(b[::4096])\n    return len(b)\n")
-        try:
-            host.run("globex", hungry, {})
-            bad("a customer took more memory than their tenant allows")
-        except zygo.ZygoError:
-            ok("a customer is held to their own limit, not the runtime's")
+        # The other language, through the same API, for the same customer.
+        # Nothing about onboarding, tokens, digests or limits changed — only
+        # which pool the host names, which is a field on its own record.
+        greeter_js = host.install("acme", GREETER_JS, "javascript")
+        out = host.run("acme", greeter_js, {"name": "world"})
+        if out.result["hello"] == "world" and out.result.get("node"):
+            ok(
+                "the same customer's JavaScript plugin runs through the same API "
+                f"(node {out.result['node']})"
+            )
+        else:
+            bad("the JavaScript plugin did not run", out.result)
+
+        if greeter_js.runtime != greeter.runtime:
+            ok(f"in its own pool ({greeter_js.runtime}, not {greeter.runtime})")
+        else:
+            bad("both languages named the same runtime", greeter_js.runtime)
+
+        # Limits are the customer's, not the runtime's — and the point of
+        # doing it twice is that the number is the same number. `globex` is
+        # capped at 64 MiB; both plugins ask for 96.
+        for language, source in (("python", HUNGRY_PY), ("javascript", HUNGRY_JS)):
+            hungry = host.install("globex", source, language)
+            try:
+                host.run("globex", hungry, {})
+                bad(f"a {language} plugin took more memory than its tenant allows")
+            except zygo.ZygoError:
+                ok(f"a {language} plugin is held to the customer's 64M, not the pool's")
 
         # And offboarding takes everything.
         removed = host.offboard("globex")
@@ -189,7 +236,7 @@ def main() -> int:
             ok("and their token stops working")
 
         host.offboard("acme")
-        operator.stop_runtime(RUNTIME)
+        host.stop()
     return 0
 
 

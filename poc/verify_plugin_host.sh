@@ -16,6 +16,9 @@ set -u
 SRC=${SRC:-/src}
 ZYGO=${ZYGO:-$SRC/poc/zygo-linux-musl}
 IMAGE=${IMAGE:-python:3.12-slim}
+# Phase 3's exit criterion adds the second language: one Python plugin and one
+# JavaScript plugin, through the same API and under the same customer's limits.
+NODE_IMAGE=${NODE_IMAGE:-node:22-slim}
 
 ZYGO_DATA_HOME=${ZYGO_DATA_HOME:-/tmp/zdata-plugin}
 export ZYGO_DATA_HOME
@@ -39,6 +42,7 @@ cleanup() {
 trap cleanup EXIT
 
 "$ZYGO" pull "$IMAGE" >/dev/null 2>&1
+"$ZYGO" pull "$NODE_IMAGE" >/dev/null 2>&1
 
 ZYGO_API_TOKEN=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
 export ZYGO_API_TOKEN
@@ -69,7 +73,7 @@ if [ ! -S "$SOCK" ]; then
     exit 1
 fi
 
-ZYGO_SDK=$SRC/sdk/python/src ZYGO_IMAGE=$IMAGE \
+ZYGO_SDK=$SRC/sdk/python/src ZYGO_IMAGE=$IMAGE ZYGO_NODE_IMAGE=$NODE_IMAGE \
     python3 "$SRC/examples/plugin-host/demo.py" "unix://$SOCK"
 status=$?
 
