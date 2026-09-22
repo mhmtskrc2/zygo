@@ -507,6 +507,46 @@ else
 fi
 rm -rf "$WORK"
 
+# --- 17. replacing the script another request is about to load --------------
+
+say "17. a script in a pool rewrites its own file"
+# The one attack `path` delivery would open, if the delivery were only a
+# directory. A pool's zygotes are shared and every process in a sandbox runs
+# as one uid, so mode bits cannot keep a script out of a directory its own uid
+# owns — and Landlock cannot either, because a nested rule grants rather than
+# removes. What does it is the mount: `/run/script` is a read-only bind of a
+# directory the supervisor owns on the host, so the answer here is `EROFS` on
+# every kernel rather than only on one with Landlock compiled in.
+WORK=/tmp/escape-pool
+mkdir -p "$WORK"
+cat > "$WORK/probe.py" <<'PY'
+import os
+
+
+def handler(event):
+    # Its own file, which it is about to be asked to run again.
+    try:
+        os.unlink(__file__)
+        return {"unlinked": True}
+    except OSError as e:
+        return {"unlinked": False, "errno": e.errno}
+PY
+
+if zygo serve --runtime escape-pool --image "$IMAGE" --agent python >/tmp/escape-pool.err 2>&1; then
+    out=$(zygo exec --runtime escape-pool --script "$WORK/probe.py" '{}' 2>>/tmp/escape-pool.err | tr -d '\n ')
+    zygo stop escape-pool >/dev/null 2>&1
+    case "$out" in
+        *'"unlinked":false'*)
+            ok "a script cannot remove the file it was loaded from ($out)" ;;
+        *'"unlinked":true'*)
+            bad "a script removed the file it was loaded from: $out" ;;
+        *) skip "17. the probe said nothing usable: '$out'" ;;
+    esac
+else
+    skip "17. the pool would not start: $(tail -2 /tmp/escape-pool.err | tr '\n' ' ')"
+fi
+rm -rf "$WORK"
+
 say ""
 say "----------------------------------------"
 say "escape suite: $PASS blocked, $FAIL escaped, $SKIP skipped"

@@ -264,6 +264,21 @@ pub fn build(abi: u32, plan: &MountPlan, network: NetPolicy, writable_root: bool
         }
     }
 
+    // `/run/script` gets no rule of its own, and the reason is worth writing
+    // down because the obvious thing does not work. It is a read-only *bind
+    // mount* inside the writable `/run` tmpfs, and what keeps a tenant from
+    // replacing the script another request is about to load is that mount —
+    // not a Landlock rule.
+    //
+    // A nested rule cannot take rights away. Landlock rules grant; within one
+    // ruleset a rule on `/run/script` is unioned with the one on `/run` above
+    // it rather than overriding it, so a read-only rule there would be worth
+    // nothing. (Measured, on 6.8 with ABI 4, rather than read off the
+    // documentation: a directory granted read-only under a parent granted
+    // read-write was still writable.) Subtracting needs a second *layer*,
+    // which means a second `landlock_restrict_self` in the request's own
+    // child — a per-child ruleset, and a protocol contract to carry it.
+    //
     rules.sort_by(|a, b| a.path.cmp(&b.path));
     rules.dedup_by(|a, b| a.path == b.path);
 
@@ -546,6 +561,24 @@ mod tests {
         assert_eq!(rights("/tmp"), Some(read_write_rights(1)));
         assert_eq!(rights("/run"), Some(read_write_rights(1)));
         assert_eq!(rights("/dev/shm"), Some(read_write_rights(1)));
+    }
+
+    /// A read-only mount inside a writable one gets no Landlock rule, and
+    /// must not: a nested rule would *grant* rights rather than remove them.
+    ///
+    /// `/run/script` is the case that matters — the scripts a pool's requests
+    /// load. It is kept read-only by being a read-only bind mount, and a
+    /// Landlock rule naming it could only make it more permissive.
+    #[test]
+    fn a_read_only_mount_inside_a_writable_one_gets_no_rule_of_its_own() {
+        let mounts = vec!["/host/scripts:/run/script:ro".parse::<Mount>().unwrap()];
+        let r = build(1, &plan(&mounts), NetPolicy::Sealed, false);
+        let named = |p: &str| r.rules.iter().any(|rule| rule.path.to_str().unwrap() == p);
+        assert!(named("/run"), "the tmpfs is writable and says so");
+        assert!(
+            !named(crate::pool::SCRIPT_DIR_IN_SANDBOX),
+            "a rule here could only add rights the mount took away"
+        );
     }
 
     #[test]

@@ -143,7 +143,17 @@ pub struct MountPoint {
 /// mounted over by the launcher (B-19). One list, in the module that does the
 /// mounting.
 pub const MANAGED_TARGETS: &[&str] = &[
-    "/proc", "/sys", "/dev", "/dev/pts", "/dev/shm", "/tmp", "/run",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/dev/pts",
+    "/dev/shm",
+    "/tmp",
+    "/run",
+    // Where a request's own script is bound in, read-only, by the pool. A
+    // spec mount here would either shadow it or be shadowed by it, and either
+    // way somebody's code would not be where the `EXEC` said it was.
+    crate::pool::SCRIPT_DIR_IN_SANDBOX,
 ];
 
 /// image itself lacks. Derived from the same list the plan uses, so the two

@@ -106,7 +106,7 @@ zygote serves all of them.
 
 | Field | Type | Meaning |
 |---|---|---|
-| `path` | string | Where the supervisor put it inside the sandbox before `GO`, `0400`, in a directory that cannot be listed. |
+| `path` | string | Where the supervisor put it inside the sandbox before `GO`, `0400`, in a read-only directory that cannot be listed. |
 | `source` | string | The script itself, on the wire. |
 | `digest` | string | `sha256:…` of the contents. **Checked by the child before it loads them.** |
 | `entry_point` | string | What to call. Default `handler`. |
@@ -124,14 +124,15 @@ Scripts are content-addressed: `path` ends in the digest's hex, so two tenants
 that register identical bytes name one file and neither can substitute a
 different script under a digest somebody else is running.
 
-**The digest is not advisory.** A sandbox has one uid: the child about to load
-`/run/script/<hash>` can unlink that file and write its own in its place —
-for itself, or for another request in flight on the same pool zygote. What it
-cannot reach is this field, which arrives on the supervisor's connection. So
-an agent that is given a `digest` **must** hash the bytes it is about to load
-and refuse them with `ERROR` / `handler_load` if they do not match, before any
-of the script runs. The same rule covers `source`, where it is only
-self-consistency, so that there is one rule rather than two.
+**The digest is not advisory.** Zygo's own supervisor delivers `path` as a
+read-only bind mount, so a child that tries to replace the file it was given
+gets `EROFS` — but that is this implementation's answer, not the protocol's.
+A digest that arrives on the supervisor's connection is the one thing a child
+can check without trusting the filesystem it was handed, so an agent that is
+given one **must** hash the bytes it is about to load and refuse them with
+`ERROR` / `handler_load` if they do not match, before any of the script runs.
+The same rule covers `source`, where it is only self-consistency, so that
+there is one rule rather than two.
 
 **The child loads it, after `GO`.** Not the agent, and not before: a zygote
 that imported a tenant's script would hold that tenant's code, and a pool is

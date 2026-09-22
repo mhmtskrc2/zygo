@@ -720,7 +720,10 @@ fn write_file(path: &Path, value: &str) -> Result<()> {
 /// Make a name safe as a single path component. Tenant names come from callers
 /// that may be passing through end-user input, so `../` must not be a way out
 /// of the tenant subtree.
-fn sanitise(name: &str) -> String {
+///
+/// Shared with the pool, which builds a per-sandbox directory name out of the
+/// same untrusted string.
+pub fn sanitise(name: &str) -> String {
     let cleaned: String = name
         .chars()
         .map(|c| {

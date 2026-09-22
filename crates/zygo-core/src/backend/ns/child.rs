@@ -403,6 +403,14 @@ unsafe fn apply(op: &PreparedOp, err_fd: c_int) {
             target,
             readonly,
         } => {
+            // The mount point, where the image did not already provide one.
+            // The rootfs view creates every target the plan names, but only
+            // on the *image's* tree: a target inside a tmpfs this plan
+            // mounted — `/run/script`, where a pool's scripts are bound in —
+            // exists nowhere until now. Harmless where it is already there,
+            // and where the parent is read-only it fails and the mount below
+            // reports the real problem.
+            unsafe { ensure_dir(target.as_ptr()) };
             let rc = unsafe {
                 libc::mount(
                     source.as_ptr(),

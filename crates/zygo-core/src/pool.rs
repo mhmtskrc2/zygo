@@ -578,6 +578,24 @@ impl Pool {
             Mode::Agent(agent) => agent_mounts(agent, self.agent_path_for(agent), f),
             Mode::Exec => f.mounts.clone(),
         };
+
+        // Where this sandbox's requests will find their own code (protocol
+        // 1.1). A directory of its own on the host, bound in **read-only**:
+        // the supervisor writes the scripts, and nothing inside can change
+        // one. See `SCRIPT_DIR_IN_SANDBOX` for why it has to be a mount.
+        //
+        // Made for every agent sandbox rather than only for pools, because a
+        // function can be sent a script too — `entry` is the fast path, not
+        // the only one — and an empty directory costs an inode.
+        let script_dir = new_script_dir(&self.config.paths, &f.name);
+        if matches!(mode, Mode::Agent(_)) {
+            ensure_script_dir(&script_dir)?;
+            warm.mounts.push(crate::spec::Mount {
+                source: script_dir.clone(),
+                target: PathBuf::from(SCRIPT_DIR_IN_SANDBOX),
+                mode: crate::spec::MountMode::Ro,
+            });
+        }
         if let Some(venv) = &venv {
             warm.mounts.push(venv.mount());
         }
@@ -735,6 +753,7 @@ impl Pool {
                     agent_host_pid: sandbox.pid(),
                     secrets: Mutex::new(Secrets::default()),
                     scripts: Mutex::new(Scripts::default()),
+                    script_dir,
                     _sandbox: sandbox,
                 })))
             }
@@ -1061,6 +1080,8 @@ pub struct WarmFn {
     /// Scripts written into the sandbox for the requests running them, and how
     /// many requests each still has. See [`Scripts`] and [`place_script`].
     scripts: Mutex<Scripts>,
+    /// The host side of `/run/script`: this sandbox's alone, removed with it.
+    script_dir: PathBuf,
     /// Kept alive: dropping it kills the sandbox.
     _sandbox: Box<dyn crate::backend::Sandbox>,
 }
@@ -1664,6 +1685,13 @@ impl Drop for WarmFn {
         if let Some(thread) = self.replies.lock().expect("replies").take() {
             let _ = thread.join();
         }
+        // The scripts this sandbox was sent go with it. `remove_dir_all` and
+        // not `remove_dir`: a request killed at its deadline may not have run
+        // its lease's `Drop`, and one leftover file is not a reason to leave
+        // the directory — nothing else can be under here, because the
+        // directory is this sandbox's alone and only the supervisor writes
+        // into it.
+        let _ = std::fs::remove_dir_all(&self.script_dir);
     }
 }
 
@@ -1912,39 +1940,45 @@ pub const SECRETS_DIR_IN_SANDBOX: &str = "/run/secrets";
 
 /// Where a request's own script lands inside the sandbox (protocol 1.1).
 ///
-/// One directory, mode `0311`, and files named by the SHA-256 of their
-/// contents at `0400`. Together those are the access rule: a child can open a
-/// script whose digest it already knows, and cannot list what else is there.
-/// In a runtime pool the sandbox is shared between tenants — that is the whole
-/// point of it — so "what else is there" is every other tenant's code that
-/// happens to be in flight, and `0311` is what keeps a `readdir` from being an
-/// inventory of it.
+/// A **read-only bind mount** of a directory on the host that belongs to this
+/// sandbox alone. The supervisor writes the scripts into the host side; the
+/// sandbox sees them through a mount it cannot write. That asymmetry is the
+/// whole control, and it is the mount namespace enforcing it rather than
+/// anything the tenant is asked to respect.
 ///
-/// `0311` rather than `0711`, and the missing bit is the whole control:
-/// everything in the sandbox runs as the uid this directory belongs to, so
-/// the *owner* bits are the ones a tenant gets. `r` there would let any script
-/// list every digest in flight beside it, which `0711` did until a test asked
-/// a script to try. Write and execute stay, because the supervisor has to
-/// create the files and the child has to traverse to them — which is also why
-/// the supervisor holds the directory open with `O_PATH`, the one way to keep
-/// a descriptor to a directory it may not read.
+/// It has to be a mount, and the two obvious alternatives are both worth
+/// naming because both were tried:
 ///
-/// It is *not* a boundary against a tenant that already knows the digest: the
-/// child runs as the same uid as the supervisor maps to, so it can unlink the
-/// file and write its own in its place. Nothing on a shared uid can prevent
-/// that, which is why the digest check happens in the child, against a digest
-/// that arrived over the control socket rather than through the filesystem.
-/// See `spec/protocol.md` §3.
+/// * **Mode bits cannot do it.** Everything in a sandbox runs as the uid the
+///   supervisor maps to, so the *owner* bits are what a tenant gets: a
+///   directory the supervisor can write is a directory the tenant can write,
+///   whatever the mode says.
+/// * **Landlock cannot do it either.** A rule grants; within one ruleset a
+///   read-only rule on `/run/script` is unioned with the read-write rule on
+///   the `/run` tmpfs above it rather than overriding it. Measured on 6.8,
+///   ABI 4. Subtracting needs a second *layer*, applied in the request's own
+///   child, which needs a protocol contract to carry it.
+///
+/// The host directory is `0311` — write and traverse, no read — so a script
+/// can open a digest it already knows and cannot list what else is in flight
+/// beside it. In a runtime pool that "what else" is other tenants' code.
+///
+/// The digest check in the child (`spec/protocol.md` §3.8) stays, and is not
+/// redundant: it covers the kernels and backends where this mount is not what
+/// it should be, and it is what makes a swapped file a refused request rather
+/// than a served one.
 pub const SCRIPT_DIR_IN_SANDBOX: &str = "/run/script";
 
-/// The mode [`SCRIPT_DIR_IN_SANDBOX`] is created with. See above for why the
-/// read bit is absent.
+/// The mode the host-side script directory is created with. See above.
 #[cfg(target_os = "linux")]
 pub const SCRIPT_DIR_MODE: u32 = 0o311;
 
-/// Everywhere else there is no sandbox to share and no `O_PATH` to open an
-/// unreadable directory with. The delivery path is Linux's; this keeps the
-/// tests that exercise it on a developer's Mac able to open what they wrote.
+/// Everywhere else, the same directory without the unreadable part.
+///
+/// There is no sandbox off Linux and no `O_PATH` to open a directory that
+/// denies read to its owner, so a `0311` here is not a boundary — it is only a
+/// directory this process cannot open. The tests that exercise the placement
+/// logic run on a developer's Mac, and this is what lets them.
 #[cfg(not(target_os = "linux"))]
 pub const SCRIPT_DIR_MODE: u32 = 0o711;
 
@@ -1959,10 +1993,8 @@ pub const SCRIPT_DIR_MODE: u32 = 0o711;
 struct Scripts {
     /// File name — the digest's hex — to the number of requests that need it.
     resident: BTreeMap<String, u32>,
-    /// The sandbox's `/run/script`, held open from the first file written
-    /// until the last is gone. A descriptor rather than the path it was
-    /// reached by, because that path goes through `/proc/<pid>/root` and stops
-    /// resolving the moment that process does.
+    /// The host side of the bind mount, held open from the first file written
+    /// until the last is gone.
     dir: Option<std::fs::File>,
     /// Whether this function has already said that it cannot deliver a script
     /// as a file. Said once: it is a property of the sandbox, so a request
@@ -2049,17 +2081,13 @@ fn write_script(
     source: &str,
 ) -> Result<()> {
     if scripts.dir.is_none() {
-        std::fs::create_dir_all(dir).at(dir)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            // Write and traverse, never list: see `SCRIPT_DIR_IN_SANDBOX`.
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(SCRIPT_DIR_MODE))
-                .at(dir)?;
-        }
-        // `O_PATH`, because the mode above denies read to this process too —
-        // it is the same uid as everything in the sandbox, which is the point.
-        // An `O_PATH` descriptor names the directory without opening it for
+        // The host side of the bind mount. It was made before the sandbox
+        // started — it has to be, because the mount names it — so this
+        // ordinarily only opens it.
+        ensure_script_dir(dir)?;
+        // `O_PATH`, because the mode denies read to this process too: it is
+        // the same uid as everything in the sandbox, which is the point. An
+        // `O_PATH` descriptor names the directory without opening it for
         // anything, and is exactly what `openat` and `unlinkat` need.
         #[cfg(target_os = "linux")]
         let opened = std::fs::File::from(
@@ -2080,10 +2108,36 @@ fn write_script(
     write_request_file_at(dir, name, source, "writing a script into the sandbox")
 }
 
-/// The sandbox's `/run/script`, as seen from the host.
-fn script_dir(agent_host_pid: u32) -> PathBuf {
-    PathBuf::from(format!(
-        "/proc/{agent_host_pid}/root{SCRIPT_DIR_IN_SANDBOX}"
+/// Make the host side of the script mount, at the mode the sandbox needs.
+///
+/// `0311`: the supervisor writes and traverses, and *nothing* reads the
+/// directory itself — not the sandbox, which would otherwise have an
+/// inventory of every script in flight, and not this process either, which
+/// has no need to list what it put there.
+fn ensure_script_dir(dir: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(dir).at(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(SCRIPT_DIR_MODE)).at(dir)?;
+    }
+    Ok(())
+}
+
+/// A directory for one sandbox's scripts, on the host.
+///
+/// One per sandbox and never reused: a pool that is replaced must not inherit
+/// the scripts of the one before it, and two pools must not be able to see
+/// each other's. The counter is what makes a replacement under the same name
+/// a different directory.
+fn new_script_dir(paths: &Paths, name: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static GENERATION: AtomicU64 = AtomicU64::new(1);
+    let generation = GENERATION.fetch_add(1, Ordering::Relaxed);
+    paths.tmp().join(format!(
+        "scripts-{}-{}-{generation}",
+        crate::cgroup::sanitise(name),
+        std::process::id()
     ))
 }
 
@@ -2139,12 +2193,7 @@ impl WarmFn {
         // check of it is the only thing standing between a tenant that
         // replaces that file and the request that was going to load it.
         let digest = crate::scripts::ScriptDigest::of(&source);
-        match place_script(
-            &self.scripts,
-            &script_dir(self.agent_host_pid),
-            digest.hex(),
-            &source,
-        ) {
+        match place_script(&self.scripts, &self.script_dir, digest.hex(), &source) {
             Ok(lease) => {
                 script.path = Some(format!("{SCRIPT_DIR_IN_SANDBOX}/{}", digest.hex()));
                 script.digest = Some(digest.to_string());
