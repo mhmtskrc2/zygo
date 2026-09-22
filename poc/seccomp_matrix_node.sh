@@ -120,6 +120,11 @@ entry = "h_spawn.js"
 [fn.spawn_strict]
 entry = "h_spawn.js"
 seccomp = "strict"
+
+# The third column: the same code in a runtime pool, where the script arrives
+# with the request and the child filter is `strict` by default.
+[runtime.matrix]
+agent = "node"
 TOML
 
 say ""
@@ -128,12 +133,25 @@ zygo up >/tmp/up-matrix-node.log 2>&1
 grep -v "^$" /tmp/up-matrix-node.log | head -12
 
 say ""
-printf '  %-16s  %-28s  %-28s\n' what default strict
-printf '  %-16s  %-28s  %-28s\n' ---- ------- ------
+say "warming the runtime pool (no handler)…"
+zygo serve --runtime matrix >>/tmp/up-matrix-node.log 2>&1 ||
+    say "  the pool did not warm; its column will read FAILS"
+
+say ""
+printf '  %-16s  %-28s  %-28s  %-28s\n' what default strict "pool (strict)"
+printf '  %-16s  %-28s  %-28s  %-28s\n' ---- ------- ------ -------------
 for case in worker_threads stdlib spawn; do
     row="  $(printf '%-16s' "$case")"
-    for profile in default strict; do
-        out=$(zygo exec "${case}_${profile}" '{}' 2>&1 | tr -d '\n')
+    case $case in
+        worker_threads) script=h_worker.js ;;
+        *) script="h_${case}.js" ;;
+    esac
+    for profile in default strict pool; do
+        if [ "$profile" = pool ]; then
+            out=$(zygo exec --runtime matrix --script "$script" '{}' 2>&1 | tr -d '\n')
+        else
+            out=$(zygo exec "${case}_${profile}" '{}' 2>&1 | tr -d '\n')
+        fi
         case "$out" in
             *'"ok": true'* | *'"ok":true'*) cell="works" ;;
             *'"spawned": false'* | *'"spawned":false'*) cell="refused (as intended)" ;;

@@ -928,7 +928,10 @@ if ! command -v jq >/dev/null 2>&1; then
     fi
 fi
 
-out=$("$ZYGO" agent test python3 -- $SRC/agents/python/zygo_agent.py --fd 3 \
+out=$("$ZYGO" agent test python3 \
+    --script $SRC/examples/agents/conformance/script.py \
+    --script-spawn $SRC/examples/agents/conformance/spawn.py -- \
+    $SRC/agents/python/zygo_agent.py --fd 3 \
     $SRC/examples/agents/conformance/handler.py 2>&1)
 case "$out" in
     *"checks passed"*) ok "the Python reference agent conforms ($(printf '%s' "$out" | grep -c 'PASS') checks)" ;;

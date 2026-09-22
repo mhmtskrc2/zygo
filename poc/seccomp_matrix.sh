@@ -201,6 +201,13 @@ entry = "h_pillow.py"
 [fn.pillow_strict]
 entry = "h_pillow.py"
 seccomp = "strict"
+
+# The third column: the same packages, in a runtime pool, where the script
+# arrives with the request and the child filter is `strict` by default. The
+# same venv — it is keyed on the image digest and the requirements bytes, and
+# both are the ones above.
+[runtime.matrix]
+agent = "python"
 TOML
 
 say ""
@@ -211,13 +218,28 @@ say "  up finished in $(( $(date +%s) - started )) s"
 grep -v "^$" /tmp/up-matrix.log | head -14
 
 say ""
-printf '  %-10s  %-28s  %-28s\n' package default strict
-printf '  %-10s  %-28s  %-28s\n' ------- ------- ------
+say "warming the runtime pool (the same venv, no handler)…"
+"$ZYGO" serve --runtime matrix >>/tmp/up-matrix.log 2>&1 ||
+    say "  the pool did not warm; its column will read FAILS"
+
+say ""
+printf '  %-10s  %-28s  %-28s  %-28s\n' package default strict "pool (strict)"
+printf '  %-10s  %-28s  %-28s  %-28s\n' ------- ------- ------ -------------
 for pkg in requests httpx pydantic numpy pandas pillow sqlite3; do
     row="  $(printf '%-10s' "$pkg")"
-    for profile in default strict; do
-        name="${pkg}_${profile}"
-        out=$("$ZYGO" exec "$name" '{}' 2>&1 | tr -d '\n')
+    # The handler file is named after the module, except sqlite3's.
+    case $pkg in
+        sqlite3) script=h_sqlite.py ;;
+        *) script="h_${pkg}.py" ;;
+    esac
+    for profile in default strict pool; do
+        if [ "$profile" = pool ]; then
+            # The same file, sent as a *script* rather than warmed as a
+            # handler: one zygote, any package, `strict` by default.
+            out=$("$ZYGO" exec --runtime matrix --script "$script" '{}' 2>&1 | tr -d '\n')
+        else
+            out=$("$ZYGO" exec "${pkg}_${profile}" '{}' 2>&1 | tr -d '\n')
+        fi
         case "$out" in
             *'"ok": true'*) cell="works" ;;
             *)
@@ -235,5 +257,9 @@ say ""
 say "strict removes: socket connect bind listen accept4 ptrace mount umount2"
 say "and, in the forked child only: execve execveat fork vfork, and clone without CLONE_THREAD"
 say "(every strict cell above ran its handler under that child filter; see docs/seccomp-profiles.md)"
+say ""
+say "the pool column is the same code as a *script*: one warm zygote holding no"
+say "tenant code, the script written into the sandbox per request, and \`strict\`"
+say "as the pool default rather than something the caller had to ask for."
 harness_verdict
 "$ZYGO" stop --all >/dev/null 2>&1

@@ -211,10 +211,33 @@ impl Spec {
         opts: &ResolveOptions,
     ) -> Result<ResolvedFn, SpecError> {
         let table = self.runtimes.get(name).cloned().unwrap_or_default();
-        let merged = defaults()
+        let mut merged = defaults()
             .merge(&self.defaults)
             .merge(&table)
             .merge(overrides);
+
+        // `strict` by default, which is the one place a pool's built-in
+        // differs from a function's. The difference is who the child is: a
+        // function's child runs code its own author deployed, and `default`
+        // is the profile that author chose by not choosing. A pool's child
+        // runs a script that arrived over an API from somebody who may never
+        // have met the operator — and `strict` takes `execve` and process
+        // creation away from it while leaving them to the agent, which is the
+        // tightening this shape was built for (`spec/protocol.md` §3.7).
+        //
+        // Asked of the layers rather than of the merge, because the merge has
+        // already filled in the built-in `default` and cannot say whether
+        // anybody chose it.
+        let chosen = overrides
+            .seccomp
+            .or(table.seccomp)
+            .or(self.defaults.seccomp);
+        match chosen {
+            None => merged.seccomp = Some(SeccompProfile::Strict),
+            Some(SeccompProfile::Strict) => {}
+            Some(_) => {} // named explicitly; `resolve_layer` warns
+        }
+
         let base_dir = opts.base_dir.clone().unwrap_or_else(|| self.base_dir());
         let opts = ResolveOptions {
             pool: true,
@@ -312,6 +335,20 @@ fn resolve_layer(
     };
 
     let cmd = l.cmd.unwrap_or_default();
+
+    // A pool whose child filter was lowered says so. `strict` is what a pool
+    // gets by default, and an operator who chose otherwise chose to let a
+    // script that arrived over an API start programs and processes — which is
+    // a decision, not a mistake, but not one to make silently either.
+    if opts.pool
+        && let Some(profile) = l.seccomp
+        && profile != SeccompProfile::Strict
+    {
+        warnings.push(format!(
+            "runtime.{name}.seccomp: `{profile}` instead of the pool default `strict`; \
+             scripts in this pool may start programs and processes"
+        ));
+    }
 
     // A pool is defined by what it does *not* have. Its zygotes are shared
     // between tenants, so anything the operator warms into one is code every
@@ -868,6 +905,57 @@ mod tests {
         let text = format!("{err}");
         assert!(text.contains("needs an agent"), "{text}");
         assert!(text.contains("python"), "{text}");
+    }
+
+    /// The one built-in a pool does not share with a function.
+    ///
+    /// A function's child runs code its own author deployed; a pool's runs
+    /// whatever arrived over an API. `strict` takes `execve` and process
+    /// creation from that child and leaves them to the agent.
+    #[test]
+    fn a_pool_child_is_strict_by_default_and_a_function_is_not() {
+        let s = spec("[runtime.p]\nimage = \"python:3.12-slim\"\nagent = \"python\"\n");
+        let pool = s.resolve_runtime("p", &Layer::default(), &opts()).unwrap();
+        assert_eq!(pool.seccomp, SeccompProfile::Strict);
+        assert!(
+            !pool.warnings.iter().any(|w| w.contains("seccomp")),
+            "the default should not warn about itself: {:?}",
+            pool.warnings
+        );
+
+        let s = spec("[fn.f]\nimage = \"python:3.12-slim\"\nentry = \"f.py\"\n");
+        let function = s
+            .resolve_for_serve("f", &Layer::default(), &opts())
+            .unwrap();
+        assert_eq!(function.seccomp, SeccompProfile::Default);
+    }
+
+    #[test]
+    fn a_pool_that_lowers_its_child_filter_says_so() {
+        // Allowed — an operator may know their tenants — but never silent.
+        let s = spec(
+            "[runtime.p]\nimage = \"python:3.12-slim\"\nagent = \"python\"\n\
+             seccomp = \"default\"\n",
+        );
+        let pool = s.resolve_runtime("p", &Layer::default(), &opts()).unwrap();
+        assert_eq!(pool.seccomp, SeccompProfile::Default);
+        assert!(
+            pool.warnings
+                .iter()
+                .any(|w| w.contains("pool default `strict`")),
+            "{:?}",
+            pool.warnings
+        );
+
+        // And `[defaults]` counts as choosing: a project that set the profile
+        // for everything meant it here too, and is told what that means.
+        let s = spec(
+            "[defaults]\nseccomp = \"permissive\"\n\
+             \n[runtime.p]\nimage = \"python:3.12-slim\"\nagent = \"python\"\n",
+        );
+        let pool = s.resolve_runtime("p", &Layer::default(), &opts()).unwrap();
+        assert_eq!(pool.seccomp, SeccompProfile::Permissive);
+        assert!(!pool.warnings.is_empty());
     }
 
     #[test]

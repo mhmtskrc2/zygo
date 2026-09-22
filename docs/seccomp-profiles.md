@@ -9,33 +9,38 @@ Three profiles, chosen per function with `seccomp = "…"` or `--seccomp`:
 | Profile | What it is | Who it is for |
 |---|---|---|
 | `default` | ~190 syscalls: the set five reference packages exercise their real code paths under — numpy's BLAS threads, Pillow's codecs, pandas' file I/O, pydantic's Rust core, requests' TLS setup. `clone` is allowed only with every `CLONE_NEW*` flag clear, so a sandbox cannot make a namespace; `ioctl` is allowed except for `TIOCSTI` and its relatives. `bpf`, `io_uring_*`, `userfaultfd`, `keyctl`, `perf_event_open`, `ptrace`, `mount` and `unshare` are absent. | Everyone (T1, T2) |
-| `strict` | `default` minus the calls that reach the network — `socket`, `connect`, `bind`, `listen`, `accept4` — and minus `ptrace`, `mount`, `umount2`. In the agent's forked child, additionally minus `execve`, `execveat`, `fork`, `vfork` and any `clone` without `CLONE_THREAD` (see [the child filter](#the-child-filter)). | A `network = "none"` function whose author wants the kernel to refuse a socket, not merely the namespace to have nothing behind it |
+| `strict` | `default` minus the calls that reach the network — `socket`, `connect`, `bind`, `listen`, `accept4` — and minus `ptrace`, `mount`, `umount2`. In the agent's forked child, additionally minus `execve`, `execveat`, `fork`, `vfork` and any `clone` without `CLONE_THREAD` (see [the child filter](#the-child-filter)). | A `network = "none"` function whose author wants the kernel to refuse a socket, not merely the namespace to have nothing behind it — and **every runtime pool by default**, because a pool's child runs a script that arrived over an API |
 | `permissive` | `default` plus `clone3`, `ptrace`, `unshare`, `setns`, `mount`, `pivot_root`, `chroot`, `mknod`, `process_vm_readv`/`writev`, `personality` and the rest of Docker's default profile. Those eight are the *only* appendix-B exclusions it grants, and a test asserts the list. | Debugging a package the tighter profiles break, and Zygo's own derived-layer builds, where `dpkg` uses the legacy `chown`/`chmod`/`mknod` calls. **Not a tenant profile.** |
 
 ## The compatibility matrix
 
 `make seccomp-matrix-linux` installs six packages into one venv, inside the
-image, and then imports and exercises each under both profiles — and then does
+image, and then imports and exercises each under every profile — and then does
 the same for Node, in a second container, because a matrix built entirely out
 of CPython says nothing about a runtime that reaches the kernel differently.
 Every cell is an attempt: the package is made to do the thing people use it
 for, and the cell is what the sandbox returned.
 
-| package | `default` | `strict` |
-|---|---|---|
-| requests 2.32.3 | works | works — the socket is refused with `EPERM`, which `requests` reports as its own `ConnectionError`; nothing hangs |
-| httpx 0.27.2 | works | works — refused at client construction rather than at send, and reported as its own error |
-| pydantic 2.9.2 | works | works |
-| numpy 2.1.3 | works | works |
-| pandas 2.2.3 | works | works |
-| Pillow 11.0.0 | works | works |
-| sqlite3 (stdlib) | works | works — on disk, so `fcntl` locking, `fsync` and `ftruncate` are all exercised |
+The third column is the same code again as a **script in a runtime pool**: one
+warm zygote holding no tenant code, the script written into the sandbox per
+request, and `strict` as the pool's default rather than something the caller
+asked for.
 
-| Node | `default` | `strict` |
-|---|---|---|
-| `worker_threads` | works | works — a thread is a `clone` **with** `CLONE_THREAD`, which the child filter permits |
-| `crypto` + `zlib` + `fs` | works | works |
-| `child_process` | works | refused, which is the point of the profile |
+| package | `default` | `strict` | pool (`strict`) |
+|---|---|---|---|
+| requests 2.32.3 | works | works — the socket is refused with `EPERM`, which `requests` reports as its own `ConnectionError`; nothing hangs | works |
+| httpx 0.27.2 | works | works — refused at client construction rather than at send, and reported as its own error | works |
+| pydantic 2.9.2 | works | works | works |
+| numpy 2.1.3 | works | works | works |
+| pandas 2.2.3 | works | works | works |
+| Pillow 11.0.0 | works | works | works |
+| sqlite3 (stdlib) | works | works — on disk, so `fcntl` locking, `fsync` and `ftruncate` are all exercised | works |
+
+| Node | `default` | `strict` | pool (`strict`) |
+|---|---|---|---|
+| `worker_threads` | works | works — a thread is a `clone` **with** `CLONE_THREAD`, which the child filter permits | works |
+| `crypto` + `zlib` + `fs` | works | works | works |
+| `child_process` | works | refused, which is the point of the profile | refused |
 
 Measured on Linux 5.10 (aarch64, Docker Desktop). "Works" means the handler
 returned `{"ok": true}` from a real operation — a validation error caught, a
@@ -122,6 +127,26 @@ which is the protocol's other conforming answer. `zygo agent test` checks all
 of this rather than trusting it: it starts a second copy of the agent with
 `ZYGO_CHILD_SECCOMP` set, asks the handler to start a program, and fails an
 agent that runs the request anyway.
+
+### `strict` is the default for a runtime pool
+
+A `[fn.<name>]` gets `default` unless its author says otherwise, and a
+`[runtime.<name>]` gets **`strict`**. The difference is who the child is. A
+function's child runs code the function's own author deployed, and `default`
+is the profile that author chose by not choosing; a pool's child runs a script
+that arrived over an API from somebody who may never have met the operator.
+
+A pool may name a lower profile — an operator may know their tenants — and
+resolution then emits a warning saying what that allows. The pool column of
+the matrix above is the same packages run as *scripts* in a pool, so the
+default is measured rather than asserted.
+
+The filter goes on **before the script's first line**, not merely before the
+handler is called: a script's module body is request code, and an agent that
+loaded it first would give a `strict` pool nothing. `zygo agent test
+--script-spawn <file>` is the check — a script whose module body starts a
+program, run once unfiltered to prove it can and once under the filter to
+prove it cannot.
 
 The Rust and Python suites, `make verify-supervisor-linux` (a `subprocess.run`
 under `default` and then under `strict`, and a thread under `strict`) and

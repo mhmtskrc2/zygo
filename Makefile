@@ -84,11 +84,13 @@ check:
 # and `make conformance-node` runs it in a container instead.
 conformance: build
 	./target/release/zygo agent test python3 \
-		--script examples/agents/conformance/script.py -- \
+		--script examples/agents/conformance/script.py \
+		--script-spawn examples/agents/conformance/spawn.py -- \
 		agents/python/zygo_agent.py --fd 3 examples/agents/conformance/handler.py
 	@command -v node >/dev/null && \
 		./target/release/zygo agent test node \
-			--script examples/agents/conformance/script.js -- \
+			--script examples/agents/conformance/script.js \
+			--script-spawn examples/agents/conformance/spawn.js -- \
 			agents/node/zygo_agent.js examples/agents/conformance/handler.js \
 		|| echo "no node on this host - 'make conformance-node' runs it in a container"
 	./target/release/zygo agent test /bin/sh -- examples/agents/sh/agent.sh \
@@ -99,7 +101,8 @@ conformance: build
 conformance-node: poc/zygo-linux-musl
 	docker run --rm -v "$(PWD):/src:ro" node:22-slim \
 		/src/poc/zygo-linux-musl agent test node \
-		--script /src/examples/agents/conformance/script.js -- \
+		--script /src/examples/agents/conformance/script.js \
+		--script-spawn /src/examples/agents/conformance/spawn.js -- \
 		/src/agents/node/zygo_agent.js /src/examples/agents/conformance/handler.js
 
 # The same Node agent with the *kernel* filter rather than Node's permission
@@ -111,7 +114,8 @@ conformance-node-seccomp: poc/zygo-linux-musl
 			/src/agents/node/zygo_child_seccomp.c && \
 		ZYGO_CHILD_SECCOMP_HELPER=/tmp/zygo_child_seccomp.so \
 		/src/poc/zygo-linux-musl agent test node \
-		--script /src/examples/agents/conformance/script.js -- \
+		--script /src/examples/agents/conformance/script.js \
+		--script-spawn /src/examples/agents/conformance/spawn.js -- \
 		/src/agents/node/zygo_agent.js /src/examples/agents/conformance/handler.js'
 
 # The static binary the cross-image checks need. `make dist-linux` checks the

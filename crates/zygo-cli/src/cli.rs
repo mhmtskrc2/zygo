@@ -332,6 +332,20 @@ pub enum AgentCommand {
         #[arg(long, value_name = "FILE")]
         script: Option<PathBuf>,
 
+        /// A script whose **module body starts a program**, in the agent's own
+        /// language.
+        ///
+        /// Checks *when* the child filter goes on. Under `strict` a script's
+        /// import-time code must already be filtered, because a module body is
+        /// request code like any other — an agent that loads the script first
+        /// and tightens afterwards passes every other check here and gives a
+        /// `strict` pool nothing.
+        ///
+        /// `examples/agents/conformance/spawn.py` and `spawn.js` are the two
+        /// that ship. Without it the check is skipped and says so.
+        #[arg(long, value_name = "FILE")]
+        script_spawn: Option<PathBuf>,
+
         /// Arguments for the agent, after `--`.
         #[arg(last = true)]
         args: Vec<String>,

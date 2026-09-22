@@ -134,8 +134,15 @@ fn run(cli: &Cli) -> anyhow::Result<u8> {
         Command::Agent(crate::cli::AgentCommand::Test {
             binary,
             script,
+            script_spawn,
             args,
-        }) => cmd::agent::test(cli, binary, script.as_deref(), args),
+        }) => cmd::agent::test(
+            cli,
+            binary,
+            script.as_deref(),
+            script_spawn.as_deref(),
+            args,
+        ),
         Command::Shell { name, command } => cmd::shell::run(cli, name, command),
     }
 }

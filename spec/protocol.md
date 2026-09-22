@@ -137,9 +137,20 @@ self-consistency, so that there is one rule rather than two.
 that imported a tenant's script would hold that tenant's code, and a pool is
 shared, so the next request could be somebody else's. The whole value of a
 pool is that the warm process is anonymous — an interpreter and its
-dependencies, and nothing of anybody's. Under `strict`, load it *after*
-installing `ZYGO_CHILD_SECCOMP` too, so a script that tries to start a program
-is refused by the kernel while it is loading rather than after.
+dependencies, and nothing of anybody's.
+
+**And after `ZYGO_CHILD_SECCOMP`** (§3.7), which is not a detail of ordering
+but the difference between a `strict` pool and a decorative one. A script's
+module body is request code: it runs before any handler is called, and it can
+start a program unless something has already stopped it. An agent that loads
+the script and installs the filter afterwards passes every other rule here.
+`zygo agent test --script-spawn <file>` is the check — a script whose module
+body starts a program, run once unfiltered to prove it can and once under the
+filter to prove it cannot.
+
+What a script prints *while it loads* belongs to the request that sent it, so
+it goes in the `stdout` of that request's `RESULT` rather than to the agent's
+own output.
 
 The cost is that the load is paid per request instead of once. That is the
 trade, and it is why `entry` still exists: warm a hot function with its

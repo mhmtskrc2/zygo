@@ -753,7 +753,11 @@ function main(argv) {
   let fd = AGENT_FD;
   let rest = argv;
   if (argv[0] === '--fd') {
-    if (argv.length < 3) return usage();
+    // Two arguments is the whole of it — `--fd 3` — because a handler is
+    // optional: without one this is a runtime pool. Demanding three here is
+    // what made a pool zygote print its usage and exit, which the supervisor
+    // saw as "expected READY, got end of stream".
+    if (argv.length < 2) return usage();
     fd = Number(argv[1]);
     rest = argv.slice(2);
   }

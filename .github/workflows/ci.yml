@@ -96,7 +96,8 @@ jobs:
             exit 0
           fi
           ./target/release/zygo agent test node \
-            --script examples/agents/conformance/script.js -- \
+            --script examples/agents/conformance/script.js \
+            --script-spawn examples/agents/conformance/spawn.js -- \
             agents/node/zygo_agent.js examples/agents/conformance/handler.js
 
       # The macOS shim, end to end against a real Linux VM. It will skip here

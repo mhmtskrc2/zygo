@@ -394,6 +394,7 @@ pub fn test(
     cli: &Cli,
     binary: &Path,
     script: Option<&Path>,
+    spawning: Option<&Path>,
     args: &[String],
 ) -> anyhow::Result<u8> {
     let mut report = Report::new(cli.json);
@@ -497,7 +498,14 @@ pub fn test(
         child_seccomp_check(&mut agent, binary, args)
     );
 
-    // 11. Shutdown. Last, because it ends the agent.
+    // 11. And it is installed before the *script* runs, not merely before the
+    // handler is called. A script's module body is request code.
+    step_or_skip!(
+        "the child filter is installed before the script's first line (proto 1.1)",
+        script_before_filter_check(&mut agent, binary, args, spawning)
+    );
+
+    // 12. Shutdown. Last, because it ends the agent.
     step!("SHUTDOWN makes the agent exit", shutdown_check(&mut agent));
 
     finish(cli, report)
@@ -1049,6 +1057,89 @@ fn child_seccomp_check(
     }
 }
 
+/// The filter is installed *before the script's first line*, not merely before
+/// the handler is called.
+///
+/// The difference is the whole of protocol 1.1's safety. A script's module
+/// body is request code: it runs with the tenant's input reachable, it can
+/// start a program, and under `strict` it must not be able to. An agent that
+/// loaded the script and installed the filter afterwards would pass every
+/// other check in this suite and give a `strict` pool nothing.
+///
+/// Asked with a script whose *module body* starts a program, which is why it
+/// is a separate file and a separate flag: the suite cannot write one in an
+/// agent's language, for the same reason `--script` exists.
+fn script_before_filter_check(
+    warm: &mut Agent,
+    binary: &Path,
+    args: &[String],
+    spawning: Option<&Path>,
+) -> anyhow::Result<Outcome> {
+    let Some(filter) = strict_child_filter() else {
+        return Ok(Outcome::Skipped(
+            "not asked: seccomp is a Linux facility, and this is not Linux".into(),
+        ));
+    };
+    let Some(spawning) = spawning else {
+        return Ok(Outcome::Skipped(
+            "not asked: pass --script-spawn <file> — a script whose module body starts \
+             a program — to check when the child filter is installed"
+                .into(),
+        ));
+    };
+    let source = std::fs::read_to_string(spawning)
+        .with_context(|| format!("could not read {}", spawning.display()))?;
+    let script = zygo_core::protocol::Script::inline(source);
+
+    // The control, on the warm agent, which has no filter: a script that
+    // cannot start a program here would make the refusal below meaningless.
+    let control = one_script_request(warm, "c-spawn-script", script.clone())?;
+    if !spawned(&control) {
+        return Ok(Outcome::Skipped(format!(
+            "not asked: the script did not start a program even without a filter, \
+             so a refusal would prove nothing ({})",
+            summarise(&control)
+        )));
+    }
+
+    let mut tightened = Agent::start_with_env(
+        binary,
+        args,
+        &[(zygo_core::protocol::CHILD_SECCOMP_ENV, filter)],
+    )?;
+    match tightened.recv()? {
+        Message::Ready { .. } => {}
+        Message::Error { code, message, .. } => {
+            return Ok(Outcome::Pass(format!(
+                "refused to start under the filter ({code:?}: {})",
+                first_line(&message)
+            )));
+        }
+        other => anyhow::bail!("expected READY, got {}", other.kind()),
+    }
+
+    match one_script_request(&mut tightened, "c-spawn-filtered", script) {
+        Ok(done) => {
+            anyhow::ensure!(
+                !spawned(&done),
+                "the script started a program from its module body with {} set: the \
+                 filter goes on after the script loads, so a `strict` pool does not \
+                 restrict the script's own import-time code (spec/protocol.md §2)",
+                zygo_core::protocol::CHILD_SECCOMP_ENV
+            );
+            Ok(Outcome::Pass(format!(
+                "the script could not start a program while loading ({})",
+                summarise(&done)
+            )))
+        }
+        Err(e) if e.to_string().contains("the agent reported") => Ok(Outcome::Pass(format!(
+            "the request was refused rather than loaded unfiltered ({})",
+            first_line(&e.to_string())
+        ))),
+        Err(e) => Err(e),
+    }
+}
+
 /// Whether the handler's program ran, as seen from outside.
 fn spawned(done: &Message) -> bool {
     match done {
@@ -1110,9 +1201,29 @@ fn shutdown_check(agent: &mut Agent) -> anyhow::Result<String> {
     }
 }
 
+/// The same cycle, for a request that carries its own script.
+fn one_script_request(
+    agent: &mut Agent,
+    id: &str,
+    script: zygo_core::protocol::Script,
+) -> anyhow::Result<Message> {
+    agent.send(&Message::Exec {
+        id: id.to_string(),
+        event: serde_json::json!({ "spawn": SPAWN_MARK }),
+        timeout_ms: 30_000,
+        env_overrides: Default::default(),
+        script: Some(script),
+    })?;
+    await_done(agent, id)
+}
+
 /// `EXEC` → `FORKED` → `GO` → `DONE`, the whole cycle for one request.
 fn one_request(agent: &mut Agent, id: &str, event: serde_json::Value) -> anyhow::Result<Message> {
     agent.send(&exec(id, event))?;
+    await_done(agent, id)
+}
+
+fn await_done(agent: &mut Agent, id: &str) -> anyhow::Result<Message> {
     loop {
         match agent.recv()? {
             Message::Forked { id: forked, .. } if forked == id => {

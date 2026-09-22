@@ -395,9 +395,16 @@ def run_request(
         # The script, if the supervisor sent one. After the filter on purpose:
         # under `strict` a script that tries to start a program is refused by
         # the kernel while it is loading, not after.
+        #
+        # Captured, because a module body is request code: what a script
+        # prints while it loads belongs to the request that sent it, not to
+        # the zygote's own log where the next tenant's `zygo logs` would find
+        # it. The same ring the handler writes into, so the two arrive in
+        # order.
         script = request.get("script")
         if script:
-            handler = load_request_script(script)
+            with _captured(out, err):
+                handler = load_request_script(script)
         elif handler is None:
             raise ScriptError(
                 "this agent was started without a handler, so every request must "
