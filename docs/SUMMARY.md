@@ -34,3 +34,4 @@ without mdBook.
 - [ADR 0001 — The embedded runtime](adr/0001-embedded-runtime.md)
 - [ADR 0002 — Warm paths stay on `ns`](adr/0002-warm-paths-stay-on-ns.md)
 - [ADR 0003 — No Deno or Bun agent](adr/0003-no-deno-or-bun-agent.md)
+- [ADR 0004 — A supervisor upgrade re-warms](adr/0004-no-supervisor-reexec.md)

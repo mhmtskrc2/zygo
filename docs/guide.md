@@ -531,6 +531,24 @@ zygo logs resize --failed -n 20
 separate and labelled, and refuses to report a 99th percentile under a hundred
 samples rather than inventing one.
 
+### Upgrading it
+
+Drain, exit, start, re-warm — there is no way to keep a warm pool across a new
+binary, and [ADR 0004](adr/0004-no-supervisor-reexec.md) is the investigation
+that says why not.
+
+```bash
+curl -X POST -H "Authorization: Bearer $ZYGO_API_TOKEN" \
+    "http://127.0.0.1:7700/drain?grace_ms=60000"
+```
+
+That stops admitting, finishes what is running and exits, answering with the
+number still in flight — `in_flight: 0` is a clean drain and anything else is
+the grace running out. What it costs is about half a second of warm-up per
+zygote afterwards; what it does not cost is a dropped request, as long as
+something else is ready to take them. Two replicas and `min_warm` are what
+make that true.
+
 ### Inside a container
 
 Zygo builds sandboxes, so a container it runs in has to let it. It needs no

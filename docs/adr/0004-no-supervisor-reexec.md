@@ -1,0 +1,88 @@
+# ADR 0004 — A supervisor upgrade re-warms; there is no `--reexec`
+
+**Status:** accepted, 2026-09-23. Records the time-boxed investigation in
+[`script_runtime.md`](../../script_runtime.md) §4.4.
+
+## Context
+
+Upgrading Zygo replaces the supervisor process, and its warm sandboxes go with
+it. The question was whether the new binary could `exec` over the old one and
+keep them — passing the zygotes' descriptors and pids across — so that an
+upgrade cost nothing.
+
+`exec` is the right primitive to ask about: it keeps the pid, so the sandbox
+init processes stay children of the same process and their
+`PR_SET_PDEATHSIG` still points at it. Nothing dies merely because the binary
+changed.
+
+What would have to cross the boundary, though, is not the pids. It is:
+
+* **Every descriptor, deliberately.** Each warm function holds an agent
+  socket; each sandbox holds seven namespace descriptors, a `/run/secrets`
+  directory descriptor and a cgroup directory descriptor. All of them are
+  `CLOEXEC`, on purpose and in one case after a bug (B-03: thirteen
+  descriptors renumbered with `dup2`, which clears the flag, were inherited
+  by every tenant program). A hand-over means enumerating exactly which to
+  un-flag, which inverts the property the launcher leans on — "everything
+  closes unless something says otherwise" becomes "everything closes unless
+  this list says otherwise", and the list is per function, per sandbox, per
+  release.
+* **The state that is not in a descriptor.** The resolved spec of every
+  function and pool, each one's counters, logs, secrets and script leases, the
+  gate's in-flight and queued counts, the idle tiering's clocks. Serialisable,
+  but a second representation of the supervisor's whole state, versioned
+  across releases, and wrong in a way nothing would notice until a limit was
+  not applied.
+* **The requests in flight, and their callers.** This is the part that does
+  not reduce. A request's answer is owed to a *control connection* — another
+  descriptor — and the mapping from request id to that connection lives in a
+  reply-router thread that `exec` destroys. Keeping them means handing over
+  the client sockets too, plus each request's cgroup, child pid and deadline,
+  and rebuilding the router around replies that may already be sitting in a
+  socket buffer. Anything short of that drops requests, which is the one thing
+  the feature exists to avoid.
+
+Against that, what a restart actually costs:
+
+* A pool re-warms at about **500 ms per zygote** (`python:3.12-slim`, measured
+  in `poc/api_driver.py`: "a runtime pool is warm (1 zygote, 502 ms)"; a
+  function, 508 ms). A Node zygote announces `READY` in 15–43 ms.
+* `min_warm` bounds the window: the replacement warms before it serves.
+* `POST /drain` means the old process stops admitting, finishes what it is
+  running and exits — so no request is dropped by the restart itself. The
+  Kubernetes example rolls with `maxUnavailable: 0`, which means the new pod
+  is ready before the old one is asked to leave.
+
+So the cost of a restart is not dropped requests. It is half a second of
+warm-up per zygote, on a schedule the operator chooses, with a drain in front
+of it.
+
+## Decision
+
+No `zygo api --reexec`. A supervisor upgrade is a restart: drain, exit, start,
+re-warm. `min_warm` and `maxUnavailable: 0` are what make it invisible to a
+caller, and both already exist.
+
+## Consequences
+
+* An upgrade costs `min_warm × warm-up` of cold pool per replica, once, while
+  the replacement comes up behind a drain.
+* A single-replica deployment has a window where the pool is cold and requests
+  are slow rather than failed. Two replicas remove it; the example uses two.
+* The descriptors stay `CLOEXEC` with no exceptions, which is the property
+  every "did this leak into the tenant's program?" argument rests on.
+* Zygo has one representation of its own state — the running one. There is no
+  serialised form to keep in step with it.
+
+## Reopening it
+
+* **A warm-up measured in tens of seconds**, not half of one. A pool whose
+  dependency set takes thirty seconds to import changes the arithmetic, and
+  the fix might still be to make *that* faster rather than to keep the
+  process.
+* **A deployment that cannot have two replicas** — a single machine with a
+  single pool and a latency budget that a cold start breaks. That is a real
+  shape, and `--reexec` is one answer to it; another is a second supervisor on
+  the same host and a load balancer, which needs nothing new.
+* Note what does **not** reopen it: wanting upgrades to be free. They are
+  already free of dropped requests, which is the part that matters.
