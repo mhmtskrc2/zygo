@@ -382,10 +382,15 @@ mod probe {
     use crate::cgroup;
 
     pub fn all(paths: &crate::Paths) -> Vec<Check> {
+        // One probe, two checks: the steps a sandbox takes first are a
+        // sequence, and running them twice would mean forking twice to ask
+        // the same question.
+        let probe = try_a_sandbox_primitive();
         vec![
             kernel(),
             kernel_age_check(),
-            user_namespaces(),
+            user_namespaces(&probe),
+            procfs(&probe),
             cgroup_v2(),
             overlayfs(),
             landlock(),
@@ -517,7 +522,7 @@ mod probe {
         }
     }
 
-    fn user_namespaces() -> Check {
+    fn user_namespaces(probe: &Primitive) -> Check {
         let max =
             read_trimmed("/proc/sys/user/max_user_namespaces").and_then(|s| s.parse::<u64>().ok());
         if max == Some(0) {
@@ -544,22 +549,111 @@ mod probe {
         // Permission denied`, which names none of this.
         //
         // So the map is written, in a child, the way the launcher writes it.
-        match try_a_sandbox_primitive() {
-            Ok(()) => Check::ok("user namespaces", "one can be built and mounted in"),
-            Err(reason) if apparmor_restricts_userns() => Check::failed(
+        match probe {
+            // `ProcMasked` means the namespace itself was fine; `procfs`
+            // reports that one.
+            Primitive::Ok | Primitive::ProcMasked(_) => {
+                Check::ok("user namespaces", "one can be built and mounted in")
+            }
+            Primitive::NoUserns(reason) if apparmor_restricts_userns() => Check::failed(
                 "user namespaces",
-                reason,
+                reason.clone(),
                 "AppArmor is restricting unprivileged user namespaces on this host: \
                  sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 \
                  (or ship an AppArmor profile for the `zygo` binary)",
             ),
-            Err(reason) => Check::failed(
+            Primitive::NoUserns(reason) if in_a_container() => Check::failed(
                 "user namespaces",
-                reason,
+                reason.clone(),
+                "a container runtime's seccomp profile is refusing it: \
+                 docker run --security-opt seccomp=unconfined, or Kubernetes \
+                 `securityContext.seccompProfile: {type: Unconfined}` \
+                 (Docker's default profile denies `unshare(CLONE_NEWUSER)`)",
+            ),
+            Primitive::NoUserns(reason) => Check::failed(
+                "user namespaces",
+                reason.clone(),
                 "an LSM is refusing what a sandbox does first; check `dmesg` for \
                  a denial from AppArmor or SELinux",
             ),
         }
+    }
+
+    /// Whether a fresh `/proc` can be mounted inside the namespace.
+    ///
+    /// The step after the mount tree is made private, and the one a container
+    /// fails. The kernel refuses a new `proc` mount when the one already
+    /// visible is *not fully visible* — masked or read-only sub-mounts over
+    /// `/proc/kcore`, `/proc/acpi` and the rest, which is exactly what every
+    /// container runtime does by default. `mount_too_revealing` in
+    /// `fs/namespace.c` is the rule.
+    ///
+    /// It has its own line because the failure reads as somebody else's bug
+    /// otherwise: the launcher said "mounting /proc failed: Operation not
+    /// permitted → this is a launcher bug, please report it", in a container
+    /// where the launcher was correct and the container was masking `/proc`.
+    fn procfs(probe: &Primitive) -> Check {
+        match probe {
+            Primitive::ProcMasked(reason) => Check::failed(
+                "procfs (fully visible)",
+                format!("{reason}{}", masking_proc()),
+                "a container is masking parts of /proc, and the kernel then refuses a \
+                 fresh `proc` mount inside a user namespace: \
+                 docker run --security-opt systempaths=unconfined, or Kubernetes \
+                 `securityContext.procMount: Unmasked`",
+            ),
+            // Nothing to say when the namespace could not be made at all: the
+            // check above is the one to read, and two failures for one cause
+            // is how a report becomes noise.
+            Primitive::NoUserns(_) => Check::absent(
+                "procfs (fully visible)",
+                "not asked: there was no user namespace to mount it in",
+                "fix the user namespace check above; this one is asked inside one",
+            ),
+            Primitive::Ok => Check::ok("procfs (fully visible)", "a fresh /proc can be mounted"),
+        }
+    }
+
+    /// What is mounted *under* `/proc`, which is what makes it not fully
+    /// visible. Read afterwards, to explain a refusal rather than to predict
+    /// one.
+    fn masking_proc() -> String {
+        let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") else {
+            return String::new();
+        };
+        let masked: Vec<&str> = mountinfo
+            .lines()
+            .filter_map(|line| line.split(' ').nth(4))
+            .filter(|point| point.starts_with("/proc/"))
+            .collect();
+        match masked.len() {
+            0 => String::new(),
+            n => format!(
+                " ({} masked: {}{})",
+                n,
+                masked[..masked.len().min(3)].join(", "),
+                if n > 3 { ", …" } else { "" }
+            ),
+        }
+    }
+
+    /// A rough "is this a container", used only to choose which remedy to
+    /// print. Wrong here costs a less useful sentence, not a wrong verdict.
+    fn in_a_container() -> bool {
+        Path::new("/.dockerenv").exists()
+            || std::env::var_os("KUBERNETES_SERVICE_HOST").is_some()
+            || std::fs::read_to_string("/proc/1/cgroup")
+                .is_ok_and(|c| c.contains("/docker/") || c.contains("/kubepods"))
+    }
+
+    /// How far the steps a sandbox takes first got.
+    enum Primitive {
+        Ok,
+        /// The namespace could not be made, or its id map or first mount was
+        /// refused.
+        NoUserns(String),
+        /// The namespace is fine and a fresh `/proc` cannot be mounted in it.
+        ProcMasked(String),
     }
 
     /// Whether Ubuntu's AppArmor restriction on unprivileged user namespaces
@@ -585,32 +679,41 @@ mod probe {
     ///
     /// A child, because `unshare` here would change the namespace `zygo
     /// doctor` itself runs in. It is killed and reaped before this returns.
-    fn try_a_sandbox_primitive() -> std::result::Result<(), String> {
+    fn try_a_sandbox_primitive() -> Primitive {
         use std::ffi::{c_int, c_void};
 
-        let pipe = || -> std::result::Result<(c_int, c_int), String> {
+        let pipe = || -> Option<(c_int, c_int)> {
             let mut fds = [0 as c_int; 2];
             // SAFETY: `pipe` writes two descriptors into the array and
             // returns non-zero on failure.
-            if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-                return Err("could not make a pipe".into());
-            }
-            Ok((fds[0], fds[1]))
+            (unsafe { libc::pipe(fds.as_mut_ptr()) } == 0).then(|| (fds[0], fds[1]))
         };
-        let (up_read, up_write) = pipe()?;
-        let (down_read, down_write) = pipe()?;
+        let (Some((up_read, up_write)), Some((down_read, down_write))) = (pipe(), pipe()) else {
+            return Primitive::NoUserns("could not make a pipe".into());
+        };
 
         // SAFETY: the child allocates nothing and takes no lock; every call
         // below is async-signal-safe.
         let pid = unsafe { libc::fork() };
         if pid < 0 {
-            return Err("could not fork".into());
+            return Primitive::NoUserns("could not fork".into());
         }
         if pid == 0 {
             unsafe {
                 libc::close(up_read);
                 libc::close(down_write);
-                let made = libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) == 0;
+                // `CLONE_NEWPID` as well as the other two, because of the
+                // step below: `procfs` refuses to mount unless the pid
+                // namespace it would show is owned by the user namespace
+                // doing the mounting. Without this the probe reported every
+                // host as masking `/proc`, including hosts where a sandbox
+                // starts perfectly — the launcher's own comment says the same
+                // thing ("mounting a fresh /proc requires being *in* the new
+                // pid namespace"), and the probe has to copy it to mean
+                // anything.
+                let made =
+                    libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWPID)
+                        == 0;
                 let byte = [u8::from(made)];
                 libc::write(up_write, byte.as_ptr() as *const c_void, 1);
                 if !made {
@@ -622,6 +725,20 @@ mod probe {
                 if libc::read(down_read, go.as_mut_ptr() as *mut c_void, 1) != 1 || go[0] == 0 {
                     libc::_exit(0);
                 }
+                // A pid namespace takes effect for *children*, so the rest
+                // of this happens one fork further down — exactly as the
+                // launcher does it.
+                let grandchild = libc::fork();
+                if grandchild < 0 {
+                    let answer = [b'n'];
+                    libc::write(up_write, answer.as_ptr() as *const c_void, 1);
+                    libc::_exit(0);
+                }
+                if grandchild > 0 {
+                    let mut status = 0;
+                    libc::waitpid(grandchild, &mut status, 0);
+                    libc::_exit(0);
+                }
                 let ok = libc::mount(
                     c"none".as_ptr(),
                     c"/".as_ptr(),
@@ -629,7 +746,23 @@ mod probe {
                     libc::MS_REC | libc::MS_PRIVATE,
                     std::ptr::null(),
                 ) == 0;
-                let answer = [if ok { b'y' } else { b'n' }];
+                if !ok {
+                    let answer = [b'n'];
+                    libc::write(up_write, answer.as_ptr() as *const c_void, 1);
+                    libc::_exit(0);
+                }
+                // And the mount every sandbox needs next. Only inside this
+                // throwaway namespace, whose tree is now private, so nothing
+                // outside it sees a thing. A container that masks parts of
+                // `/proc` makes the kernel refuse this — see `procfs`.
+                let proc_ok = libc::mount(
+                    c"proc".as_ptr(),
+                    c"/proc".as_ptr(),
+                    c"proc".as_ptr(),
+                    0,
+                    std::ptr::null(),
+                ) == 0;
+                let answer = [if proc_ok { b'y' } else { b'p' }];
                 libc::write(up_write, answer.as_ptr() as *const c_void, 1);
                 libc::_exit(0);
             }
@@ -645,7 +778,7 @@ mod probe {
             let mut status = 0;
             libc::waitpid(pid, &mut status, 0);
         };
-        let finish = |result: std::result::Result<(), String>| {
+        let finish = |result: Primitive| {
             reap();
             close_all();
             result
@@ -658,8 +791,16 @@ mod probe {
         };
 
         match read_one(up_read) {
-            Some(0) => return finish(Err("unshare(CLONE_NEWUSER) was refused".into())),
-            None => return finish(Err("the child said nothing".into())),
+            Some(0) => {
+                return finish(Primitive::NoUserns(
+                    // All three, because that is what was asked for: a
+                    // profile that allows the user namespace and refuses the
+                    // pid namespace lands here too, and naming only the first
+                    // would send the reader after the wrong one.
+                    "unshare(CLONE_NEWUSER|CLONE_NEWNS|CLONE_NEWPID) was refused".into(),
+                ));
+            }
+            None => return finish(Primitive::NoUserns("the child said nothing".into())),
             Some(_) => {}
         }
 
@@ -671,15 +812,20 @@ mod probe {
         // SAFETY: one byte out of a local array.
         unsafe { libc::write(down_write, go.as_ptr() as *const c_void, 1) };
         if let Err(e) = wrote {
-            return finish(Err(format!("the id map was refused ({e})")));
+            return finish(Primitive::NoUserns(format!("the id map was refused ({e})")));
         }
 
         match read_one(up_read) {
-            Some(b'y') => finish(Ok(())),
-            Some(_) => finish(Err(
+            Some(b'y') => finish(Primitive::Ok),
+            Some(b'p') => finish(Primitive::ProcMasked(
+                "mounting a fresh /proc inside the namespace was refused".into(),
+            )),
+            Some(_) => finish(Primitive::NoUserns(
                 "the mount tree could not be made private inside the namespace".into(),
             )),
-            None => finish(Err("the child died before it could mount".into())),
+            None => finish(Primitive::NoUserns(
+                "the child died before it could mount".into(),
+            )),
         }
     }
 

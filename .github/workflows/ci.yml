@@ -363,6 +363,107 @@ jobs:
           name: zygo-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/zygo
 
+  # Zygo inside a container that is **not** privileged, which is how anybody
+  # deploying it will run it. The whole job is the flag list: three things, no
+  # `--privileged` and no added capabilities, measured rather than guessed.
+  #
+  #   seccomp=unconfined     Docker's default profile refuses
+  #                          `unshare(CLONE_NEWUSER)`, which is what a sandbox
+  #                          does first.
+  #   systempaths=unconfined a masked `/proc` is not "fully visible", and the
+  #                          kernel then refuses a fresh `proc` mount inside a
+  #                          user namespace (`mount_too_revealing`). Without
+  #                          this every sandbox dies on "mounting /proc
+  #                          failed: Operation not permitted".
+  #   a writable cgroup      the container's own subtree, and only that. The
+  #                          usual `-v /sys/fs/cgroup:rw` hands over the
+  #                          *host's* whole hierarchy, which is worse than the
+  #                          privilege it avoids.
+  #
+  # `docs/guide.md` carries the same list, and `examples/kubernetes/` the same
+  # thing as a `securityContext`.
+  unprivileged-container:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    name: unprivileged container
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Let unprivileged user namespaces mount
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
+      - run: cargo build --release
+      - run: install -m 0755 target/release/zygo poc/zygo-linux-musl
+
+      # A cgroup for the container, and nothing above it. `cgroup-parent` puts
+      # the container's own cgroup underneath, and the bind makes exactly that
+      # subtree writable inside.
+      - name: A delegated cgroup subtree for the container
+        run: |
+          sudo mkdir -p /sys/fs/cgroup/zygo-unpriv
+          for c in memory pids cpu; do
+            echo "+$c" | sudo tee /sys/fs/cgroup/cgroup.subtree_control >/dev/null \
+              || echo "::warning::this kernel will not delegate $c from the root"
+          done
+          cat /sys/fs/cgroup/zygo-unpriv/cgroup.controllers
+
+      - name: What the container can do
+        run: |
+          docker run --rm \
+            --security-opt seccomp=unconfined \
+            --security-opt systempaths=unconfined \
+            --cgroupns=host --cgroup-parent=/zygo-unpriv \
+            -v /sys/fs/cgroup/zygo-unpriv:/sys/fs/cgroup/zygo-unpriv:rw \
+            -v "$PWD:/src:ro" -e ZYGO_DATA_HOME=/tmp/zdata \
+            python:3.12-slim /src/poc/zygo-linux-musl doctor
+
+      - name: Supervisor lifecycle, unprivileged
+        run: |
+          docker run --rm \
+            --security-opt seccomp=unconfined \
+            --security-opt systempaths=unconfined \
+            --cgroupns=host --cgroup-parent=/zygo-unpriv \
+            -v /sys/fs/cgroup/zygo-unpriv:/sys/fs/cgroup/zygo-unpriv:rw \
+            -v "$PWD:/src:ro" -e ZYGO_DATA_HOME=/tmp/zdata-sup \
+            python:3.12-slim sh /src/poc/verify_supervisor.sh
+
+      - name: The HTTP API, unprivileged
+        # Run even when the suite above failed: they test different things,
+        # and one job that reports both is one round trip instead of two.
+        if: ${{ !cancelled() }}
+        run: |
+          docker run --rm \
+            --security-opt seccomp=unconfined \
+            --security-opt systempaths=unconfined \
+            --cgroupns=host --cgroup-parent=/zygo-unpriv \
+            -v /sys/fs/cgroup/zygo-unpriv:/sys/fs/cgroup/zygo-unpriv:rw \
+            -v "$PWD:/src:ro" -e ZYGO_DATA_HOME=/tmp/zdata-api \
+            python:3.12-slim sh /src/poc/verify_api.sh
+
+      # The negative half: without the two `--security-opt`s, `zygo doctor`
+      # has to *say so* rather than a sandbox dying four steps later with a
+      # message about somebody else's bug. This is the check that keeps those
+      # two lines of the report honest.
+      - name: And a plain container is told why it cannot
+        if: ${{ !cancelled() }}
+        run: |
+          out=$(docker run --rm -v "$PWD:/src:ro" -e ZYGO_DATA_HOME=/tmp/zd \
+            python:3.12-slim /src/poc/zygo-linux-musl doctor 2>&1 || true)
+          printf '%s\n' "$out"
+          echo "$out" | grep -q "seccomp=unconfined" \
+            || { echo "::error::doctor did not name the seccomp profile"; exit 1; }
+          out=$(docker run --rm --security-opt seccomp=unconfined \
+            -v "$PWD:/src:ro" -e ZYGO_DATA_HOME=/tmp/zd \
+            python:3.12-slim /src/poc/zygo-linux-musl doctor 2>&1 || true)
+          printf '%s\n' "$out"
+          echo "$out" | grep -q "systempaths=unconfined" \
+            || { echo "::error::doctor did not name the masked /proc"; exit 1; }
+
   # The seccomp syscall numbers are generated from each architecture's headers.
   # A profile that gained a syscall without regenerating them would silently
   # drop it from the filter, so the committed tables are checked against a

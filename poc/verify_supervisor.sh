@@ -1016,7 +1016,13 @@ if ! command -v pasta >/dev/null 2>&1 || ! command -v nft >/dev/null 2>&1 ||
     say "  SKIP  egress needs pasta, nft and tc, and they are not installed here"
     say "        → sudo apt install passt nftables iproute2 (this script only"
     say "          installs them when it is root, as it is inside the container)"
-elif ! : <>/dev/net/tun 2>/dev/null; then
+elif ! ( : <>/dev/net/tun ) 2>/dev/null; then
+    # In a **subshell**, and that is not style. `:` is a special built-in, so
+    # POSIX says a redirection error on it ends the shell — and where
+    # `/dev/net` does not exist at all (any container started without
+    # `--device /dev/net/tun`), this prerequisite check killed the suite it
+    # was protecting, one line below the comment about not letting a missing
+    # package become twenty failures.
     say "  SKIP  egress needs /dev/net/tun, and this user cannot open it here"
     say "        → the device is missing or unreadable; on a host that means"
     say "          loading the tun module, on a container passing --device"

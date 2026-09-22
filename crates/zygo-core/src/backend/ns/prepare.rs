@@ -143,9 +143,19 @@ impl Step {
                 "overlayfs inside a user namespace needs Linux 5.11+; \
                  run `zygo doctor` — the store can fall back to a flattened rootfs",
             ),
+            // Almost always a container masking parts of `/proc`: the
+            // kernel refuses a new `proc` mount when the one already visible
+            // is not *fully visible*, and every container runtime mounts
+            // something over `/proc/kcore` and friends by default. The
+            // message used to say "this is a launcher bug, please report it",
+            // which sent everybody who ran Zygo in a container after the
+            // wrong thing. `zygo doctor` has a line for it now.
             (MountProc, libc::EPERM) => Some(
-                "mounting a fresh /proc requires being *in* the new pid namespace; \
-                 this is a launcher bug, please report it",
+                "a container is probably masking parts of /proc, and the kernel then \
+                 refuses a fresh `proc` mount inside a user namespace: \
+                 docker run --security-opt systempaths=unconfined, or Kubernetes \
+                 `securityContext.procMount: Unmasked`. Run `zygo doctor`, which \
+                 checks this directly",
             ),
             (Execve, libc::ENOENT) => Some(
                 "the program does not exist inside the image — check the command and the image",

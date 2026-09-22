@@ -531,6 +531,44 @@ zygo logs resize --failed -n 20
 separate and labelled, and refuses to report a 99th percentile under a hundred
 samples rather than inventing one.
 
+### Inside a container
+
+Zygo builds sandboxes, so a container it runs in has to let it. It needs no
+privileges and no capabilities, and **`--privileged` is not the answer** — it
+needs exactly three things, and `zygo doctor` names each one when it is
+missing:
+
+```bash
+docker run \
+  --security-opt seccomp=unconfined \
+  --security-opt systempaths=unconfined \
+  --cgroupns=host --cgroup-parent=/zygo \
+  -v /sys/fs/cgroup/zygo:/sys/fs/cgroup/zygo:rw \
+  ghcr.io/…/zygo
+```
+
+* **A seccomp profile that allows `unshare(CLONE_NEWUSER)`.** Docker's default
+  profile denies it, and a sandbox does it first. In Kubernetes that is
+  `securityContext.seccompProfile: {type: Unconfined}`.
+* **An unmasked `/proc`.** Every container runtime mounts something over
+  `/proc/kcore`, `/proc/acpi` and a few others; the kernel then refuses a
+  fresh `proc` mount inside a user namespace, because the one already there is
+  not *fully visible*. Sandboxes die on "mounting /proc failed: Operation not
+  permitted" until this is off. In Kubernetes: `securityContext.procMount:
+  Unmasked`.
+* **A writable cgroup v2 subtree — its own.** Zygo puts every sandbox in a
+  cgroup, and the container's `/sys/fs/cgroup` is read-only by default. The
+  usual advice is to bind `/sys/fs/cgroup` read-write, which hands the
+  container the *host's whole hierarchy*: it can then write to any cgroup on
+  the machine, including other containers'. Give it a subtree of its own
+  instead, as above.
+
+That is a container that can be escaped from no more easily than the host it
+runs on, which is the point: the boundary Zygo enforces is the one it builds
+inside, not the one it runs in. `poc/verify_supervisor.sh` and
+`poc/verify_api.sh` both run in exactly this shape in CI, unprivileged, on
+every change.
+
 ### Debugging a live function
 
 ```bash
