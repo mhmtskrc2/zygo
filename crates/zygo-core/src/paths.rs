@@ -128,6 +128,15 @@ impl Paths {
     pub fn scripts(&self) -> PathBuf {
         self.data.join("scripts")
     }
+    /// Tenants, one JSON file each.
+    ///
+    /// Under `data` rather than `run`, because a tenant outlives the
+    /// supervisor: its functions do not survive a restart — nothing warm does
+    /// — but the fact that the tenant exists, and which scripts belong to it,
+    /// is the embedder's state and losing it would lose their customers.
+    pub fn tenants(&self) -> PathBuf {
+        self.data.join("tenants")
+    }
     pub fn venv_cache(&self) -> PathBuf {
         self.data.join("cache/venvs")
     }

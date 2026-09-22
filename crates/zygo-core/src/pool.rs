@@ -655,7 +655,7 @@ impl Pool {
         }
         let tenant_cgroup = crate::cgroup::Hierarchy::discover()
             .ok()
-            .map(|h| h.tenant(&f.name));
+            .map(|h| h.function(&f.tenant, &f.name));
         let backend = crate::backend::for_isolation(f.isolation, &self.config.paths)?;
 
         match mode {

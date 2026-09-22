@@ -248,8 +248,9 @@ impl Supervisor {
         script: Script,
         event: serde_json::Value,
         timeout: Duration,
+        tenant: Option<&str>,
     ) -> std::result::Result<Response, Response> {
-        let script = self.script_for_request(script)?;
+        let script = self.script_for_request(script, tenant)?;
         let pool = self.runtime_named(name)?;
 
         let permit = match pool.gate.enter(QUEUE_WAIT) {
@@ -317,7 +318,11 @@ impl Supervisor {
     /// also where the store's own check that a file hashes to its name
     /// happens. A `source` is the one-off. A `path` is somebody who has
     /// arranged delivery themselves and is taken at their word.
-    fn script_for_request(&self, mut script: Script) -> std::result::Result<Script, Response> {
+    fn script_for_request(
+        &self,
+        mut script: Script,
+        tenant: Option<&str>,
+    ) -> std::result::Result<Script, Response> {
         if script.is_loadable() {
             return Ok(script);
         }
@@ -329,6 +334,27 @@ impl Supervisor {
         };
         let digest = crate::scripts::ScriptDigest::parse(&digest)
             .map_err(|e| Response::error(ControlError::BadSpec, e))?;
+
+        // A tenant may only name a script it registered. The digest is not a
+        // capability — anybody who has the bytes can compute it — so without
+        // this a tenant who guessed, or who was told, another tenant's digest
+        // could run their code and read whatever it returns.
+        if let Some(tenant) = tenant {
+            let owned = crate::tenants::Tenants::new(&self.paths)
+                .get(tenant)
+                .map_err(|e| Response::error(ControlError::BadSpec, e))?
+                .is_some_and(|t| t.scripts.contains(digest.as_str()));
+            if !owned {
+                // The same answer as a digest nobody registered, deliberately:
+                // telling a tenant that a script exists but is not theirs is
+                // telling them something about another tenant.
+                return Err(Response::error(
+                    ControlError::NotFound,
+                    format!("no script {digest}; register it with `PUT /scripts` first"),
+                ));
+            }
+        }
+
         let store = crate::scripts::ScriptStore::new(&self.paths);
         match store.get(&digest) {
             Ok(Some(source)) => {

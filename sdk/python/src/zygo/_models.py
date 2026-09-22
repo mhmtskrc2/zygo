@@ -113,6 +113,28 @@ class Served:
 
 
 @dataclass(frozen=True)
+class Tenant:
+    """One customer of whoever embedded Zygo.
+
+    ``scripts`` are the digests registered for this tenant. The bytes are
+    shared with any other tenant that registered the same script; the
+    reference is not, and it is what deleting a tenant takes with it.
+    """
+
+    id: str
+    created_ms: int = 0
+    scripts: List[str] = field(default_factory=list)
+
+    @classmethod
+    def parse(cls, raw: Dict[str, Any]) -> "Tenant":
+        return cls(
+            id=str(raw.get("id", "")),
+            created_ms=int(raw.get("created_ms", 0)),
+            scripts=list(raw.get("scripts", [])),
+        )
+
+
+@dataclass(frozen=True)
 class Runtime:
     """One runtime pool: several anonymous zygotes any script can run in.
 

@@ -4,18 +4,27 @@
 //! zygo.slice/                     memory.max = host RAM − reserve
 //! ├── system/                     supervisor, image GC   memory.min = 512M
 //! └── tenants/                    memory.max = tenant budget
-//!     ├── tenant-A/               memory.max, pids.max, cpu.max
-//!     │   └── g4242-1/            one generation of the sandbox
-//!     │       ├── zygote
-//!     │       ├── req-01f3…
-//!     │       └── req-01f4…
-//!     └── tenant-B/
+//!     ├── acme/                   one tenant: a customer of the embedder
+//!     │   ├── resize/             one function or pool  memory.max, pids.max, cpu.max
+//!     │   │   └── g4242-1/        one generation of the sandbox
+//!     │   │       ├── zygote
+//!     │   │       ├── req-01f3…
+//!     │   │       └── req-01f4…
+//!     │   └── thumbnail/
+//!     └── default/                everything served without a tenant
 //! ```
 //!
-//! The tenant carries the limits and outlives any one sandbox; a *generation*
-//! is what one sandbox — its zygote and its requests — lives in and is torn
-//! down with. Replacing or rewarming a function starts the new sandbox in a
-//! generation of its own, so retiring the old one takes only the old one.
+//! Three levels, and each answers a different question. The **tenant** is who
+//! the work is for — a customer of whoever embedded Zygo — and is where a
+//! per-tenant budget goes. The **function** carries the limits a request is
+//! actually held to and outlives any one sandbox. A **generation** is what one
+//! sandbox — its zygote and its requests — lives in and is torn down with, so
+//! replacing or rewarming a function takes only the sandbox being replaced.
+//!
+//! The tenant level was added when tenants became first-class (roadmap 2.1).
+//! Before that, `tenants/<name>` *was* the function, which is why the word
+//! turns up in this file meaning two things in two different releases; the
+//! directory keeps its name because the level it names is now the tenant.
 //!
 //! The point of `system/` having a `memory.min` reservation is that a thousand
 //! tenants all pressed against their limits must not be able to OOM the
@@ -117,11 +126,19 @@ impl Hierarchy {
         self.root.join("tenants")
     }
 
-    pub fn tenant(&self, name: &str) -> PathBuf {
-        self.tenants().join(sanitise(name))
+    /// `zygo.slice/tenants/<tenant>` — one customer of the embedder.
+    pub fn tenant(&self, tenant: &str) -> PathBuf {
+        self.tenants().join(sanitise(tenant))
     }
 
-    /// A fresh generation of a tenant's sandbox: `tenants/<name>/g<pid>-<n>`.
+    /// `zygo.slice/tenants/<tenant>/<name>` — one function or pool, where the
+    /// limits a request is held to are written.
+    pub fn function(&self, tenant: &str, name: &str) -> PathBuf {
+        self.tenant(tenant).join(sanitise(name))
+    }
+
+    /// A fresh generation of a function's sandbox:
+    /// `tenants/<tenant>/<name>/g<pid>-<n>`.
     ///
     /// Before generations existed the old and the new sandbox of a replaced
     /// function shared the tenant cgroup, and on a kernel with `cgroup.kill`
@@ -132,10 +149,10 @@ impl Hierarchy {
     /// The name is unique per supervisor lifetime: the pid keeps it apart from
     /// a dead supervisor's leftovers, the counter from this supervisor's own
     /// earlier generations of the same tenant.
-    pub fn generation(&self, name: &str) -> PathBuf {
+    pub fn generation(&self, tenant: &str, name: &str) -> PathBuf {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        self.tenant(name)
+        self.function(tenant, name)
             .join(format!("g{}-{n}", std::process::id()))
     }
 
@@ -239,15 +256,21 @@ impl Hierarchy {
             .unwrap_or(Bytes(2 * 1024 * 1024 * 1024))
     }
 
-    /// Create a tenant cgroup and apply its limits.
+    /// Create a function cgroup, and the tenant above it, and apply the
+    /// function's limits.
     ///
     /// Fails rather than silently running without limits. A cgroup whose
     /// controllers were never delegated looks perfectly normal — the directory
     /// exists, `mkdir` succeeded — but `memory.max` is simply absent and every
     /// write to it is ignored. That is risk R2, and requirement N4 says a
     /// sandbox must never start in that state.
-    pub fn create_tenant(&self, name: &str, limits: &Limits) -> Result<PathBuf> {
-        let dir = self.tenant(name);
+    ///
+    /// The tenant level above gets no limits of its own here. It is a grouping
+    /// — everything one customer runs, in one place, killable in one write —
+    /// and what bounds a request is the function's own limits below it. A
+    /// per-tenant ceiling is roadmap 2.8 and goes on this same directory.
+    pub fn create_function(&self, tenant: &str, name: &str, limits: &Limits) -> Result<PathBuf> {
+        let dir = self.function(tenant, name);
 
         // Controllers have to be enabled at *every* level between the root and
         // the leaf; enabling them only at the top leaves the grandchild without
@@ -255,6 +278,9 @@ impl Hierarchy {
         create(&self.tenants())?;
         enable_controllers(&self.root, CONTROLLERS)?;
         enable_controllers(&self.tenants(), CONTROLLERS)?;
+
+        create(&self.tenant(tenant))?;
+        enable_controllers(&self.tenant(tenant), CONTROLLERS)?;
 
         create(&dir)?;
         enable_controllers(&dir, CONTROLLERS)?;
@@ -278,18 +304,19 @@ impl Hierarchy {
         Ok(dir)
     }
 
-    /// Create a generation under an existing tenant, with the leaf the
-    /// sandbox's process will live in. Limits stay on the tenant so they cover
-    /// every generation, the zygote and every per-request child together.
-    pub fn create_generation(&self, name: &str) -> Result<PathBuf> {
-        let dir = self.generation(name);
+    /// Create a generation under an existing function, with the leaf the
+    /// sandbox's process will live in. Limits stay on the function so they
+    /// cover every generation, the zygote and every per-request child.
+    pub fn create_generation(&self, tenant: &str, name: &str) -> Result<PathBuf> {
+        let dir = self.generation(tenant, name);
         create(&dir)?;
         enable_controllers(&dir, CONTROLLERS)?;
         create(&Self::zygote(&dir))?;
         Ok(dir)
     }
 
-    /// Create a per-request cgroup. Limits are inherited from the tenant; only
+    /// Create a per-request cgroup. Limits are inherited from the function;
+    /// only
     /// the wall-clock kill switch is per request.
     pub fn create_request(generation: &Path, request_id: &str) -> Result<PathBuf> {
         let dir = Self::request(generation, request_id);
@@ -786,13 +813,13 @@ mod tests {
         // anything, but the tenant is very much in use.
         let tmp = tempfile::tempdir().expect("tempdir");
         let h = Hierarchy::new(tmp.path().join("zygo.slice"));
-        let g = h.generation("resize");
-        fake_cgroup(&h.tenant("resize"), "");
+        let g = h.generation("acme", "resize");
+        fake_cgroup(&h.function("acme", "resize"), "");
         fake_cgroup(&g, "");
         fake_cgroup(&Hierarchy::zygote(&g), "");
         fake_cgroup(&Hierarchy::request(&g, "00000001"), "99\n");
 
-        assert!(!is_empty_subtree(&h.tenant("resize")));
+        assert!(!is_empty_subtree(&h.tenant("acme")));
         assert!(
             h.clean_stale_tenants().is_empty(),
             "a tenant with a running request was cleaned up"
@@ -804,12 +831,12 @@ mod tests {
     fn a_whole_empty_tree_is_empty() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let h = Hierarchy::new(tmp.path().join("zygo.slice"));
-        let g = h.generation("resize");
-        fake_cgroup(&h.tenant("resize"), "");
+        let g = h.generation("acme", "resize");
+        fake_cgroup(&h.function("acme", "resize"), "");
         fake_cgroup(&g, "");
         fake_cgroup(&Hierarchy::zygote(&g), "");
         fake_cgroup(&Hierarchy::request(&g, "00000001"), "");
-        assert!(is_empty_subtree(&h.tenant("resize")));
+        assert!(is_empty_subtree(&h.tenant("acme")));
     }
 
     #[test]
@@ -888,11 +915,16 @@ mod tests {
         assert_eq!(h.system(), Path::new("/sys/fs/cgroup/zygo.slice/system"));
         assert_eq!(h.tenants(), Path::new("/sys/fs/cgroup/zygo.slice/tenants"));
         assert_eq!(
-            h.tenant("tenant-A"),
-            Path::new("/sys/fs/cgroup/zygo.slice/tenants/tenant-A")
+            h.tenant("acme"),
+            Path::new("/sys/fs/cgroup/zygo.slice/tenants/acme")
         );
-        let g = h.generation("tenant-A");
-        assert_eq!(g.parent().unwrap(), h.tenant("tenant-A"));
+        assert_eq!(
+            h.function("acme", "resize"),
+            Path::new("/sys/fs/cgroup/zygo.slice/tenants/acme/resize"),
+            "a function belongs to a tenant, and the path says so"
+        );
+        let g = h.generation("acme", "resize");
+        assert_eq!(g.parent().unwrap(), h.function("acme", "resize"));
         assert!(
             g.file_name().unwrap().to_str().unwrap().starts_with('g'),
             "{}",
@@ -902,12 +934,12 @@ mod tests {
         assert_eq!(Hierarchy::request(&g, "01f3"), g.join("req-01f3"));
     }
 
-    /// Two generations of one tenant never collide, even in one process.
+    /// Two generations of one function never collide, even in one process.
     #[test]
     fn generations_are_unique() {
         let h = Hierarchy::new("/cg/zygo.slice");
-        let a = h.generation("t");
-        let b = h.generation("t");
+        let a = h.generation("t", "f");
+        let b = h.generation("t", "f");
         assert_ne!(a, b);
         assert_eq!(a.parent(), b.parent());
     }
@@ -923,9 +955,18 @@ mod tests {
                 "`{evil}` escaped to {}",
                 p.display()
             );
+            // And a function name, which after 2.1 arrives from the same
+            // direction as a tenant id: an API request.
+            let f = h.function("t", evil);
+            assert_eq!(
+                f.parent().unwrap(),
+                h.tenant("t"),
+                "`{evil}` escaped to {}",
+                f.display()
+            );
         }
         // And the same for request ids, which come from the same direction.
-        let g = h.generation("t");
+        let g = h.generation("t", "f");
         let p = Hierarchy::request(&g, "../../x");
         assert_eq!(p.parent().unwrap(), g);
     }
@@ -962,9 +1003,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let h = Hierarchy::new(tmp.path().join("zygo.slice"));
         h.ensure(Bytes(8 * (1 << 30))).unwrap();
-        fake_delegation(&h.tenant("acme"));
+        fake_delegation(&h.function("acme", "resize"));
 
-        let dir = h.create_tenant("acme", &limits()).unwrap();
+        let dir = h.create_function("acme", "resize", &limits()).unwrap();
 
         let read = |f: &str| std::fs::read_to_string(dir.join(f)).unwrap();
         assert_eq!(read("memory.max"), (256 * (1 << 20)).to_string());
@@ -982,11 +1023,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let h = Hierarchy::new(tmp.path().join("zygo.slice"));
         h.ensure(Bytes(8 * (1 << 30))).unwrap();
-        fake_delegation(&h.tenant("acme"));
-        h.create_tenant("acme", &limits()).unwrap();
+        fake_delegation(&h.function("acme", "resize"));
+        h.create_function("acme", "resize", &limits()).unwrap();
 
-        let old = h.create_generation("acme").unwrap();
-        let new = h.create_generation("acme").unwrap();
+        let old = h.create_generation("acme", "resize").unwrap();
+        let new = h.create_generation("acme", "resize").unwrap();
         assert_ne!(old, new);
         assert!(Hierarchy::zygote(&old).is_dir());
         assert!(Hierarchy::zygote(&new).is_dir());
@@ -995,7 +1036,7 @@ mod tests {
         assert!(!old.exists());
         assert!(Hierarchy::zygote(&new).is_dir(), "the replacement survived");
         assert!(
-            h.tenant("acme").join("memory.max").exists(),
+            h.function("acme", "resize").join("memory.max").exists(),
             "limits stay on the tenant"
         );
     }
@@ -1009,7 +1050,7 @@ mod tests {
         let h = Hierarchy::new(tmp.path().join("zygo.slice"));
         h.ensure(Bytes(8 * (1 << 30))).unwrap();
 
-        let err = h.create_tenant("acme", &limits()).unwrap_err();
+        let err = h.create_function("acme", "resize", &limits()).unwrap_err();
         let text = err.to_string();
         assert!(text.contains("not delegated"), "{text}");
         assert!(text.contains("memory.max"), "{text}");

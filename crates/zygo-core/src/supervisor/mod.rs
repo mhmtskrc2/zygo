@@ -998,18 +998,149 @@ impl Supervisor {
     /// second writer would be a second opinion about what a digest means.
     /// Content-addressed, so this is idempotent — the same bytes from two
     /// tenants are one file, and `existed` is how the caller finds that out.
-    pub fn put_script(&self, source: &str) -> std::result::Result<Response, Response> {
+    ///
+    /// `tenant` records *whose* script it is. The file is shared; the
+    /// reference is not, and it is what lets deleting a tenant take its code
+    /// and leave everybody else's.
+    pub fn put_script(
+        &self,
+        source: &str,
+        tenant: Option<&str>,
+    ) -> std::result::Result<Response, Response> {
         let store = crate::scripts::ScriptStore::new(&self.paths);
         let digest = crate::scripts::ScriptDigest::of(source);
         let existed = store.contains(&digest);
         let digest = store
             .put(source)
             .map_err(|e| Response::error(ControlError::BadSpec, e))?;
+        if let Some(tenant) = tenant {
+            crate::tenants::Tenants::new(&self.paths)
+                .add_script(tenant, digest.as_str())
+                .map_err(|e| Response::error(ControlError::BadSpec, e))?;
+        }
         Ok(Response::Script {
             digest: digest.to_string(),
             size: source.len() as u64,
             existed,
         })
+    }
+
+    /// Register a tenant, or find the one already registered.
+    pub fn create_tenant(&self, id: &str) -> std::result::Result<Response, Response> {
+        let (tenant, existed) = crate::tenants::Tenants::new(&self.paths)
+            .create(id)
+            .map_err(|e| Response::error(ControlError::BadSpec, e))?;
+        Ok(Response::Tenants {
+            tenants: vec![tenant],
+            existed,
+            removed_scripts: Vec::new(),
+            stopped: Vec::new(),
+        })
+    }
+
+    /// Every tenant, or one of them.
+    pub fn tenants(&self, id: Option<&str>) -> std::result::Result<Response, Response> {
+        let store = crate::tenants::Tenants::new(&self.paths);
+        let tenants = match id {
+            Some(id) => match store
+                .get(id)
+                .map_err(|e| Response::error(ControlError::BadSpec, e))?
+            {
+                Some(tenant) => vec![tenant],
+                None => {
+                    return Err(Response::error(
+                        ControlError::NotFound,
+                        format!("no tenant `{id}`"),
+                    ));
+                }
+            },
+            None => store
+                .list()
+                .map_err(|e| Response::error(ControlError::CallFailed, e))?,
+        };
+        Ok(Response::Tenants {
+            tenants,
+            existed: false,
+            removed_scripts: Vec::new(),
+            stopped: Vec::new(),
+        })
+    }
+
+    /// Forget a tenant: stop what it was running, then take the scripts only
+    /// it referred to.
+    ///
+    /// In that order, and the order matters. A script removed while a request
+    /// is still loading it would fail that request for a reason the caller
+    /// cannot see; stopping first means there is nothing left to be reading.
+    pub fn delete_tenant(&self, id: &str) -> std::result::Result<Response, Response> {
+        let store = crate::tenants::Tenants::new(&self.paths);
+        let Some(tenant) = store
+            .get(id)
+            .map_err(|e| Response::error(ControlError::BadSpec, e))?
+        else {
+            return Err(Response::error(
+                ControlError::NotFound,
+                format!("no tenant `{id}`"),
+            ));
+        };
+
+        let stopped = self.stop_everything_for(id);
+        let removed_scripts = store
+            .remove(id)
+            .map_err(|e| Response::error(ControlError::CallFailed, e))?
+            .unwrap_or_default();
+        let script_store = crate::scripts::ScriptStore::new(&self.paths);
+        for digest in &removed_scripts {
+            if let Ok(digest) = crate::scripts::ScriptDigest::parse(digest) {
+                let _ = script_store.remove(&digest);
+            }
+        }
+        // The tenant's cgroup, now that nothing of its is running. Left behind
+        // it would be one empty directory per deleted customer, for ever.
+        if let Ok(hierarchy) = crate::cgroup::Hierarchy::discover() {
+            let _ = crate::cgroup::Hierarchy::remove(&hierarchy.tenant(id));
+        }
+
+        Ok(Response::Tenants {
+            tenants: vec![tenant],
+            existed: false,
+            removed_scripts,
+            stopped,
+        })
+    }
+
+    /// Stop every function and pool that belongs to a tenant. Returns their
+    /// names.
+    fn stop_everything_for(&self, tenant: &str) -> Vec<String> {
+        let functions: Vec<String> = self
+            .functions
+            .lock()
+            .expect("registry")
+            .iter()
+            .filter(|(_, entry)| entry.resolved.tenant == tenant)
+            .map(|(name, _)| name.clone())
+            .collect();
+        let runtimes: Vec<String> = self
+            .runtimes
+            .lock()
+            .expect("runtimes")
+            .iter()
+            .filter(|(_, pool)| pool.resolved.tenant == tenant)
+            .map(|(name, _)| name.clone())
+            .collect();
+
+        let mut stopped = Vec::new();
+        for name in functions {
+            if self.stop(Some(&name)).is_ok() {
+                stopped.push(name);
+            }
+        }
+        for name in runtimes {
+            if self.stop_runtime(&name).is_ok() {
+                stopped.push(format!("runtime.{name}"));
+            }
+        }
+        stopped
     }
 
     /// Whether this host holds a script, and how big it is.
@@ -1415,6 +1546,7 @@ fn handle(supervisor: &Supervisor, stream: UnixStream) -> Result<()> {
                     base_dir: Some(base_dir),
                     one_shot: true,
                     pool: false,
+                    tenant: None,
                 };
                 // Received before anything else, and before deciding
                 // anything: the client has already sent them, and leaving
@@ -1509,6 +1641,7 @@ fn dispatch(supervisor: &Supervisor, request: Request, greeted: &mut bool) -> Re
             allow_unlimited,
             secrets,
             if_changed,
+            tenant,
         } => {
             let options = ResolveOptions {
                 allow_host_net,
@@ -1517,6 +1650,7 @@ fn dispatch(supervisor: &Supervisor, request: Request, greeted: &mut bool) -> Re
                 base_dir: Some(base_dir),
                 one_shot: false,
                 pool: false,
+                tenant,
             };
             merge(supervisor.serve(
                 &name,
@@ -1549,6 +1683,7 @@ fn dispatch(supervisor: &Supervisor, request: Request, greeted: &mut bool) -> Re
             allow_host_net,
             allow_private_net,
             allow_unlimited,
+            tenant,
         } => {
             let options = ResolveOptions {
                 allow_host_net,
@@ -1557,6 +1692,7 @@ fn dispatch(supervisor: &Supervisor, request: Request, greeted: &mut bool) -> Re
                 base_dir: Some(base_dir),
                 one_shot: false,
                 pool: true,
+                tenant,
             };
             merge(supervisor.serve_runtime(&name, spec.as_deref(), &layer, &options))
         }
@@ -1565,17 +1701,24 @@ fn dispatch(supervisor: &Supervisor, request: Request, greeted: &mut bool) -> Re
             script,
             event,
             timeout_ms,
+            tenant,
         } => merge(supervisor.exec_script(
             &runtime,
             script,
             event,
             Duration::from_millis(timeout_ms),
+            tenant.as_deref(),
         )),
         Request::Runtimes => Response::Runtimes {
             runtimes: supervisor.runtimes(),
         },
         Request::StopRuntime { name } => merge(supervisor.stop_runtime(&name)),
-        Request::PutScript { source } => merge(supervisor.put_script(&source)),
+        Request::PutScript { source, tenant } => {
+            merge(supervisor.put_script(&source, tenant.as_deref()))
+        }
+        Request::CreateTenant { id } => merge(supervisor.create_tenant(&id)),
+        Request::Tenants { id } => merge(supervisor.tenants(id.as_deref())),
+        Request::DeleteTenant { id } => merge(supervisor.delete_tenant(&id)),
         Request::GetScript { digest } => merge(supervisor.get_script(&digest)),
         Request::DeleteScript { digest } => merge(supervisor.delete_script(&digest)),
         Request::Shutdown => Response::Ok,
@@ -2405,6 +2548,7 @@ mod tests {
             &supervisor,
             Request::PutScript {
                 source: source.into(),
+                tenant: None,
             },
             &mut greeted,
         );
@@ -2412,6 +2556,7 @@ mod tests {
             &supervisor,
             Request::PutScript {
                 source: source.into(),
+                tenant: None,
             },
             &mut greeted,
         );
@@ -2473,6 +2618,148 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// A tenant owns the scripts it registered, and deleting it takes them.
+    #[test]
+    fn deleting_a_tenant_takes_its_scripts_and_leaves_the_shared_ones() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let supervisor = Supervisor::new(paths(&dir)).expect("supervisor");
+        let mut greeted = true;
+        let put = |source: &str, tenant: &str, greeted: &mut bool| -> String {
+            match dispatch(
+                &supervisor,
+                Request::PutScript {
+                    source: source.into(),
+                    tenant: Some(tenant.into()),
+                },
+                greeted,
+            ) {
+                Response::Script { digest, .. } => digest,
+                other => panic!("{other:?}"),
+            }
+        };
+
+        dispatch(
+            &supervisor,
+            Request::CreateTenant { id: "a".into() },
+            &mut greeted,
+        );
+        dispatch(
+            &supervisor,
+            Request::CreateTenant { id: "b".into() },
+            &mut greeted,
+        );
+        let shared = put("shared = 1\n", "a", &mut greeted);
+        assert_eq!(shared, put("shared = 1\n", "b", &mut greeted));
+        let only_a = put("only_a = 1\n", "a", &mut greeted);
+
+        match dispatch(
+            &supervisor,
+            Request::DeleteTenant { id: "a".into() },
+            &mut greeted,
+        ) {
+            Response::Tenants {
+                removed_scripts, ..
+            } => assert_eq!(removed_scripts, vec![only_a.clone()]),
+            other => panic!("{other:?}"),
+        }
+
+        let store = crate::scripts::ScriptStore::new(supervisor.paths());
+        let parse = crate::scripts::ScriptDigest::parse;
+        assert!(
+            !store.contains(&parse(&only_a).unwrap()),
+            "the script only the deleted tenant had is still on disk"
+        );
+        assert!(
+            store.contains(&parse(&shared).unwrap()),
+            "a script another tenant still refers to was deleted"
+        );
+    }
+
+    /// A tenant may only name a script it registered.
+    ///
+    /// A digest is not a capability — anybody holding the bytes can compute
+    /// one — so a tenant that learns another's digest must not be able to run
+    /// it. The answer is the same one a digest nobody registered gets, which
+    /// is deliberate: "exists but not yours" is a fact about another tenant.
+    #[test]
+    fn a_tenant_cannot_run_another_tenants_script_by_digest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let supervisor = Supervisor::new(paths(&dir)).expect("supervisor");
+        let mut greeted = true;
+        dispatch(
+            &supervisor,
+            Request::CreateTenant { id: "a".into() },
+            &mut greeted,
+        );
+        dispatch(
+            &supervisor,
+            Request::CreateTenant { id: "b".into() },
+            &mut greeted,
+        );
+        let digest = match dispatch(
+            &supervisor,
+            Request::PutScript {
+                source: "secret = 1\n".into(),
+                tenant: Some("a".into()),
+            },
+            &mut greeted,
+        ) {
+            Response::Script { digest, .. } => digest,
+            other => panic!("{other:?}"),
+        };
+
+        // No pool is registered, so a request that got past the ownership
+        // check would fail with `no runtime named` instead — which is exactly
+        // how this test tells the two refusals apart.
+        let by_stranger = dispatch(
+            &supervisor,
+            Request::ExecScript {
+                runtime: "nowhere".into(),
+                script: crate::protocol::Script {
+                    path: None,
+                    source: None,
+                    digest: Some(digest.clone()),
+                    entry_point: None,
+                },
+                event: serde_json::Value::Null,
+                timeout_ms: 1_000,
+                tenant: Some("b".into()),
+            },
+            &mut greeted,
+        );
+        match by_stranger {
+            Response::Error { code, message } => {
+                assert_eq!(code, ControlError::NotFound);
+                assert!(message.contains("no script"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // And the owner gets past the ownership check, to the missing pool.
+        let by_owner = dispatch(
+            &supervisor,
+            Request::ExecScript {
+                runtime: "nowhere".into(),
+                script: crate::protocol::Script {
+                    path: None,
+                    source: None,
+                    digest: Some(digest),
+                    entry_point: None,
+                },
+                event: serde_json::Value::Null,
+                timeout_ms: 1_000,
+                tenant: Some("a".into()),
+            },
+            &mut greeted,
+        );
+        match by_owner {
+            Response::Error { message, .. } => {
+                assert!(message.contains("no runtime"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     /// A digest becomes a path, so it is parsed before it is used as one.

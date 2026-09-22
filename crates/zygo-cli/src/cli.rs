@@ -840,6 +840,7 @@ impl SandboxArgs {
             base_dir: None,
             one_shot: false,
             pool: false,
+            tenant: None,
         }
     }
 }

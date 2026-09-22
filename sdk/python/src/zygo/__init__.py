@@ -47,6 +47,7 @@ from ._models import (
     Runtime,
     Script,
     Served,
+    Tenant,
 )
 from ._sync import Client, FunctionHandle, connect
 
@@ -68,6 +69,7 @@ __all__ = [
     "Runtime",
     "Script",
     "Served",
+    "Tenant",
     # failures
     "AuthError",
     "Busy",

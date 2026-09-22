@@ -229,11 +229,17 @@ impl SandboxConfig {
         let mut merged: std::collections::BTreeMap<String, String> =
             image_env.iter().cloned().collect();
         merged.extend(f.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        // The *function*, not the tenant, and the name is now wrong for what
+        // it holds — but it is a variable tenant code reads, so changing it
+        // would break handlers to correct a word. `ZYGO_FUNCTION` is the same
+        // value under the right name; both are set until the next release
+        // that may break a handler.
         merged.insert("ZYGO_TENANT".to_string(), f.name.clone());
+        merged.insert("ZYGO_FUNCTION".to_string(), f.name.clone());
         let env: Vec<(String, String)> = merged.into_iter().collect();
 
         Self {
-            id: SandboxId::new(&f.name),
+            id: SandboxId::with_tenant(&f.tenant, &f.name),
             isolation: f.isolation,
             seccomp: f.seccomp,
             network: f.network,
@@ -285,7 +291,12 @@ mod tests {
         let cfg =
             SandboxConfig::from_resolved(&f, &view, "/newroot", vec!["/bin/true".into()], &[]);
 
-        assert_eq!(cfg.id.tenant, "demo");
+        assert_eq!(
+            cfg.id.tenant,
+            crate::spec::DEFAULT_TENANT,
+            "nobody named a tenant, so it is the operator's own"
+        );
+        assert_eq!(cfg.id.name, "demo");
         assert_eq!(cfg.limits.pids, 64);
         assert_eq!(cfg.uid, 1000);
         assert!(

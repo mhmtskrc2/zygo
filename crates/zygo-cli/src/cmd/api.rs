@@ -381,8 +381,29 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<Full<B
         .filter(|s| !s.is_empty())
         .collect();
 
+    let actor = Actor::of(&req)?;
+
     match (req.method(), segments.as_slice()) {
         (&Method::GET, ["fn"]) => list(api).await,
+        (&Method::POST, ["tenants"]) => {
+            actor.operator_only("creating a tenant")?;
+            let body = read_body(req).await?;
+            create_tenant(api, &body).await
+        }
+        (&Method::GET, ["tenants"]) => {
+            actor.operator_only("listing the tenants")?;
+            tenants(api, None).await
+        }
+        (&Method::GET, ["tenants", id]) => {
+            actor.operator_only("reading a tenant")?;
+            tenants(api, Some(id.to_string())).await
+        }
+        (&Method::DELETE, ["tenants", id]) => {
+            let id = id.to_string();
+            actor.operator_only("deleting a tenant")?;
+            deployable(api)?;
+            delete_tenant(api, id).await
+        }
         (&Method::GET, ["metrics"]) => metrics(api).await,
         (&Method::GET, ["version"]) => Ok(json(
             StatusCode::OK,
@@ -395,9 +416,10 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<Full<B
         )),
         (&Method::PUT, ["fn", name]) => {
             let name = name.to_string();
+            let tenant = actor.tenant().map(str::to_string);
             deployable(api)?;
             let body = read_body(req).await?;
-            serve_fn(api, name, &body).await
+            serve_fn(api, name, &body, tenant).await
         }
         (&Method::DELETE, ["fn", name]) => {
             let name = name.to_string();
@@ -438,8 +460,9 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<Full<B
         (&Method::GET, ["runtimes"]) => runtimes(api).await,
         (&Method::POST, ["runtimes"]) => {
             deployable(api)?;
+            let tenant = actor.tenant().map(str::to_string);
             let body = read_body(req).await?;
-            serve_runtime(api, &body).await
+            serve_runtime(api, &body, tenant).await
         }
         (&Method::DELETE, ["runtimes", name]) => {
             let name = name.to_string();
@@ -448,14 +471,16 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<Full<B
         }
         (&Method::POST, ["runtimes", name, "call"]) => {
             let name = name.to_string();
+            let tenant = actor.tenant().map(str::to_string);
             let timeout_ms = timeout_header(&req)?;
             let body = read_body(req).await?;
-            call_runtime(api, name, &body, timeout_ms).await
+            call_runtime(api, name, &body, timeout_ms, tenant).await
         }
         (&Method::PUT, ["scripts"]) => {
             deployable(api)?;
+            let tenant = actor.tenant().map(str::to_string);
             let body = read_body(req).await?;
-            put_script(api, &body).await
+            put_script(api, &body, tenant).await
         }
         (&Method::GET, ["scripts", digest]) => get_script(api, digest.to_string()).await,
         (&Method::DELETE, ["scripts", digest]) => {
@@ -468,6 +493,7 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<Full<B
         | (_, ["version"])
         | (_, ["run"])
         | (_, ["runtimes", ..])
+        | (_, ["tenants", ..])
         | (_, ["scripts", ..]) => Err(HttpError::new(
             StatusCode::METHOD_NOT_ALLOWED,
             format!("{} {}", req.method(), path),
@@ -476,6 +502,76 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<Full<B
             StatusCode::NOT_FOUND,
             format!("no route {path}"),
         )),
+    }
+}
+
+/// Who a request acts for.
+///
+/// Everything below `/fn`, `/runtimes` and `/scripts` belongs to somebody: an
+/// embedder's customer, or the operator themselves. Today the answer comes
+/// from `X-Zygo-Tenant`, which is trusted because holding the bearer token is
+/// already the whole of this API's authority — there is one token and it is
+/// the operator's.
+///
+/// **That changes in roadmap 2.2**, where a token belongs to a tenant and the
+/// answer comes from the token instead. The shape is here now so that every
+/// route already asks "whose is this?" and only the *answer* has to move: a
+/// tenant token will resolve to `Tenant`, an operator token to `Operator`,
+/// and the header will be honoured only for an operator acting on somebody's
+/// behalf.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Actor {
+    /// The operator: whoever runs this API. May create tenants and runtimes.
+    Operator,
+    /// One tenant, named in the request.
+    Tenant(String),
+}
+
+/// The header a caller names a tenant with.
+const TENANT_HEADER: &str = "x-zygo-tenant";
+
+impl Actor {
+    fn of(req: &Request<Incoming>) -> Result<Actor, HttpError> {
+        let Some(value) = req.headers().get(TENANT_HEADER) else {
+            return Ok(Actor::Operator);
+        };
+        let id = value
+            .to_str()
+            .map_err(|_| {
+                HttpError::new(
+                    StatusCode::BAD_REQUEST,
+                    "X-Zygo-Tenant must be ASCII: it is an id, not a name",
+                )
+            })?
+            .trim();
+        zygo_core::tenants::valid_id(id)
+            .map_err(|e| HttpError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
+        Ok(Actor::Tenant(id.to_string()))
+    }
+
+    fn tenant(&self) -> Option<&str> {
+        match self {
+            Actor::Operator => None,
+            Actor::Tenant(id) => Some(id),
+        }
+    }
+
+    /// Refuse a route that is the operator's alone.
+    ///
+    /// Creating and deleting tenants is not something a tenant does, and
+    /// neither is listing them: a customer that could enumerate the other
+    /// customers is a leak, whatever the limits say.
+    fn operator_only(&self, what: &str) -> Result<(), HttpError> {
+        match self {
+            Actor::Operator => Ok(()),
+            Actor::Tenant(id) => Err(HttpError::new(
+                StatusCode::FORBIDDEN,
+                format!(
+                    "{what} is the operator's, and this request names tenant `{id}`\n  \
+                     → drop the X-Zygo-Tenant header to act as the operator"
+                ),
+            )),
+        }
     }
 }
 
@@ -762,7 +858,11 @@ struct ServeRuntimeRequest {
     base_dir: Option<std::path::PathBuf>,
 }
 
-async fn serve_runtime(api: &Arc<Api>, body: &[u8]) -> Result<Response<Full<Bytes>>, HttpError> {
+async fn serve_runtime(
+    api: &Arc<Api>,
+    body: &[u8],
+    tenant: Option<String>,
+) -> Result<Response<Full<Bytes>>, HttpError> {
     let request: ServeRuntimeRequest = serde_json::from_slice(body).map_err(|e| {
         HttpError::new(
             StatusCode::BAD_REQUEST,
@@ -790,6 +890,7 @@ async fn serve_runtime(api: &Arc<Api>, body: &[u8]) -> Result<Response<Full<Byte
 
     let reply = control(api, move |c| {
         Ok(c.send(&Control::ServeRuntime {
+            tenant,
             name: request.name,
             spec: None,
             layer: Box::new(request.layer),
@@ -850,6 +951,7 @@ async fn call_runtime(
     name: String,
     body: &[u8],
     timeout_ms: u64,
+    tenant: Option<String>,
 ) -> Result<Response<Full<Bytes>>, HttpError> {
     let request: CallRuntimeRequest = serde_json::from_slice(body).map_err(|e| {
         HttpError::new(
@@ -878,6 +980,7 @@ async fn call_runtime(
             script,
             event: request.event,
             timeout_ms,
+            tenant,
         })?)
     })
     .await?;
@@ -891,7 +994,83 @@ async fn call_runtime(
 /// transformation with no reader. Content-addressed, so this is idempotent —
 /// the same bytes are the same name however many times, and from however many
 /// tenants, which is what `201` versus `200` says.
-async fn put_script(api: &Arc<Api>, body: &[u8]) -> Result<Response<Full<Bytes>>, HttpError> {
+/// `POST /tenants`: one customer of the embedder.
+///
+/// Idempotent — `201` when it was created, `200` when it was already there —
+/// for the same reason `PUT /scripts` is: an embedder that creates a customer
+/// they already have has not made a mistake worth failing a deploy over.
+async fn create_tenant(api: &Arc<Api>, body: &[u8]) -> Result<Response<Full<Bytes>>, HttpError> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct CreateTenantRequest {
+        id: String,
+    }
+    let request: CreateTenantRequest = serde_json::from_slice(body).map_err(|e| {
+        HttpError::new(
+            StatusCode::BAD_REQUEST,
+            format!("body must be {{\"id\": \"<tenant>\"}}: {e}"),
+        )
+    })?;
+
+    let reply = control(api, move |c| {
+        Ok(c.send(&Control::CreateTenant { id: request.id })?)
+    })
+    .await?;
+    match reply {
+        Reply::Tenants {
+            tenants, existed, ..
+        } => Ok(json(
+            if existed {
+                StatusCode::OK
+            } else {
+                StatusCode::CREATED
+            },
+            &serde_json::json!({ "tenant": tenants.first(), "existed": existed }),
+        )),
+        other => Ok(reply_to_response(other)),
+    }
+}
+
+async fn tenants(api: &Arc<Api>, id: Option<String>) -> Result<Response<Full<Bytes>>, HttpError> {
+    let one = id.is_some();
+    let reply = control(api, move |c| Ok(c.send(&Control::Tenants { id })?)).await?;
+    match reply {
+        Reply::Tenants { tenants, .. } if one => Ok(json(
+            StatusCode::OK,
+            &serde_json::json!({ "tenant": tenants.first() }),
+        )),
+        Reply::Tenants { tenants, .. } => Ok(json(
+            StatusCode::OK,
+            &serde_json::json!({ "tenants": tenants }),
+        )),
+        other => Ok(reply_to_response(other)),
+    }
+}
+
+async fn delete_tenant(api: &Arc<Api>, id: String) -> Result<Response<Full<Bytes>>, HttpError> {
+    let reply = control(api, move |c| Ok(c.send(&Control::DeleteTenant { id })?)).await?;
+    match reply {
+        Reply::Tenants {
+            removed_scripts,
+            stopped,
+            ..
+        } => Ok(json(
+            StatusCode::OK,
+            &serde_json::json!({
+                "deleted": true,
+                "removed_scripts": removed_scripts,
+                "stopped": stopped,
+            }),
+        )),
+        other => Ok(reply_to_response(other)),
+    }
+}
+
+async fn put_script(
+    api: &Arc<Api>,
+    body: &[u8],
+    tenant: Option<String>,
+) -> Result<Response<Full<Bytes>>, HttpError> {
     let source = std::str::from_utf8(body)
         .map_err(|e| {
             HttpError::new(
@@ -907,7 +1086,10 @@ async fn put_script(api: &Arc<Api>, body: &[u8]) -> Result<Response<Full<Bytes>>
         ));
     }
 
-    let reply = control(api, move |c| Ok(c.send(&Control::PutScript { source })?)).await?;
+    let reply = control(api, move |c| {
+        Ok(c.send(&Control::PutScript { source, tenant })?)
+    })
+    .await?;
     match reply {
         Reply::Script {
             digest,
@@ -1004,6 +1186,7 @@ async fn serve_fn(
     api: &Arc<Api>,
     name: String,
     body: &[u8],
+    tenant: Option<String>,
 ) -> Result<Response<Full<Bytes>>, HttpError> {
     let request: ServeRequest = serde_json::from_slice(body).map_err(|e| {
         HttpError::new(
@@ -1024,6 +1207,7 @@ async fn serve_fn(
 
     let reply = control(api, move |c| {
         Ok(c.send(&Control::Serve {
+            tenant,
             name,
             spec: None,
             layer: Box::new(request.layer),

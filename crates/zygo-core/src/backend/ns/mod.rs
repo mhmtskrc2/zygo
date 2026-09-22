@@ -508,17 +508,18 @@ pub fn launch(config: &SandboxConfig, hierarchy: Option<&cgroup::Hierarchy>) -> 
     let uid_map = idmap::render_id_map(&idmap::id_map(config.uid, outer_uid, sub));
     let gid_map = idmap::render_id_map(&idmap::id_map(config.gid, outer_gid, sub));
 
-    // The tenant carries the limits and outlives this sandbox; the generation
-    // is what this one launch attaches to, kills and removes, so retiring it
-    // cannot reach a replacement started under the same name.
+    // The function carries the limits and outlives this sandbox; the
+    // generation is what this one launch attaches to, kills and removes, so
+    // retiring it cannot reach a replacement started under the same name. The
+    // tenant above groups everything one customer runs.
     let generation = match hierarchy {
         Some(h) => {
             // Builds `zygo.slice/{system,tenants}` and moves this process into
             // `system`, without which the controllers below cannot be
             // delegated. Idempotent, so every launch may call it.
             h.ensure(cgroup::Hierarchy::host_ram())?;
-            h.create_tenant(&config.id.tenant, &config.limits)?;
-            Some(h.create_generation(&config.id.tenant)?)
+            h.create_function(&config.id.tenant, &config.id.name, &config.limits)?;
+            Some(h.create_generation(&config.id.tenant, &config.id.name)?)
         }
         None => None,
     };

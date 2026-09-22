@@ -246,6 +246,55 @@ export class Client {
   }
 
   /**
+   * Register a customer, or find the one already registered.
+   *
+   * Idempotent, so a deploy that runs twice is not an error. A tenant owns the
+   * scripts registered for it, and its functions and pools live in a cgroup of
+   * its own — which is what makes {@link deleteTenant} able to stop everything
+   * of theirs and nobody else's. Operator-only.
+   */
+  async createTenant(id) {
+    const body = await this.#request('POST', '/tenants', { body: { id } });
+    return body.tenant ?? {};
+  }
+
+  /** Every tenant this host holds. Operator-only. */
+  async tenants() {
+    const body = await this.#request('GET', '/tenants');
+    return body.tenants ?? [];
+  }
+
+  /** One tenant. Throws {@link NotFound} if there is no such id. */
+  async tenant(id) {
+    const body = await this.#request('GET', `/tenants/${esc(id)}`);
+    return body.tenant ?? {};
+  }
+
+  /**
+   * Forget a tenant: stop its work, then remove the scripts only it had.
+   *
+   * Answers with what it stopped and what it removed, because neither can be
+   * reconstructed afterwards. Operator-only, and needs `--allow-deploy`.
+   */
+  async deleteTenant(id) {
+    return this.#request('DELETE', `/tenants/${esc(id)}`);
+  }
+
+  /**
+   * A view of this client that acts for one tenant.
+   *
+   * Every call through it carries the tenant, so scripts are registered
+   * against them and pool calls may only name their own. The connection is
+   * shared — this is a header, not a second client.
+   */
+  forTenant(id) {
+    const view = Object.create(Object.getPrototypeOf(this));
+    Object.assign(view, this);
+    view._tenantId = id;
+    return view;
+  }
+
+  /**
    * Register a **runtime pool**: an image, a dependency set, an agent.
    *
    * A pool holds no code. Scripts arrive with each call, so one pool serves
@@ -361,6 +410,7 @@ export class Client {
       sent['content-length'] = String(payload.length);
     }
     if (authenticated && this.token) sent.authorization = `Bearer ${this.token}`;
+    if (this._tenantId) sent['x-zygo-tenant'] = this._tenantId;
 
     const options = {
       method,

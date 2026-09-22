@@ -352,6 +352,9 @@ fn name_of(request: &Request) -> &'static str {
         Request::Runtimes => "listing the runtimes",
         Request::StopRuntime { .. } => "stopping a runtime",
         Request::PutScript { .. } => "registering a script",
+        Request::CreateTenant { .. } => "creating a tenant",
+        Request::Tenants { .. } => "listing the tenants",
+        Request::DeleteTenant { .. } => "deleting a tenant",
         Request::GetScript { .. } => "looking a script up",
         Request::DeleteScript { .. } => "removing a script",
     }
@@ -514,6 +517,7 @@ mod tests {
     #[test]
     fn each_request_gets_a_budget_that_fits_what_it_does() {
         let serve = Client::budget(&Request::Serve {
+            tenant: None,
             name: "x".into(),
             spec: None,
             layer: Box::default(),

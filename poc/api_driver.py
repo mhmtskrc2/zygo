@@ -383,6 +383,81 @@ def main() -> int:
             bad("DELETE /runtimes/<name>")
         client.delete_script(registered.sha256)
 
+        # --- tenants ---------------------------------------------------------
+        #
+        # The embedder's customers. What matters is that a tenant's things are
+        # theirs: their scripts, their cgroup, and nobody else's reachable.
+        print("\ntenants")
+
+        acme = client.create_tenant("acme")
+        other = client.create_tenant("globex")
+        if acme.id == "acme" and {t.id for t in client.tenants()} >= {"acme", "globex"}:
+            ok("two tenants are registered and listed")
+        else:
+            bad("POST /tenants", acme)
+
+        if client.create_tenant("acme").id == "acme":
+            ok("creating one twice is the same tenant, not an error")
+        else:
+            bad("the second create")
+
+        try:
+            client.create_tenant("../escape")
+            bad("a tenant id that is a path was accepted")
+        except zygo.SpecError:
+            ok("an id that would escape its directory is refused")
+
+        for_acme = client.for_tenant("acme")
+        for_globex = client.for_tenant("globex")
+        theirs = for_acme.put_script(
+            "def handler(event):\n    return {'from': 'acme'}\n"
+        )
+        if client.tenant("acme").scripts == [theirs.sha256]:
+            ok("a script registered for a tenant is recorded against them")
+        else:
+            bad("GET /tenants/<id>", client.tenant("acme"))
+
+        pool = client.serve_runtime(
+            "shared", {"image": image, "agent": "python", "timeout": "20s"}
+        )
+        if pool.get("warm", 0) >= 1:
+            ok("an operator's pool is warm, and both tenants may call it")
+        else:
+            bad("POST /runtimes", pool)
+
+        out = for_acme.run_script("shared", theirs.sha256, {})
+        if out.result.get("from") == "acme":
+            ok("the tenant that registered a script can run it")
+        else:
+            bad("the owner's own script", out)
+
+        # The digest is not a capability: knowing one must not be enough.
+        try:
+            for_globex.run_script("shared", theirs.sha256, {})
+            bad("a tenant ran another tenant's script by naming its digest")
+        except zygo.NotFound:
+            ok("another tenant naming that digest is refused as `not found`")
+
+        # And a tenant may not look at the tenant list at all.
+        try:
+            for_globex.tenants()
+            bad("a tenant listed the other tenants")
+        except zygo.AuthError:
+            ok("a tenant cannot enumerate the tenants")
+
+        removed = client.delete_tenant("acme")
+        if removed.get("removed_scripts") == [theirs.sha256]:
+            ok("deleting a tenant removes the scripts only it had")
+        else:
+            bad("DELETE /tenants/<id>", removed)
+        try:
+            client.script(theirs.sha256)
+            bad("the deleted tenant's script is still in the store")
+        except zygo.NotFound:
+            ok("and the script really is gone from the store")
+        client.delete_tenant("globex")
+        client.stop_runtime("shared")
+
         # --- the ceilings ----------------------------------------------------
         print("\nceilings")
 

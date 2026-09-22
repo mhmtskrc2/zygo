@@ -18,7 +18,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from ._endpoint import Endpoint, resolve
 from ._errors import NotFound, SpecError, TransportError, ZygoError, from_response
-from ._models import Function, LogPage, Result, Run, Runtime, Script, Served
+from ._models import Function, LogPage, Result, Run, Runtime, Script, Served, Tenant
 
 #: Largest answer read into memory. The API's own request limit is the same
 #: order, and an answer past it is a bug rather than a large result.
@@ -79,6 +79,8 @@ class Client:
         self._idle: List[http.client.HTTPConnection] = []
         self._lock = threading.Lock()
         self._closed = False
+        #: Set by :meth:`for_tenant`; sent as ``X-Zygo-Tenant`` on every call.
+        self._tenant: Optional[str] = None
 
     # ---- lifecycle ----------------------------------------------------
 
@@ -234,6 +236,50 @@ class Client:
             described["cmd"] = list(cmd)
         return Run.parse(self._request("POST", "/run", body={"layer": described, "stdin": stdin}))
 
+    def create_tenant(self, id: str) -> Tenant:
+        """Register a customer, or find the one already registered.
+
+        Idempotent, so a deploy that runs twice is not an error. A tenant owns
+        the scripts registered for it, and its functions and pools live in a
+        cgroup of its own — which is what makes :meth:`delete_tenant` able to
+        stop everything of theirs and nobody else's.
+
+        Operator-only.
+        """
+        body = self._request("POST", "/tenants", body={"id": id})
+        return Tenant.parse(body.get("tenant") or {})
+
+    def tenants(self) -> List[Tenant]:
+        """Every tenant this host holds. Operator-only."""
+        body = self._request("GET", "/tenants")
+        return [Tenant.parse(t) for t in body.get("tenants", [])]
+
+    def tenant(self, id: str) -> Tenant:
+        """One tenant. Raises :class:`~zygo.NotFound` if there is no such id."""
+        body = self._request("GET", f"/tenants/{_escape(id)}")
+        return Tenant.parse(body.get("tenant") or {})
+
+    def delete_tenant(self, id: str) -> Dict[str, Any]:
+        """Forget a tenant: stop its work, then remove the scripts only it had.
+
+        Answers with what it stopped and what it removed, because both are
+        facts the caller cannot reconstruct afterwards. Operator-only, and
+        needs an API started with ``--allow-deploy``.
+        """
+        return self._request("DELETE", f"/tenants/{_escape(id)}")
+
+    def for_tenant(self, id: str) -> "Client":
+        """A view of this client that acts for one tenant.
+
+        Every call through it carries the tenant, so scripts are registered
+        against them and pool calls may only name their own. The connection is
+        shared — this is a header, not a second client.
+        """
+        view = Client.__new__(Client)
+        view.__dict__.update(self.__dict__)
+        view._tenant = id
+        return view
+
     def serve_runtime(
         self,
         name: str,
@@ -361,6 +407,8 @@ class Client:
             sent["content-type"] = "application/json"
         if authenticated and self.token:
             sent["authorization"] = f"Bearer {self.token}"
+        if getattr(self, "_tenant", None):
+            sent["x-zygo-tenant"] = self._tenant
         sent.update(headers or {})
 
         connection = self._take()

@@ -59,6 +59,7 @@ pub mod sandbox;
 pub mod scripts;
 pub mod spec;
 pub mod supervisor;
+pub mod tenants;
 pub mod venv;
 
 pub use error::{Error, Result};

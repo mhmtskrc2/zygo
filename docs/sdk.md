@@ -77,6 +77,8 @@ executes.
 | Recent log | `client.logs(name)` | `client.logs(name)` | no |
 | Version | `client.version()` | `client.version()` | no |
 | Look a script up | `client.script(digest)` | `client.script(digest)` | no |
+| Act for a tenant | `client.for_tenant(id)` | `client.forTenant(id)` | no |
+| List tenants (operator) | `client.tenants()` | `client.tenants()` | no |
 | Run a script in a pool | `client.run_script(runtime, script)` | `client.runScript(runtime, script)` | no |
 | List runtime pools | `client.runtimes()` | `client.runtimes()` | no |
 | Serve a function | `client.serve(name, layer)` | `client.serve(name, layer)` | **yes** |
@@ -84,6 +86,8 @@ executes.
 | One-shot sandbox | `client.run(image, cmd)` | `client.run(image, cmd)` | **yes** |
 | Register a script | `client.put_script(source)` | `client.putScript(source)` | **yes** |
 | Forget a script | `client.delete_script(digest)` | `client.deleteScript(digest)` | **yes** |
+| Create a tenant (operator) | `client.create_tenant(id)` | `client.createTenant(id)` | no |
+| Delete one (operator) | `client.delete_tenant(id)` | `client.deleteTenant(id)` | **yes** |
 | Serve a runtime pool | `client.serve_runtime(name, layer)` | `client.serveRuntime(name, layer)` | **yes** |
 | Stop one | `client.stop_runtime(name)` | `client.stopRuntime(name)` | **yes** |
 
@@ -100,6 +104,43 @@ A deadline kill and an out-of-memory kill are both `SIGKILL`, so both are 137.
 comes from the kernel's own counter in the sandbox's cgroup. Neither is a
 guess, and a caller deciding between "too slow" and "too much memory" — an
 online judge, a CI step — has nothing else to go on.
+
+## Tenants
+
+An embedder has customers. A **tenant** is one of them, and it is what makes
+"whose script is this?" a question the API can answer:
+
+```python
+client.create_tenant("acme")                    # POST /tenants, idempotent
+acme = client.for_tenant("acme")                # a view; the same connection
+
+script = acme.put_script(source)                # registered against acme
+acme.run_script("py312", script.sha256, event)  # and only acme may run it
+```
+
+```js
+await client.createTenant('acme');
+const acme = client.forTenant('acme');
+```
+
+What a tenant gets:
+
+* **Its own scripts.** A digest is not a capability — anyone holding the bytes
+  can compute one — so a tenant naming a digest it did not register is told
+  the script does not exist. The same answer an unregistered digest gets, on
+  purpose: "it exists but is not yours" is a fact about another customer.
+* **Its own cgroup.** `tenants/<tenant>/<function>/…`, so everything one
+  customer runs is in one place, killable in one write, and countable in one
+  read. Per-tenant *limits* on that cgroup are the next piece of work.
+* **Deletion that means it.** `client.delete_tenant(id)` stops their functions
+  and pools and removes the scripts nothing else refers to — and answers with
+  both lists, because neither can be reconstructed afterwards.
+
+Listing or creating tenants is the **operator's**: a customer that could
+enumerate the other customers is a leak whatever the limits say. Today the
+tenant is named by the `X-Zygo-Tenant` header, which is trusted because
+holding the bearer token is already this API's whole authority. Per-tenant
+tokens are the next piece of work, and then the token answers instead.
 
 ## Runtime pools
 

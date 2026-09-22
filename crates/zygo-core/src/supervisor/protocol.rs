@@ -36,7 +36,10 @@ use crate::spec::{Layer, Spec};
 /// - v4: `SERVE_RUNTIME`, `EXEC_SCRIPT`, `RUNTIMES`, `STOP_RUNTIME` and their
 ///   answers — runtime pools, where the zygote is warm and the script arrives
 ///   with the request.
-pub const CONTROL_VERSION: u32 = 4;
+/// - v5: `CREATE_TENANT`, `TENANTS`, `DELETE_TENANT`, and a `tenant` on
+///   everything that acts for one — the embedder's customers as a first-class
+///   object rather than a word for "function".
+pub const CONTROL_VERSION: u32 = 5;
 
 /// CLI → supervisor.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -81,6 +84,16 @@ pub enum Request {
         /// "already running" is not an answer to that.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         if_changed: bool,
+        /// Whose function this is. `None` is the operator's own.
+        ///
+        /// What it decides today is the cgroup the sandbox lives in and who
+        /// `DELETE /tenants/<id>` stops. It does **not** yet namespace the
+        /// name: the registry is keyed by name alone, which is sound only
+        /// while the operator is the one choosing every name. When a tenant
+        /// token can serve a function (roadmap 2.2), the key has to become
+        /// the pair or two customers will collide on `resize`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tenant: Option<String>,
     },
 
     /// Call a warm function.
@@ -179,6 +192,10 @@ pub enum Request {
 
     /// Register a script, and get back the name the store gave it.
     ///
+    /// `tenant` is whose script it is. The bytes are shared — two tenants
+    /// with identical scripts have one file — but the *reference* is not, and
+    /// it is what lets deleting a tenant take its code with it.
+    ///
     /// Content-addressed, so this is idempotent in the strongest sense: the
     /// same bytes are the same name and the same file, however many tenants
     /// send them and however many times. The answer says whether this call
@@ -186,7 +203,11 @@ pub enum Request {
     ///
     /// The script is not run, and naming it does not make it runnable: a
     /// request has to name a function or (from Phase 1.2) a runtime as well.
-    PutScript { source: String },
+    PutScript {
+        source: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tenant: Option<String>,
+    },
 
     /// Whether the store holds this digest, and how big it is.
     GetScript { digest: String },
@@ -208,6 +229,9 @@ pub enum Request {
         allow_host_net: bool,
         allow_private_net: bool,
         allow_unlimited: bool,
+        /// Whose pool this is. See `Serve::tenant`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tenant: Option<String>,
     },
 
     /// Run one script in a pool.
@@ -220,6 +244,9 @@ pub enum Request {
         script: crate::protocol::Script,
         event: serde_json::Value,
         timeout_ms: u64,
+        /// Whose request this is. `None` is the operator's own.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tenant: Option<String>,
     },
 
     /// Everything `zygo top` shows about the pools.
@@ -227,6 +254,19 @@ pub enum Request {
 
     /// Stop a pool and drop its zygotes.
     StopRuntime { name: String },
+
+    /// Register a tenant, or find the one already registered.
+    ///
+    /// Idempotent: an embedder creating a customer they already have is not
+    /// an error worth failing a deploy over.
+    CreateTenant { id: String },
+
+    /// Every tenant this host holds, or one of them.
+    Tenants { id: Option<String> },
+
+    /// Forget a tenant: its functions and pools stop, and the scripts nothing
+    /// else refers to are removed with it.
+    DeleteTenant { id: String },
 }
 
 fn default_log_limit() -> u32 {
@@ -359,6 +399,24 @@ pub enum Response {
         runtimes: Vec<super::runtime::RuntimeStatus>,
     },
 
+    /// Answer to `CreateTenant`, `Tenants` and `DeleteTenant`.
+    ///
+    /// One shape for all three, because the interesting fields are the same
+    /// and a caller that has to branch on the response type to read an id is
+    /// a caller writing three code paths for one idea.
+    Tenants {
+        tenants: Vec<crate::tenants::Tenant>,
+        /// For a create: the tenant was already registered.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        existed: bool,
+        /// For a delete: the scripts removed because nothing else referred to
+        /// them, and the functions and pools stopped with the tenant.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        removed_scripts: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        stopped: Vec<String>,
+    },
+
     /// Answer to `PutScript` and `GetScript`.
     Script {
         /// `sha256:…`, which is the script's name everywhere else.
@@ -477,6 +535,7 @@ mod tests {
                     "sk_test_123".to_string(),
                 )]),
                 if_changed: true,
+                tenant: Some("acme".into()),
             },
             Request::Exec {
                 name: "resize".into(),
@@ -514,6 +573,7 @@ mod tests {
             },
             Request::PutScript {
                 source: "def handler(event):\n    return event\n".into(),
+                tenant: Some("acme".into()),
             },
             Request::GetScript {
                 digest: "sha256:abc".into(),
@@ -533,13 +593,18 @@ mod tests {
                 allow_host_net: false,
                 allow_private_net: false,
                 allow_unlimited: false,
+                tenant: Some("acme".into()),
             },
             Request::ExecScript {
                 runtime: "py312".into(),
                 script: crate::protocol::Script::inline("def handler(e):\n    return e\n"),
                 event: serde_json::json!({ "n": 1 }),
                 timeout_ms: 30_000,
+                tenant: Some("acme".into()),
             },
+            Request::CreateTenant { id: "acme".into() },
+            Request::Tenants { id: None },
+            Request::DeleteTenant { id: "acme".into() },
             Request::Runtimes,
             Request::StopRuntime {
                 name: "py312".into(),
@@ -590,6 +655,16 @@ mod tests {
                 digest: "sha256:abc".into(),
                 size: 41,
                 existed: true,
+            },
+            Response::Tenants {
+                tenants: vec![crate::tenants::Tenant {
+                    id: "acme".into(),
+                    created_ms: 1_700_000_000_000,
+                    scripts: ["sha256:abc".to_string()].into_iter().collect(),
+                }],
+                existed: true,
+                removed_scripts: vec!["sha256:abc".into()],
+                stopped: vec!["resize".into()],
             },
             Response::RuntimeServed {
                 name: "py312".into(),
@@ -774,6 +849,7 @@ mod tests {
             allow_unlimited: false,
             secrets: Default::default(),
             if_changed: false,
+            tenant: None,
         };
         // The *top-level* key, not the word: the layer inside has a `secrets`
         // field of its own (the names), and that one is allowed to be there.

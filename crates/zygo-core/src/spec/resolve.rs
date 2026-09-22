@@ -59,6 +59,13 @@ pub struct ResolveOptions {
     /// warning printed on every invocation of the default configuration is
     /// noise that trains people to ignore the ones that matter.
     pub one_shot: bool,
+    /// Whose work this is: a tenant of whoever embedded Zygo.
+    ///
+    /// Not a spec field, because it is not a property of the code — it is who
+    /// the request is for, and it arrives with the request. `None` is
+    /// [`DEFAULT_TENANT`]: an operator serving a function from a terminal is
+    /// not acting for anybody but themselves.
+    pub tenant: Option<String>,
     /// This is a `[runtime.<name>]` pool, not a function.
     ///
     /// The difference is what it is allowed to hold. A function *must* say
@@ -68,10 +75,20 @@ pub struct ResolveOptions {
     pub pool: bool,
 }
 
+/// The tenant a function or pool belongs to when nobody named one.
+///
+/// Everything `zygo serve` and `zygo up` start, and every API request from a
+/// token that is not a tenant's. It is a real tenant in the cgroup tree — the
+/// operator's own — rather than a special case the rest of the code has to
+/// know about.
+pub const DEFAULT_TENANT: &str = "default";
+
 /// A fully resolved function: no optional fields, every limit decided.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedFn {
     pub name: String,
+    /// Whose work this is. See [`ResolveOptions::tenant`].
+    pub tenant: String,
     pub image: String,
 
     /// Handler file, made absolute. `None` for warm-exec functions.
@@ -685,6 +702,10 @@ fn resolve_layer(
 
     Ok(ResolvedFn {
         name: name.to_string(),
+        tenant: opts
+            .tenant
+            .clone()
+            .unwrap_or_else(|| DEFAULT_TENANT.to_string()),
         image,
         entry,
         cmd,

@@ -119,6 +119,14 @@ export interface RuntimePool {
   uptime_s: number;
 }
 
+/** One customer of whoever embedded Zygo. */
+export interface Tenant {
+  id: string;
+  created_ms: number;
+  /** Digests of the scripts registered for this tenant. */
+  scripts: string[];
+}
+
 /** A script the host holds, named by the SHA-256 of its bytes. */
 export interface Script {
   /** `sha256:…`, which is the script's name everywhere else. */
@@ -230,6 +238,17 @@ export declare class Client {
   stop(name: string): Promise<string[]>;
   /** Needs an API started with `--allow-deploy`. */
   run(image: string, cmd?: string[] | null, options?: Layer & { stdin?: string }): Promise<RunResult>;
+
+  /** Operator-only. */
+  createTenant(id: string): Promise<Tenant>;
+  /** Operator-only. */
+  tenants(): Promise<Tenant[]>;
+  /** Operator-only. */
+  tenant(id: string): Promise<Tenant>;
+  /** Operator-only, and needs an API started with `--allow-deploy`. */
+  deleteTenant(id: string): Promise<{ deleted: boolean; removed_scripts: string[]; stopped: string[] }>;
+  /** A view of this client that acts for one tenant. */
+  forTenant(id: string): Client;
 
   /** Needs an API started with `--allow-deploy`. */
   serveRuntime(name: string, layer: Layer, options?: { baseDir?: string }): Promise<Record<string, unknown>>;

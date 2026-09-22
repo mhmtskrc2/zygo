@@ -148,6 +148,9 @@ pub fn serve(cli: &Cli, args: &ServeArgs) -> anyhow::Result<u8> {
     let mut client = Client::connect_or_start(&paths, &exe)?;
 
     let response = client.send(&Request::Serve {
+        // The CLI is the operator at a terminal; a tenant's work arrives over
+        // the API, where the caller says whose it is.
+        tenant: None,
         name: name.clone(),
         spec: spec.map(Box::new),
         layer: Box::new(layer),
@@ -225,6 +228,7 @@ fn serve_runtime(cli: &Cli, args: &ServeArgs, name: &str) -> anyhow::Result<u8> 
     let exe = std::env::current_exe().context("cannot find this binary to start a supervisor")?;
     let mut client = Client::connect_or_start(&paths, &exe)?;
     let response = client.send(&Request::ServeRuntime {
+        tenant: None,
         name: name.to_string(),
         spec: spec.map(Box::new),
         layer: Box::new(layer),
@@ -401,6 +405,7 @@ pub fn up(cli: &Cli, file: Option<&std::path::Path>, relock: bool) -> anyhow::Re
             }
         };
         let response = client.send(&Request::Serve {
+            tenant: None,
             name: name.clone(),
             spec: Some(Box::new(spec.clone())),
             layer: Box::new(zygo_core::spec::Layer::default()),
@@ -595,6 +600,9 @@ pub fn exec(cli: &Cli, args: &ExecArgs) -> anyhow::Result<u8> {
             script: script_for(args)?,
             event,
             timeout_ms,
+            // The CLI is the operator at a terminal. A request for a tenant
+            // comes over the API, where the caller says whose it is.
+            tenant: None,
         },
         None => Request::Exec {
             name: args

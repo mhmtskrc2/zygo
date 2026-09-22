@@ -395,8 +395,8 @@ fn start_vm(config: &SandboxConfig, kernel: &Path) -> Result<Box<dyn Sandbox>> {
             limits.mem = crate::spec::Bytes(
                 u64::from(guest_ram_mib(&config.limits) + VMM_OVERHEAD_MIB) * 1024 * 1024,
             );
-            h.create_tenant(&config.id.tenant, &limits)?;
-            Some(h.create_generation(&config.id.tenant)?)
+            h.create_function(&config.id.tenant, &config.id.name, &limits)?;
+            Some(h.create_generation(&config.id.tenant, &config.id.name)?)
         }
         None => None,
     };
