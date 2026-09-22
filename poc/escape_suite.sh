@@ -438,13 +438,58 @@ else
 fi
 
 # --- 14. the host's filesystem ----------------------------------------------
+#
+# `/work` used to be on this list and is not any more. Phase 2.6 mounted a
+# tmpfs there for per-request workspaces, so the path now exists in every
+# sandbox and this case began reporting an escape on a directory Zygo itself
+# had created. Existence is the wrong question for it; 14b asks the right one.
 
 say "14. reach the host's filesystem"
 out=$(py "
 import os
-reachable = [p for p in ('/src', '/work', '/host', '/var/lib/docker') if os.path.exists(p)]
+reachable = [p for p in ('/src', '/host', '/var/lib/docker') if os.path.exists(p)]
 print(','.join(reachable) if reachable else 'none')")
-[ "$out" = "none" ] && ok "no host path is reachable" || bad "reachable: $out"
+if [ -z "$out" ]; then
+    nothing_ran "this case"
+elif [ "$out" = "none" ]; then
+    ok "no host path is reachable"
+else
+    bad "reachable: $out"
+fi
+
+# --- 14b. the other requests' workspaces ------------------------------------
+#
+# One sandbox serves several requests and, in a pool, several tenants. Each
+# request's files live under `/work/<128 random bits>` and the directory above
+# them is mode 0311, so a handler cannot enumerate its neighbours — that mode
+# is the whole boundary, because a mount namespace per request is not
+# available to a forked child (6.12). Two answers would break it: `/work`
+# turning out to be a directory of the host's rather than a tmpfs of Zygo's,
+# and `/work` turning out to be listable.
+
+say "14b. list the other requests' workspaces"
+out=$(py "
+import os
+# mountinfo: '<id> <parent> <maj:min> <root> <mountpoint> <opts…> - <fstype> …'
+try:
+    kind = [l.split(' - ')[1].split()[0] for l in open('/proc/self/mountinfo')
+            if l.split(' - ')[0].split()[4] == '/work'][-1]
+except (IndexError, IOError):
+    kind = 'not-a-mount'
+try:
+    names = os.listdir('/work')
+    listed = 'LISTED:' + (','.join(names[:5]) or 'empty')
+except OSError as e:
+    listed = 'refused:%d' % e.errno
+print('%s %s' % (kind, listed))")
+case "$out" in
+    "tmpfs refused:13")
+        ok "/work is a tmpfs of Zygo's own and cannot be listed ($out)" ;;
+    "")
+        nothing_ran "this case" ;;
+    *)
+        bad "the workspace directory: $out" ;;
+esac
 
 # --- 15. the image layers on the host ---------------------------------------
 
