@@ -1,0 +1,17 @@
+# A warm-exec **pool**: one held sandbox, a different script every request.
+#
+# `cmd` and no `agent` is what makes it warm-exec. Zygo writes each request's
+# script into the sandbox and runs `/bin/sh <that path>` with the event on
+# stdin; whatever the script prints to stdout is the result.
+#
+#   zygo serve --runtime sh
+#   zygo exec --runtime sh --script wordcount.sh '{"text": "warm exec in sh"}'
+#
+# `mem` and `timeout` are the pool's ceiling, not one script's: every request
+# runs under them, whoever sent it.
+
+[runtime.sh]
+image   = "alpine:3"
+cmd     = ["/bin/sh"]
+mem     = "64M"
+timeout = "10s"

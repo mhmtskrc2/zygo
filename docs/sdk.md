@@ -563,6 +563,30 @@ installed. That is what makes it safe for two tenants to share a pool, and it
 is checked rather than asserted — `poc/verify_api.sh` asks a script where it
 was loaded from and whether it can list what else is in flight.
 
+### A pool with no agent
+
+A pool usually holds an agent — an interpreter, warm, forking per request. It
+does not have to. Give it a `cmd` and no `agent` and you get the **warm-exec**
+shape: Zygo holds the sandbox, writes each request's script into it, and runs
+`cmd` with that path as its last argument and the event on stdin.
+
+```python
+client.serve_runtime("sh", {"image": "alpine:3", "cmd": ["/bin/sh"]})
+script = client.put_script(open("wordcount.sh").read())
+out = client.run_script("sh", script.sha256, {"text": "warm exec in sh"})
+```
+
+That is `sh /run/script/<digest>` inside the sandbox. It is the right shape for
+`bash`, for a static binary that takes a script as an argument, and for any
+language whose runtime starts in under a millisecond — there is nothing for an
+agent to amortise, and the warm protocol would only be a moving part.
+
+What it does not have, because there is no protocol to carry it: streaming,
+`progress()`, workspaces, and per-tenant limits narrowed per request. The
+sandbox is identical — same namespaces, same seccomp profile, same cgroup per
+request, same deadline. [`examples/warm-exec/`](../examples/warm-exec) has
+both shapes side by side.
+
 ## Dependency sets
 
 A pool's `requirements` names a file **on the Zygo host**, which is the one

@@ -136,15 +136,24 @@ pub struct ResolvedFn {
     /// Non-fatal problems worth telling the user about. The CLI prints these;
     /// they never block a run.
     pub warnings: Vec<String>,
+
+    /// Resolved as a `[runtime.<name>]` pool rather than a `[fn.<name>]`.
+    ///
+    /// Recorded rather than inferred from the shape, and it used to be
+    /// inferred: "an agent and no handler" told a pool from a function for as
+    /// long as every pool had an agent. A **warm-exec pool** has a `cmd` and
+    /// no agent, which is the same shape as a warm-exec *function* — so the
+    /// inference quietly answered `false`, the sandbox was built without the
+    /// script directory every request needs, and `sh` said `can't open
+    /// /run/script/<digest>`. The resolver knows which it was asked for; this
+    /// is it remembering.
+    pub pool: bool,
 }
 
 impl ResolvedFn {
     /// Whether this is a runtime pool rather than a function.
-    ///
-    /// An agent and no handler: the zygote holds an interpreter and its
-    /// dependency set, and every request brings the script it runs.
     pub fn is_pool(&self) -> bool {
-        self.entry.is_none() && self.cmd.is_empty() && self.runtime.is_some()
+        self.pool
     }
 }
 
@@ -372,20 +381,36 @@ fn resolve_layer(
     // tenant's request forks from — and a pool that could name an `entry`
     // would be a function with several copies, which is not what this is for.
     if opts.pool {
-        if entry.is_some() || !cmd.is_empty() {
+        if entry.is_some() {
             return Err(SpecError::invalid_with(
                 format!("runtime.{name}"),
-                "a runtime pool cannot name code to run",
+                "a runtime pool cannot name code to warm",
                 "its zygotes are shared, and every request brings its own \
                  `script`. Use `[fn.<name>]` to warm one handler.",
             ));
         }
-        if runtime.is_none() {
+        // `cmd` is the **warm-exec pool**: one held sandbox running a program
+        // the operator named, with each request's script as the last word of
+        // its command line. Still no tenant code in the zygote — what differs
+        // from an agent pool is that the request's code is `execve`d rather
+        // than imported, which is the right trade for a runtime that starts
+        // in under a millisecond and has nothing to amortise.
+        if runtime.is_none() && cmd.is_empty() {
             return Err(SpecError::invalid_with(
                 format!("runtime.{name}.agent"),
-                "a runtime pool needs an agent",
-                "`agent = \"python\"`, `agent = \"node\"`, or \
-                 `agent = { agent = \"/path/to/your-agent\" }` for one of your own",
+                "a runtime pool needs an agent or a command",
+                "`agent = \"python\"`, `agent = \"node\"`, \
+                 `agent = { agent = \"/path/to/your-agent\" }` for one of your own, \
+                 or `cmd = [\"/bin/sh\"]` for warm-exec, where each request's script \
+                 is the last argument",
+            ));
+        }
+        if runtime.is_some() && !cmd.is_empty() {
+            return Err(SpecError::invalid_with(
+                format!("runtime.{name}"),
+                "`agent` and `cmd` are mutually exclusive",
+                "`agent` speaks the warm protocol and loads a script per request; \
+                 `cmd` is warm-exec and is given one as an argument. Pick one.",
             ));
         }
     }
@@ -701,6 +726,7 @@ fn resolve_layer(
     }
 
     Ok(ResolvedFn {
+        pool: opts.pool,
         name: name.to_string(),
         tenant: opts
             .tenant
@@ -906,26 +932,61 @@ mod tests {
     }
 
     #[test]
-    fn a_pool_that_names_code_is_refused_because_its_zygotes_are_shared() {
-        for table in [
+    fn a_pool_that_names_code_to_warm_is_refused_because_its_zygotes_are_shared() {
+        let err = spec(
             "[runtime.p]\nimage = \"python:3.12-slim\"\nagent = \"python\"\nentry = \"h.py\"\n",
-            "[runtime.p]\nimage = \"alpine:3\"\nagent = \"python\"\ncmd = [\"true\"]\n",
-        ] {
-            let err = spec(table)
-                .resolve_runtime("p", &Layer::default(), &opts())
-                .expect_err("a pool cannot hold tenant code");
-            assert!(format!("{err}").contains("cannot name code"), "{err}");
-        }
+        )
+        .resolve_runtime("p", &Layer::default(), &opts())
+        .expect_err("a pool cannot hold tenant code");
+        assert!(format!("{err}").contains("cannot name code"), "{err}");
+    }
+
+    /// A pool may be warm-exec, and then `cmd` is the program, not the code.
+    ///
+    /// The distinction the refusal above is about: `entry` is imported into
+    /// the zygote every tenant forks from, and `cmd` is a program the operator
+    /// named that is handed a different tenant's script on every request.
+    #[test]
+    fn a_pool_may_be_warm_exec_with_the_script_as_an_argument() {
+        let pool = spec("[runtime.sh]\nimage = \"alpine:3\"\ncmd = [\"/bin/sh\"]\n")
+            .resolve_runtime("sh", &Layer::default(), &opts())
+            .expect("a warm-exec pool is a pool");
+        assert_eq!(pool.cmd, vec!["/bin/sh".to_string()]);
+        assert!(pool.runtime.is_none(), "no agent: {:?}", pool.runtime);
+        assert!(pool.entry.is_none());
+        // And it knows it is one. This was inferred from the shape until a
+        // pool could be warm-exec, at which point the inference could not
+        // tell it from a warm-exec *function* — and the sandbox was built
+        // without the script directory every request needs.
+        assert!(pool.is_pool(), "{pool:?}");
     }
 
     #[test]
-    fn a_pool_without_an_agent_is_refused_and_told_which_ones_there_are() {
+    fn a_warm_exec_function_is_not_a_pool_though_it_has_the_same_shape() {
+        let f = spec("[fn.parse]\nimage = \"alpine:3\"\ncmd = [\"/app/parse\"]\n")
+            .resolve(Some("parse"), &Layer::default(), &opts())
+            .expect("a warm-exec function resolves");
+        assert!(!f.is_pool(), "{f:?}");
+        assert_eq!(f.cmd, vec!["/app/parse".to_string()]);
+    }
+
+    #[test]
+    fn a_pool_with_both_an_agent_and_a_command_is_refused() {
+        let err = spec("[runtime.p]\nimage = \"alpine:3\"\nagent = \"python\"\ncmd = [\"true\"]\n")
+            .resolve_runtime("p", &Layer::default(), &opts())
+            .expect_err("an agent and a cmd are two answers to one question");
+        assert!(format!("{err}").contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn a_pool_with_neither_an_agent_nor_a_command_is_refused_and_told_the_options() {
         let err = spec("[runtime.p]\nimage = \"alpine:3\"\n")
             .resolve_runtime("p", &Layer::default(), &opts())
-            .expect_err("a pool with no agent cannot serve anything");
+            .expect_err("a pool with nothing to run cannot serve anything");
         let text = format!("{err}");
-        assert!(text.contains("needs an agent"), "{text}");
+        assert!(text.contains("needs an agent or a command"), "{text}");
         assert!(text.contains("python"), "{text}");
+        assert!(text.contains("cmd"), "{text}");
     }
 
     /// The one built-in a pool does not share with a function.

@@ -119,10 +119,50 @@ else
 fi
 
 say ""
+say "a shell script in a warm-exec pool"
+# The other warm-exec shape (todo 3.4): `cmd` and no agent, with each
+# request's script written into the sandbox and named on the command line.
+# The point of the check is that a pool needs no agent at all — `sh` has no
+# protocol and nothing to warm.
+mkdir -p /tmp/sh-example && cp -r "$SRC/examples/warm-exec/shell/." /tmp/sh-example/
+cd /tmp/sh-example || exit 1
+if "$ZYGO" serve --runtime sh >/tmp/serve-sh.log 2>&1; then
+    ok "\`serve --runtime\` brings up a pool whose agent is /bin/sh"
+    out=$("$ZYGO" exec --runtime sh --script wordcount.sh '{"text": "warm exec in sh"}' 2>&1 | tr -d '\n ')
+    case "$out" in
+        *'"words":4'*) ok "a script ran with the event on stdin and answered on stdout" ;;
+        *) bad "sh pool: $(printf '%s' "$out" | cut -c1-200)" ;;
+    esac
+
+    # A second script in the same pool, to show the pool holds none of the
+    # first: this is the claim that makes one sandbox serve many tenants.
+    cat > /tmp/sh-example/second.sh <<'SECOND'
+read -r _
+echo '{"second":true}'
+SECOND
+    out=$("$ZYGO" exec --runtime sh --script /tmp/sh-example/second.sh '{}' 2>&1 | tr -d '\n ')
+    case "$out" in
+        *'"second":true'*) ok "and a different script runs in the same warm sandbox" ;;
+        *) bad "second script: $(printf '%s' "$out" | cut -c1-200)" ;;
+    esac
+
+    # The program's own failure, which is the whole error-handling story when
+    # there is no protocol to report one.
+    out=$("$ZYGO" exec --runtime sh --script wordcount.sh '{"nothing": 1}' 2>&1)
+    case "$out" in
+        *'needs a "text" field'*) ok "a script that exits non-zero fails the request, carrying its stderr" ;;
+        *) bad "the script's stderr did not come back: $(printf '%s' "$out" | head -2 | tr '\n' ' ')" ;;
+    esac
+    "$ZYGO" stop sh >/dev/null 2>&1
+else
+    bad "serve --runtime sh: $(grep -v '^$' /tmp/serve-sh.log | tail -3 | tr '\n' ' ' | cut -c1-200)"
+fi
+
+say ""
 say "the example specs"
 # Every example ships a `sandbox.toml`; each has to resolve, or the README
 # beside it is describing something that does not run.
-for example in webhook agent-tool warm-exec/go workflow-engine; do
+for example in webhook agent-tool warm-exec/go warm-exec/shell workflow-engine; do
     if "$ZYGO" spec -f "$SRC/examples/$example/sandbox.toml" validate >/dev/null 2>&1; then
         ok "examples/$example/sandbox.toml validates"
     else

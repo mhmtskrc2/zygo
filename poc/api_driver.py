@@ -440,6 +440,69 @@ def main() -> int:
             bad("DELETE /runtimes/<name>")
         client.delete_script(registered.sha256)
 
+        # --- a warm-exec pool --------------------------------------------------
+        #
+        # The other pool shape (todo 3.4). No agent and no protocol: the
+        # sandbox is held, the script is written into it, and each request is
+        # `cmd` plus that path with the event on stdin. For a runtime that
+        # starts in under a millisecond there is nothing for an agent to
+        # amortise, and `sh` is the case that proves it — there is no zygote
+        # to speak of.
+        print("\nwarm-exec pools")
+
+        pool = client.serve_runtime(
+            "sh-pool", {"image": "alpine:3", "cmd": ["/bin/sh"], "timeout": "20s"}
+        )
+        if pool.get("warm", 0) >= 1:
+            ok(f"a pool with a `cmd` and no agent warms ({pool.get('warm_ms', 0):.0f} ms)")
+        else:
+            bad("POST /runtimes with a cmd", pool)
+
+        shell = client.put_script(
+            'read -r event\n'
+            'n=$(echo "$event" | tr -cd "0-9")\n'
+            'printf \'{"shell":"%s","n":%s}\\n\' "$0" "${n:-0}"\n'
+        )
+        out = client.run_script("sh-pool", shell.sha256, {"n": 41})
+        if out.result.get("n") == 41:
+            ok(f"a shell script runs with the event on stdin ({out.result.get('shell')})")
+        else:
+            bad("POST /runtimes/sh-pool/call", f"{out.result} {out.stderr}")
+
+        if str(out.result.get("shell", "")).startswith("/run/script/"):
+            ok("and the script is a file in the sandbox, named on the command line")
+        else:
+            bad("the script did not arrive as a path", out.result)
+
+        # Two requests, two processes — the same claim an agent pool makes,
+        # and here it is structural: every request is an `execve`.
+        first = client.run_script(
+            "sh-pool", 'read -r _\nprintf \'{"pid":%s}\\n\' "$$"\n'
+        ).result.get("pid")
+        second = client.run_script(
+            "sh-pool", 'read -r _\nprintf \'{"pid":%s}\\n\' "$$"\n'
+        ).result.get("pid")
+        if first and second and first != second:
+            ok(f"each request is a fresh process ({first} then {second})")
+        else:
+            bad("two warm-exec requests shared a process", f"{first} and {second}")
+
+        # A non-zero exit is a failed request, and stderr comes back — which
+        # is the whole error-handling story for a program with no protocol.
+        try:
+            client.run_script(
+                "sh-pool",
+                'read -r _\necho "it went wrong" >&2\nexit 3\n',
+            )
+            bad("a script that exited non-zero was reported as a success")
+        except zygo.HandlerError as e:
+            if "it went wrong" in str(e) or "3" in str(e):
+                ok("a non-zero exit is a failed request, carrying its stderr")
+            else:
+                bad("the failure said nothing useful", e)
+
+        client.stop_runtime("sh-pool")
+
         # --- tenants ---------------------------------------------------------
         #
         # The embedder's customers. What matters is that a tenant's things are

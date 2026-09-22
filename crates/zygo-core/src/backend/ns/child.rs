@@ -139,7 +139,7 @@ pub unsafe fn child_main(plan: &PreparedLaunch, ready_fd: c_int, err_fd: c_int) 
     if plan.hold {
         unsafe { hold(err_fd) }
     }
-    unsafe { exec_or_fail(plan, err_fd) }
+    unsafe { exec_or_fail(plan, plan.argv(), err_fd) }
 }
 
 /// Steps 7–10: everything that turns a process with the sandbox's view of the
@@ -213,9 +213,13 @@ pub(super) unsafe fn harden(plan: &PreparedLaunch, err_fd: c_int) {
 ///
 /// # Safety
 /// Child side of a clone or fork: nothing here may allocate.
-pub(super) unsafe fn exec_or_fail(plan: &PreparedLaunch, err_fd: c_int) -> ! {
+pub(super) unsafe fn exec_or_fail(
+    plan: &PreparedLaunch,
+    argv: *const *const c_char,
+    err_fd: c_int,
+) -> ! {
     for candidate in &plan.program_candidates {
-        unsafe { libc::execve(candidate.as_ptr(), plan.argv(), plan.envp()) };
+        unsafe { libc::execve(candidate.as_ptr(), argv, plan.envp()) };
     }
     fail(err_fd, Step::Execve);
 }

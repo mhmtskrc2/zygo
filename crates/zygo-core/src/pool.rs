@@ -910,8 +910,14 @@ impl Pool {
         // only code that reaches the sandbox afterwards arrives per request
         // and is loaded in the child. Asserted rather than assumed, because
         // every isolation claim about a shared pool rests on it.
+        //
+        // `cmd` is the exception and not a hole: a **warm-exec pool** runs one
+        // program the operator named — `sh`, a static binary — and the script
+        // arrives as the last word of its command line. Nothing of the
+        // tenant's is warmed into the sandbox there either; what differs is
+        // that the request's code is `execve`d rather than imported.
         if f.is_pool() {
-            debug_assert!(f.entry.is_none() && f.cmd.is_empty());
+            debug_assert!(f.entry.is_none());
             if f.entry.is_some() {
                 return Err(Error::BackendUnavailable {
                     backend: "pool",
@@ -939,9 +945,12 @@ impl Pool {
         //
         // Made for every agent sandbox rather than only for pools, because a
         // function can be sent a script too — `entry` is the fast path, not
-        // the only one — and an empty directory costs an inode.
+        // the only one — and an empty directory costs an inode. A warm-exec
+        // *pool* needs it for the same reason and one more: its script has to
+        // be a file, because it is named on a command line, so there is no
+        // `source` shape to fall back to.
         let script_dir = new_script_dir(&self.config.paths, &f.name);
-        if matches!(mode, Mode::Agent(_)) {
+        if matches!(mode, Mode::Agent(_)) || f.is_pool() {
             ensure_script_dir(&script_dir)?;
             warm.mounts.push(crate::spec::Mount {
                 source: script_dir.clone(),
@@ -1012,7 +1021,7 @@ impl Pool {
         let backend = crate::backend::for_isolation(f.isolation, &self.config.paths)?;
 
         match mode {
-            Mode::Exec => self.serve_exec(f, config, backend.as_ref(), tenant_cgroup),
+            Mode::Exec => self.serve_exec(f, config, backend.as_ref(), tenant_cgroup, &script_dir),
             Mode::Agent(_) => {
                 // A socket pair rather than a listening socket: no path,
                 // nothing on the filesystem, and the sandbox cannot reach a
@@ -1119,12 +1128,14 @@ impl Pool {
     /// Bring up a warm-exec function: a held sandbox and the plan every
     /// request will be hardened with.
     #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
     fn serve_exec(
         &self,
         f: &ResolvedFn,
         mut config: crate::sandbox::SandboxConfig,
         backend: &dyn crate::backend::Backend,
         tenant_cgroup: Option<PathBuf>,
+        script_dir: &std::path::Path,
     ) -> Result<Function> {
         // The init holds; the requests run. Two plans from one configuration:
         // the held one for the sandbox, and one with `hold` off whose
@@ -1171,6 +1182,8 @@ impl Pool {
             per_request_cgroup: self.config.per_request_cgroup,
             timeout: f.limits.timeout.get(),
             secrets: Mutex::new(Secrets::default()),
+            scripts: Mutex::new(Scripts::default()),
+            script_dir: script_dir.to_path_buf(),
         })))
     }
 
@@ -1349,6 +1362,7 @@ impl Pool {
         _config: crate::sandbox::SandboxConfig,
         _backend: &dyn crate::backend::Backend,
         _tenant_cgroup: Option<PathBuf>,
+        _script_dir: &std::path::Path,
     ) -> Result<Function> {
         Err(Error::BackendUnavailable {
             backend: "pool",
@@ -2958,6 +2972,13 @@ pub struct WarmExec {
     per_request_cgroup: bool,
     timeout: std::time::Duration,
     secrets: Mutex<Secrets>,
+    /// Scripts written into the sandbox for the requests running them. As on
+    /// [`WarmFn`], and for a pool of these it is the only way code arrives:
+    /// the script is a **file named on a command line**, so there is no
+    /// `source` shape to fall back to.
+    scripts: Mutex<Scripts>,
+    /// The host side of `/run/script`: this sandbox's alone, removed with it.
+    script_dir: PathBuf,
 }
 
 #[cfg(target_os = "linux")]
@@ -3046,14 +3067,88 @@ impl WarmExec {
         CpuAccounting::read(self.tenant_cgroup.as_ref()?)
     }
 
+    /// Write one request's script into the sandbox and say where it is.
+    ///
+    /// [`WarmFn::place_script`] falls back to sending the bytes in the `EXEC`
+    /// when it cannot write into the sandbox. There is no such fallback here:
+    /// the script is named on a command line, so a path is the only shape it
+    /// has. A caller that already arranged delivery — a `path` of their own —
+    /// is taken at their word, as on the agent path.
+    fn place_script(
+        &self,
+        script: crate::protocol::Script,
+    ) -> Result<(String, Option<ScriptLease<'_>>)> {
+        if let Some(path) = script.path {
+            return Ok((path, None));
+        }
+        let Some(source) = script.source else {
+            return Err(Error::Spec(crate::spec::SpecError::invalid(
+                "script",
+                "carries neither `source` nor `path`",
+            )));
+        };
+        let digest = crate::scripts::ScriptDigest::of(&source);
+        let lease = place_script(&self.scripts, &self.script_dir, digest.hex(), &source)?;
+        Ok((
+            format!("{SCRIPT_DIR_IN_SANDBOX}/{}", digest.hex()),
+            Some(lease),
+        ))
+    }
+
     /// Serve one request: enter, admit, run, collect.
     pub fn call_timed(
         &self,
         event: serde_json::Value,
         timeout: std::time::Duration,
     ) -> Result<(Outcome, CallTiming)> {
+        self.call_script_timed(event, None, timeout)
+    }
+
+    /// The same, for a request that brought its own script (todo 3.4).
+    ///
+    /// The **warm-exec pool** shape: one held sandbox running a program the
+    /// operator named — `sh`, a static binary — and each request's script
+    /// written into `/run/script/<digest>` and named as the last word of the
+    /// command line. For a language whose runtime starts in under a
+    /// millisecond there is nothing for an agent to amortise, and the warm
+    /// protocol would only be a moving part.
+    ///
+    /// The script has to be a **file**: `source` on the wire has nowhere to go
+    /// when the thing that loads it is `execve`. A sandbox this process cannot
+    /// write into is therefore a refusal rather than a fallback — unlike the
+    /// agent path, which still has `EXEC.source`.
+    ///
+    /// Nothing checks the digest here, and nothing needs to: `/run/script` is
+    /// a **read-only bind mount**, so the file the supervisor wrote is the
+    /// file that is `execve`d. The agent path carries the digest because its
+    /// fallback shape puts the bytes on the wire.
+    pub fn call_script_timed(
+        &self,
+        event: serde_json::Value,
+        script: Option<crate::protocol::Script>,
+        timeout: std::time::Duration,
+    ) -> Result<(Outcome, CallTiming)> {
         use crate::backend::ns::enter;
         use std::io::Write as _;
+
+        // Placed before anything is forked, and held for the whole request:
+        // the lease is what keeps the file there while it runs and removes it
+        // when the last request using it is done.
+        let (script_path, _script_lease) = match script {
+            None => (None, None),
+            Some(script) => {
+                let (path, lease) = self.place_script(script)?;
+                (Some(path), lease)
+            }
+        };
+        let argv = match &script_path {
+            None => None,
+            Some(path) => Some(self.plan.argv_with(path).map_err(|e| Error::Primitive {
+                operation: "prepare a request's argv",
+                remedy: "the script path contains a NUL byte; this is an internal error".into(),
+                source: std::io::Error::other(e.to_string()),
+            })?),
+        };
 
         let id = next_request_id();
         let started = Instant::now();
@@ -3074,7 +3169,7 @@ impl WarmExec {
                     reason: "the sandbox has no namespace descriptors".into(),
                     remedy: "internal error; the function will be rewarmed".into(),
                 })?;
-            enter::enter(&self.plan, ns)
+            enter::enter_with(&self.plan, ns, argv.as_ref())
         };
         let entered = match entered {
             Ok(entered) => entered,
@@ -3600,10 +3695,14 @@ impl Function {
 
     /// Serve one request against a script that did not come with the zygote.
     ///
-    /// The runtime-pool shape. Only an agent can do this: warm-exec has no
-    /// protocol to carry a script in, and a `cmd` that took one as an
-    /// argument is the *warm-exec runtime* of the roadmap's Phase 3.4 rather
-    /// than this.
+    /// The runtime-pool shape, and there are two of them. An **agent** pool
+    /// loads the script in the forked child, under the child's own seccomp
+    /// filter, and can stream, take a workspace and be narrowed per tenant. A
+    /// **warm-exec** pool `execve`s a program the operator named with the
+    /// script as its last argument — right for a language that starts in
+    /// under a millisecond, and without any of those four things, because
+    /// there is no protocol between the supervisor and the program to carry
+    /// them.
     pub fn call_script_with_timeout(
         &self,
         event: serde_json::Value,
@@ -3707,17 +3806,13 @@ impl Function {
                 workspace,
                 tenant_limits,
             ),
+            // A warm-exec pool takes a script as the last word of its
+            // command line (todo 3.4); a warm-exec *function* has an `entry`
+            // of its own and is not asked for one. Either way there is no
+            // agent here, so `sink`, `workspace` and `tenant_limits` have
+            // nowhere to go — see the note on `Function::call_full`.
             #[cfg(target_os = "linux")]
-            Function::Exec(f) => match script {
-                None => f.call_timed(event, timeout),
-                Some(_) => Err(Error::BackendUnavailable {
-                    backend: "pool",
-                    reason: "a warm-exec function cannot be given a script".into(),
-                    remedy: "run scripts in a runtime pool, whose agent loads one per \
-                             request"
-                        .into(),
-                }),
-            },
+            Function::Exec(f) => f.call_script_timed(event, script, timeout),
         }
     }
 

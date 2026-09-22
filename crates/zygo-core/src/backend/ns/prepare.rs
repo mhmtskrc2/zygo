@@ -279,9 +279,49 @@ pub struct PreparedLaunch {
 unsafe impl Send for PreparedLaunch {}
 unsafe impl Sync for PreparedLaunch {}
 
+/// One request's argv: the plan's, with something on the end.
+///
+/// A warm-exec **pool** runs the same program for every request and gives each
+/// one a different script — `sh /run/script/<digest>` — so the tail is
+/// per-request where everything else in the plan is not. Built before the
+/// fork, because the side of a fork that runs it may not allocate.
+///
+/// Owns only the tail; the pointers before it point into the plan's own
+/// strings, which is why it borrows the plan for its lifetime.
+pub struct RequestArgv<'a> {
+    _plan: &'a PreparedLaunch,
+    _tail: CString,
+    ptrs: Vec<*const c_char>,
+}
+
+impl RequestArgv<'_> {
+    pub fn as_ptr(&self) -> *const *const c_char {
+        self.ptrs.as_ptr()
+    }
+}
+
+// SAFETY: as for `PreparedLaunch` — the pointers point into heap buffers this
+// struct and the plan it borrows own and never mutate after construction.
+unsafe impl Send for RequestArgv<'_> {}
+unsafe impl Sync for RequestArgv<'_> {}
+
 impl PreparedLaunch {
     pub fn argv(&self) -> *const *const c_char {
         self.argv_ptrs.as_ptr()
+    }
+
+    /// This launch with one more argument on the end. See [`RequestArgv`].
+    pub fn argv_with(&self, tail: &str) -> Result<RequestArgv<'_>, PrepareError> {
+        let tail = cstr_str(tail)?;
+        // Everything but the plan's trailing NULL, then the tail, then a NULL.
+        let mut ptrs: Vec<*const c_char> = self._argv.iter().map(|s| s.as_ptr()).collect();
+        ptrs.push(tail.as_ptr());
+        ptrs.push(core::ptr::null());
+        Ok(RequestArgv {
+            _plan: self,
+            _tail: tail,
+            ptrs,
+        })
     }
 
     pub fn envp(&self) -> *const *const c_char {

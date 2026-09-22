@@ -88,6 +88,25 @@ impl Entered {
 /// is written, which is the supervisor's moment to put it in a cgroup. Same
 /// handshake as `FORKED`/`GO` on the agent path, for the same reason.
 pub fn enter(plan: &PreparedLaunch, ns: &NamespaceFds) -> Result<Entered> {
+    enter_with(plan, ns, None)
+}
+
+/// The same, with one more argument on this request's argv.
+///
+/// The warm-exec **pool** shape: one held sandbox running the same program,
+/// and each request's script named on the end of its command line. The tail is
+/// materialised by the caller before the fork — see
+/// [`crate::backend::ns::prepare::PreparedLaunch::argv_with`] — because the
+/// side of a fork that `execve`s it may not allocate.
+pub fn enter_with(
+    plan: &PreparedLaunch,
+    ns: &NamespaceFds,
+    argv: Option<&crate::backend::ns::prepare::RequestArgv<'_>>,
+) -> Result<Entered> {
+    let argv_ptr = match argv {
+        Some(argv) => argv.as_ptr(),
+        None => plan.argv(),
+    };
     // Every pipe close-on-exec, and every copy made of one below keeps the
     // flag: the request `dup2`s the three it keeps onto 0, 1 and 2 (which
     // clears the flag on those three, as it must) and the rest vanish at
@@ -117,6 +136,7 @@ pub fn enter(plan: &PreparedLaunch, ns: &NamespaceFds) -> Result<Entered> {
             helper_main(
                 plan,
                 ns,
+                argv_ptr,
                 Ends {
                     go_r: go_r.as_raw_fd(),
                     stdin_r: stdin_r.as_raw_fd(),
@@ -216,7 +236,12 @@ pub(super) unsafe fn close_from(first: c_int) {
 /// # Safety
 /// Child side of a fork from a multi-threaded parent: nothing here allocates,
 /// and it never returns.
-unsafe fn helper_main(plan: &PreparedLaunch, ns: &NamespaceFds, ends: Ends) -> ! {
+unsafe fn helper_main(
+    plan: &PreparedLaunch,
+    ns: &NamespaceFds,
+    argv: *const *const std::os::raw::c_char,
+    ends: Ends,
+) -> ! {
     // Die with the supervisor, so a request cannot outlive the thing that is
     // enforcing its deadline.
     unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) };
@@ -322,7 +347,7 @@ unsafe fn helper_main(plan: &PreparedLaunch, ns: &NamespaceFds, ends: Ends) -> !
         child::fail(ends.err_w, Step::Setns);
     }
     if request == 0 {
-        unsafe { request_main(plan, mnt, ends) }
+        unsafe { request_main(plan, argv, mnt, ends) }
     }
 
     // Only the status pipe stays open here. Closing `err_w` matters: the
@@ -358,7 +383,12 @@ unsafe fn helper_main(plan: &PreparedLaunch, ns: &NamespaceFds, ends: Ends) -> !
 ///
 /// # Safety
 /// As [`helper_main`].
-unsafe fn request_main(plan: &PreparedLaunch, mnt: c_int, ends: Ends) -> ! {
+unsafe fn request_main(
+    plan: &PreparedLaunch,
+    argv: *const *const std::os::raw::c_char,
+    mnt: c_int,
+    ends: Ends,
+) -> ! {
     unsafe {
         libc::close(ends.status_w);
     }
@@ -397,7 +427,7 @@ unsafe fn request_main(plan: &PreparedLaunch, mnt: c_int, ends: Ends) -> ! {
     // Exactly what the init went through, so a request is never less
     // constrained than the sandbox it is in.
     unsafe { child::harden(plan, ends.err_w) };
-    unsafe { child::exec_or_fail(plan, ends.err_w) }
+    unsafe { child::exec_or_fail(plan, argv, ends.err_w) }
 }
 
 fn pipe_cloexec() -> Result<(OwnedFd, OwnedFd)> {
