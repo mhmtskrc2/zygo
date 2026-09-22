@@ -26,11 +26,15 @@ export class FakeApi {
       const chunks = [];
       for await (const chunk of request) chunks.push(chunk);
       const raw = Buffer.concat(chunks).toString('utf8');
+      // Not every body is JSON: `PUT /scripts` sends the script as itself, so
+      // parsing by content type rather than by hope.
+      const isJson = (request.headers['content-type'] ?? '').startsWith('application/json');
       this.requests.push({
         method: request.method,
         path: request.url,
         headers: request.headers,
-        body: raw ? JSON.parse(raw) : null,
+        body: raw && isJson ? JSON.parse(raw) : null,
+        raw,
       });
 
       if (this.delay) await new Promise((r) => setTimeout(r, this.delay));

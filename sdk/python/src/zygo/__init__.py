@@ -37,7 +37,7 @@ from ._errors import (
     TransportError,
     ZygoError,
 )
-from ._models import Function, LogEntry, LogPage, Metrics, Result, Run, Served
+from ._models import Function, LogEntry, LogPage, Metrics, Result, Run, Script, Served
 from ._sync import Client, FunctionHandle, connect
 
 __version__ = "0.1.0"
@@ -55,6 +55,7 @@ __all__ = [
     "Metrics",
     "Result",
     "Run",
+    "Script",
     "Served",
     # failures
     "AuthError",

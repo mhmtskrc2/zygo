@@ -50,13 +50,17 @@ pub const CHILD_SECCOMP_ENV: &str = "ZYGO_CHILD_SECCOMP";
 /// Two shapes, and the difference is who holds the bytes:
 ///
 /// * `path` — the supervisor wrote the script into the sandbox before `GO`,
-///   read-only, and this names it. Content-addressed, so the same script from
-///   two tenants is one file, and an immutable one.
-/// * `source` — the text itself, on the wire. Simple, needs no store, and
-///   costs a copy of the script in every `EXEC`. For a one-off, or for an
-///   embedder that has nowhere to put a file.
+///   `0400`, in a directory that cannot be listed, and this names it. The
+///   preferred shape, and the reason is which processes have the bytes: only
+///   the child does. A `source` on the wire is read into the *zygote's*
+///   address space to be forwarded, and in a runtime pool the zygote is shared
+///   — so the next tenant's fork inherits a copy-on-write view of a heap that
+///   held this tenant's code.
+/// * `source` — the text itself, on the wire. Needs no writable path into the
+///   sandbox, which is what makes it the fallback where there is none, and
+///   what makes it right for a one-off.
 ///
-/// Exactly one is set. Both being absent is the same as no `script` at all,
+/// At least one is set. Both being absent is the same as no `script` at all,
 /// and is refused rather than guessed at.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Script {
@@ -66,12 +70,20 @@ pub struct Script {
     /// The script itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
-    /// `sha256:…` of the contents.
+    /// `sha256:…` of the contents, which the child checks before it loads them.
     ///
-    /// Not a security control — the supervisor put the file there and the
-    /// child cannot reach anything else — but an identity. An agent may use
-    /// it to key a compiled-code cache *in the child*, and a log line that
-    /// carries it can say which version of a script failed.
+    /// Load-bearing for `path`, and the reason is that the file is *not*
+    /// protected from the tenant. A sandbox has one uid: the child that is
+    /// about to load `/run/script/<hash>` can unlink it and write its own in
+    /// its place, for itself or for another request in flight on the same pool
+    /// zygote. What it cannot do is reach this field, which arrives on the
+    /// supervisor's connection — so a script whose bytes do not hash to it is
+    /// refused rather than run. Under `source` the check is self-consistency
+    /// and costs a hash; it is kept so that one rule covers both shapes.
+    ///
+    /// Also an identity: an agent may key a compiled-code cache *in the child*
+    /// on it, and a log line that carries it says which version of a script
+    /// failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
     /// The entry point to call, when it is not `handler`.
@@ -80,6 +92,29 @@ pub struct Script {
 }
 
 impl Script {
+    /// A script the `EXEC` carries the bytes of.
+    ///
+    /// The one-off shape. The supervisor turns this into the `path` shape
+    /// wherever it can write into the sandbox; see `pool::WarmFn::place_script`.
+    pub fn inline(source: impl Into<String>) -> Script {
+        Script {
+            path: None,
+            source: Some(source.into()),
+            digest: None,
+            entry_point: None,
+        }
+    }
+
+    /// A script already in the sandbox, named and digested.
+    pub fn at(path: impl Into<String>, digest: impl Into<String>) -> Script {
+        Script {
+            path: Some(path.into()),
+            source: None,
+            digest: Some(digest.into()),
+            entry_point: None,
+        }
+    }
+
     /// Whether this names something the child could actually load.
     pub fn is_loadable(&self) -> bool {
         self.path.is_some() || self.source.is_some()

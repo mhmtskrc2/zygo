@@ -28,6 +28,7 @@
 
 'use strict';
 
+const crypto = require('crypto');
 const fs = require('fs');
 const net = require('net');
 const os = require('os');
@@ -314,13 +315,19 @@ function loadRequestScript(script) {
   const filename = script.path || '/zygo/request-script.js';
   const entryPoint = script.entry_point || 'handler';
 
-  let source = script.source;
-  if (source === undefined || source === null) {
+  // As bytes, and hashed as read. Reading as text would decode and normalise,
+  // so what is checked below would not be what the supervisor wrote.
+  let raw;
+  if (script.source === undefined || script.source === null) {
     if (!script.path) {
       throw new Error("the request's script carries neither `source` nor `path`");
     }
-    source = fs.readFileSync(script.path, 'utf8');
+    raw = fs.readFileSync(script.path);
+  } else {
+    raw = Buffer.from(script.source, 'utf8');
   }
+  checkDigest(raw, script.digest, script.path);
+  const source = raw.toString('utf8');
 
   const loaded = new Module(filename, null);
   loaded.filename = filename;
@@ -337,6 +344,36 @@ function loadRequestScript(script) {
     );
   }
   return handler;
+}
+
+/// The bytes are not the ones the supervisor named.
+///
+/// Reported as `ERROR` / `handler_load` rather than as a failed request: a
+/// handler that threw is the tenant's problem, and this is a disagreement
+/// about what the request *is*.
+class ScriptDigestMismatch extends Error {}
+
+/// Refuse bytes that are not the ones the supervisor named.
+///
+/// Not a formality. `/run/script/<hash>` is written by the supervisor but sits
+/// in a sandbox with one uid, so the worker about to load it can unlink it and
+/// put its own there instead — for itself, or for another request in flight on
+/// the same pool zygote. The digest arrives on the supervisor's connection,
+/// which nothing inside can reach, so it is the part a tenant cannot forge.
+///
+/// Hashed over what was *read*, never by opening the file a second time: two
+/// reads are two different files if somebody is trying.
+function checkDigest(raw, digest, scriptPath) {
+  if (!digest) return;
+  const actual = 'sha256:' + crypto.createHash('sha256').update(raw).digest('hex');
+  const a = Buffer.from(actual);
+  const b = Buffer.from(String(digest));
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    throw new ScriptDigestMismatch(
+      `${scriptPath || 'the script in this EXEC'} is ${actual}, and the request ` +
+        `asked for ${digest}; refusing to run it`
+    );
+  }
 }
 
 function loadHandler(handlerPath, mode) {
@@ -431,6 +468,13 @@ function worker(argv) {
       reply = { type: 'result', ok: true, result: result === undefined ? null : result };
     } catch (e) {
       reply = { type: 'result', ok: false, error: (e && e.stack) || String(e) };
+      // Nothing of the script has run: the supervisor and this worker disagree
+      // about what the request is, which §2 makes an `ERROR` rather than a
+      // result, so that a caller can tell "your code threw" from "your code
+      // was not what was asked for".
+      if (e instanceof ScriptDigestMismatch) {
+        reply.refused = { code: 'handler_load', message: e.message };
+      }
     }
     const cpu = process.cpuUsage(cpuBefore);
     reply.wall_ms = Number(process.hrtime.bigint() - started) / 1e6;
@@ -553,6 +597,14 @@ class Agent {
     const id = w.request.id;
     this._inflight.delete(id);
     const result = w.result;
+    // A worker that refused the request answers `ERROR`, not `DONE`: it is the
+    // answer to this `EXEC` either way (§3.5), and a request that was refused
+    // produced no result to report.
+    if (result && result.refused) {
+      this._error(id, result.refused.code, result.refused.message);
+      if (this._shuttingDown && this._inflight.size === 0) process.exit(0);
+      return;
+    }
     const done = {
       type: 'DONE',
       id,
@@ -776,6 +828,7 @@ if (require.main === module) {
 module.exports = {
   Framing,
   Ring,
+  ScriptDigestMismatch,
   loadRequestScript,
   childFilterPlan,
   loadHandler,

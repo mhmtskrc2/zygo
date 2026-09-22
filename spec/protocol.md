@@ -106,12 +106,32 @@ zygote serves all of them.
 
 | Field | Type | Meaning |
 |---|---|---|
-| `source` | string | The script itself. Needs no store; costs a copy per `EXEC`. |
-| `path` | string | Where the supervisor put it inside the sandbox, read-only, before `GO`. |
-| `digest` | string | `sha256:…` of the contents. An identity, not a control — the supervisor wrote the file and the child can reach nothing else. |
+| `path` | string | Where the supervisor put it inside the sandbox before `GO`, `0400`, in a directory that cannot be listed. |
+| `source` | string | The script itself, on the wire. |
+| `digest` | string | `sha256:…` of the contents. **Checked by the child before it loads them.** |
 | `entry_point` | string | What to call. Default `handler`. |
 
-Exactly one of `source` and `path` is set.
+At least one of `path` and `source` is set, and `path` is the shape the
+supervisor sends whenever it can write into the sandbox. The difference is
+which processes hold the bytes. A `source` has to be read into the *agent's*
+address space to be forwarded, and the agent is the zygote every later request
+forks from — so in a pool shared between tenants, the next tenant's child
+inherits a copy-on-write view of a heap that held this one's code. With `path`
+only the child ever has it. `source` remains correct where there is no writable
+path into the sandbox, and for a one-off.
+
+Scripts are content-addressed: `path` ends in the digest's hex, so two tenants
+that register identical bytes name one file and neither can substitute a
+different script under a digest somebody else is running.
+
+**The digest is not advisory.** A sandbox has one uid: the child about to load
+`/run/script/<hash>` can unlink that file and write its own in its place —
+for itself, or for another request in flight on the same pool zygote. What it
+cannot reach is this field, which arrives on the supervisor's connection. So
+an agent that is given a `digest` **must** hash the bytes it is about to load
+and refuse them with `ERROR` / `handler_load` if they do not match, before any
+of the script runs. The same rule covers `source`, where it is only
+self-consistency, so that there is one rule rather than two.
 
 **The child loads it, after `GO`.** Not the agent, and not before: a zygote
 that imported a tenant's script would hold that tenant's code, and a pool is
@@ -164,6 +184,14 @@ conforming result is:
 ```json
 {"type":"RESULT","id":"01f3","exit_code":0}
 ```
+
+A child that could not run the request *at all* may answer with an `ERROR`
+frame in place of its `RESULT`, and the agent forwards that upwards with the
+request's `id` instead of a `DONE`. The distinction is who was wrong: a handler
+that raised is a `DONE` with a non-zero `exit_code`, and a script whose bytes
+do not hash to the digest the supervisor sent is an `ERROR` / `handler_load`,
+because the supervisor and the child disagree about what this request *is*.
+Either way it is exactly one answer per `EXEC` (§3.5).
 
 ### `DONE` — agent → supervisor
 
@@ -275,6 +303,12 @@ agent in POSIX sh, to check the suite against something that is not Python.
    native addons, no WASI — when the image has no such object; it says which
    in `READY`. The `sh` agent refuses every request instead, which is the
    other conforming answer.
+8. **A script's digest is checked, if there is one.** An agent that implements
+   the 1.1 `script` field and is given a `digest` hashes the bytes it is about
+   to load and refuses them with `ERROR` / `handler_load` unless they match.
+   Hash *what was read*, not the file again: reading twice is a window for the
+   tenant to change it in between. An agent that does not implement `script`
+   at all is unaffected — it never loads anything a digest describes.
 
 ### Strongly recommended
 - **Import nothing lazily on the request path.** Every module the child touches

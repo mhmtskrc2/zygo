@@ -37,9 +37,20 @@ that kills the whole process tree possible.
 zygo agent test /bin/sh -- examples/agents/sh/agent.sh examples/agents/sh/handler.sh
 ```
 
-Ten checks, run against your agent over a real socket. The agent is started
+Eleven checks, run against your agent over a real socket. The agent is started
 with the control socket at descriptor 3, which is where a sandboxed agent finds
 it too, and everything after the binary is passed through as its arguments.
+
+`--script <file>` adds the protocol 1.1 check: a script that arrives with the
+request rather than with the zygote. Pass a file in the agent's own language —
+the suite cannot guess which one that is, and sending Python to a Node agent
+fails in a way indistinguishable from "does not implement 1.1". Without the
+flag the check is skipped and the agent is reported as serving functions only,
+which is conforming. With it, the suite sends the script three ways: as
+`source`, as a `path`, and with a `digest` that does not match. An agent that
+runs the third has no defence against a tenant swapping the file it was about
+to load, and fails; one that manages `source` but not `path` is reported as
+**partial**, because `path` is what the supervisor actually sends.
 
 ## What there is to read
 

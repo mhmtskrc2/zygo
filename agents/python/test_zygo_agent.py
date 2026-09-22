@@ -9,6 +9,7 @@ Run with:  python3 -m unittest discover agents/python
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -24,6 +25,12 @@ from pathlib import Path
 
 AGENT = Path(__file__).resolve().parent / "zygo_agent.py"
 HEADER = struct.Struct(">I")
+
+
+def digest_of(source: str) -> str:
+    """What the supervisor puts in `script.digest`, computed here rather than
+    taken from the agent — the two have to agree without sharing code."""
+    return "sha256:" + hashlib.sha256(source.encode()).hexdigest()
 
 
 class Wire:
@@ -105,6 +112,23 @@ class AgentHarness:
         script: dict | None = None,
     ) -> dict:
         """One full EXEC → FORKED → GO → DONE exchange."""
+        answer = self.call_raw(event, request_id, timeout_ms, script)
+        assert answer["type"] == "DONE", answer
+        return answer
+
+    def call_raw(
+        self,
+        event,
+        request_id: str = "req-1",
+        timeout_ms: int = 30_000,
+        script: dict | None = None,
+    ) -> dict:
+        """The same, for a request whose answer may be an `ERROR`.
+
+        A child that refuses the request — a script whose digest does not match
+        — answers `ERROR` rather than `DONE` (§2), so a caller checking that
+        has to be able to see it.
+        """
         exec_message = {
             "type": "EXEC",
             "id": request_id,
@@ -122,9 +146,7 @@ class AgentHarness:
         self.forked_pid = forked["pid"]
 
         self.wire.send({"type": "GO", "id": request_id})
-        done = self.wire.recv()
-        assert done["type"] == "DONE", done
-        return done
+        return self.wire.recv()
 
     def close(self) -> str:
         try:
@@ -607,7 +629,17 @@ class FixtureTests(unittest.TestCase):
                 done = h.wire.recv()
                 self.assertEqual(done["type"], "DONE", case["name"])
                 self.assertEqual(done["id"], message["id"])
-                self.assertEqual(done["result"], message["event"], "the echo handler")
+                if (message.get("script") or {}).get("path"):
+                    # The path names a file inside a sandbox, and this harness
+                    # has no sandbox. What the fixture pins is the shape on the
+                    # wire; `RuntimePoolTests` covers the shape working.
+                    self.assertEqual(done["exit_code"], 1, case["name"])
+                    self.assertIn("cannot read", done["error"], case["name"])
+                else:
+                    # Both the echo handler and the inline fixture script
+                    # return the event unchanged, so one assertion covers a
+                    # request with a script and one without.
+                    self.assertEqual(done["result"], message["event"], case["name"])
             elif kind == "GO":
                 # A GO for a request that is not in flight: nothing to do, and
                 # not an error. The next PING must still be answered.
@@ -1102,6 +1134,86 @@ class RuntimePoolTests(unittest.TestCase):
             done = h.call({}, script={"path": str(script)})
             self.assertEqual(done["exit_code"], 0, done.get("error"))
             self.assertEqual(done["result"]["from"], "by-path")
+        finally:
+            h.close()
+
+    def test_a_script_whose_bytes_do_not_match_its_digest_is_refused(self):
+        """The check that makes `path` delivery safe on a shared uid.
+
+        A sandbox has one uid, so the child about to load `/run/script/<hash>`
+        can unlink it and write its own there instead — for itself, or for
+        another tenant's request in flight on the same pool zygote. The digest
+        comes over the supervisor's connection, which nothing inside can reach.
+        So the swap is caught, and the request is refused rather than run.
+        """
+        planted = self.root_script("swapped", "def handler(event):\n    return 'mine'\n")
+        h = AgentHarness(None)
+        try:
+            h.ready()
+            answer = h.call_raw(
+                {},
+                script={"path": str(planted), "digest": digest_of("the script asked for")},
+            )
+            self.assertEqual(answer["type"], "ERROR", answer)
+            self.assertEqual(answer["code"], "handler_load", answer)
+            self.assertEqual(answer["id"], "req-1", answer)
+            self.assertIn("refusing to run it", answer["message"])
+
+            # The pool is untouched: a refused request is one request.
+            good = h.call(
+                {}, request_id="after", script={"source": textwrap.dedent(self.ECHO)}
+            )
+            self.assertEqual(good["result"]["from"], "script-one")
+        finally:
+            h.close()
+
+    def test_a_script_that_matches_its_digest_runs(self):
+        """The positive path, without which the test above proves nothing."""
+        source = textwrap.dedent(self.ECHO)
+        h = AgentHarness(None)
+        try:
+            h.ready()
+            done = h.call({}, script={"source": source, "digest": digest_of(source)})
+            self.assertEqual(done["exit_code"], 0, done.get("error"))
+            self.assertEqual(done["result"]["from"], "script-one")
+
+            by_path = self.root_script("digested", self.ECHO)
+            done = h.call(
+                {},
+                request_id="by-path",
+                script={
+                    "path": str(by_path),
+                    "digest": digest_of(by_path.read_text()),
+                },
+            )
+            self.assertEqual(done["exit_code"], 0, done.get("error"))
+        finally:
+            h.close()
+
+    def test_an_inline_script_is_checked_against_its_digest_too(self):
+        """One rule for both shapes, so there is one thing to get right."""
+        h = AgentHarness(None)
+        try:
+            h.ready()
+            answer = h.call_raw(
+                {},
+                script={
+                    "source": textwrap.dedent(self.ECHO),
+                    "digest": digest_of("something else entirely"),
+                },
+            )
+            self.assertEqual(answer["type"], "ERROR", answer)
+            self.assertEqual(answer["code"], "handler_load", answer)
+        finally:
+            h.close()
+
+    def test_a_script_with_no_digest_is_run_as_it_always_was(self):
+        """The field is optional; an `EXEC` without one still works."""
+        h = AgentHarness(None)
+        try:
+            h.ready()
+            done = h.call({}, script={"source": textwrap.dedent(self.ECHO)})
+            self.assertEqual(done["exit_code"], 0, done.get("error"))
         finally:
             h.close()
 

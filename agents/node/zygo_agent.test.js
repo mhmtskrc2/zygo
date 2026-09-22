@@ -202,6 +202,47 @@ test('a handler may export the function directly or as `handler`', () => {
   }
 });
 
+/// What the supervisor puts in `script.digest`, computed here rather than
+/// taken from the agent — the two have to agree without sharing code.
+function digestOf(source) {
+  return 'sha256:' + require('node:crypto').createHash('sha256').update(source).digest('hex');
+}
+
+test('a script whose bytes do not match its digest is refused before it runs', () => {
+  // The check that makes `path` delivery safe on a shared uid: the worker
+  // about to load `/run/script/<hash>` can unlink it and write its own there,
+  // for itself or for another tenant's request on the same pool zygote. The
+  // digest arrives on the supervisor's connection, which it cannot reach.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zygo-agent-'));
+  const script = path.join(dir, 'swapped.js');
+  fs.writeFileSync(script, 'module.exports = () => "mine";\n');
+  try {
+    assert.throws(
+      () => agent.loadRequestScript({ path: script, digest: digestOf('what was asked for') }),
+      (e) => e instanceof agent.ScriptDigestMismatch && /refusing to run it/.test(e.message)
+    );
+    // The positive path, without which the above proves nothing.
+    const honest = fs.readFileSync(script);
+    assert.strictEqual(
+      agent.loadRequestScript({ path: script, digest: digestOf(honest) })(),
+      'mine'
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('an inline script is checked against its digest too', () => {
+  const source = 'module.exports = () => "inline";\n';
+  assert.throws(
+    () => agent.loadRequestScript({ source, digest: digestOf('something else') }),
+    agent.ScriptDigestMismatch
+  );
+  assert.strictEqual(agent.loadRequestScript({ source, digest: digestOf(source) })(), 'inline');
+  // The field is optional: an `EXEC` without one still works.
+  assert.strictEqual(agent.loadRequestScript({ source })(), 'inline');
+});
+
 test('a signal is reported by its own number, not as SIGKILL whatever happened', () => {
   if (process.platform === 'win32') return;
   assert.strictEqual(agent.signalNumber('SIGKILL'), os.constants.signals.SIGKILL);

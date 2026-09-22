@@ -13,13 +13,15 @@
 //! file, and a request that names a digest gets exactly those bytes or an
 //! error — never somebody's newer version.
 //!
-//! What is deliberately *not* here: delivery into the sandbox. The store lives
-//! on the host, and the supervisor reads a script out of it and sends it in
-//! the `EXEC` as `source`. A mount visible to every pool sandbox would make
-//! every tenant's script listable by every other tenant's code, and a
-//! per-request copy into the sandbox is what `/run/secrets` already does at a
-//! cost this does not need to pay for a few kilobytes of text. The bytes go to
-//! one child, over the control socket, and die with it.
+//! What is deliberately *not* here: delivery into the sandbox. This store is
+//! on the host and nothing in a sandbox can see it. A request's script is
+//! copied in for the length of that request, by the same machinery that
+//! delivers secrets — `pool::place_script`, and [`SCRIPT_DIR_IN_SANDBOX`] is
+//! where it lands. Mounting the store itself would make every tenant's script
+//! listable by every other tenant's code, which is the one thing a shared
+//! runtime pool must not allow.
+//!
+//! [`SCRIPT_DIR_IN_SANDBOX`]: crate::pool::SCRIPT_DIR_IN_SANDBOX
 
 use std::fmt;
 use std::path::PathBuf;
@@ -83,7 +85,11 @@ impl ScriptDigest {
     }
 
     /// The hex half, which is the file name.
-    fn hex(&self) -> &str {
+    ///
+    /// Public because it is the name a script has in two places outside this
+    /// module: the file in the store, and the file the supervisor writes into
+    /// the sandbox at `/run/script/<hex>` for the child to load.
+    pub fn hex(&self) -> &str {
         &self.0["sha256:".len()..]
     }
 }

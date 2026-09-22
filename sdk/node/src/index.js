@@ -246,6 +246,40 @@ export class Client {
   }
 
   /**
+   * Register a script and get back the name the host gave it.
+   *
+   * The name is the SHA-256 of the bytes, so this is idempotent in the
+   * strongest sense: the same script registered twice — or by two tenants — is
+   * one file, and `existed` says which call wrote it. Register once and name
+   * the digest on every call after that.
+   *
+   * Needs an API started with `--allow-deploy`.
+   */
+  async putScript(source) {
+    const body = await this.#request('PUT', '/scripts', { rawBody: Buffer.from(source, 'utf8') });
+    return { sha256: String(body.sha256 ?? ''), size: Number(body.size ?? 0), existed: Boolean(body.existed) };
+  }
+
+  /**
+   * Whether this host holds a script, and how big it is.
+   *
+   * Never the bytes: a digest is not a capability, so a store that answered
+   * with the script would make every tenant's code readable by anyone who
+   * could guess what it was. Throws {@link NotFound} when the host does not
+   * have it.
+   */
+  async script(digest) {
+    const body = await this.#request('GET', `/scripts/${escDigest(digest)}`);
+    return { sha256: String(body.sha256 ?? ''), size: Number(body.size ?? 0), existed: true };
+  }
+
+  /** Forget a script. Throws {@link NotFound} if it was not there. */
+  async deleteScript(digest) {
+    const body = await this.#request('DELETE', `/scripts/${escDigest(digest)}`);
+    return Boolean(body.deleted);
+  }
+
+  /**
    * A callable bound to one function. `client.fn('resize')(event)` reads
    * better than repeating the name at every call site, and it is the shape an
    * embedder wraps as a tool.
@@ -263,11 +297,14 @@ export class Client {
 
   // ---- transport ----------------------------------------------------
 
-  #request(method, path, { body = undefined, headers = {}, authenticated = true } = {}) {
-    const payload = body === undefined ? null : Buffer.from(JSON.stringify(body));
+  #request(method, path, { body = undefined, headers = {}, authenticated = true, rawBody = undefined } = {}) {
+    // `rawBody` is for the one route whose body is not JSON: a script is a
+    // file, and wrapping its bytes in a JSON string to unwrap them again is a
+    // transformation with no reader.
+    const payload = rawBody !== undefined ? rawBody : body === undefined ? null : Buffer.from(JSON.stringify(body));
     const sent = { accept: 'application/json', ...headers };
     if (payload !== null) {
-      sent['content-type'] = 'application/json';
+      sent['content-type'] = rawBody !== undefined ? 'text/plain; charset=utf-8' : 'application/json';
       sent['content-length'] = String(payload.length);
     }
     if (authenticated && this.token) sent.authorization = `Bearer ${this.token}`;
@@ -394,6 +431,23 @@ function batchElement(answer) {
 
 function esc(name) {
   return encodeURIComponent(name);
+}
+
+/**
+ * A digest, checked here so it can go into the path as it stands.
+ *
+ * `encodeURIComponent` would escape the colon, and the route matches on the
+ * segment it was given. Checking the shape instead of escaping it also means
+ * `../../etc/passwd` is a mistake this client names, rather than a request
+ * somebody's proxy might normalise into a different route.
+ */
+function escDigest(digest) {
+  if (!/^sha256:[0-9a-f]{64}$/.test(String(digest))) {
+    throw new SpecError(
+      `\`${digest}\` is not a script digest; expected sha256: followed by 64 lowercase hex digits`
+    );
+  }
+  return digest;
 }
 
 function timeoutHeader(seconds) {

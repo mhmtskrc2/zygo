@@ -984,6 +984,62 @@ impl Supervisor {
         })
     }
 
+    /// Register a script and answer with the name the store gave it.
+    ///
+    /// The supervisor owns the store for the same reason it owns the
+    /// sandboxes: it is the process that will hand a script to a child, and a
+    /// second writer would be a second opinion about what a digest means.
+    /// Content-addressed, so this is idempotent — the same bytes from two
+    /// tenants are one file, and `existed` is how the caller finds that out.
+    pub fn put_script(&self, source: &str) -> std::result::Result<Response, Response> {
+        let store = crate::scripts::ScriptStore::new(&self.paths);
+        let digest = crate::scripts::ScriptDigest::of(source);
+        let existed = store.contains(&digest);
+        let digest = store
+            .put(source)
+            .map_err(|e| Response::error(ControlError::BadSpec, e))?;
+        Ok(Response::Script {
+            digest: digest.to_string(),
+            size: source.len() as u64,
+            existed,
+        })
+    }
+
+    /// Whether this host holds a script, and how big it is.
+    pub fn get_script(&self, digest: &str) -> std::result::Result<Response, Response> {
+        let store = crate::scripts::ScriptStore::new(&self.paths);
+        let digest = crate::scripts::ScriptDigest::parse(digest)
+            .map_err(|e| Response::error(ControlError::BadSpec, e))?;
+        let size = std::fs::metadata(store.path(&digest))
+            .map(|m| m.len())
+            .map_err(|_| Response::error(ControlError::NotFound, format!("no script {digest}")))?;
+        Ok(Response::Script {
+            digest: digest.to_string(),
+            size,
+            existed: true,
+        })
+    }
+
+    /// Forget a script.
+    ///
+    /// Nothing checks whether anything still refers to it, because until
+    /// tenants exist (Phase 2) nothing *can* refer to it durably: a request
+    /// already in flight has the bytes, and a caller that removes a script it
+    /// is about to run has made that call fail on purpose.
+    pub fn delete_script(&self, digest: &str) -> std::result::Result<Response, Response> {
+        let store = crate::scripts::ScriptStore::new(&self.paths);
+        let digest = crate::scripts::ScriptDigest::parse(digest)
+            .map_err(|e| Response::error(ControlError::BadSpec, e))?;
+        match store.remove(&digest) {
+            Ok(true) => Ok(Response::Ok),
+            Ok(false) => Err(Response::error(
+                ControlError::NotFound,
+                format!("no script {digest}"),
+            )),
+            Err(e) => Err(Response::error(ControlError::CallFailed, e)),
+        }
+    }
+
     /// Where a debug shell should enter, for `zygo shell`.
     ///
     /// Warms the function first, for the same reason `warm` does: a shell into
@@ -1469,6 +1525,9 @@ fn dispatch(supervisor: &Supervisor, request: Request, greeted: &mut bool) -> Re
             limit,
             failed,
         } => merge(supervisor.logs(&name, after, limit, failed)),
+        Request::PutScript { source } => merge(supervisor.put_script(&source)),
+        Request::GetScript { digest } => merge(supervisor.get_script(&digest)),
+        Request::DeleteScript { digest } => merge(supervisor.delete_script(&digest)),
         Request::Shutdown => Response::Ok,
         // Intercepted in `handle`, which has the socket the descriptors
         // arrive on; a `RUN` that reaches this table was sent to a code path
@@ -2274,6 +2333,122 @@ mod tests {
             dispatch(&supervisor, Request::List, &mut greeted),
             Response::Functions { functions } if functions.is_empty()
         ));
+    }
+
+    /// Two tenants, byte-identical scripts, one file.
+    ///
+    /// Deduplication is not a saving here, it is the property that makes a
+    /// content-addressed store safe to share: a name derived from the bytes
+    /// cannot be claimed, so the second tenant to register a script gets the
+    /// first one's file *because it is the same file*, and neither can put
+    /// different bytes under a digest the other is running. The tenants cannot
+    /// reach each other through it either, and that is proved where it can be
+    /// — in the agent, by `test_two_scripts_in_one_pool_cannot_see_each_other`.
+    #[test]
+    fn two_tenants_registering_the_same_script_get_one_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let supervisor = Supervisor::new(paths(&dir)).expect("supervisor");
+        let mut greeted = true;
+        let source = "def handler(event):\n    return {'ok': True}\n";
+
+        let first = dispatch(
+            &supervisor,
+            Request::PutScript {
+                source: source.into(),
+            },
+            &mut greeted,
+        );
+        let second = dispatch(
+            &supervisor,
+            Request::PutScript {
+                source: source.into(),
+            },
+            &mut greeted,
+        );
+
+        let (digest, size) = match (&first, &second) {
+            (
+                Response::Script {
+                    digest: a,
+                    size,
+                    existed: false,
+                },
+                Response::Script {
+                    digest: b,
+                    existed: true,
+                    ..
+                },
+            ) => {
+                assert_eq!(a, b, "the same bytes must have the same name");
+                (a.clone(), *size)
+            }
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(size as usize, source.len());
+        assert_eq!(
+            crate::scripts::ScriptStore::new(supervisor.paths())
+                .list()
+                .expect("list")
+                .len(),
+            1,
+            "two registrations left two files"
+        );
+
+        // And it is there to be found, by name, by either of them.
+        match dispatch(
+            &supervisor,
+            Request::GetScript {
+                digest: digest.clone(),
+            },
+            &mut greeted,
+        ) {
+            Response::Script { digest: back, .. } => assert_eq!(back, digest),
+            other => panic!("{other:?}"),
+        }
+
+        assert!(matches!(
+            dispatch(
+                &supervisor,
+                Request::DeleteScript {
+                    digest: digest.clone()
+                },
+                &mut greeted
+            ),
+            Response::Ok
+        ));
+        assert!(matches!(
+            dispatch(&supervisor, Request::GetScript { digest }, &mut greeted),
+            Response::Error {
+                code: ControlError::NotFound,
+                ..
+            }
+        ));
+    }
+
+    /// A digest becomes a path, so it is parsed before it is used as one.
+    #[test]
+    fn a_digest_that_is_not_one_is_refused_rather_than_looked_up() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let supervisor = Supervisor::new(paths(&dir)).expect("supervisor");
+        let mut greeted = true;
+
+        for bad in ["../../etc/passwd", "sha256:nope", ""] {
+            let response = dispatch(
+                &supervisor,
+                Request::GetScript { digest: bad.into() },
+                &mut greeted,
+            );
+            assert!(
+                matches!(
+                    response,
+                    Response::Error {
+                        code: ControlError::BadSpec,
+                        ..
+                    }
+                ),
+                "{bad:?} → {response:?}"
+            );
+        }
     }
 
     #[test]

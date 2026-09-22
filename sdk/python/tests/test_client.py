@@ -269,6 +269,50 @@ class DeployTests(unittest.TestCase):
         self.assertEqual(sent["network"], "none")
 
 
+class ScriptTests(unittest.TestCase):
+    DIGEST = "sha256:" + "0" * 64
+
+    def test_a_script_is_sent_as_itself_and_its_digest_comes_back(self) -> None:
+        # Not JSON around the bytes: the API takes the script as the body, and
+        # the name it answers with is the SHA-256 of exactly what was sent.
+        source = "def handler(event):\n    return event\n"
+        with FakeApi() as api:
+            api.answer("PUT", "/scripts", 201, {"sha256": self.DIGEST, "size": 37, "existed": False})
+            api.answer("GET", f"/scripts/{self.DIGEST}", 200, {"sha256": self.DIGEST, "size": 37})
+            api.answer("DELETE", f"/scripts/{self.DIGEST}", 200, {"deleted": True})
+            with zygo.connect(api.url) as client:
+                script = client.put_script(source)
+                self.assertEqual(script.sha256, self.DIGEST)
+                self.assertFalse(script.existed)
+                self.assertEqual(client.script(self.DIGEST).size, 37)
+                self.assertTrue(client.delete_script(self.DIGEST))
+
+        self.assertEqual(api.requests[0]["raw"], source, "the body is the script itself")
+        self.assertTrue(api.requests[0]["headers"]["content-type"].startswith("text/plain"))
+
+    def test_a_script_the_host_does_not_have_is_a_not_found(self) -> None:
+        with FakeApi() as api:
+            api.answer(
+                "GET",
+                f"/scripts/{self.DIGEST}",
+                404,
+                {"error": "no script", "code": "not_found"},
+            )
+            with zygo.connect(api.url) as client:
+                with self.assertRaises(zygo.NotFound):
+                    client.script(self.DIGEST)
+
+    def test_something_that_is_not_a_digest_never_reaches_the_wire(self) -> None:
+        # A digest goes into the path as it stands, so a value that is not one
+        # is named here rather than becoming a request to some other route.
+        with FakeApi() as api:
+            with zygo.connect(api.url) as client:
+                for bad in ["../../etc/passwd", "sha256:nope", "", "SHA256:" + "A" * 64]:
+                    with self.assertRaises(zygo.SpecError):
+                        client.script(bad)
+            self.assertEqual(api.requests, [])
+
+
 class OutcomeTests(unittest.TestCase):
     """Why a one-shot sandbox ended, which the exit code cannot carry.
 

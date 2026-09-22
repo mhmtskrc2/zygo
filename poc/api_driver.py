@@ -222,6 +222,54 @@ def main() -> int:
         except zygo.NotFound:
             ok("and stopping it twice is a NotFound, not a silent success")
 
+        # --- the script store ------------------------------------------------
+        print("\nthe script store")
+
+        source = "def handler(event):\n    return {'from': 'the-store'}\n"
+        registered = client.put_script(source)
+        if registered.sha256.startswith("sha256:") and registered.existed is False:
+            ok(f"a script registers and is named by its bytes ({registered.sha256[:20]}…)")
+        else:
+            bad("PUT /scripts", registered)
+
+        # Deduplication, which is what makes a content-addressed store safe to
+        # share: a second tenant registering the same bytes gets the same file,
+        # not a second one — and cannot put different bytes under that name.
+        again = client.put_script(source)
+        if again.sha256 == registered.sha256 and again.existed is True:
+            ok("the same script from a second caller is the same file, and says so")
+        else:
+            bad("the second registration", again)
+
+        other = client.put_script(source.replace("the-store", "somewhere-else"))
+        if other.sha256 != registered.sha256:
+            ok("different bytes are a different name")
+        else:
+            bad("two different scripts collided", other)
+
+        found = client.script(registered.sha256)
+        if found.size == len(source):
+            ok(f"and it can be looked up by name ({found.size} bytes)")
+        else:
+            bad("GET /scripts/<hash>", found)
+
+        try:
+            client.script("sha256:" + "b" * 64)
+            bad("a digest nobody registered was found")
+        except zygo.NotFound:
+            ok("a digest nobody registered is a NotFound")
+
+        if client.delete_script(registered.sha256):
+            ok("a script can be forgotten")
+        else:
+            bad("DELETE /scripts/<hash>")
+        try:
+            client.script(registered.sha256)
+            bad("a deleted script is still there")
+        except zygo.NotFound:
+            ok("and is gone afterwards")
+        client.delete_script(other.sha256)
+
         # --- the ceilings ----------------------------------------------------
         print("\nceilings")
 
@@ -245,7 +293,7 @@ def main() -> int:
 
 
 def call_only(socket_path: str) -> int:
-    """The same API without `--allow-deploy`: three routes, all refused."""
+    """The same API without `--allow-deploy`: the deploy routes, all refused."""
     import zygo
 
     global FAIL
@@ -268,6 +316,8 @@ def call_only(socket_path: str) -> int:
             ("POST /run", lambda: client.run("alpine:3", ["true"])),
             ("PUT /fn/<name>", lambda: client.serve("x", {"image": "alpine:3", "cmd": ["true"]}, base_dir="/tmp")),
             ("DELETE /fn/<name>", lambda: client.stop("x")),
+            ("PUT /scripts", lambda: client.put_script("x = 1\n")),
+            ("DELETE /scripts/<hash>", lambda: client.delete_script("sha256:" + "c" * 64)),
         ):
             try:
                 call()

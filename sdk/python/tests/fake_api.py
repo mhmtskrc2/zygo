@@ -50,13 +50,17 @@ def _handler(recorder: Recorder):
         def _serve(self, method: str) -> None:
             length = int(self.headers.get("content-length", 0) or 0)
             raw = self.rfile.read(length) if length else b""
+            # Not every body is JSON: `PUT /scripts` sends the script as
+            # itself, so this parses by content type rather than by hope.
+            is_json = (self.headers.get("content-type") or "").startswith("application/json")
             with recorder.lock:
                 recorder.requests.append(
                     {
                         "method": method,
                         "path": self.path,
                         "headers": {k.lower(): v for k, v in self.headers.items()},
-                        "body": json.loads(raw) if raw else None,
+                        "body": json.loads(raw) if raw and is_json else None,
+                        "raw": raw.decode("utf-8", "replace"),
                     }
                 )
             if recorder.delay:

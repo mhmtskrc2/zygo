@@ -435,12 +435,25 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<Full<B
         }
         (&Method::GET, ["fn", name, "stats"]) => stats(api, name.to_string()).await,
         (&Method::POST, ["fn", name, "warm"]) => warm(api, name.to_string()).await,
-        (_, ["fn", ..]) | (_, ["metrics"]) | (_, ["version"]) | (_, ["run"]) => {
-            Err(HttpError::new(
-                StatusCode::METHOD_NOT_ALLOWED,
-                format!("{} {}", req.method(), path),
-            ))
+        (&Method::PUT, ["scripts"]) => {
+            deployable(api)?;
+            let body = read_body(req).await?;
+            put_script(api, &body).await
         }
+        (&Method::GET, ["scripts", digest]) => get_script(api, digest.to_string()).await,
+        (&Method::DELETE, ["scripts", digest]) => {
+            let digest = digest.to_string();
+            deployable(api)?;
+            delete_script(api, digest).await
+        }
+        (_, ["fn", ..])
+        | (_, ["metrics"])
+        | (_, ["version"])
+        | (_, ["run"])
+        | (_, ["scripts", ..]) => Err(HttpError::new(
+            StatusCode::METHOD_NOT_ALLOWED,
+            format!("{} {}", req.method(), path),
+        )),
         _ => Err(HttpError::new(
             StatusCode::NOT_FOUND,
             format!("no route {path}"),
@@ -711,6 +724,76 @@ async fn stats(api: &Arc<Api>, name: String) -> Result<Response<Full<Bytes>>, Ht
 async fn warm(api: &Arc<Api>, name: String) -> Result<Response<Full<Bytes>>, HttpError> {
     let reply = control(api, move |c| Ok(c.send(&Control::Warm { name })?)).await?;
     Ok(reply_to_response(reply))
+}
+
+/// `PUT /scripts`: the body **is** the script, and the answer is its name.
+///
+/// Not JSON around it: a script is a file, the caller has it as bytes, and
+/// wrapping those bytes in a JSON string to unwrap them again is a
+/// transformation with no reader. Content-addressed, so this is idempotent —
+/// the same bytes are the same name however many times, and from however many
+/// tenants, which is what `201` versus `200` says.
+async fn put_script(api: &Arc<Api>, body: &[u8]) -> Result<Response<Full<Bytes>>, HttpError> {
+    let source = std::str::from_utf8(body)
+        .map_err(|e| {
+            HttpError::new(
+                StatusCode::BAD_REQUEST,
+                format!("a script must be UTF-8 text: {e}"),
+            )
+        })?
+        .to_string();
+    if source.is_empty() {
+        return Err(HttpError::new(
+            StatusCode::BAD_REQUEST,
+            "the body is empty; it should be the script itself",
+        ));
+    }
+
+    let reply = control(api, move |c| Ok(c.send(&Control::PutScript { source })?)).await?;
+    match reply {
+        Reply::Script {
+            digest,
+            size,
+            existed,
+        } => Ok(json(
+            if existed {
+                StatusCode::OK
+            } else {
+                StatusCode::CREATED
+            },
+            &serde_json::json!({ "sha256": digest, "size": size, "existed": existed }),
+        )),
+        other => Ok(reply_to_response(other)),
+    }
+}
+
+/// `GET /scripts/<hash>`: whether this host holds it, and how big it is.
+///
+/// Never the bytes. A digest is not a capability — anyone who can guess one
+/// has it — so answering with the script would make every tenant's code
+/// readable by every other tenant that knows what it is looking for. What this
+/// answers is the question a caller actually has: do I need to upload it
+/// again?
+async fn get_script(api: &Arc<Api>, digest: String) -> Result<Response<Full<Bytes>>, HttpError> {
+    let reply = control(api, move |c| Ok(c.send(&Control::GetScript { digest })?)).await?;
+    match reply {
+        Reply::Script { digest, size, .. } => Ok(json(
+            StatusCode::OK,
+            &serde_json::json!({ "sha256": digest, "size": size }),
+        )),
+        other => Ok(reply_to_response(other)),
+    }
+}
+
+async fn delete_script(api: &Arc<Api>, digest: String) -> Result<Response<Full<Bytes>>, HttpError> {
+    let reply = control(api, move |c| Ok(c.send(&Control::DeleteScript { digest })?)).await?;
+    match reply {
+        Reply::Ok => Ok(json(
+            StatusCode::OK,
+            &serde_json::json!({ "deleted": true }),
+        )),
+        other => Ok(reply_to_response(other)),
+    }
 }
 
 /// The gate on everything that creates or destroys a sandbox.
@@ -1127,6 +1210,14 @@ fn reply_to_json(reply: Reply) -> (StatusCode, serde_json::Value) {
             }),
         ),
         Reply::Stopped { names } => (StatusCode::OK, serde_json::json!({ "stopped": names })),
+        Reply::Script {
+            digest,
+            size,
+            existed,
+        } => (
+            StatusCode::OK,
+            serde_json::json!({ "sha256": digest, "size": size, "existed": existed }),
+        ),
         Reply::Logs {
             name,
             entries,

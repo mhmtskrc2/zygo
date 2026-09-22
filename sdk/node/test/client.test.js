@@ -15,6 +15,7 @@ import {
   AuthError,
   Busy,
   HandlerError,
+  NotFound,
   Timeout,
   TransportError,
   ZygoError,
@@ -342,6 +343,44 @@ test('a one-shot run reports a non-zero exit without throwing', async () => {
     // `stdin` describes the call, not the sandbox, and must not leak into the
     // spec the server writes — `deny_unknown_fields` would refuse it there.
     assert.ok(!('stdin' in sent));
+  } finally {
+    client.close();
+    await api.close();
+  }
+});
+
+test('a script is sent as itself, and its digest comes back', async () => {
+  // Not JSON around the bytes: the API takes the script as the body, and the
+  // name it answers with is the SHA-256 of exactly what was sent.
+  const api = await FakeApi.start();
+  const digest = 'sha256:' + '0'.repeat(64);
+  api.answer('PUT', '/scripts', 201, { sha256: digest, size: 37, existed: false });
+  api.answer('GET', `/scripts/${digest}`, 200, { sha256: digest, size: 37 });
+  api.answer('DELETE', `/scripts/${digest}`, 200, { deleted: true });
+  const client = connect(api.url, { token: null });
+  try {
+    const source = 'def handler(event):\n    return event\n';
+    const script = await client.putScript(source);
+    assert.equal(script.sha256, digest);
+    assert.equal(script.existed, false);
+    assert.equal(api.requests[0].raw, source, 'the body is the script itself');
+    assert.match(api.requests[0].headers['content-type'], /^text\/plain/);
+
+    assert.equal((await client.script(digest)).size, 37);
+    assert.equal(await client.deleteScript(digest), true);
+  } finally {
+    client.close();
+    await api.close();
+  }
+});
+
+test('a script the host does not have is a NotFound', async () => {
+  const api = await FakeApi.start();
+  const digest = 'sha256:' + 'a'.repeat(64);
+  api.answer('GET', `/scripts/${digest}`, 404, { error: `no script ${digest}`, code: 'not_found' });
+  const client = connect(api.url, { token: null });
+  try {
+    await assert.rejects(() => client.script(digest), NotFound);
   } finally {
     client.close();
     await api.close();

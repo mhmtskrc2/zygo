@@ -21,6 +21,18 @@
       "message": {"type": "EXEC", "id": "01f4", "event": null, "timeout_ms": 5000}
     },
     {
+      "name": "exec-with-script-in-the-sandbox",
+      "direction": "supervisor -> agent",
+      "canonical": true,
+      "message": {"type": "EXEC", "id": "01f5", "event": {"n": 3}, "timeout_ms": 30000, "script": {"path": "/run/script/71e2b5139272b44c8fb6693a3f356c070bcdc8b85a628c7428ed97d3bd66103f", "digest": "sha256:71e2b5139272b44c8fb6693a3f356c070bcdc8b85a628c7428ed97d3bd66103f", "entry_point": "main"}}
+    },
+    {
+      "name": "exec-with-inline-script",
+      "direction": "supervisor -> agent",
+      "canonical": true,
+      "message": {"type": "EXEC", "id": "01f6", "event": {"n": 4}, "timeout_ms": 5000, "script": {"source": "def handler(event):\n    return event\n", "digest": "sha256:71e2b5139272b44c8fb6693a3f356c070bcdc8b85a628c7428ed97d3bd66103f"}}
+    },
+    {
       "name": "forked",
       "direction": "agent -> supervisor",
       "canonical": true,

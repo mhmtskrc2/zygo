@@ -20,8 +20,16 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from ._endpoint import Endpoint, resolve
 from ._errors import TransportError, ZygoError
-from ._models import Function, LogPage, Result, Run, Served
-from ._sync import MAX_BODY, _batch_element, _decode, _escape, _retry_after, _timeout_header
+from ._models import Function, LogPage, Result, Run, Script, Served
+from ._sync import (
+    MAX_BODY,
+    _batch_element,
+    _decode,
+    _escape,
+    _escape_digest,
+    _retry_after,
+    _timeout_header,
+)
 
 _Connection = Tuple[asyncio.StreamReader, asyncio.StreamWriter]
 
@@ -149,6 +157,16 @@ class AsyncClient:
         body = await self._request("POST", "/run", body={"layer": described, "stdin": stdin})
         return Run.parse(body)
 
+    async def put_script(self, source: str) -> Script:
+        return Script.parse(await self._request("PUT", "/scripts", raw_body=source.encode()))
+
+    async def script(self, digest: str) -> Script:
+        return Script.parse(await self._request("GET", f"/scripts/{_escape_digest(digest)}"))
+
+    async def delete_script(self, digest: str) -> bool:
+        body = await self._request("DELETE", f"/scripts/{_escape_digest(digest)}")
+        return bool(body.get("deleted", False))
+
     def fn(self, name: str) -> "AsyncFunctionHandle":
         return AsyncFunctionHandle(self, name)
 
@@ -162,17 +180,24 @@ class AsyncClient:
         body: Any = None,
         headers: Optional[Dict[str, str]] = None,
         authenticated: bool = True,
+        raw_body: Optional[bytes] = None,
     ) -> Any:
         if self._closed:
             raise ZygoError("this client has been closed")
 
-        payload = b"" if body is None else json.dumps(body).encode()
+        # `raw_body` is for the one route whose body is not JSON: see the
+        # synchronous client, which says why a script travels as itself.
+        payload = raw_body if raw_body is not None else (
+            b"" if body is None else json.dumps(body).encode()
+        )
         sent = {
             "host": "localhost" if self.endpoint.is_unix else f"{self.endpoint.host}:{self.endpoint.port}",
             "accept": "application/json",
             "content-length": str(len(payload)),
         }
-        if body is not None:
+        if raw_body is not None:
+            sent["content-type"] = "text/plain; charset=utf-8"
+        elif body is not None:
             sent["content-type"] = "application/json"
         if authenticated and self.token:
             sent["authorization"] = f"Bearer {self.token}"

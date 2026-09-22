@@ -11,13 +11,14 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import re
 import socket
 import threading
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from ._endpoint import Endpoint, resolve
-from ._errors import NotFound, TransportError, ZygoError, from_response
-from ._models import Function, LogPage, Result, Run, Served
+from ._errors import NotFound, SpecError, TransportError, ZygoError, from_response
+from ._models import Function, LogPage, Result, Run, Script, Served
 
 #: Largest answer read into memory. The API's own request limit is the same
 #: order, and an answer past it is a bug rather than a large result.
@@ -233,6 +234,33 @@ class Client:
             described["cmd"] = list(cmd)
         return Run.parse(self._request("POST", "/run", body={"layer": described, "stdin": stdin}))
 
+    def put_script(self, source: str) -> Script:
+        """Register a script and get back the name the host gave it.
+
+        The name is the SHA-256 of the bytes, so this is idempotent in the
+        strongest sense: the same script registered twice — or by two tenants —
+        is one file, and ``Script.existed`` says which call wrote it. Register
+        once and name the digest on every call after that.
+
+        Needs an API started with ``--allow-deploy``.
+        """
+        return Script.parse(self._request("PUT", "/scripts", raw_body=source.encode()))
+
+    def script(self, digest: str) -> Script:
+        """Whether this host holds a script, and how big it is.
+
+        Never the bytes: a digest is not a capability, so a store that
+        answered with the script would make every tenant's code readable by
+        anyone who could guess what it was. Raises
+        :class:`~zygo.NotFound` when the host does not have it.
+        """
+        return Script.parse(self._request("GET", f"/scripts/{_escape_digest(digest)}"))
+
+    def delete_script(self, digest: str) -> bool:
+        """Forget a script. Raises :class:`~zygo.NotFound` if it was not there."""
+        body = self._request("DELETE", f"/scripts/{_escape_digest(digest)}")
+        return bool(body.get("deleted", False))
+
     def fn(self, name: str) -> "FunctionHandle":
         """A callable bound to one function.
 
@@ -251,13 +279,21 @@ class Client:
         body: Any = None,
         headers: Optional[Dict[str, str]] = None,
         authenticated: bool = True,
+        raw_body: Optional[bytes] = None,
     ) -> Any:
         if self._closed:
             raise ZygoError("this client has been closed")
 
-        payload = None if body is None else json.dumps(body).encode()
+        # `raw_body` is for the one route whose body is not JSON: a script is
+        # a file, and wrapping its bytes in a JSON string to unwrap them again
+        # is a transformation with no reader.
+        payload = raw_body if raw_body is not None else (
+            None if body is None else json.dumps(body).encode()
+        )
         sent = {"accept": "application/json"}
-        if payload is not None:
+        if raw_body is not None:
+            sent["content-type"] = "text/plain; charset=utf-8"
+        elif payload is not None:
             sent["content-type"] = "application/json"
         if authenticated and self.token:
             sent["authorization"] = f"Bearer {self.token}"
@@ -370,6 +406,22 @@ def _escape(name: str) -> str:
     from urllib.parse import quote
 
     return quote(name, safe="")
+
+
+def _escape_digest(digest: str) -> str:
+    """A digest, checked here so it can go into the path as it stands.
+
+    ``quote`` would escape the colon, and the route matches on the segment it
+    was given. Checking the shape instead of escaping it also means
+    ``../../etc/passwd`` is a mistake this client names, rather than a request
+    somebody's proxy might normalise into a different route.
+    """
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest or ""):
+        raise SpecError(
+            f"`{digest}` is not a script digest; "
+            "expected sha256: followed by 64 lowercase hex digits"
+        )
+    return digest
 
 
 def _timeout_header(timeout: Optional[float]) -> Dict[str, str]:

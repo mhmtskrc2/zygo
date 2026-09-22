@@ -76,9 +76,12 @@ executes.
 | Warm one now | `client.warm(name)` | `client.warm(name)` | no |
 | Recent log | `client.logs(name)` | `client.logs(name)` | no |
 | Version | `client.version()` | `client.version()` | no |
+| Look a script up | `client.script(digest)` | `client.script(digest)` | no |
 | Serve a function | `client.serve(name, layer)` | `client.serve(name, layer)` | **yes** |
 | Stop one | `client.stop(name)` | `client.stop(name)` | **yes** |
 | One-shot sandbox | `client.run(image, cmd)` | `client.run(image, cmd)` | **yes** |
+| Register a script | `client.put_script(source)` | `client.putScript(source)` | **yes** |
+| Forget a script | `client.delete_script(digest)` | `client.deleteScript(digest)` | **yes** |
 
 A one-shot run answers with more than an exit code, because the exit code
 cannot carry what a caller needs:
@@ -94,18 +97,52 @@ comes from the kernel's own counter in the sandbox's cgroup. Neither is a
 guess, and a caller deciding between "too slow" and "too much memory" — an
 online judge, a CI step — has nothing else to go on.
 
+## The script store
+
+An embedder's scripts live in the embedder's database, not on the Zygo host.
+`PUT /scripts` is how one gets to a sandbox without a file on the host or a
+line in `sandbox.toml`:
+
+```python
+script = client.put_script(source)      # PUT /scripts, body is the script
+script.sha256                           # 'sha256:71e2b5…' — its name from now on
+script.existed                          # the store already had exactly these bytes
+```
+
+The body is the script itself, not JSON around it: a script is a file, and
+wrapping its bytes to unwrap them again has no reader. The name is the SHA-256
+of those bytes, which makes the call idempotent in the strongest sense — the
+same script from two tenants is one file on disk, and neither of them can put
+different bytes under a digest the other is running.
+
+`client.script(digest)` says whether the host holds it and how big it is, and
+never returns the bytes: a digest is not a capability, so a store that answered
+with the script would make every tenant's code readable by anyone who could
+guess what it was. `client.delete_script(digest)` forgets one.
+
+Registering a script does not make it runnable on its own — a request still has
+to name something to run it *in*. Runtime pools, which is what a registered
+script is for, are the next piece of work; until they land the store is
+reachable and empty of consequence.
+
 ## The deploy gate
 
 `zygo api` starts **call-only**. A token then reaches the functions somebody
 declared in a spec file and nothing else, which is the shape most deployments
 want: the boundary lives in a file that was reviewed.
 
-`--allow-deploy` adds `PUT /fn/<name>`, `DELETE /fn/<name>` and `POST /run`.
-Those let a caller name any image, any mount and any command, which is running
-arbitrary code as the user the API runs as — a shell, not an API. Turn it on
-for a local SDK or an embedder you control, and think twice anywhere else.
+`--allow-deploy` adds `PUT /fn/<name>`, `DELETE /fn/<name>`, `POST /run`,
+`PUT /scripts` and `DELETE /scripts/<hash>`. The first three let a caller name
+any image, any mount and any command, which is running arbitrary code as the
+user the API runs as — a shell, not an API. Turn it on for a local SDK or an
+embedder you control, and think twice anywhere else.
 
-Without it, those three calls raise `AuthError` and the message names the flag.
+Registering a script is behind the same gate for now, and that is a placeholder
+rather than a judgement: a script nobody can run is not a widened boundary, but
+a *tenant* registering one is exactly what per-tenant tokens are for, and those
+do not exist yet. `GET /scripts/<hash>` is not gated — it answers a size.
+
+Without it, those calls raise `AuthError` and the message names the flag.
 
 Two things stay off even then, because a request body must not be able to
 remove a guarantee: host networking and private-range egress are refused over

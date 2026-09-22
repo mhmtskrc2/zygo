@@ -704,6 +704,7 @@ impl Pool {
                     timeout: f.limits.timeout.get(),
                     agent_host_pid: sandbox.pid(),
                     secrets: Mutex::new(Secrets::default()),
+                    scripts: Mutex::new(Scripts::default()),
                     _sandbox: sandbox,
                 })))
             }
@@ -1027,6 +1028,9 @@ pub struct WarmFn {
     /// two requests racing on that boundary must not leave a caller reading a
     /// file the other just deleted.
     secrets: Mutex<Secrets>,
+    /// Scripts written into the sandbox for the requests running them, and how
+    /// many requests each still has. See [`Scripts`] and [`place_script`].
+    scripts: Mutex<Scripts>,
     /// Kept alive: dropping it kills the sandbox.
     _sandbox: Box<dyn crate::backend::Sandbox>,
 }
@@ -1271,6 +1275,16 @@ impl WarmFn {
         }
         let id = next_request_id();
         let started = Instant::now();
+
+        // Before the `EXEC`, because the `EXEC` has to say where the script
+        // is. The file only has to *exist* by `GO` — the child loads it after
+        // that — but the decision cannot wait that long, and placing it here
+        // means a sandbox that cannot take the file falls back to sending the
+        // bytes rather than failing a request that is already in flight.
+        //
+        // The lease lives until this function returns, by any route, which is
+        // what takes the file away again.
+        let (script, _script) = self.place_script(script);
 
         // Registering and writing are one step, and nothing is held afterwards:
         // the agent can be serving several requests at once, so the only
@@ -1791,7 +1805,8 @@ fn write_secrets(secrets: &mut Secrets, at: SecretsAt<'_>) -> Result<()> {
 
     let mut written = Vec::with_capacity(secrets.values.len());
     for (name, value) in &secrets.values {
-        if let Err(e) = write_secret_file_at(dir, name, value) {
+        if let Err(e) = write_request_file_at(dir, name, value, "writing a secret into the sandbox")
+        {
             // Undo this attempt rather than leaving a partial set: a handler
             // that received two of its three secrets is a worse failure than
             // one that received none and was told why.
@@ -1865,6 +1880,145 @@ fn kill_request(request_cgroup: Option<&std::path::Path>, host_pid: u32) {
 /// Where secret files live inside the sandbox (design doc §3.10).
 pub const SECRETS_DIR_IN_SANDBOX: &str = "/run/secrets";
 
+/// Where a request's own script lands inside the sandbox (protocol 1.1).
+///
+/// One directory, mode `0711`, and files named by the SHA-256 of their
+/// contents at `0400`. Together those are the access rule: a child can open a
+/// script whose digest it already knows, and cannot list what else is there.
+/// In a runtime pool the sandbox is shared between tenants — that is the whole
+/// point of it — so "what else is there" is every other tenant's code that
+/// happens to be in flight, and `0711` is what keeps a `readdir` from being an
+/// inventory of it.
+///
+/// It is *not* a boundary against a tenant that already knows the digest: the
+/// child runs as the same uid as the supervisor maps to, so it can unlink the
+/// file and write its own in its place. Nothing on a shared uid can prevent
+/// that, which is why the digest check happens in the child, against a digest
+/// that arrived over the control socket rather than through the filesystem.
+/// See `spec/protocol.md` §3.
+pub const SCRIPT_DIR_IN_SANDBOX: &str = "/run/script";
+
+/// Scripts present in the sandbox for the requests that named them.
+///
+/// Counted, not merely present: a script is shared, two requests may run the
+/// same one at once, and the second must not find the file the first has just
+/// removed. The same reason [`Secrets`] counts, for the same boundary — except
+/// that the count is per script rather than per function, because two requests
+/// in flight on a pool zygote are generally two *different* scripts.
+#[derive(Debug, Default)]
+struct Scripts {
+    /// File name — the digest's hex — to the number of requests that need it.
+    resident: BTreeMap<String, u32>,
+    /// The sandbox's `/run/script`, held open from the first file written
+    /// until the last is gone. A descriptor rather than the path it was
+    /// reached by, because that path goes through `/proc/<pid>/root` and stops
+    /// resolving the moment that process does.
+    dir: Option<std::fs::File>,
+    /// Whether this function has already said that it cannot deliver a script
+    /// as a file. Said once: it is a property of the sandbox, so a request
+    /// that logs it logs it for every request after.
+    warned: bool,
+}
+
+/// A script file that exists in the sandbox for as long as this is alive.
+///
+/// Dropping it is what takes the file away, so every exit from the request
+/// path — the reply, the deadline, a broken connection — removes it, exactly
+/// as [`SecretsLease`] does.
+struct ScriptLease<'a> {
+    scripts: &'a Mutex<Scripts>,
+    name: String,
+}
+
+impl Drop for ScriptLease<'_> {
+    fn drop(&mut self) {
+        let mut guard = self.scripts.lock().expect("scripts");
+        let last = match guard.resident.get_mut(&self.name) {
+            Some(count) => {
+                *count -= 1;
+                *count == 0
+            }
+            None => false,
+        };
+        if !last {
+            return;
+        }
+        guard.resident.remove(&self.name);
+        if let Some(dir) = guard.dir.as_ref() {
+            let _ = rustix::fs::unlinkat(dir, self.name.as_str(), rustix::fs::AtFlags::empty());
+        }
+        // The last script out closes the directory too: holding a descriptor
+        // into a sandbox that may be replaced under us buys nothing once there
+        // is nothing in there to remove.
+        if guard.resident.is_empty() {
+            guard.dir = None;
+        }
+    }
+}
+
+/// Put one request's script where its child will find it.
+///
+/// `dir` is the sandbox's `/run/script` as seen from the host — through
+/// `/proc/<agent pid>/root`, the same route secrets take and for the same
+/// reason: nothing inside the sandbox is asked to cooperate, and the zygote
+/// never holds the bytes.
+fn place_script<'a>(
+    scripts: &'a Mutex<Scripts>,
+    dir: &std::path::Path,
+    name: &str,
+    source: &str,
+) -> Result<ScriptLease<'a>> {
+    let mut guard = scripts.lock().expect("scripts");
+    let count = guard.resident.entry(name.to_string()).or_insert(0);
+    *count += 1;
+    let write_now = *count == 1;
+
+    let written = if write_now {
+        write_script(&mut guard, dir, name, source)
+    } else {
+        Ok(())
+    };
+    drop(guard);
+
+    // The lease is built with no lock held, for the reason `place_secrets`
+    // spells out: dropping one takes this same mutex, and a lease created
+    // above an early `?` return would be dropped by the thread holding it.
+    let lease = ScriptLease {
+        scripts,
+        name: name.to_string(),
+    };
+    written?;
+    Ok(lease)
+}
+
+/// Write one script file. Called with the lock held; takes none.
+fn write_script(
+    scripts: &mut Scripts,
+    dir: &std::path::Path,
+    name: &str,
+    source: &str,
+) -> Result<()> {
+    if scripts.dir.is_none() {
+        std::fs::create_dir_all(dir).at(dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Enter but do not list: see `SCRIPT_DIR_IN_SANDBOX`.
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o711)).at(dir)?;
+        }
+        scripts.dir = Some(std::fs::File::open(dir).at(dir)?);
+    }
+    let dir = scripts.dir.as_ref().expect("just set");
+    write_request_file_at(dir, name, source, "writing a script into the sandbox")
+}
+
+/// The sandbox's `/run/script`, as seen from the host.
+fn script_dir(agent_host_pid: u32) -> PathBuf {
+    PathBuf::from(format!(
+        "/proc/{agent_host_pid}/root{SCRIPT_DIR_IN_SANDBOX}"
+    ))
+}
+
 impl WarmFn {
     /// Give this function its secret values.
     ///
@@ -1879,14 +2033,90 @@ impl WarmFn {
     fn place_secrets(&self) -> Result<SecretsLease<'_>> {
         place_secrets(&self.secrets, SecretsAt::Proc(self.agent_host_pid))
     }
+
+    /// Decide how a request's script reaches its child, and put it there.
+    ///
+    /// Protocol 1.1 has two shapes and this is where the preference between
+    /// them lives. **`path`** is the one to want: the supervisor writes the
+    /// script into the sandbox from outside, the `EXEC` carries only its name
+    /// and its digest, and the zygote — which in a runtime pool is shared
+    /// between tenants — never has the bytes in its address space at all. A
+    /// zygote that did would be one that the *next* tenant's fork inherits a
+    /// copy-on-write view of.
+    ///
+    /// **`source`** is the fallback, for a sandbox this process cannot write
+    /// into: a backend with no `/proc/<pid>/root` to reach through, or a
+    /// kernel that refuses. It still works, and it is still safe from the
+    /// filesystem's point of view, but it gives up the property above — so it
+    /// is logged, once per function, rather than chosen quietly.
+    ///
+    /// A script that already carries a `path` is left exactly as it is: the
+    /// caller has arranged delivery itself and knows something this does not.
+    fn place_script(
+        &self,
+        script: Option<crate::protocol::Script>,
+    ) -> (Option<crate::protocol::Script>, Option<ScriptLease<'_>>) {
+        let Some(mut script) = script else {
+            return (None, None);
+        };
+        if script.path.is_some() {
+            return (Some(script), None);
+        }
+        let Some(source) = script.source.take() else {
+            return (Some(script), None);
+        };
+
+        // Of the bytes about to be written, not of whatever the caller
+        // believed: the `digest` field describes the file, and the child's
+        // check of it is the only thing standing between a tenant that
+        // replaces that file and the request that was going to load it.
+        let digest = crate::scripts::ScriptDigest::of(&source);
+        match place_script(
+            &self.scripts,
+            &script_dir(self.agent_host_pid),
+            digest.hex(),
+            &source,
+        ) {
+            Ok(lease) => {
+                script.path = Some(format!("{SCRIPT_DIR_IN_SANDBOX}/{}", digest.hex()));
+                script.digest = Some(digest.to_string());
+                (Some(script), Some(lease))
+            }
+            Err(e) => {
+                let mut guard = self.scripts.lock().expect("scripts");
+                if !std::mem::replace(&mut guard.warned, true) {
+                    tracing::warn!(
+                        function = %self.name,
+                        error = %e,
+                        "cannot write a script into this sandbox; sending it in the \
+                         EXEC instead, so the zygote holds tenant code while the \
+                         request runs"
+                    );
+                }
+                drop(guard);
+                script.digest = Some(digest.to_string());
+                script.source = Some(source);
+                (Some(script), None)
+            }
+        }
+    }
 }
 
-/// Create a secret file readable by its owner and nobody else.
+/// Create a request-scoped file readable by its owner and nobody else.
+///
+/// A secret value, or the script one request runs: both are written from
+/// outside the sandbox into a directory inside it, both last exactly as long
+/// as the requests that need them, and both are `0400`.
 ///
 /// Created with the mode from the start rather than chmodded afterwards, so
 /// there is no moment at which it is readable more widely — `/run` is a tmpfs
 /// shared by everything in the sandbox.
-fn write_secret_file_at(dir: &std::fs::File, name: &str, value: &str) -> Result<()> {
+fn write_request_file_at(
+    dir: &std::fs::File,
+    name: &str,
+    value: &str,
+    what: &'static str,
+) -> Result<()> {
     use rustix::fs::{Mode, OFlags};
     use std::io::Write as _;
 
@@ -1907,16 +2137,10 @@ fn write_secret_file_at(dir: &std::fs::File, name: &str, value: &str) -> Result<
         OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
         Mode::from_bits_truncate(0o400),
     )
-    .map_err(|e| {
-        Error::primitive(
-            "openat",
-            "writing a secret into the sandbox",
-            std::io::Error::from(e),
-        )
-    })?;
+    .map_err(|e| Error::primitive("openat", what, std::io::Error::from(e)))?;
     let mut file = std::fs::File::from(fd);
     file.write_all(value.as_bytes())
-        .map_err(|e| Error::primitive("write", "writing a secret into the sandbox", e))?;
+        .map_err(|e| Error::primitive("write", what, e))?;
     Ok(())
 }
 
@@ -3050,6 +3274,12 @@ mod tests {
         assert_eq!(s.in_flight, 0);
     }
 
+    /// What these tests were written against, before a script became the
+    /// other thing written into a sandbox the same way.
+    fn write_secret_file_at(dir: &std::fs::File, name: &str, value: &str) -> Result<()> {
+        write_request_file_at(dir, name, value, "writing a secret into the sandbox")
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_secret_file_is_owner_readable_from_the_moment_it_exists() {
@@ -3155,6 +3385,113 @@ mod tests {
             "v"
         );
         assert!(!inner.exists(), "the old path really is gone");
+    }
+
+    // --- a request's own script (protocol 1.1) ------------------------------
+
+    /// Where a script goes, and what it looks like when it gets there.
+    ///
+    /// `0400` on the file and `0711` on the directory: a child can open a
+    /// script whose digest it knows, and `readdir` tells it nothing about what
+    /// else is in flight on a pool zygote it shares with other tenants.
+    #[cfg(unix)]
+    #[test]
+    fn a_script_arrives_at_0400_in_a_directory_that_cannot_be_listed() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("run-script");
+        let scripts = Mutex::new(Scripts::default());
+
+        let lease = place_script(&scripts, &dir, "abc123", "x = 1\n").expect("place");
+        let file = dir.join("abc123");
+        assert_eq!(std::fs::read_to_string(&file).expect("read"), "x = 1\n");
+        assert_eq!(
+            std::fs::metadata(&file).expect("stat").permissions().mode() & 0o777,
+            0o400
+        );
+        assert_eq!(
+            std::fs::metadata(&dir).expect("stat").permissions().mode() & 0o777,
+            0o711
+        );
+
+        drop(lease);
+        assert!(
+            !file.exists(),
+            "the script outlived the request that named it"
+        );
+    }
+
+    /// Two requests, one script: the first to finish must not take the file
+    /// away from the second. The per-script count is the whole reason
+    /// [`Scripts`] holds one.
+    #[cfg(unix)]
+    #[test]
+    fn a_script_two_requests_share_leaves_when_the_second_one_does() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("run-script");
+        let scripts = Mutex::new(Scripts::default());
+
+        let first = place_script(&scripts, &dir, "shared", "handler = 1\n").expect("first");
+        let second = place_script(&scripts, &dir, "shared", "handler = 1\n").expect("second");
+        drop(first);
+        assert!(
+            dir.join("shared").exists(),
+            "the request still running lost its script"
+        );
+        drop(second);
+        assert!(!dir.join("shared").exists());
+    }
+
+    /// Two tenants' scripts in flight at once are two files, and neither
+    /// departure disturbs the other.
+    #[cfg(unix)]
+    #[test]
+    fn two_scripts_in_flight_are_two_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("run-script");
+        let scripts = Mutex::new(Scripts::default());
+
+        let a = place_script(&scripts, &dir, "aaa", "a = 1\n").expect("a");
+        let b = place_script(&scripts, &dir, "bbb", "b = 2\n").expect("b");
+        assert_eq!(
+            std::fs::read_dir(&dir).expect("readdir").count(),
+            2,
+            "one file per script in flight"
+        );
+        drop(a);
+        assert!(!dir.join("aaa").exists());
+        assert!(dir.join("bbb").exists());
+        drop(b);
+        assert_eq!(std::fs::read_dir(&dir).expect("readdir").count(), 0);
+        assert!(
+            scripts.lock().expect("scripts").dir.is_none(),
+            "the last script out closes the directory it was written through"
+        );
+    }
+
+    /// A placement that cannot happen leaves the count honest.
+    ///
+    /// The lease is taken either way — `place_script` builds it after the lock
+    /// is released and before it reports the failure — so a sandbox that
+    /// refuses one write does not leave a phantom reference behind that stops
+    /// the next request's file ever being removed.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_placement_does_not_leak_a_reference() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // A file where the directory should be: `create_dir_all` cannot win.
+        let dir = tmp.path().join("run-script");
+        std::fs::write(&dir, "not a directory").expect("write");
+        let scripts = Mutex::new(Scripts::default());
+
+        assert!(
+            place_script(&scripts, &dir, "abc", "x = 1\n").is_err(),
+            "a file is not a directory"
+        );
+        assert!(
+            scripts.lock().expect("scripts").resident.is_empty(),
+            "the failed request is still counted as holding its script"
+        );
     }
 
     // --- pid translation ---------------------------------------------------

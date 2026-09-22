@@ -78,6 +78,16 @@ const GO_GRACE: Duration = Duration::from_millis(300);
 enum Outcome {
     Pass(String),
     Skipped(String),
+    /// The agent does part of what the check asked and not the rest.
+    ///
+    /// Distinct from both, because both would be misleading. An agent that
+    /// loads a script from `source` but not from `path` is not "functions
+    /// only" — it advertises 1.1 — and it is not passing either: the
+    /// supervisor sends `path` whenever it can write into the sandbox, which
+    /// is the usual case, so those requests fail in production. Reported, not
+    /// fatal: the conformance run is about the protocol, and this one says
+    /// which half of a feature is there.
+    Partial(String),
 }
 
 /// One conformance check.
@@ -91,6 +101,8 @@ struct Report {
     stalled: bool,
     results: Vec<(String, bool, String)>,
     skips: Vec<(String, String)>,
+    /// Checks the agent answered in part. See [`Outcome::Partial`].
+    partials: Vec<(String, String)>,
 }
 
 impl Report {
@@ -103,6 +115,7 @@ impl Report {
             stalled: false,
             results: Vec::new(),
             skips: Vec::new(),
+            partials: Vec::new(),
         }
     }
 
@@ -155,6 +168,15 @@ impl Report {
         self.record(what, outcome.map(Outcome::Pass))
     }
 
+    /// A check the agent answered in part. Neither passed nor failed, and
+    /// named in the summary so it cannot be read as a pass.
+    fn partial(&mut self, what: &str, detail: &str) {
+        if !self.json {
+            println!("  {} {what} — {detail}", self.style.yellow("PART"));
+        }
+        self.partials.push((what.to_string(), detail.to_string()));
+    }
+
     /// The same, for a check that is entitled to decline.
     fn record(&mut self, what: &str, outcome: anyhow::Result<Outcome>) -> bool {
         match outcome {
@@ -164,6 +186,10 @@ impl Report {
             }
             Ok(Outcome::Skipped(why)) => {
                 self.skipped(what, &why);
+                true
+            }
+            Ok(Outcome::Partial(detail)) => {
+                self.partial(what, &detail);
                 true
             }
             Err(e) => {
@@ -497,6 +523,11 @@ fn finish(cli: &Cli, report: Report) -> anyhow::Result<u8> {
                 .iter()
                 .map(|(what, why)| serde_json::json!({ "check": what, "reason": why }))
                 .collect::<Vec<_>>(),
+            "partial": report
+                .partials
+                .iter()
+                .map(|(what, detail)| serde_json::json!({ "check": what, "detail": detail }))
+                .collect::<Vec<_>>(),
         }))?;
     } else {
         println!();
@@ -504,7 +535,20 @@ fn finish(cli: &Cli, report: Report) -> anyhow::Result<u8> {
             0 => String::new(),
             n => format!(", {n} not asked"),
         };
-        if report.failed == 0 {
+        let partial = match report.partials.len() {
+            0 => String::new(),
+            n => format!(", {n} partial"),
+        };
+        if report.failed == 0 && !report.partials.is_empty() {
+            // Not "conforms": it does the protocol, and not all of a feature
+            // it advertises. Saying so here is the whole point of the bucket.
+            println!(
+                "{} {} checks passed{skipped}{partial} — conforms to protocol \
+                 {PROTOCOL_VERSION}, with gaps named above",
+                report.style.yellow("~"),
+                report.passed
+            );
+        } else if report.failed == 0 {
             println!(
                 "{} {} checks passed{skipped} — this agent conforms to protocol {PROTOCOL_VERSION}",
                 report.style.green("✓"),
@@ -512,7 +556,7 @@ fn finish(cli: &Cli, report: Report) -> anyhow::Result<u8> {
             );
         } else {
             println!(
-                "{} {} passed, {} failed{skipped}",
+                "{} {} passed, {} failed{skipped}{partial}",
                 report.style.red("✗"),
                 report.passed,
                 report.failed
@@ -779,32 +823,109 @@ fn script_in_exec_check(agent: &mut Agent, script: Option<&Path>) -> anyhow::Res
     };
     let source = std::fs::read_to_string(script)
         .with_context(|| format!("could not read the script {}", script.display()))?;
+    let digest = zygo_core::scripts::ScriptDigest::of(&source);
 
+    // First the shape every 1.1 agent has to manage, because it decides what
+    // the rest of this check means: an agent that does not run a `source`
+    // script is not implementing 1.1 at all, and the two probes below would
+    // then be asking a question it never claimed to answer.
+    let inline = zygo_core::protocol::Script::inline(source);
     let event = serde_json::json!({ "n": 11 });
-    let exec = Message::Exec {
-        id: "c-script".into(),
+    match ran_the_script(agent, "c-script", &event, inline.clone())? {
+        ScriptRun::Ran => {}
+        ScriptRun::NotSupported(why) => return Ok(Outcome::Skipped(why)),
+    }
+
+    // Then the shape the supervisor actually sends. `path` is preferred
+    // wherever the sandbox can be written into, because a `source` has to
+    // pass through the zygote's memory and the zygote is shared between
+    // tenants — so an agent that only reads `source` fails the common case.
+    //
+    // The file is on this host rather than in a sandbox, which is the one
+    // thing this harness can arrange; what is under test is whether the agent
+    // opens a path it is given, not where the path came from.
+    let staged = tempfile::Builder::new()
+        .prefix("zygo-conformance-")
+        .suffix(&script_suffix(script))
+        .tempfile()
+        .context("could not stage a script for the `path` shape")?;
+    std::fs::write(staged.path(), inline.source.as_deref().unwrap_or_default())
+        .context("could not write the staged script")?;
+    let by_path =
+        zygo_core::protocol::Script::at(staged.path().display().to_string(), digest.to_string());
+    let path_shape = ran_the_script(agent, "c-script-path", &event, by_path)?;
+
+    // And the rule that makes `path` safe to use: a sandbox has one uid, so
+    // the child can replace the file it is about to load. The digest arrives
+    // on the supervisor's connection, where it cannot. An agent that runs the
+    // script anyway has no defence against that swap (§3.8).
+    let mut tampered = inline.clone();
+    tampered.digest = Some(zygo_core::scripts::ScriptDigest::of("not this script").to_string());
+    let refused = matches!(
+        ran_the_script(agent, "c-script-digest", &event, tampered)?,
+        ScriptRun::NotSupported(_)
+    );
+
+    match (path_shape, refused) {
+        (ScriptRun::Ran, true) => Ok(Outcome::Pass(
+            "the request's own script ran, from `source` and from `path`, and a \
+             digest that did not match was refused"
+                .into(),
+        )),
+        (ScriptRun::Ran, false) => anyhow::bail!(
+            "the agent ran a script whose bytes do not hash to the `digest` in \
+             its own EXEC\n  → §3.8: hash what you read and answer ERROR / \
+             handler_load instead. Without it a tenant can swap \
+             /run/script/<hash> for its own code and be served it"
+        ),
+        (ScriptRun::NotSupported(why), _) => Ok(Outcome::Partial(format!(
+            "`source` works and `path` does not ({why})\n    → the supervisor \
+             sends `path` whenever it can write into the sandbox, which is the \
+             usual case, so this agent would fail those requests"
+        ))),
+    }
+}
+
+/// The suffix of the script the suite was given, so the staged copy is the
+/// same kind of file. A Node agent resolves `require` by extension.
+fn script_suffix(script: &Path) -> String {
+    match script.extension().and_then(|e| e.to_str()) {
+        Some(extension) => format!(".{extension}"),
+        None => String::new(),
+    }
+}
+
+/// Whether the agent ran *this* script, or did something else it is entitled
+/// to do.
+enum ScriptRun {
+    Ran,
+    NotSupported(String),
+}
+
+/// Send one `EXEC` carrying a script and find out what happened to it.
+fn ran_the_script(
+    agent: &mut Agent,
+    id: &str,
+    event: &serde_json::Value,
+    script: zygo_core::protocol::Script,
+) -> anyhow::Result<ScriptRun> {
+    agent.send(&Message::Exec {
+        id: id.to_string(),
         event: event.clone(),
         timeout_ms: 30_000,
         env_overrides: Default::default(),
-        script: Some(zygo_core::protocol::Script {
-            source: Some(source),
-            path: None,
-            digest: None,
-            entry_point: None,
-        }),
-    };
+        script: Some(script),
+    })?;
 
-    agent.send(&exec)?;
     let done = loop {
         match agent.recv()? {
-            Message::Forked { id, .. } if id == "c-script" => {
-                agent.send(&Message::Go { id })?;
+            Message::Forked { id: forked, .. } if forked == id => {
+                agent.send(&Message::Go { id: forked })?;
             }
-            done @ Message::Done { .. } if done.request_id() == Some("c-script") => break done,
+            done @ Message::Done { .. } if done.request_id() == Some(id) => break done,
             Message::Error { code, message, .. } => {
-                return Ok(Outcome::Skipped(format!(
-                    "this agent serves functions only: it refused a script with \
-                     {code:?} ({})",
+                return Ok(ScriptRun::NotSupported(format!(
+                    "refused with {code:?} ({})",
                     first_line(&message)
                 )));
             }
@@ -820,12 +941,10 @@ fn script_in_exec_check(agent: &mut Agent, script: Option<&Path>) -> anyhow::Res
             ..
         } => {
             if result.get("from").and_then(|v| v.as_str()) == Some(SCRIPT_MARK) {
-                return Ok(Outcome::Pass(
-                    "the request's own script ran, so one zygote can serve many".into(),
-                ));
+                return Ok(ScriptRun::Ran);
             }
-            if result == event {
-                return Ok(Outcome::Skipped(
+            if result == *event {
+                return Ok(ScriptRun::NotSupported(
                     "this agent serves functions only: it ignored the script and ran \
                      the handler it was warmed with, which §5 allows"
                         .into(),
@@ -836,9 +955,8 @@ fn script_in_exec_check(agent: &mut Agent, script: Option<&Path>) -> anyhow::Res
                 "the agent answered neither the script's result nor its own \
                  handler's: {result}"
             );
-            Ok(Outcome::Skipped(format!(
-                "this agent serves functions only: the script failed rather than \
-                 running ({})",
+            Ok(ScriptRun::NotSupported(format!(
+                "the script failed rather than running ({})",
                 error.map(|e| first_line(&e)).unwrap_or_default()
             )))
         }

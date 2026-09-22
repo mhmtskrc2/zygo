@@ -31,7 +31,9 @@ use crate::spec::{Layer, Spec};
 ///
 /// - v2: `RUN`, `STARTED` and `RAN` — a one-shot sandbox started by the
 ///   supervisor on the client's streams.
-pub const CONTROL_VERSION: u32 = 2;
+/// - v3: `PUT_SCRIPT`, `GET_SCRIPT`, `DELETE_SCRIPT` and `SCRIPT` — the
+///   content-addressed script store behind `PUT /scripts`.
+pub const CONTROL_VERSION: u32 = 3;
 
 /// CLI → supervisor.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -171,6 +173,23 @@ pub enum Request {
     /// it. A function that was never served is `not_found` — this warms, it
     /// does not register.
     Warm { name: String },
+
+    /// Register a script, and get back the name the store gave it.
+    ///
+    /// Content-addressed, so this is idempotent in the strongest sense: the
+    /// same bytes are the same name and the same file, however many tenants
+    /// send them and however many times. The answer says whether this call
+    /// was the one that wrote it.
+    ///
+    /// The script is not run, and naming it does not make it runnable: a
+    /// request has to name a function or (from Phase 1.2) a runtime as well.
+    PutScript { source: String },
+
+    /// Whether the store holds this digest, and how big it is.
+    GetScript { digest: String },
+
+    /// Forget a script. `not_found` if it was never registered.
+    DeleteScript { digest: String },
 }
 
 fn default_log_limit() -> u32 {
@@ -281,6 +300,20 @@ pub enum Response {
     Warmed {
         name: String,
         state: crate::sandbox::SandboxState,
+    },
+
+    /// Answer to `PutScript` and `GetScript`.
+    Script {
+        /// `sha256:…`, which is the script's name everywhere else.
+        digest: String,
+        size: u64,
+        /// The store already held these bytes.
+        ///
+        /// The observable half of deduplication: two tenants that register
+        /// byte-identical scripts get one file, and the second is told so
+        /// rather than being left to assume it. Always true for a `GetScript`,
+        /// which answers `not_found` otherwise.
+        existed: bool,
     },
 
     Pong,
@@ -422,6 +455,15 @@ mod tests {
                 limit: 20,
                 failed: true,
             },
+            Request::PutScript {
+                source: "def handler(event):\n    return event\n".into(),
+            },
+            Request::GetScript {
+                digest: "sha256:abc".into(),
+            },
+            Request::DeleteScript {
+                digest: "sha256:abc".into(),
+            },
         ];
         for r in &requests {
             assert_eq!(&roundtrip_request(r), r, "{r:?}");
@@ -463,6 +505,11 @@ mod tests {
             Response::Warmed {
                 name: "resize".into(),
                 state: crate::sandbox::SandboxState::Warm,
+            },
+            Response::Script {
+                digest: "sha256:abc".into(),
+                size: 41,
+                existed: true,
             },
             Response::Sandbox {
                 name: "resize".into(),

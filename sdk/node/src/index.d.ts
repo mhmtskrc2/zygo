@@ -94,6 +94,18 @@ export interface RunResult {
   readonly ok: boolean;
 }
 
+/** A script the host holds, named by the SHA-256 of its bytes. */
+export interface Script {
+  /** `sha256:…`, which is the script's name everywhere else. */
+  sha256: string;
+  size: number;
+  /**
+   * The store already had exactly these bytes. What deduplication looks like
+   * from outside: two tenants registering the same script get one file.
+   */
+  existed: boolean;
+}
+
 export interface LogEntry {
   seq: number;
   at_ms: number;
@@ -189,6 +201,12 @@ export declare class Client {
   stop(name: string): Promise<string[]>;
   /** Needs an API started with `--allow-deploy`. */
   run(image: string, cmd?: string[] | null, options?: Layer & { stdin?: string }): Promise<RunResult>;
+
+  /** Needs an API started with `--allow-deploy`. */
+  putScript(source: string): Promise<Script>;
+  script(digest: string): Promise<Script>;
+  /** Needs an API started with `--allow-deploy`. */
+  deleteScript(digest: string): Promise<boolean>;
 
   fn<T = unknown>(name: string): FunctionHandle<T>;
 }

@@ -113,6 +113,29 @@ class Served:
 
 
 @dataclass(frozen=True)
+class Script:
+    """A script the host holds, named by the SHA-256 of its bytes.
+
+    ``existed`` is true when the store already had exactly these bytes, which
+    is what deduplication looks like from outside: two tenants registering the
+    same script get one file, and the second is told so rather than left to
+    assume it.
+    """
+
+    sha256: str
+    size: int = 0
+    existed: bool = False
+
+    @classmethod
+    def parse(cls, raw: Dict[str, Any]) -> "Script":
+        return cls(
+            sha256=str(raw.get("sha256", "")),
+            size=int(raw.get("size", 0)),
+            existed=bool(raw.get("existed", False)),
+        )
+
+
+@dataclass(frozen=True)
 class Run:
     """What a one-shot sandbox said.
 

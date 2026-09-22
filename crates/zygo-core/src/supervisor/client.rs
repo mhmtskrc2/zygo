@@ -347,6 +347,9 @@ fn name_of(request: &Request) -> &'static str {
         Request::Logs { .. } => "logs",
         Request::Warm { .. } => "warm",
         Request::Run { .. } => "run",
+        Request::PutScript { .. } => "registering a script",
+        Request::GetScript { .. } => "looking a script up",
+        Request::DeleteScript { .. } => "removing a script",
     }
 }
 

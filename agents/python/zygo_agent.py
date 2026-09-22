@@ -26,6 +26,8 @@ from __future__ import annotations
 import base64
 import binascii
 import gc
+import hashlib
+import hmac
 import importlib.util
 import json
 import os
@@ -199,6 +201,15 @@ class ScriptError(Exception):
     """The request named a script the child could not load."""
 
 
+class ScriptDigestMismatch(ScriptError):
+    """The bytes are not the ones the supervisor named.
+
+    Reported as `ERROR` / `handler_load` rather than as a failed request: a
+    handler that raised is the tenant's problem, and this is a disagreement
+    about what the request *is*.
+    """
+
+
 def load_request_script(script: dict):
     """Load the script an `EXEC` carried, and return its entry point.
 
@@ -221,12 +232,20 @@ def load_request_script(script: dict):
     if source is None and path is None:
         raise ScriptError("the request's script carries neither `source` nor `path`")
 
-    if source is None:
+    if source is not None:
+        raw = source.encode()
+    else:
+        # Binary, and hashed as read. Text mode would translate newlines and
+        # decode by the locale's encoding, so the bytes compiled here would not
+        # be the bytes the supervisor wrote — and the digest below would be
+        # checking something other than what runs.
         try:
-            with open(path, "r") as f:
-                source = f.read()
+            with open(path, "rb") as f:
+                raw = f.read()
         except OSError as e:
             raise ScriptError(f"cannot read {path}: {e}") from None
+
+    _check_digest(raw, script.get("digest"), path)
 
     module = types.ModuleType(name)
     module.__file__ = path or "<script>"
@@ -234,7 +253,7 @@ def load_request_script(script: dict):
     # registered can be found by anything else the handler imports. Nothing
     # here should outlive the request, and this is the only copy of it.
     try:
-        exec(compile(source, module.__file__, "exec"), module.__dict__)
+        exec(compile(raw, module.__file__, "exec"), module.__dict__)
     except BaseException as exc:
         raise ScriptError(f"the script did not load: {_handler_traceback(exc)}") from None
 
@@ -245,6 +264,30 @@ def load_request_script(script: dict):
             f"expected `def {entry_point}(event: dict)`"
         )
     return handler
+
+
+def _check_digest(raw: bytes, digest: "str | None", path: "str | None") -> None:
+    """Refuse bytes that are not the ones the supervisor named.
+
+    Not a formality. `/run/script/<hash>` is written by the supervisor but
+    lives in a sandbox with one uid, so the child about to load it can unlink
+    it and put its own there instead — for itself, or for another request in
+    flight on the same pool zygote. The digest arrives on the supervisor's
+    connection, which nothing inside can reach, so it is the part of this that
+    a tenant cannot forge.
+
+    Hashed over what was *read*, never by opening the file a second time: two
+    reads are two different files if somebody is trying.
+    """
+    if not digest:
+        return
+    actual = "sha256:" + hashlib.sha256(raw).hexdigest()
+    if not hmac.compare_digest(actual, digest):
+        where = path or "the script in this EXEC"
+        raise ScriptDigestMismatch(
+            f"{where} is {actual}, and the request asked for {digest}; "
+            "refusing to run it"
+        )
 
 
 def has_extra_threads() -> bool:
@@ -318,6 +361,9 @@ def run_request(
     error = None
     value = None
     wall_ms = 0.0
+    # Set when the request was refused rather than run: the answer is then an
+    # `ERROR` frame rather than a `RESULT`. See `_check_digest`.
+    refused = None
     out, err = _Ring(), _Ring()
     started = time.monotonic()
 
@@ -377,6 +423,12 @@ def run_request(
         except (TypeError, ValueError) as exc:
             raise TypeError(f"handler returned a value that is not JSON: {exc}") from exc
 
+    except ScriptDigestMismatch as exc:
+        # Not a failed handler — nothing of the script has run. The supervisor
+        # and this child disagree about what the request is, which §2 makes an
+        # `ERROR` so that a caller can tell "your code raised" from "your code
+        # was not what was asked for".
+        refused = str(exc)
     except BaseException as exc:  # noqa: BLE001 - the child reports everything upwards
         error = _handler_traceback(exc)
         exit_code = 1
@@ -385,19 +437,27 @@ def run_request(
             wall_ms = (time.monotonic() - started) * 1000.0
 
     usage = resource.getrusage(resource.RUSAGE_SELF)
-    message = {
-        "type": "RESULT",
-        "id": request.get("id", ""),
-        "exit_code": exit_code,
-        "result": value,
-        "stdout": _text(out),
-        "stderr": _text(err),
-        "peak_rss_kb": _peak_rss_kb(usage),
-        "wall_ms": wall_ms,
-        "cpu_ms": (usage.ru_utime + usage.ru_stime) * 1000.0,
-    }
-    if error is not None:
-        message["error"] = error
+    if refused is not None:
+        message = {
+            "type": "ERROR",
+            "id": request.get("id", ""),
+            "code": "handler_load",
+            "message": refused,
+        }
+    else:
+        message = {
+            "type": "RESULT",
+            "id": request.get("id", ""),
+            "exit_code": exit_code,
+            "result": value,
+            "stdout": _text(out),
+            "stderr": _text(err),
+            "peak_rss_kb": _peak_rss_kb(usage),
+            "wall_ms": wall_ms,
+            "cpu_ms": (usage.ru_utime + usage.ru_stime) * 1000.0,
+        }
+        if error is not None:
+            message["error"] = error
 
     body = json.dumps(message, default=_json_default, separators=(",", ":")).encode()
     os.write(result_fd, HEADER.pack(len(body)) + body)
@@ -748,7 +808,11 @@ class Agent:
             # reaping later keeps that off the request's clock.
             self._unreaped.append(request.pid)
 
-        result["type"] = "DONE"
+        # An `ERROR` from the child goes up as an `ERROR`: it is the answer to
+        # this `EXEC` either way (§3.5), and a request that was refused is not
+        # a request that produced a result.
+        if result.get("type") != "ERROR":
+            result["type"] = "DONE"
         self._send_result(result)
         self._reap_finished()
 
@@ -926,7 +990,10 @@ class Agent:
                 "wall_ms": 0.0,
                 "cpu_ms": 0.0,
             }
-        result["type"] = "DONE"
+        # As on the fork path: a worker that refused the request answers
+        # `ERROR`, and that is what goes up.
+        if result.get("type") != "ERROR":
+            result["type"] = "DONE"
         self._wire.send(result)
 
     def _await_go(self, request_id: str, proc) -> bool:
@@ -1044,7 +1111,12 @@ class Agent:
 
 
 def _decode_result_frame(raw: bytes, request_id: str) -> dict | None:
-    """Parse the child's single `RESULT` frame, or `None` if it never sent one."""
+    """Parse the child's single frame, or `None` if it never sent one.
+
+    Usually a `RESULT`. A child that refused the request answers `ERROR`
+    instead, and the `type` is kept so the caller can tell which — it is the
+    difference between a `DONE` and an `ERROR` going up to the supervisor.
+    """
     if len(raw) < HEADER.size:
         return None
     (size,) = HEADER.unpack(raw[: HEADER.size])
@@ -1056,7 +1128,6 @@ def _decode_result_frame(raw: bytes, request_id: str) -> dict | None:
     except json.JSONDecodeError:
         return None
     message["id"] = request_id
-    message.pop("type", None)
     return message
 
 
