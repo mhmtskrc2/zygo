@@ -173,28 +173,59 @@ if [ -n "$vm_uname" ]; then
         bad "the guest reports the host's own kernel ($vm_uname); that is not a virtual machine"
     fi
 
-    # The root must be read-only, and the reason is not tidiness. The directory
-    # libkrun shares as the root is the store's flattened rootfs for an image
-    # digest — one directory, shared by every sandbox that runs that image. It
-    # was writable once, and `echo x > /pwned` in a guest left
-    # `cache/flat/<digest>/pwned` on the host for the next tenant to find.
+    # Two properties, and they are separate. The guest must be able to write —
+    # a sandbox with no scratch is not one — and nothing it writes may reach
+    # the host. The root libkrun shares is the store's flattened rootfs for an
+    # image digest, used by every sandbox that runs that image; it was once
+    # shared writable, and `echo x > /pwned` in one guest left
+    # `cache/flat/<digest>/pwned` on the host for the next tenant. Now the
+    # guest gets a private overlay: writes go to a tmpfs upper in the VMM's
+    # own mount namespace, the shared image is the read-only lower, and
+    # the host's copy is checked here rather than assumed.
+    probe="probe-$$-$(date +%s)"
     out=$(zygo run --quiet --isolation vm --timeout "${BOOT_S}s" "$IMAGE" \
-        /bin/sh -c 'echo y > /rootfs-probe 2>/dev/null && echo ROOT-WRITABLE || echo root-ro; echo x > /tmp/w 2>/dev/null && echo tmp-writable || echo tmp-ro' 2>/dev/null)
+        /bin/sh -c "echo y > /$probe 2>/dev/null && echo root-writable || echo root-ro; echo x > /tmp/w 2>/dev/null && echo tmp-writable || echo tmp-ro" 2>/dev/null)
     case "$out" in
-        *ROOT-WRITABLE*) bad "the guest's root filesystem is writable — a tenant can edit the shared image cache" ;;
-        *root-ro*)       ok "the guest's root filesystem is read-only, enforced by the VMM" ;;
+        *root-writable*) ok "the guest can write to its root" ;;
+        *root-ro*)       skip "the guest's root is read-only: no private overlay on this host, so no scratch" ;;
         *) bad "the guest's filesystem probe said: $(printf '%s' "$out" | tr '\n' ' ')" ;;
     esac
-
-    # And the gap that read-only root leaves, named rather than left to be
-    # discovered: the guest has no writable scratch at all. libkrun's init
-    # mounts /dev/shm and not /tmp, and mounting one needs guest-side code —
-    # `zygo guest-init`, which is also where the guest's own cgroups, seccomp
-    # and Landlock go. Until then a vm sandbox can read and compute but not
-    # write, which is a real limit and not a bug in this check.
     case "$out" in
         *tmp-writable*) ok "/tmp is writable inside the guest" ;;
-        *tmp-ro*) skip "/tmp is not writable in a guest: no scratch until guest-init mounts one" ;;
+        *tmp-ro*)       skip "/tmp is not writable in the guest" ;;
+    esac
+    # The property that matters: the write stayed in the guest.
+    leaked=$(find "$ZYGO_DATA_HOME" -name "$probe" 2>/dev/null | head -1)
+    if [ -n "$leaked" ]; then
+        bad "a guest write reached the host's image cache: $leaked"
+    else
+        ok "nothing the guest wrote reached the host (no $probe under the data directory)"
+    fi
+    # The layer is bounded, or a guest could fill the host's memory: the
+    # tmpfs is sized to `scratch`, so a write past it fails inside the guest
+    # rather than growing on the host. 200 MB against the 64 MB default, and
+    # the file has to come out exactly 64 MB — not 200, which would mean the
+    # bound is not there, and not 0, which would mean the write never ran.
+    written=$(zygo run --quiet --isolation vm --timeout "${BOOT_S}s" "$IMAGE" \
+        /bin/sh -c 'dd if=/dev/zero of=/big bs=1M count=200 >/dev/null 2>&1; stat -c %s /big 2>/dev/null || echo 0' 2>/dev/null | tr -d '\n ')
+    case "$written" in
+        67108864) ok "a guest's writes are bounded by scratch: 200 MB attempted, 64 MB landed" ;;
+        0|"")     bad "the bound probe wrote nothing at all, so the bound was not tested" ;;
+        *)        if [ "$written" -gt 67108864 ] 2>/dev/null; then
+                      bad "a guest wrote ${written} bytes past its 64 MB scratch bound"
+                  else
+                      bad "the bound probe stopped at ${written} bytes, which is neither the bound nor the whole file"
+                  fi ;;
+    esac
+
+    # And it did not persist into the next guest either, which is what a
+    # per-sandbox upper means.
+    again=$(zygo run --quiet --isolation vm --timeout "${BOOT_S}s" "$IMAGE" \
+        /bin/sh -c "[ -e /$probe ] && echo persisted || echo fresh" 2>/dev/null)
+    case "$again" in
+        *fresh*)     ok "the next guest on the same image starts from the pristine image" ;;
+        *persisted*) bad "a file written by one guest was visible to the next" ;;
+        *) bad "the second guest did not answer: $again" ;;
     esac
 
     # The claim from §2 of the plan: a guest can offer controls the host lacks.

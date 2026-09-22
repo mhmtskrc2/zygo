@@ -483,6 +483,8 @@ mod tests {
             uid: 1000,
             gid: 1000,
             stdio: None,
+            stdio_streams: None,
+            ignored_signals: None,
             agent_fd: None,
             hold: false,
             writable_root: false,

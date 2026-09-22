@@ -17,7 +17,10 @@
 //!
 //! * return the event it was given, unchanged;
 //! * if `event.stdout` is a string, write it to stdout;
-//! * if `event.stderr` is a string, write it to stderr.
+//! * if `event.stderr` is a string, write it to stderr;
+//! * if `event.spawn` is a string, start a *program* that prints it — which is
+//!   what the `strict` child filter takes away, and so what the suite has to
+//!   be able to attempt.
 //!
 //! `examples/agents/` has one of these per agent.
 
@@ -57,12 +60,25 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 /// is how it knows.
 const STALLED: &str = "stopped answering";
 
+/// Why the checks after a missed deadline are not asked.
+const OUT_OF_STEP: &str = "not asked: the agent is no longer in step with this suite";
+
 /// How long to wait, after `FORKED`, for a `DONE` that must *not* arrive.
 ///
 /// The child is required to do nothing until `GO`. Long enough that a child
 /// which ignored the rule has finished the echo handler many times over,
 /// short enough not to dominate the suite.
 const GO_GRACE: Duration = Duration::from_millis(300);
+
+/// What a check produced.
+///
+/// A check that could not be asked is neither a pass nor a failure: the
+/// `strict` child filter has nothing to say on a kernel that has no seccomp,
+/// and a suite that counted that as either would be lying about a platform.
+enum Outcome {
+    Pass(String),
+    Skipped(String),
+}
 
 /// One conformance check.
 struct Report {
@@ -74,6 +90,7 @@ struct Report {
     /// answering the previous question, so the run stops.
     stalled: bool,
     results: Vec<(String, bool, String)>,
+    skips: Vec<(String, String)>,
 }
 
 impl Report {
@@ -85,6 +102,7 @@ impl Report {
             json,
             stalled: false,
             results: Vec::new(),
+            skips: Vec::new(),
         }
     }
 
@@ -120,23 +138,32 @@ impl Report {
     /// Counted as neither passed nor failed: it is not a result. A suite that
     /// scored these as failures would report an agent as non-conforming on
     /// the strength of one slow reply.
-    fn skipped(&mut self, what: &str) {
+    fn skipped(&mut self, what: &str, why: &str) {
         if !self.json {
             println!(
                 "  {} {what} — {}",
                 self.style.yellow("SKIP"),
-                self.style
-                    .dim("not asked: the agent is no longer in step with this suite")
+                self.style.dim(why)
             );
         }
+        self.skips.push((what.to_string(), why.to_string()));
     }
 
     /// Record one check from a `Result`, so a failed step reads the same as a
     /// failed assertion rather than aborting the suite.
     fn check(&mut self, what: &str, outcome: anyhow::Result<String>) -> bool {
+        self.record(what, outcome.map(Outcome::Pass))
+    }
+
+    /// The same, for a check that is entitled to decline.
+    fn record(&mut self, what: &str, outcome: anyhow::Result<Outcome>) -> bool {
         match outcome {
-            Ok(detail) => {
+            Ok(Outcome::Pass(detail)) => {
                 self.ok(what, detail);
+                true
+            }
+            Ok(Outcome::Skipped(why)) => {
+                self.skipped(what, &why);
                 true
             }
             Err(e) => {
@@ -160,6 +187,16 @@ struct Agent {
 impl Agent {
     /// Start the agent with a connected socket at [`AGENT_FD`].
     fn start(binary: &Path, args: &[String]) -> anyhow::Result<Agent> {
+        Agent::start_with_env(binary, args, &[])
+    }
+
+    /// The same, with extra environment — how the supervisor hands over the
+    /// `strict` child filter.
+    fn start_with_env(
+        binary: &Path,
+        args: &[String],
+        env: &[(&str, String)],
+    ) -> anyhow::Result<Agent> {
         use std::os::fd::AsRawFd;
         use std::os::unix::process::CommandExt;
 
@@ -168,6 +205,9 @@ impl Agent {
 
         let mut command = std::process::Command::new(binary);
         command.args(args);
+        for (key, value) in env {
+            command.env(key, value);
+        }
         // SAFETY: between `fork` and `execve`. `dup2` and `fcntl` are
         // async-signal-safe, and nothing here allocates.
         unsafe {
@@ -315,6 +355,7 @@ impl Drop for Agent {
 /// An `EXEC` whose event the handler is contracted to echo.
 fn exec(id: &str, event: serde_json::Value) -> Message {
     Message::Exec {
+        script: None,
         id: id.to_string(),
         event,
         timeout_ms: 30_000,
@@ -323,7 +364,12 @@ fn exec(id: &str, event: serde_json::Value) -> Message {
 }
 
 /// `zygo agent test <binary> [args…]`.
-pub fn test(cli: &Cli, binary: &Path, args: &[String]) -> anyhow::Result<u8> {
+pub fn test(
+    cli: &Cli,
+    binary: &Path,
+    script: Option<&Path>,
+    args: &[String],
+) -> anyhow::Result<u8> {
     let mut report = Report::new(cli.json);
     if !cli.json {
         println!(
@@ -332,9 +378,10 @@ pub fn test(cli: &Cli, binary: &Path, args: &[String]) -> anyhow::Result<u8> {
         );
         println!(
             "  {}",
-            Report::new(false)
-                .style
-                .dim("the handler must echo the event, and write `stdout`/`stderr` when present")
+            Report::new(false).style.dim(
+                "the handler must echo the event, write `stdout`/`stderr` when present, \
+                 and start a program for `spawn`"
+            )
         );
         println!();
     }
@@ -359,9 +406,18 @@ pub fn test(cli: &Cli, binary: &Path, args: &[String]) -> anyhow::Result<u8> {
     macro_rules! step {
         ($what:expr, $check:expr) => {
             if report.stalled {
-                report.skipped($what);
+                report.skipped($what, OUT_OF_STEP);
             } else {
                 report.check($what, $check);
+            }
+        };
+    }
+    macro_rules! step_or_skip {
+        ($what:expr, $check:expr) => {
+            if report.stalled {
+                report.skipped($what, OUT_OF_STEP);
+            } else {
+                report.record($what, $check);
             }
         };
     }
@@ -399,7 +455,23 @@ pub fn test(cli: &Cli, binary: &Path, args: &[String]) -> anyhow::Result<u8> {
         bad_message_check(&mut agent)
     );
 
-    // 9. Shutdown. Last, because it ends the agent.
+    // 9. Protocol 1.1: a script that arrives with the request. Optional —
+    // an agent that only serves the handler it was warmed with is still
+    // conforming, and is reported as such rather than failed.
+    step_or_skip!(
+        "a script in EXEC is loaded by the child (proto 1.1)",
+        script_in_exec_check(&mut agent, script)
+    );
+
+    // 10. The `strict` child filter. Runs a second copy of the agent, because
+    // `ZYGO_CHILD_SECCOMP` is read at start-up and the conversation above
+    // must not be held under it.
+    step_or_skip!(
+        "ZYGO_CHILD_SECCOMP is installed in the child, or the request is refused",
+        child_seccomp_check(&mut agent, binary, args)
+    );
+
+    // 11. Shutdown. Last, because it ends the agent.
     step!("SHUTDOWN makes the agent exit", shutdown_check(&mut agent));
 
     finish(cli, report)
@@ -410,6 +482,7 @@ fn finish(cli: &Cli, report: Report) -> anyhow::Result<u8> {
         output::json(&serde_json::json!({
             "passed": report.passed,
             "failed": report.failed,
+            "skipped": report.skips.len(),
             "checks": report
                 .results
                 .iter()
@@ -419,18 +492,27 @@ fn finish(cli: &Cli, report: Report) -> anyhow::Result<u8> {
                     "detail": detail,
                 }))
                 .collect::<Vec<_>>(),
+            "skips": report
+                .skips
+                .iter()
+                .map(|(what, why)| serde_json::json!({ "check": what, "reason": why }))
+                .collect::<Vec<_>>(),
         }))?;
     } else {
         println!();
+        let skipped = match report.skips.len() {
+            0 => String::new(),
+            n => format!(", {n} not asked"),
+        };
         if report.failed == 0 {
             println!(
-                "{} {} checks passed — this agent conforms to protocol {PROTOCOL_VERSION}",
+                "{} {} checks passed{skipped} — this agent conforms to protocol {PROTOCOL_VERSION}",
                 report.style.green("✓"),
                 report.passed
             );
         } else {
             println!(
-                "{} {} passed, {} failed",
+                "{} {} passed, {} failed{skipped}",
                 report.style.red("✗"),
                 report.passed,
                 report.failed
@@ -653,6 +735,247 @@ fn bad_message_check(agent: &mut Agent) -> anyhow::Result<String> {
         }
         other => anyhow::bail!("expected ERROR, got {}", other.kind()),
     }
+}
+
+/// The word the spawning handler prints, which is how the suite tells a child
+/// that started a program from one that could not.
+const SPAWN_MARK: &str = "zygo-child-spawned";
+
+/// What the script the suite sends has to return.
+///
+/// A value the conformance handler never produces, so "the script ran" and
+/// "the agent ignored it and ran the handler it was warmed with" are told
+/// apart rather than guessed at.
+const SCRIPT_MARK: &str = "the-request";
+
+/// Protocol 1.1: the script arrives with the request, and the *child* loads it.
+///
+/// This is what lets one warm interpreter serve ten thousand scripts instead
+/// of ten thousand zygotes serving one each — the measurement behind it is in
+/// `docs/bench-embed.md`, where a warm script costs 9.98 MB of proportional
+/// memory and an embedder has far more than a thousand of them.
+///
+/// Optional, and the three outcomes are all legitimate:
+///
+/// * the script ran — the agent implements 1.1;
+/// * the agent's own handler ran instead — it ignored a field it does not
+///   know, which is exactly what §5 tells it to do, and it serves functions
+///   only;
+/// * the request failed — also fine, as long as it *answered*: an agent may
+///   refuse what it cannot do, and silence is the only wrong answer.
+fn script_in_exec_check(agent: &mut Agent, script: Option<&Path>) -> anyhow::Result<Outcome> {
+    // The suite cannot know what language the agent under test speaks, and a
+    // Python script sent to a Node agent fails in a way indistinguishable
+    // from "this agent does not implement 1.1". So it is given one rather
+    // than guessed at — which is also why its absence is a skip and not a
+    // failure. (This check sent Python to the Node agent until the Node agent
+    // implemented 1.1 and still could not pass.)
+    let Some(script) = script else {
+        return Ok(Outcome::Skipped(
+            "not asked: pass --script <file> in this agent's own language to check \
+             protocol 1.1"
+                .into(),
+        ));
+    };
+    let source = std::fs::read_to_string(script)
+        .with_context(|| format!("could not read the script {}", script.display()))?;
+
+    let event = serde_json::json!({ "n": 11 });
+    let exec = Message::Exec {
+        id: "c-script".into(),
+        event: event.clone(),
+        timeout_ms: 30_000,
+        env_overrides: Default::default(),
+        script: Some(zygo_core::protocol::Script {
+            source: Some(source),
+            path: None,
+            digest: None,
+            entry_point: None,
+        }),
+    };
+
+    agent.send(&exec)?;
+    let done = loop {
+        match agent.recv()? {
+            Message::Forked { id, .. } if id == "c-script" => {
+                agent.send(&Message::Go { id })?;
+            }
+            done @ Message::Done { .. } if done.request_id() == Some("c-script") => break done,
+            Message::Error { code, message, .. } => {
+                return Ok(Outcome::Skipped(format!(
+                    "this agent serves functions only: it refused a script with \
+                     {code:?} ({})",
+                    first_line(&message)
+                )));
+            }
+            _ => {}
+        }
+    };
+
+    match done {
+        Message::Done {
+            exit_code,
+            result,
+            error,
+            ..
+        } => {
+            if result.get("from").and_then(|v| v.as_str()) == Some(SCRIPT_MARK) {
+                return Ok(Outcome::Pass(
+                    "the request's own script ran, so one zygote can serve many".into(),
+                ));
+            }
+            if result == event {
+                return Ok(Outcome::Skipped(
+                    "this agent serves functions only: it ignored the script and ran \
+                     the handler it was warmed with, which §5 allows"
+                        .into(),
+                ));
+            }
+            anyhow::ensure!(
+                exit_code != 0 || error.is_some(),
+                "the agent answered neither the script's result nor its own \
+                 handler's: {result}"
+            );
+            Ok(Outcome::Skipped(format!(
+                "this agent serves functions only: the script failed rather than \
+                 running ({})",
+                error.map(|e| first_line(&e)).unwrap_or_default()
+            )))
+        }
+        other => anyhow::bail!("expected DONE, got {}", other.kind()),
+    }
+}
+
+/// `ZYGO_CHILD_SECCOMP`: the supervisor's tightening of the forked child.
+///
+/// Under `strict` the supervisor hands the agent a seccomp program that the
+/// *child* is to install before any handler code, removing `execve` and
+/// process creation from the request without removing them from the agent.
+/// `spec/protocol.md` §3 gives an agent two acceptable answers and no third:
+/// install it, or fail the request. Running the request anyway, with the
+/// sandbox's filter alone, is the outcome this check exists to catch — the
+/// `sh` and Node example agents both did it silently before it existed.
+///
+/// The positive path is proved first, on the agent that is already warm: if
+/// the handler cannot start a program *without* a filter, then its failing to
+/// start one with a filter proves nothing at all.
+fn child_seccomp_check(
+    warm: &mut Agent,
+    binary: &Path,
+    args: &[String],
+) -> anyhow::Result<Outcome> {
+    let Some(filter) = strict_child_filter() else {
+        return Ok(Outcome::Skipped(
+            "not asked: seccomp is a Linux facility, and this is not Linux".into(),
+        ));
+    };
+
+    // The control. A handler that cannot spawn here — no `/bin/echo`, a
+    // language without a way to start a program — makes the real check
+    // vacuous, so it is a skip rather than a pass.
+    let control = one_request(warm, "c-spawn", serde_json::json!({ "spawn": SPAWN_MARK }))?;
+    if !spawned(&control) {
+        return Ok(Outcome::Skipped(format!(
+            "not asked: the handler did not start a program even without a filter, \
+             so a refusal would prove nothing ({})",
+            summarise(&control)
+        )));
+    }
+
+    // The same request, on a new agent that was told to tighten its children.
+    let mut tightened = Agent::start_with_env(
+        binary,
+        args,
+        &[(zygo_core::protocol::CHILD_SECCOMP_ENV, filter)],
+    )?;
+    // A start-up `ERROR` is a conforming answer too: an agent that cannot
+    // decode the program refuses to serve rather than serving unfiltered.
+    match tightened.recv()? {
+        Message::Ready { .. } => {}
+        Message::Error { code, message, .. } => {
+            return Ok(Outcome::Pass(format!(
+                "refused to start under the filter ({code:?}: {})",
+                first_line(&message)
+            )));
+        }
+        other => anyhow::bail!(
+            "the first message under {} was {} rather than READY",
+            zygo_core::protocol::CHILD_SECCOMP_ENV,
+            other.kind()
+        ),
+    }
+
+    match one_request(
+        &mut tightened,
+        "c-filtered",
+        serde_json::json!({ "spawn": SPAWN_MARK }),
+    ) {
+        Ok(done) => {
+            anyhow::ensure!(
+                !spawned(&done),
+                "the child started a program with {} set: the filter was ignored and \
+                 the request ran with the sandbox's filter alone",
+                zygo_core::protocol::CHILD_SECCOMP_ENV
+            );
+            Ok(Outcome::Pass(format!(
+                "the child could not start a program ({})",
+                summarise(&done)
+            )))
+        }
+        // `one_request` turns an `ERROR` into a failure; here it is an answer.
+        Err(e) if e.to_string().contains("the agent reported") => Ok(Outcome::Pass(format!(
+            "the request was refused rather than run unfiltered ({})",
+            first_line(&e.to_string())
+        ))),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether the handler's program ran, as seen from outside.
+fn spawned(done: &Message) -> bool {
+    match done {
+        Message::Done { stdout, .. } => stdout.contains(SPAWN_MARK),
+        _ => false,
+    }
+}
+
+fn summarise(done: &Message) -> String {
+    match done {
+        Message::Done {
+            exit_code, error, ..
+        } => match error {
+            Some(e) => format!("exit {exit_code}: {}", first_line(e)),
+            None => format!("exit {exit_code}"),
+        },
+        other => other.kind().to_string(),
+    }
+}
+
+fn first_line(text: &str) -> String {
+    let line = text.lines().next().unwrap_or("").trim();
+    if line.len() > 90 {
+        format!("{}…", &line[..89])
+    } else {
+        line.to_string()
+    }
+}
+
+/// The `strict` child program, base64 as the supervisor sends it.
+///
+/// `None` where there is no such thing to build — every platform that is not
+/// Linux, and a Linux architecture with no syscall table compiled in.
+#[cfg(target_os = "linux")]
+fn strict_child_filter() -> Option<String> {
+    use base64::Engine as _;
+    use zygo_core::backend::ns::seccomp;
+
+    let program = seccomp::child_program(zygo_core::spec::SeccompProfile::Strict).ok()??;
+    Some(base64::engine::general_purpose::STANDARD.encode(seccomp::encode(&program)))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn strict_child_filter() -> Option<String> {
+    None
 }
 
 fn shutdown_check(agent: &mut Agent) -> anyhow::Result<String> {

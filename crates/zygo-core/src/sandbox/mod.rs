@@ -67,6 +67,29 @@ pub struct SandboxConfig {
     /// also adopts as its controlling terminal, or a plain pipe, which is how
     /// the venv builder captures what `pip` says.
     pub stdio: Option<std::os::fd::RawFd>,
+    /// Three descriptors for the sandbox's stdin, stdout and stderr, kept
+    /// distinct.
+    ///
+    /// The other shape `stdio` has: a caller that is not this process — a
+    /// `zygo run` client whose sandbox the *supervisor* is starting on its
+    /// behalf — hands over its own three streams, and they are three
+    /// different things (a pipe on stdin, a terminal on stdout, a file on
+    /// stderr) that must stay three different things. `stdio` collapses them
+    /// into one, which is right for a pty and wrong for everything else.
+    ///
+    /// Takes precedence over `stdio` when both are set; the launcher applies
+    /// exactly one of them.
+    pub stdio_streams: Option<[std::os::fd::RawFd; 3]>,
+    /// Signal dispositions for the program: `Some(mask)` resets every signal
+    /// to its default and then ignores those in `mask` (bit `n - 1` for
+    /// signal `n`); `None` leaves what this process would pass on.
+    ///
+    /// Set for a sandbox started on another process's behalf, with *that*
+    /// process's ignored set: dispositions survive `clone3` and `SIG_IGN`
+    /// survives `execve`, so the program would otherwise get the
+    /// supervisor's — and a supervisor a script put in the background with
+    /// `&` has `SIGINT` ignored.
+    pub ignored_signals: Option<u64>,
     /// A connected socket for the runtime agent, placed at
     /// [`crate::pool::AGENT_FD`] in the sandbox.
     ///
@@ -129,6 +152,8 @@ impl SandboxConfig {
             uid: 1000,
             gid: 1000,
             stdio: None,
+            stdio_streams: None,
+            ignored_signals: None,
             agent_fd: None,
             hold: false,
             writable_root: false,
@@ -220,6 +245,8 @@ impl SandboxConfig {
             uid,
             gid: uid,
             stdio: None,
+            stdio_streams: None,
+            ignored_signals: None,
             agent_fd: None,
             hold: false,
             writable_root: false,

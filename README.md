@@ -7,21 +7,77 @@ Docker's ergonomics, but without the container create/destroy cycle. The sandbox
 waits warm; a request costs a `fork()`.
 
 ```bash
-zygo run --mount ./hello.py:/hello.py:ro python:3.12 python3 /hello.py   # first run pulls the image
-zygo run --mount ./hello.py:/hello.py:ro python:3.12 python3 /hello.py   # second: ~30 ms, mostly Python itself
-zygo serve ./handler.py --name resize                                     # a warm zygote comes up
-zygo exec resize '{"url": "..."}'                                         # ~2 ms of overhead
+zygo serve ./handler.py --name resize        # a warm zygote: ~270 ms, once
+zygo exec resize '{"url": "..."}'            # 1.7 ms of overhead, a fresh process
+zygo exec resize '{"url": "..."}'            # and again, on a clean copy
 ```
 
 ## Why
 
-Running a 30-line Python function in a container costs 300–1000 ms, of which the
-code itself is 5–20 ms. That overhead is not isolation — a namespace set costs
-about 1 ms, a cgroup 0.1 ms, a seccomp filter microseconds. It is orchestration
-(daemon → containerd → shim → runc) and cold interpreter start.
+A warm process that serves many requests is fast and dirty: request *n* sees
+whatever request *n-1* left — a monkeypatch, a cached connection, a mutated
+module, an `atexit` handler. A container per request is clean and slow:
+300–1000 ms, of which your code is 5–20 ms.
 
-Zygo removes both: the orchestration leaves the request path, and the
-interpreter start is amortised by a warm zygote that forks per request.
+Zygo is the third thing. `zygo serve` starts an interpreter, lets it do its
+imports, and parks it. `zygo exec` forks it. The child is a copy of a process
+that has **never served a request**, so it is as clean as a fresh container
+and as cheap as a fork — a median of **1.7 ms** against 300–1000.
+
+| | `docker exec` | a shared worker process | **`zygo exec`** |
+|---|---|---|---|
+| Overhead per request | 50–100 ms | ~0 | **1.7 ms** (p99 2.8 ms) |
+| What request *n* can see of *n-1* | everything | everything | **nothing** |
+| Limits per request | the container's | none | **its own cgroup: memory, pids, CPU, a deadline** |
+| A request that overruns | kills the container | kills the worker | killed through its own cgroup; the zygote keeps serving |
+| Paid once, up front | a `docker run -d` | your worker's start | a `zygo serve`: ~270 ms for a Python handler, plus your imports |
+
+```text
+WARM ── pay once, then request after request
+═══════════════════════════════════════════════════════════════════════════
+
+  docker run -d ──▶ one container, shared state
+                       │
+                       ├─ docker exec ▶ dockerd ▶ containerd ▶ shim ▶ runc ▶ process
+                       ├─ docker exec ▶ dockerd ▶ containerd ▶ shim ▶ runc ▶ process
+                       │                                   same state, every time
+                       ▼
+                    docker rm                                50–100 ms per exec
+
+
+  zygo serve ──▶ warm zygote: interpreter up, imports done, waiting
+                       │
+                       ├─ zygo exec ▶ fork() ▶ process
+                       ├─ zygo exec ▶ fork() ▶ process
+                       │               clean copy, every time
+                       ▼
+                    zygo down                                ~1.7 ms per exec
+```
+
+A handler is a function — `def handler(event)` — and everything around it is
+the runtime's: the fork, the per-request cgroup, the deadline, the secrets
+written outside the sandbox and removed afterwards, and the metrics. A
+compiled program needs none of that and gets the same treatment through
+*warm-exec*: the sandbox is held and each request is a fresh process running
+your `cmd`, at about 2 ms. There is a protocol
+([`spec/protocol.md`](spec/protocol.md)) rather than an interface, so an agent
+in any language gets all of it — Zygo ships one for Python and one for Node,
+and `zygo agent test` checks anything else against the same conversation.
+
+## And the one-shot case, underneath
+
+Everything above is built on an ordinary sandbox, and that sandbox is worth
+having by itself:
+
+```bash
+zygo run --mount ./hello.py:/hello.py:ro python:3.12 python3 /hello.py   # first run pulls the image
+zygo run --mount ./hello.py:/hello.py:ro python:3.12 python3 /hello.py   # second: ~30 ms, mostly Python itself
+```
+
+Running a 30-line Python function in a container costs 300–1000 ms, and that
+overhead is not isolation — a namespace set costs about 1 ms, a cgroup 0.1 ms,
+a seccomp filter microseconds. It is orchestration: daemon → containerd →
+shim → runc, and a container object left behind to remove.
 
 | | `docker run` | `docker exec` | `zygo run` | `zygo exec` (warm) |
 |---|---|---|---|---|
@@ -36,10 +92,9 @@ interpreter start is amortised by a warm zygote that forks per request.
 Zygo's two numbers are medians with the image cached, on the machines named in
 [what Zygo costs](docs/performance.md#the-machines) — a Raspberry Pi 5 and two
 VMs on an Apple-silicon Mac, all aarch64; Docker's are its commonly measured
-range. The program's own start-up is on top of every column.
-
-The same four columns as lifecycles. On the left, what every request walks
-through; on the right, what is left when it is done.
+range. The program's own start-up is on top of every column. `zygo bench all`
+reproduces every one of them on your host, prints the machine it ran on, and
+refuses to give a verdict if that machine was throttled or busy.
 
 ```text
 ONE-SHOT ── one request, one fresh sandbox
@@ -68,35 +123,34 @@ ONE-SHOT ── one request, one fresh sandbox
   container object stays → docker rm
 
   300–1000 ms                         ~18 ms
-
-
-WARM ── pay once, then request after request
-═══════════════════════════════════════════════════════════════════════════
-
-  docker run -d ──▶ one container, shared state
-                       │
-                       ├─ docker exec ▶ dockerd ▶ containerd ▶ shim ▶ runc ▶ process
-                       ├─ docker exec ▶ dockerd ▶ containerd ▶ shim ▶ runc ▶ process
-                       │                                   same state, every time
-                       ▼
-                    docker rm                                50–100 ms per exec
-
-
-  zygo serve ──▶ warm zygote: interpreter up, imports done, waiting
-                       │
-                       ├─ zygo exec ▶ fork() ▶ process
-                       ├─ zygo exec ▶ fork() ▶ process
-                       │               clean copy, every time
-                       ▼
-                    zygo down                                ~1.7 ms per exec
 ```
 
 ## Try it
 
 ```bash
-cargo build --release && sudo install -m 0755 target/release/zygo /usr/local/bin/zygo
+# Linux: one static binary, no runtime dependencies
+curl -fsSL https://github.com/zygo-dev/zygo/releases/latest/download/zygo-x86_64-unknown-linux-musl.tar.gz | tar xz
+sudo install -m 0755 zygo-*/zygo /usr/local/bin/zygo
 
+# macOS: the shim, plus the Linux build it forwards into, plus Lima
+brew install lima && brew install --formula \
+    https://github.com/zygo-dev/zygo/releases/latest/download/zygo.rb
+
+# or from source, anywhere
+cargo install zygo-cli
+```
+
+```bash
 zygo doctor                                   # can this host run sandboxes?
+zygo doctor --fix                             # and apply what it names, after asking
+
+# the warm path, which is the point
+echo 'def handler(event): return {"got": event}' > handler.py
+zygo serve ./handler.py --name echo
+zygo exec echo '{"n": 1}'
+zygo bench all                                # every published number, on this host
+
+# and the sandbox underneath it
 zygo run python:3.12-slim python3 -c 'print("hello")'
 zygo run --mem 128M --pids 16 --timeout 10s alpine:3 /bin/sh
 zygo run --tty alpine:3 /bin/sh               # with a terminal of its own
@@ -113,7 +167,9 @@ policies get in the way of sandboxes and of networked sandboxes respectively;
 
 **macOS** gets a Linux VM. Every sandbox command is forwarded into one that
 Zygo starts and manages, with the same arguments, working directory and
-streams, and your home directory mounted at the same path. Two things to have:
+streams, and your home directory mounted at the same path. It needs `limactl`,
+which starts the VM, and a Linux build of Zygo to put inside it. The Homebrew
+formula installs both; from a checkout they are:
 
 ```bash
 brew install lima            # what starts the VM
@@ -122,7 +178,9 @@ make poc/zygo-linux-musl     # the Linux build that runs inside it
 
 Crossing into the VM costs about 100 ms per command, which hides the warm path
 from anything typed at a Mac shell; it is still there through the API and the
-SDKs. [The guide](docs/guide.md#macos) has the details.
+SDKs, and through `zygo api` running *inside* the VM. That hop is not being
+optimised on purpose: a Mac is where Zygo is developed and tested, and Linux
+is where it runs. [The guide](docs/guide.md#macos) has the details.
 
 ## How
 
@@ -230,14 +288,19 @@ against a real kernel, including actual escape attempts; every syscall number
 the architecture has is swept against all three seccomp profiles; and fifty
 scenarios shaped by use case rather than by mechanism run on two of the three.
 [What Zygo costs](docs/performance.md) has the numbers, the hosts, and what is
-*not* measured.
+*not* measured — and `zygo bench all` reproduces every one of them on your own
+host, printing the machine it ran on and refusing to give a verdict when that
+machine was throttled or busy.
 
-**Not ready.** The `vm` backend boots a guest and runs one-shot sandboxes —
-about 400 ms against `ns`'s 40 ms on the same host, for a kernel of the
-guest's own — but it has no writable scratch, no network and no warm
-functions yet, so it is a hardware boundary for code that reads and computes
-and not much else. `gvisor` runs one-shot sandboxes only; warm functions and
-networked sandboxes on it are refused with a reason rather than weakened.
+**Scoped, not unfinished.** The `vm` backend boots a guest and runs one-shot
+sandboxes — about 400 ms against `ns`'s 40 ms on the same host, for a kernel
+of the guest's own. The guest can write, to a private layer bounded by
+`scratch` and never to the shared image. It has no network and no warm
+functions, and `gvisor` has neither either; both refuse them with a reason
+rather than weakening something. That is a decision rather than a gap —
+[ADR 0002](docs/adr/0002-warm-paths-stay-on-ns.md) says why, and what would
+reopen it. Warm functions are an `ns` feature.
+
 Zygo scales to one machine, and answers `429` past its capacity. No external
 audit has been done.
 
@@ -250,6 +313,7 @@ audit has been done.
 | [Concepts](docs/concepts.md) | The eight principles, and what each one costs. |
 | [`sandbox.toml` reference](docs/spec-reference.md) | Every field, its default, and what it maps to. |
 | [What Zygo costs](docs/performance.md) | The measured numbers and the hosts they came from. |
+| [The embedder's benchmark](docs/bench-embed.md) | The warm fork against a container and a one-shot sandbox, on one host: 6.4 ms against 384.7 and 761.9. And what a host costs per warm script, which is the number the roadmap's next phase exists to change. |
 | [Troubleshooting](docs/troubleshooting.md) | The errors people actually hit, and the fix for each. |
 | [Threat model](docs/threat-model.md) | Every vector, the control against it, and whether the suite attempts it. |
 | [Seccomp profiles](docs/seccomp-profiles.md) | The three syscall profiles and the compatibility matrix. |
@@ -272,7 +336,8 @@ crates/zygo-core     the library; the CLI and the bindings sit on top
   protocol/          the warm execution wire protocol
   doctor.rs          environment probing
 crates/zygo-cli      the `zygo` binary
-agents/python        the reference runtime agent and its conformance suite
+agents/python        the reference Python agent and its conformance suite
+agents/node          the reference Node agent: a worker pool, not a fork
 spec/protocol.md     the wire protocol
 sdk/python           the Python client, and the async one beside it
 sdk/node             the Node client, with types and no build step
@@ -286,9 +351,13 @@ make check-linux    # type-check the Linux-only code from a non-Linux host
 make test-linux     # the full suite inside a Linux container
 make verify-linux   # 36 isolation and limit checks against a real kernel
 make verify-supervisor-linux  # 139 end-to-end supervisor lifecycle checks
-make escape-linux   # 16 escape attempts against a real kernel
+make escape-linux   # 20 escape attempts against a real kernel
 make fuzz-linux     # every syscall number, against all three seccomp profiles
+make landlock-net-linux  # Landlock's bind/connect rules, on a 6.7+ kernel
+make seccomp-matrix-linux  # real packages, and Node, under default and strict
 make gvisor-linux   # the gvisor backend against a real runsc, compared with ns
+make conformance    # the agent protocol suite, against all three reference agents
+make bench          # every published number, reproduced on this host
 make verify-mcp     # 26 checks driving `zygo mcp` over a pipe, against a real kernel
 make test-sdk       # the Python and Node clients, against a stand-in API
 make verify-shim    # 14 macOS checks, against the Linux VM the shim manages

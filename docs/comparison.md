@@ -148,18 +148,109 @@ and shared by everything that names the same thing.
 * **Firecracker / Cloud Hypervisor** are microVMs: the strongest boundary,
   at a boot cost per VM. Zygo's `vm` backend is built on libkrun for the same
   purpose — anonymous code, not your own. It boots a guest and runs one-shot
-  sandboxes today; warm functions, networking and writable scratch inside the
-  guest are not built.
+  sandboxes, with a private writable layer over the image. Warm functions and
+  guest networking are refused, by decision rather than by omission:
+  [ADR 0002](adr/0002-warm-paths-stay-on-ns.md).
 * **gVisor** is a userspace kernel: a smaller attack surface than the host
   kernel without KVM, at a syscall cost. Zygo's `gvisor` backend is built for
   one-shot runs (`zygo backend install gvisor`, then
-  `zygo run --isolation gvisor`); warm functions still need `ns`.
+  `zygo run --isolation gvisor`); warm functions are an `ns` feature, for the
+  same reason.
 * **Lambda and its relatives** are managed platforms. Zygo is a local runtime
   with a similar shape — a function, a warm instance, a request — and no
   platform: no billing, no scaling across machines, no ingress.
 * **Windmill, Temporal, and other workflow platforms** run user scripts and
   are exactly the embedder Zygo is designed for: a worker calls `zygo serve`
   or the SDK, and each script run is a `fork()` instead of a container.
+  [`examples/workflow-engine/`](../examples/workflow-engine) is that worker.
+
+## The projects you are actually choosing between
+
+Docker, Firecracker, gVisor and Lambda are the landmarks; they are not the
+shortlist. A reader looking for "run this agent's code somewhere safe" ends up
+comparing Zygo with three much closer projects, and the honest answer in two
+of the three cases is that they are solving a different problem.
+
+Their claims below are theirs, not measurements taken here. All three are
+moving quickly; check the numbers before quoting them.
+
+| | [kern](https://github.com/getkern/kern) | [nono](https://nono.sh) | [microsandbox](https://github.com/superradcompany/microsandbox) | **Zygo** |
+|---|---|---|---|---|
+| Shape | rootless container runtime, one static binary | a confinement you apply to a process you already have | microVM runtime and platform | rootless sandbox runtime **plus a warm-process protocol** |
+| Boundary | host kernel (namespaces, seccomp, cgroups) | host kernel (Landlock + seccomp; Seatbelt on macOS) | hardware (libkrun) | host kernel (`ns`), userspace kernel (`gvisor`), hardware (`vm`) |
+| OCI images | yes | no images at all | yes | yes |
+| Per-call cost | a fresh box, single-digit ms | none — it confines a process you were starting anyway | a microVM, boot under ~100 ms | a fresh sandbox, 18 ms — **or a fork into a warm one, 1.7 ms** |
+| State between calls | none: the box is destroyed | whatever your process kept | a sandbox can be kept, branched and snapshotted | none, and not by destroying anything: each request is a `fork()` of a process that has never served one |
+| Runs on macOS | Linux and WSL2 | yes, natively, with Seatbelt | yes | through a Linux VM it manages |
+| Daemon | no | no | no | no |
+
+### kern
+
+The closest thing to Zygo's one-shot half, and close enough that the
+resemblance is worth being precise about: rootless, daemonless, one static
+Rust binary, OCI images, namespaces plus a seccomp allowlist plus cgroup v2,
+a box started and destroyed per call in single-digit milliseconds. If what
+you want is `docker run` without the daemon and without the 300 ms, the two
+projects are answering the same question, and kern's answer is a good one.
+
+They diverge on what happens next. kern's model is that a box is cheap enough
+to throw away every time, so there is nothing to keep warm and nothing to
+reuse; Zygo's is that the expensive part is not the box, it is the
+*interpreter inside it* — a Python process with its imports done is 270 ms
+that a per-call box pays again every call, whatever the box costs. `zygo
+serve` pays it once and `zygo exec` forks into it for 1.7 ms, with request *n*
+running on a copy of the memory the zygote had before request *n-1* existed.
+That warm path, the protocol behind it
+([`spec/protocol.md`](../spec/protocol.md)) and the per-request cgroup,
+deadline and secrets that hang off it are Zygo's actual subject; the one-shot
+runner is the part that had to exist underneath it.
+
+Also unlike Zygo: kern has virtual resource slices (`vcpu:`, `vdisk:`,
+`vgpio:`) declared in a config file and attachable to a bare host process,
+which Zygo has no equivalent of and no plans for.
+
+### nono
+
+Not a comparison so much as a different layer, and it is worth saying so
+because the words overlap. nono applies Landlock and seccomp — Seatbelt on
+macOS — to a process you are starting anyway: your coding agent, running as
+you, with your files. There is no image, no namespace, no cgroup and no
+runtime; what it gives you is that the agent cannot read `~/.ssh` or reach a
+host you did not allow, enforced by the kernel and irrevocable once applied.
+
+That is the right tool for confining an agent that is *meant* to edit your
+working tree. It is the wrong one for running code the agent wrote, because
+the code still runs as you, in your filesystem, with your environment — a
+narrower version of it, but yours. Zygo is the other half: the agent stays
+outside and its generated code goes into a sandbox with its own root
+filesystem, its own pid namespace, a memory limit and a deadline. The two
+compose, and on a developer's machine using both is reasonable.
+
+### microsandbox
+
+The closest project to Zygo's `vm` backend, and further along it. microsandbox
+is microVM-first: every sandbox is a libkrun guest with its own kernel, OCI
+images are supported, boot is claimed under 100 ms, and it can branch and
+snapshot a live sandbox — which Zygo cannot do at all. It ships Python,
+TypeScript and Rust SDKs and an MCP server, as Zygo does.
+
+The difference is where the default sits. microsandbox's boundary is hardware
+for everything; Zygo's default is the host kernel, with hardware available as
+`--isolation vm` for the workloads that need it, and the two are the same spec
+and the same command. That is a real trade and it does not go one way: a
+microVM per request is a boundary a kernel bug does not cross, and Zygo's `ns`
+backend is one kernel away from the host, as [the threat
+model](threat-model.md) says in as many words. What Zygo has instead is the
+warm path — 1.7 ms, a fork, clean state — which a VM per request cannot
+reach, and which is the only reason the project exists. If your code is
+genuinely hostile and 100 ms per call is affordable, microsandbox's default is
+the safer one; if you are running a thousand short calls a minute from your
+own users' scripts, Zygo's is the faster one, and `--isolation vm` is there
+for the subset that is not.
+
+Zygo's `vm` backend is also, today, much less than microsandbox's: it boots a
+guest and runs one-shot sandboxes, and warm functions and networking inside
+the guest are not built. [The status section](../README.md#status) says so.
 
 ## What Zygo does not do
 

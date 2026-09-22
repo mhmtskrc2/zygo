@@ -4,8 +4,9 @@
         fuzz-linux gvisor-linux verify-login-linux verify-shim \
         repro-blue-green-linux verify-api-linux vm-build vm-probe vm-kernel \
         verify-vm-pi use-cases-linux vm-use-cases-linux \
-        syscall-tables conformance conformance-node examples-go-linux \
-        seccomp-matrix-linux fmt lint clean
+        syscall-tables conformance conformance-node conformance-node-seccomp \
+        examples-go-linux \
+        seccomp-matrix-linux landlock-net-linux bench bench-embed bench-density fmt lint clean
 
 help:
 	@echo "build        build the zygo binary"
@@ -27,13 +28,18 @@ help:
 	@echo "verify-supervisor-linux  139 end-to-end supervisor lifecycle checks"
 	@echo "repro-blue-green-linux   the one open supervisor question, five times"
 	@echo "escape-linux attempt every known escape vector against a real kernel"
+	@echo "landlock-net-linux  Landlock's bind/connect rules, on a 6.7+ kernel"
 	@echo "fuzz-linux   sweep every syscall number against all three seccomp profiles"
 	@echo "gvisor-linux the gvisor backend against a real runsc, compared with ns"
+	@echo "bench        reproduce every published number on this host"
+	@echo "bench-embed  the warm fork against a container, one import-heavy script"
+	@echo "bench-density  what one more warm script costs this host"
 	@echo "dist-linux   build the static musl binary and check it against N6"
 	@echo "verify-login-linux  zygo login against a registry that really refuses people"
 	@echo "examples-go-linux   the Go warm-exec example, built and run for real"
 	@echo "seccomp-matrix-linux  five reference packages under default and strict"
 	@echo "conformance / conformance-node  the agent protocol suite"
+	@echo "conformance-node-seccomp  the Node agent with the real kernel filter"
 	@echo "verify-shim  the macOS shim, against the Linux VM it manages"
 	@echo "syscall-tables  regenerate the seccomp syscall number tables"
 	@echo "fmt / lint   rustfmt / clippy"
@@ -48,6 +54,7 @@ test-rust:
 
 test-agent:
 	python3 -W error::ResourceWarning -m unittest discover -s agents/python
+	node --test 'agents/node/*.test.js'
 
 # The two clients. Neither needs Linux, a kernel or a sandbox: what is under
 # test is the client — the transport, the error mapping, the connection pool.
@@ -71,12 +78,19 @@ verify-mcp: poc/zygo-linux-musl
 check:
 	cargo check --workspace --all-targets
 
-# The protocol conformance suite, against both reference agents. The claim is
-# that the wire is language independent; this is what makes it checkable.
-# The `sh` agent needs `jq`.
+# The protocol conformance suite, against all three reference agents. The claim
+# is that the wire is language independent; this is what makes it checkable.
+# The `sh` agent needs `jq`; the Node one is skipped where there is no `node`,
+# and `make conformance-node` runs it in a container instead.
 conformance: build
-	./target/release/zygo agent test python3 -- agents/python/zygo_agent.py --fd 3 \
-		examples/agents/conformance/handler.py
+	./target/release/zygo agent test python3 \
+		--script examples/agents/conformance/script.py -- \
+		agents/python/zygo_agent.py --fd 3 examples/agents/conformance/handler.py
+	@command -v node >/dev/null && \
+		./target/release/zygo agent test node \
+			--script examples/agents/conformance/script.js -- \
+			agents/node/zygo_agent.js examples/agents/conformance/handler.js \
+		|| echo "no node on this host - 'make conformance-node' runs it in a container"
 	./target/release/zygo agent test /bin/sh -- examples/agents/sh/agent.sh \
 		examples/agents/sh/handler.sh
 
@@ -84,8 +98,21 @@ conformance: build
 # musl one: the node image's glibc is older than the build image's.
 conformance-node: poc/zygo-linux-musl
 	docker run --rm -v "$(PWD):/src:ro" node:22-slim \
-		/src/poc/zygo-linux-musl agent test node -- \
-		/src/examples/agents/node/agent.js /src/examples/agents/node/handler.js
+		/src/poc/zygo-linux-musl agent test node \
+		--script /src/examples/agents/conformance/script.js -- \
+		/src/agents/node/zygo_agent.js /src/examples/agents/conformance/handler.js
+
+# The same Node agent with the *kernel* filter rather than Node's permission
+# model: `node:22` has a compiler, so the helper object can be built and the
+# `seccomp` branch of the agent exercised for real.
+conformance-node-seccomp: poc/zygo-linux-musl
+	docker run --rm -v "$(PWD):/src:ro" node:22 sh -c '\
+		cc -shared -fPIC -O2 -o /tmp/zygo_child_seccomp.so \
+			/src/agents/node/zygo_child_seccomp.c && \
+		ZYGO_CHILD_SECCOMP_HELPER=/tmp/zygo_child_seccomp.so \
+		/src/poc/zygo-linux-musl agent test node \
+		--script /src/examples/agents/conformance/script.js -- \
+		/src/agents/node/zygo_agent.js /src/examples/agents/conformance/handler.js'
 
 # The static binary the cross-image checks need. `make dist-linux` checks the
 # same build against N6; this one keeps it.
@@ -289,6 +316,16 @@ gvisor-linux: poc/zygo-linux-musl
 		-v zygo-gvisor-data:/data -e ZYGO_DATA_HOME=/data python:3.12-slim \
 		sh /src/poc/verify_gvisor.sh
 
+# Landlock's network rules, which need ABI v4 (kernel 6.7). The container
+# shares the host kernel, so this only runs where the *host* is new enough —
+# it says so and passes otherwise. CI runs it on ubuntu-24.04, which is 6.8.
+landlock-net-linux: poc/zygo-linux-musl
+	docker run --rm --privileged -v "$(PWD):/src:ro" \
+		-e ZYGO_DATA_HOME=/tmp/zdata-landlock python:3.12-slim \
+		sh -c 'apt-get -qq update >/dev/null 2>&1 && \
+		apt-get -qq install -y passt nftables >/dev/null 2>&1; \
+		sh /src/poc/verify_landlock_net.sh'
+
 # The escape suite attempts the vectors somebody thought of; this attempts
 # every syscall number the architecture has, against all three profiles, and
 # compares what the kernel answered. `bash` because the comparisons use
@@ -307,6 +344,44 @@ fuzz-linux: poc/zygo-linux-musl
 syscall-tables:
 	python3 poc/gen_syscall_tables.py
 
+# The embedder's benchmark: one import-heavy script through the warm fork, a
+# one-shot sandbox and a container, on one host. The docker socket is mounted
+# so `docker run` from inside starts a sibling on the same kernel — a
+# comparison across two VMs would not be one.
+#
+# `kern` is not downloaded by this target. Point ZYGO_BENCH_KERN at a binary
+# you fetched yourself to add the column — the path is read inside the
+# container, so it has to be under the checkout or another mounted directory.
+bench-embed: poc/zygo-linux-musl
+	@mkdir -p /tmp/zygo-bench-embed
+	docker run --rm --privileged -v "$(PWD):/src:ro" \
+		-v /var/run/docker.sock:/var/run/docker.sock \
+		-v /tmp/zygo-bench-embed:/work \
+		-e ZYGO_DATA_HOME=/tmp/zdata-embed -e ZYGO_BENCH_KERN \
+		-e WORK_DIR=/work -e ZYGO_BENCH_HOST_DIR=/tmp/zygo-bench-embed \
+		python:3.12-slim sh /src/poc/bench_embed.sh $(ARGS)
+
+# What one more warm script costs this host. The number an embedder with ten
+# thousand scripts asks first, and the one Phase 1 of the embedded-runtime
+# roadmap (docs/adr/0001-embedded-runtime.md) is meant to change.
+bench-density: poc/zygo-linux-musl
+	docker run --rm --privileged -v "$(PWD):/src:ro" \
+		-e ZYGO_DATA_HOME=/tmp/zdata-density python:3.12-slim \
+		sh /src/poc/bench_density.sh $(ARGS)
+
+# Every number in the README and docs/performance.md, reproduced on this
+# host, with the host printed. Privileged because it starts real sandboxes;
+# the container is the machine the numbers will be about, which on Docker
+# Desktop is a VM and will say so.
+#
+# It exits 2 rather than 0 or 1 when the machine was throttled or busy while it
+# ran: those numbers are not a verdict and the exit code says which kind of
+# non-zero it is.
+bench: poc/zygo-linux-musl
+	docker run --rm --privileged -v "$(PWD):/src:ro" \
+		-e ZYGO_DATA_HOME=/tmp/zdata-bench python:3.12-slim \
+		sh /src/poc/bench_all.sh
+
 # Requirement N6: one static binary, no runtime dependencies, small enough to
 # `curl | sh`. Fails if it stops being static or grows past the budget.
 dist-linux:
@@ -314,12 +389,7 @@ dist-linux:
 		rust:1-alpine sh -c '\
 		apk add --no-cache musl-dev file >/dev/null && \
 		cargo build --release && \
-		BIN=/tmp/target/release/zygo && \
-		file "$$BIN" && \
-		SIZE=$$(stat -c %s "$$BIN") && \
-		echo "size: $$((SIZE / 1048576)) MB" && \
-		file "$$BIN" | grep -q "statically linked" || { echo "not static"; exit 1; } && \
-		[ "$$SIZE" -lt 15728640 ] || { echo "over the 15 MB budget"; exit 1; }'
+		sh /src/poc/check_dist.sh /tmp/target/release/zygo'
 
 fmt:
 	cargo fmt --all
@@ -331,9 +401,16 @@ lint:
 clean:
 	cargo clean
 
-# The `strict` seccomp profile against real packages: requests, pydantic,
-# numpy, pandas, Pillow — imported and exercised under both profiles in one
-# venv. The output is the compatibility matrix in docs/seccomp-profiles.md.
+# The `strict` seccomp profile against real packages: requests, httpx,
+# pydantic, numpy, pandas, Pillow and sqlite3 in one venv, then the same two
+# profiles against Node — worker threads, the standard library, and a handler
+# that starts a program. The output is the compatibility matrix in
+# docs/seccomp-profiles.md.
+#
+# Two containers because they are two images. The Node half is the one that
+# found `socketpair` missing from `strict`.
 seccomp-matrix-linux: poc/zygo-linux-musl
 	docker run --rm --privileged -v "$(PWD):/src:ro" python:3.12-slim \
 		sh /src/poc/seccomp_matrix.sh
+	docker run --rm --privileged -v "$(PWD):/src:ro" python:3.12-slim \
+		sh /src/poc/seccomp_matrix_node.sh

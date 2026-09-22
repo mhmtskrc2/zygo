@@ -240,6 +240,12 @@ pub struct PreparedLaunch {
     pub landlock: super::landlock::Ruleset,
     /// Terminal for the sandbox's stdio, when one was allocated for it.
     pub stdio: Option<std::os::fd::RawFd>,
+    /// Three distinct streams for stdin, stdout and stderr, when a caller
+    /// handed its own over. Applied instead of `stdio` when both are set.
+    pub stdio_streams: Option<[std::os::fd::RawFd; 3]>,
+    /// Reset the program's signal dispositions to these: see
+    /// [`SandboxConfig::ignored_signals`].
+    pub ignored_signals: Option<u64>,
     /// The runtime agent's connected socket, to be placed at `AGENT_FD`.
     pub agent_fd: Option<std::os::fd::RawFd>,
 
@@ -445,6 +451,8 @@ pub fn prepare(config: &SandboxConfig) -> Result<PreparedLaunch, PrepareError> {
         drop_capabilities: true,
         seccomp: super::seccomp::program(config.seccomp)?,
         stdio: config.stdio,
+        stdio_streams: config.stdio_streams,
+        ignored_signals: config.ignored_signals,
         agent_fd: config.agent_fd,
         secrets_fd: None,
         hold: config.hold,

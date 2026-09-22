@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import struct
 import subprocess
@@ -59,13 +60,21 @@ class AgentHarness:
     """Start an agent against a handler and speak the protocol to it."""
 
     def __init__(
-        self, handler_source: str, mode: str = "function", env: dict | None = None
+        self,
+        handler_source: str | None,
+        mode: str = "function",
+        env: dict | None = None,
     ) -> None:
         self._dir = tempfile.TemporaryDirectory()
         root = Path(self._dir.name)
+        self.root = root
 
-        self.handler_path = root / "handler.py"
-        self.handler_path.write_text(textwrap.dedent(handler_source))
+        # `None` starts a *runtime pool*: an interpreter with no tenant code in
+        # it, where every request carries its own script.
+        self.handler_path = None
+        if handler_source is not None:
+            self.handler_path = root / "handler.py"
+            self.handler_path.write_text(textwrap.dedent(handler_source))
 
         self._sock_path = root / "agent.sock"
         self._listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -73,8 +82,11 @@ class AgentHarness:
         self._listener.listen(1)
         self._listener.settimeout(30)
 
+        argv = [sys.executable, str(AGENT), str(self._sock_path)]
+        if self.handler_path is not None:
+            argv += [str(self.handler_path), mode]
         self.proc = subprocess.Popen(
-            [sys.executable, str(AGENT), str(self._sock_path), str(self.handler_path), mode],
+            argv,
             stderr=subprocess.PIPE,
             env={**os.environ, **(env or {})},
         )
@@ -85,16 +97,23 @@ class AgentHarness:
     def ready(self) -> dict:
         return self.wire.recv()
 
-    def call(self, event, request_id: str = "req-1", timeout_ms: int = 30_000) -> dict:
+    def call(
+        self,
+        event,
+        request_id: str = "req-1",
+        timeout_ms: int = 30_000,
+        script: dict | None = None,
+    ) -> dict:
         """One full EXEC → FORKED → GO → DONE exchange."""
-        self.wire.send(
-            {
-                "type": "EXEC",
-                "id": request_id,
-                "event": event,
-                "timeout_ms": timeout_ms,
-            }
-        )
+        exec_message = {
+            "type": "EXEC",
+            "id": request_id,
+            "event": event,
+            "timeout_ms": timeout_ms,
+        }
+        if script is not None:
+            exec_message["script"] = script
+        self.wire.send(exec_message)
 
         forked = self.wire.recv()
         assert forked["type"] == "FORKED", forked
@@ -1005,3 +1024,176 @@ class ChildFilterTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RuntimePoolTests(unittest.TestCase):
+    """Protocol 1.1: one zygote, many scripts.
+
+    The shape an embedder needs. A zygote is an interpreter and its dependency
+    set — no tenant code at all — and each request carries the script it wants
+    run. What has to be true for that to be safe is exactly one thing, and
+    every test here is a way of asking it: **the zygote never holds anything a
+    request put there.**
+    """
+
+    ECHO = """
+        CONSTANT = "script-one"
+
+        def handler(event):
+            return {"from": CONSTANT, "event": event}
+        """
+
+    def test_a_pool_starts_with_no_handler_and_runs_a_script_from_the_request(self):
+        h = AgentHarness(None)
+        try:
+            ready = h.ready()
+            self.assertEqual(ready["type"], "READY", ready)
+            done = h.call({"n": 1}, script={"source": textwrap.dedent(self.ECHO)})
+            self.assertEqual(done["exit_code"], 0, done.get("error"))
+            self.assertEqual(done["result"], {"from": "script-one", "event": {"n": 1}})
+        finally:
+            h.close()
+
+    def test_two_scripts_in_one_pool_cannot_see_each_other(self):
+        """The property the whole design rests on.
+
+        Script A defines a global and writes into a module it imports; script
+        B looks for both. If the zygote kept anything, B finds it.
+        """
+        leaker = """
+            import json
+
+            LEAKED = "from-a"
+            json.zygo_leak = "from-a"
+
+            def handler(event):
+                return {"wrote": True}
+            """
+        looker = """
+            import json
+
+            def handler(event):
+                return {
+                    "saw_global": "LEAKED" in globals(),
+                    "saw_module_attr": hasattr(json, "zygo_leak"),
+                }
+            """
+        h = AgentHarness(None)
+        try:
+            h.ready()
+            first = h.call({}, request_id="a", script={"source": textwrap.dedent(leaker)})
+            self.assertEqual(first["exit_code"], 0, first.get("error"))
+
+            second = h.call({}, request_id="b", script={"source": textwrap.dedent(looker)})
+            self.assertEqual(second["exit_code"], 0, second.get("error"))
+            self.assertEqual(
+                second["result"],
+                {"saw_global": False, "saw_module_attr": False},
+                "the zygote carried something from one script to the next",
+            )
+        finally:
+            h.close()
+
+    def test_a_script_can_arrive_as_a_path(self):
+        script = self.root_script("by-path", self.ECHO.replace("script-one", "by-path"))
+        h = AgentHarness(None)
+        try:
+            h.ready()
+            done = h.call({}, script={"path": str(script)})
+            self.assertEqual(done["exit_code"], 0, done.get("error"))
+            self.assertEqual(done["result"]["from"], "by-path")
+        finally:
+            h.close()
+
+    def test_a_named_entry_point_is_honoured(self):
+        source = """
+            def main(event):
+                return {"called": "main"}
+            """
+        h = AgentHarness(None)
+        try:
+            h.ready()
+            done = h.call(
+                {},
+                script={"source": textwrap.dedent(source), "entry_point": "main"},
+            )
+            self.assertEqual(done["result"], {"called": "main"})
+        finally:
+            h.close()
+
+    def test_a_script_that_does_not_load_fails_its_request_and_not_the_pool(self):
+        h = AgentHarness(None)
+        try:
+            h.ready()
+            broken = h.call({}, request_id="bad", script={"source": "def handler(  \n"})
+            self.assertEqual(broken["exit_code"], 1, broken)
+            self.assertIn("did not load", broken["error"])
+
+            # And the pool is untouched: the next request is served normally.
+            good = h.call(
+                {}, request_id="good", script={"source": textwrap.dedent(self.ECHO)}
+            )
+            self.assertEqual(good["exit_code"], 0, good.get("error"))
+            self.assertEqual(good["result"]["from"], "script-one")
+        finally:
+            h.close()
+
+    def test_a_script_with_no_entry_point_says_which_one_was_missing(self):
+        h = AgentHarness(None)
+        try:
+            h.ready()
+            done = h.call({}, script={"source": "X = 1\n"})
+            self.assertEqual(done["exit_code"], 1, done)
+            self.assertIn("handler", done["error"])
+        finally:
+            h.close()
+
+    def test_a_pool_refuses_a_request_that_carries_no_script(self):
+        h = AgentHarness(None)
+        try:
+            h.ready()
+            done = h.call({})
+            self.assertEqual(done["exit_code"], 1, done)
+            self.assertIn("must carry a `script`", done["error"])
+        finally:
+            h.close()
+
+    def test_a_handler_backed_agent_still_ignores_a_script_free_request(self):
+        """The original shape has to keep working, unchanged."""
+        h = AgentHarness(self.ECHO)
+        try:
+            h.ready()
+            done = h.call({"n": 2})
+            self.assertEqual(done["exit_code"], 0, done.get("error"))
+            self.assertEqual(done["result"]["from"], "script-one")
+        finally:
+            h.close()
+
+    def test_a_script_in_the_request_overrides_the_agents_own_handler(self):
+        """A pool is the usual reason to send a script, but not the only one.
+
+        An agent warmed with a handler can still be asked to run something
+        else, which is what makes a "warm this, mostly" deployment possible.
+        """
+        h = AgentHarness(self.ECHO)
+        try:
+            h.ready()
+            other = """
+                def handler(event):
+                    return {"from": "the-request"}
+                """
+            done = h.call({}, script={"source": textwrap.dedent(other)})
+            self.assertEqual(done["result"], {"from": "the-request"})
+
+            # And the agent's own handler is still there afterwards.
+            back = h.call({}, request_id="back")
+            self.assertEqual(back["result"]["from"], "script-one")
+        finally:
+            h.close()
+
+    def root_script(self, name: str, source: str) -> Path:
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        path = directory / f"{name}.py"
+        path.write_text(textwrap.dedent(source))
+        return path

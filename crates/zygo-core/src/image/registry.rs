@@ -87,7 +87,7 @@ impl RegistryClient {
             .connect_timeout(CONNECT_TIMEOUT)
             .read_timeout(READ_TIMEOUT)
             .build()
-            .map_err(|e| ImageError::Registry(e.to_string()))?;
+            .map_err(ImageError::registry_source)?;
 
         let credentials = CredentialStore::load(store.paths());
         Ok(Self {
@@ -226,7 +226,7 @@ impl RegistryClient {
         let body = response
             .bytes()
             .await
-            .map_err(|e| ImageError::Registry(e.to_string()))?;
+            .map_err(ImageError::registry_source)?;
 
         // What was actually served. Computed every time, and then compared
         // against everything that claimed to know it.
@@ -241,7 +241,7 @@ impl RegistryClient {
         if let Some(claimed) = &header_digest
             && claimed != &digest
         {
-            return Err(ImageError::Registry(format!(
+            return Err(ImageError::registry(format!(
                 "{}: the registry's Docker-Content-Digest says {claimed} and the \
                  body hashes to {digest}",
                 reference
@@ -251,7 +251,7 @@ impl RegistryClient {
         if let Some(wanted) = &reference.digest
             && wanted != &digest
         {
-            return Err(ImageError::Registry(format!(
+            return Err(ImageError::registry(format!(
                 "{}: asked for {wanted} and the registry served {digest}",
                 reference
             ))
@@ -261,7 +261,7 @@ impl RegistryClient {
         // The media type in the document is authoritative; the `Content-Type`
         // header is not always set correctly by proxying registries.
         let probe: serde_json::Value = serde_json::from_slice(&body)
-            .map_err(|e| ImageError::Registry(format!("malformed manifest: {e}")))?;
+            .map_err(|e| ImageError::registry_with("malformed manifest", e))?;
         let media_type = probe
             .get("mediaType")
             .and_then(|v| v.as_str())
@@ -273,7 +273,7 @@ impl RegistryClient {
 
         if looks_like_index {
             let index: Index = serde_json::from_slice(&body)
-                .map_err(|e| ImageError::Registry(format!("malformed index: {e}")))?;
+                .map_err(|e| ImageError::registry_with("malformed index", e))?;
             let descriptor =
                 index
                     .select(&self.platform)
@@ -307,7 +307,7 @@ impl RegistryClient {
         }
 
         let manifest: Manifest = serde_json::from_slice(&body)
-            .map_err(|e| ImageError::Registry(format!("malformed manifest: {e}")))?;
+            .map_err(|e| ImageError::registry_with("malformed manifest", e))?;
 
         // Every digest in it reaches a URL or a path, so each is parsed here
         // rather than wherever it is first used.
@@ -324,7 +324,7 @@ impl RegistryClient {
     pub async fn image_config(&self, entry: &ImageEntry) -> Result<ImageConfig> {
         let bytes = self.store.read_blob(&entry.config)?;
         serde_json::from_slice(&bytes)
-            .map_err(|e| ImageError::Registry(format!("malformed image config: {e}")).into())
+            .map_err(|e| ImageError::registry_with("malformed image config", e).into())
     }
 
     async fn fetch_blob_bytes(&self, reference: &Reference, digest: &str) -> Result<Vec<u8>> {
@@ -340,7 +340,7 @@ impl RegistryClient {
         Ok(response
             .bytes()
             .await
-            .map_err(|e| ImageError::Registry(e.to_string()))?
+            .map_err(ImageError::registry_source)?
             .to_vec())
     }
 
@@ -373,7 +373,7 @@ impl RegistryClient {
         });
 
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| ImageError::Registry(e.to_string()))?;
+            let chunk = chunk.map_err(ImageError::registry_source)?;
             if tx.send(Ok(chunk.to_vec())).is_err() {
                 break; // the writer stopped; its error is the real one
             }
@@ -382,7 +382,7 @@ impl RegistryClient {
 
         writer
             .await
-            .map_err(|e| ImageError::Registry(format!("blob writer panicked: {e}")))??;
+            .map_err(|e| ImageError::registry_with("blob writer panicked", e))??;
         Ok(())
     }
 
@@ -439,7 +439,7 @@ impl RegistryClient {
         }
         req.send()
             .await
-            .map_err(|e| ImageError::Registry(format!("{url}: {e}")).into())
+            .map_err(|e| ImageError::registry_with(url, e).into())
     }
 
     /// Check a credential against a registry, the way `docker login` does.
@@ -469,13 +469,13 @@ impl RegistryClient {
             .get(&url)
             .send()
             .await
-            .map_err(|e| ImageError::Registry(format!("{url}: {e}")))?;
+            .map_err(|e| ImageError::registry_with(&url, e))?;
 
         if probe.status().is_success() {
             return Ok(Verified::NoCredentialsNeeded);
         }
         if probe.status() != reqwest::StatusCode::UNAUTHORIZED {
-            return Err(ImageError::Registry(format!(
+            return Err(ImageError::registry(format!(
                 "{url} answered {} before any credential was offered",
                 probe.status()
             ))
@@ -497,7 +497,7 @@ impl RegistryClient {
                     .header(reqwest::header::AUTHORIZATION, credential.basic_header())
                     .send()
                     .await
-                    .map_err(|e| ImageError::Registry(format!("{token_url}: {e}")))?
+                    .map_err(|e| ImageError::registry_with(&token_url, e))?
             }
             // No Bearer challenge: a Basic-only registry. Ask again with the
             // credential and see whether the answer changes.
@@ -507,7 +507,7 @@ impl RegistryClient {
                 .header(reqwest::header::AUTHORIZATION, credential.basic_header())
                 .send()
                 .await
-                .map_err(|e| ImageError::Registry(format!("{url}: {e}")))?,
+                .map_err(|e| ImageError::registry_with(&url, e))?,
         };
 
         if response.status().is_success() {
@@ -531,7 +531,7 @@ impl RegistryClient {
         let response = req
             .send()
             .await
-            .map_err(|e| ImageError::Registry(format!("{url}: {e}")))?;
+            .map_err(|e| ImageError::registry_with(&url, e))?;
 
         if !response.status().is_success() {
             return Err(ImageError::Auth {
@@ -544,7 +544,7 @@ impl RegistryClient {
         let token: TokenResponse = response
             .json()
             .await
-            .map_err(|e| ImageError::Registry(format!("malformed token response: {e}")))?;
+            .map_err(|e| ImageError::registry_with("malformed token response", e))?;
         Ok(token.bearer()?)
     }
 }
@@ -563,15 +563,15 @@ async fn check_status(
             registry: reference.registry.clone(),
             reason: format!("registry returned {status}"),
         },
-        reqwest::StatusCode::NOT_FOUND => ImageError::Registry(format!(
+        reqwest::StatusCode::NOT_FOUND => ImageError::registry(format!(
             "`{reference}` not found on {}\n  → check the name and tag",
             reference.registry
         )),
-        reqwest::StatusCode::TOO_MANY_REQUESTS => ImageError::Registry(format!(
+        reqwest::StatusCode::TOO_MANY_REQUESTS => ImageError::registry(format!(
             "{} is rate limiting this pull\n  → authenticate with `zygo login {}`",
             reference.registry, reference.registry
         )),
-        other => ImageError::Registry(format!("{reference}: registry returned {other}")),
+        other => ImageError::registry(format!("{reference}: registry returned {other}")),
     }
     .into())
 }

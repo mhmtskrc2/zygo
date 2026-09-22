@@ -95,8 +95,9 @@ jobs:
             echo "no node on this runner — skipped"
             exit 0
           fi
-          ./target/release/zygo agent test node -- \
-            examples/agents/node/agent.js examples/agents/node/handler.js
+          ./target/release/zygo agent test node \
+            --script examples/agents/conformance/script.js -- \
+            agents/node/zygo_agent.js examples/agents/conformance/handler.js
 
       # The macOS shim, end to end against a real Linux VM. It will skip here
       # and say so: GitHub's hosted macOS runners are themselves virtual
@@ -250,6 +251,18 @@ jobs:
         env:
           SRC: ${{ github.workspace }}
 
+      # The same two profiles against Node, which reaches the kernel very
+      # differently: libuv builds every pipe out of `socketpair()`, and this
+      # is the check that found it missing from `strict`.
+      - name: Seccomp compatibility matrix (Node)
+        if: ${{ !cancelled() }}
+        run: |
+          . poc/ci_cgroup.sh
+          sh poc/seccomp_matrix_node.sh
+        env:
+          SRC: ${{ github.workspace }}
+          ZYGO_DATA_HOME: /tmp/zygo-matrix-node
+
       # `zygo login` against a real `registry:2` with htpasswd
       # authentication, in two containers sharing a network namespace. No
       # sandbox and no privileges, so it runs once rather than per matrix
@@ -271,6 +284,48 @@ jobs:
           (cd examples/warm-exec/go && CGO_ENABLED=0 go build -o bin/parse .) || echo "::warning::no Go toolchain; the Go example is skipped"
           sh poc/verify_examples.sh
         env:
+          SRC: ${{ github.workspace }}
+
+  # Landlock's network rules, which need ABI v4 — kernel 6.7. No development
+  # machine here has one: 5.10 reports ABI 0 and the Raspberry Pi's kernel does
+  # not compile Landlock in at all, so `bind` and `connect` were built,
+  # unit-tested and never once enforced. ubuntu-24.04 is 6.8.
+  #
+  # Its own job rather than a step in `launcher`, because it is the only check
+  # in the tree whose whole point is the kernel version: a green tick here
+  # means a kernel enforced the rules, and burying that in a job that also runs
+  # on 22.04 would make the tick mean "skipped" half the time.
+  landlock-network:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Let unprivileged user namespaces mount
+        run: |
+          before=$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo "not present")
+          if [ "$before" != "not present" ] && [ "$before" != 0 ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
+      - name: What this runner's Landlock can do
+        run: |
+          echo "kernel: $(cat /proc/sys/kernel/osrelease)"
+          echo "lsm:    $(cat /sys/kernel/security/lsm 2>/dev/null || echo '?')"
+
+      - run: cargo build --release
+      - run: sudo apt-get install -y --no-install-recommends passt nftables iproute2
+
+      - name: bind and connect, refused by the kernel
+        run: |
+          . poc/ci_cgroup.sh
+          install -m 0755 target/release/zygo poc/zygo-linux
+          sh poc/verify_landlock_net.sh
+        env:
+          ZYGO: ${{ github.workspace }}/poc/zygo-linux
+          ZYGO_DATA_HOME: /tmp/zygo-landlock
           SRC: ${{ github.workspace }}
 
   # Requirement N6: one static binary, no runtime dependencies, small enough to
@@ -297,29 +352,10 @@ jobs:
 
       - run: cargo build --release --target ${{ matrix.target }}
 
-      - name: It must be static, and under 15 MB
-        run: |
-          BIN=target/${{ matrix.target }}/release/zygo
-          file "$BIN"
-          SIZE=$(stat -c %s "$BIN")
-          echo "size: $((SIZE / 1048576)) MB ($SIZE bytes)"
-
-          # `static-pie linked` and `statically linked` are both static: the
-          # question requirement N6 asks is whether there is a dynamic
-          # interpreter to satisfy at run time, and neither has one. x86_64
-          # musl produces the PIE form and aarch64 does not, so matching only
-          # the second phrase failed the architecture it was not written on.
-          # `if`, not `&&`: this step runs under `bash -e`, where a trailing
-          # `grep … && …` that finds nothing is a non-zero last command and
-          # fails the step for passing the check.
-          if ! file "$BIN" | grep -qE "static(ally|-pie) linked"; then
-            echo "::error::the binary is not statically linked"; exit 1
-          fi
-          if file "$BIN" | grep -q "dynamically linked"; then
-            echo "::error::the binary has a dynamic interpreter"; exit 1
-          fi
-          [ "$SIZE" -lt 15728640 ] \
-            || { echo "::error::binary is $((SIZE / 1048576)) MB, over the 15 MB budget"; exit 1; }
+      # The same script `make dist-linux` and the release workflow run, so
+      # there is one copy of the budget rather than three.
+      - name: It must be static, and inside the size budget
+        run: sh poc/check_dist.sh target/${{ matrix.target }}/release/zygo
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -354,12 +390,14 @@ jobs:
           echo "KVM (the vm backend, PoC 8): $([ -e /dev/kvm ] && echo present || echo ABSENT)"
           echo "Landlock:                    $(grep -o landlock /sys/kernel/security/lsm 2>/dev/null || echo ABSENT)"
           echo
-          echo "Landlock is exercised by the supervisor suite where the ABI is 4 or"
-          echo "above: it asserts that a port off the allowlist is refused by the"
-          echo "kernel at connect(), and says which mechanism refused it otherwise."
-          echo "Neither development machine has it — 5.10 reports ABI 0 and the"
-          echo "Raspberry Pi's kernel does not compile it in — so this runner is"
-          echo "where those rules run for the first time."
+          echo "Landlock's network rules have a job of their own now"
+          echo "(landlock-network, on ubuntu-24.04 / 6.8): it proves a bind and an"
+          echo "off-list connect are refused by *Landlock* rather than by nftables,"
+          echo "by picking two cases nftables cannot account for — a bind, which"
+          echo "sends no packet, and a loopback connect, which the filter accepts"
+          echo "on its first line. Neither development machine can run them: 5.10"
+          echo "reports ABI 0 and the Raspberry Pi's kernel does not compile"
+          echo "Landlock in at all."
           echo
           echo "KVM is the one with no home yet: the vm backend needs a runner"
           echo "that exposes /dev/kvm, and no hosted one does."

@@ -62,6 +62,11 @@ struct State {
 /// Admission control for one function.
 #[derive(Debug)]
 pub struct Gate {
+    /// Which function's gate, and which generation of it, for the log. Two
+    /// gates exist for a function during a replacement — the old one being
+    /// closed and the new one being entered — and a line that says "admitted"
+    /// without saying to which is no evidence at all.
+    id: String,
     /// How many requests may be in flight at once — the spec's `concurrency`.
     limit: u32,
     /// How many may wait for a slot before the rest are turned away.
@@ -75,7 +80,16 @@ impl Gate {
     /// a configuration that has no useful meaning, and silently accepting it
     /// would deadlock every caller instead of failing at resolve time.
     pub fn new(limit: u32, queue_limit: u32) -> Gate {
+        Self::named("gate", limit, queue_limit)
+    }
+
+    /// A gate that says whose it is in the log.
+    pub fn named(name: &str, limit: u32, queue_limit: u32) -> Gate {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static GENERATION: AtomicU64 = AtomicU64::new(1);
+        let generation = GENERATION.fetch_add(1, Ordering::Relaxed);
         Gate {
+            id: format!("{name}#{generation}"),
             limit: limit.max(1),
             queue_limit,
             state: Mutex::new(State::default()),
@@ -100,13 +114,21 @@ impl Gate {
     pub fn enter(&self, wait: Duration) -> Result<Permit<'_>, Rejected> {
         let mut state = self.state.lock().expect("gate");
         if state.closed {
+            tracing::debug!(gate = self.id, "refused: closed");
             return Err(Rejected::Closed);
         }
         if state.in_flight < self.limit {
             state.in_flight += 1;
+            tracing::debug!(gate = self.id, in_flight = state.in_flight, "admitted");
             return Ok(Permit { gate: self });
         }
         if state.queued >= self.queue_limit {
+            tracing::debug!(
+                gate = self.id,
+                in_flight = state.in_flight,
+                queued = state.queued,
+                "refused: queue full"
+            );
             return Err(Rejected::Busy {
                 in_flight: state.in_flight,
                 queued: state.queued,
@@ -115,6 +137,14 @@ impl Gate {
         }
 
         state.queued += 1;
+        tracing::debug!(
+            gate = self.id,
+            in_flight = state.in_flight,
+            queued = state.queued,
+            wait_ms = wait.as_millis() as u64,
+            "queued"
+        );
+        let waited = std::time::Instant::now();
         let (mut state, timeout) = self
             .slot_freed
             .wait_timeout_while(state, wait, |s| !s.closed && s.in_flight >= self.limit)
@@ -122,11 +152,19 @@ impl Gate {
         // Decremented here rather than on each exit path below, so no early
         // return can leak a queue slot and shrink the queue for good.
         state.queued -= 1;
+        let waited_ms = waited.elapsed().as_millis() as u64;
 
         if state.closed {
+            tracing::debug!(gate = self.id, waited_ms, "woke: closed, redirecting");
             return Err(Rejected::Closed);
         }
         if timeout.timed_out() {
+            tracing::debug!(
+                gate = self.id,
+                waited_ms,
+                in_flight = state.in_flight,
+                "woke: timed out waiting for a slot"
+            );
             return Err(Rejected::TimedOut {
                 in_flight: state.in_flight,
                 queued: state.queued,
@@ -134,6 +172,7 @@ impl Gate {
             });
         }
         state.in_flight += 1;
+        tracing::debug!(gate = self.id, waited_ms, "woke: admitted");
         Ok(Permit { gate: self })
     }
 
@@ -150,6 +189,12 @@ impl Gate {
     pub fn close(&self) {
         let mut state = self.state.lock().expect("gate");
         state.closed = true;
+        tracing::debug!(
+            gate = self.id,
+            in_flight = state.in_flight,
+            queued = state.queued,
+            "closed"
+        );
         self.slot_freed.notify_all();
     }
 

@@ -230,7 +230,7 @@ impl Store {
             LayerCompression::Gzip => extract_tar(flate2::read::GzDecoder::new(file), &dir),
             LayerCompression::Zstd => {
                 let dec = ruzstd::StreamingDecoder::new(file)
-                    .map_err(|e| ImageError::Unpack(format!("zstd: {e}")))?;
+                    .map_err(|e| ImageError::unpack_with("zstd", e))?;
                 extract_tar(dec, &dir)
             }
         };
@@ -750,7 +750,7 @@ fn extract_tar<R: Read>(reader: R, dir: &Path) -> Result<Whiteouts> {
                     .link_name()
                     .map_err(unpack_err)?
                     .ok_or_else(|| {
-                        ImageError::Unpack(format!("hard link {} has no target", path.display()))
+                        ImageError::unpack(format!("hard link {} has no target", path.display()))
                     })?
                     .into_owned();
                 link_or_copy(&safe_join(dir, &target)?, &dest)?;
@@ -807,7 +807,7 @@ fn create_mount_points(dir: &Path, mount_points: &[MountPoint]) -> Result<()> {
 /// do not support hard links at all. It costs disk, not correctness.
 fn link_or_copy(source: &Path, dest: &Path) -> Result<()> {
     if std::fs::symlink_metadata(source).is_err() {
-        return Err(ImageError::Unpack(format!(
+        return Err(ImageError::unpack(format!(
             "hard link target {} is missing from the layer",
             source.display()
         ))
@@ -867,7 +867,7 @@ fn ensure_real_directory(root: &Path, path: &Path) -> Result<()> {
 }
 
 fn unpack_err(e: std::io::Error) -> crate::Error {
-    ImageError::Unpack(e.to_string()).into()
+    ImageError::unpack_source(e).into()
 }
 
 /// Recursive copy used by [`Store::flatten`]. Later layers overwrite earlier

@@ -52,6 +52,7 @@ mkdir -p /tmp/matrix && cd /tmp/matrix || exit 1
 
 cat > requirements.txt <<'REQ'
 requests==2.32.3
+httpx==0.27.2
 pydantic==2.9.2
 numpy==2.1.3
 pandas==2.2.3
@@ -73,6 +74,37 @@ def handler(event):
         return {"ok": False, "why": "a request left a sealed sandbox"}
     except requests.exceptions.ConnectionError as e:
         return {"ok": True, "prepared": req.url, "error": type(e).__name__}
+PY
+cat > h_httpx.py <<'PY'
+import httpx
+
+
+def handler(event):
+    # The other half of the HTTP client population, and a different shape:
+    # httpx builds its transport — and therefore its socket — when the client
+    # is constructed rather than when a request is sent, so `strict` bites in
+    # a different place from requests.
+    try:
+        with httpx.Client(timeout=1.0) as client:
+            client.get("http://example.invalid/")
+        return {"ok": False, "why": "a request left a sealed sandbox"}
+    except Exception as e:
+        return {"ok": True, "error": type(e).__name__}
+PY
+cat > h_sqlite.py <<'PY'
+import sqlite3
+
+
+def handler(event):
+    # On disk, not in memory: a file-backed database is the case that uses
+    # `fcntl` locking, `fsync` and `ftruncate`, and an in-memory one would
+    # exercise none of them. `/tmp` is the sandbox's own writable scratch.
+    with sqlite3.connect("/tmp/matrix.db") as db:
+        db.execute("CREATE TABLE IF NOT EXISTS t (k TEXT PRIMARY KEY, v INTEGER)")
+        db.execute("INSERT OR REPLACE INTO t VALUES ('a', 1), ('b', 2)")
+        db.commit()
+        total = db.execute("SELECT sum(v) FROM t").fetchone()[0]
+    return {"ok": total == 3, "sum": total, "version": sqlite3.sqlite_version}
 PY
 cat > h_pydantic.py <<'PY'
 from pydantic import BaseModel, ValidationError
@@ -134,6 +166,18 @@ entry = "h_requests.py"
 entry = "h_requests.py"
 seccomp = "strict"
 
+[fn.httpx_default]
+entry = "h_httpx.py"
+[fn.httpx_strict]
+entry = "h_httpx.py"
+seccomp = "strict"
+
+[fn.sqlite3_default]
+entry = "h_sqlite.py"
+[fn.sqlite3_strict]
+entry = "h_sqlite.py"
+seccomp = "strict"
+
 [fn.pydantic_default]
 entry = "h_pydantic.py"
 [fn.pydantic_strict]
@@ -160,7 +204,7 @@ seccomp = "strict"
 TOML
 
 say ""
-say "building the venv once (five packages, inside the image)…"
+say "building the venv once (six packages, inside the image)…"
 started=$(date +%s)
 "$ZYGO" up >/tmp/up-matrix.log 2>&1
 say "  up finished in $(( $(date +%s) - started )) s"
@@ -169,7 +213,7 @@ grep -v "^$" /tmp/up-matrix.log | head -14
 say ""
 printf '  %-10s  %-28s  %-28s\n' package default strict
 printf '  %-10s  %-28s  %-28s\n' ------- ------- ------
-for pkg in requests pydantic numpy pandas pillow; do
+for pkg in requests httpx pydantic numpy pandas pillow sqlite3; do
     row="  $(printf '%-10s' "$pkg")"
     for profile in default strict; do
         name="${pkg}_${profile}"
@@ -188,7 +232,7 @@ for pkg in requests pydantic numpy pandas pillow; do
 done
 
 say ""
-say "strict removes: socket socketpair connect bind listen accept4 ptrace mount umount2"
+say "strict removes: socket connect bind listen accept4 ptrace mount umount2"
 say "and, in the forked child only: execve execveat fork vfork, and clone without CLONE_THREAD"
 say "(every strict cell above ran its handler under that child filter; see docs/seccomp-profiles.md)"
 harness_verdict

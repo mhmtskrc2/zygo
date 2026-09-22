@@ -132,25 +132,31 @@ impl Backend for GvisorBackend {
             remedy: remedy.to_string(),
         };
 
+        // Not "yet". Warm functions are an `ns` feature by decision, recorded
+        // in docs/adr/0002-warm-paths-stay-on-ns.md: a second warm path would
+        // be a second thing to keep correct, benchmark and defend, against
+        // the one the product rests on. The refusals below are the design.
         if config.hold {
             return Err(unsupported(
-                "the gvisor backend cannot hold a warm sandbox yet: entering a running \
-                 one is `runsc exec`, not `setns`",
-                "use --isolation ns for warm functions",
+                "warm functions are an `ns` feature: entering a running gVisor sandbox \
+                 is `runsc exec`, not `setns` (docs/adr/0002)",
+                "use --isolation ns for warm functions; `gvisor` is for one-shot runs",
             ));
         }
         if config.agent_fd.is_some() {
             return Err(unsupported(
                 "the runtime agent is handed its control socket as an inherited \
-                 descriptor, and an OCI runtime closes everything but stdio",
-                "use --isolation ns for agent runtimes",
+                 descriptor, and an OCI runtime closes everything but stdio \
+                 (docs/adr/0002)",
+                "use --isolation ns for agent runtimes; `gvisor` is for one-shot runs",
             ));
         }
         if config.network != Network::None {
             return Err(unsupported(
                 &format!(
                     "the gvisor backend has only `network = \"none\"`; this function asks \
-                     for `{}`, which needs pasta attached to gVisor's own netstack",
+                     for `{}`, which needs pasta attached to gVisor's own netstack \
+                     (docs/adr/0002)",
                     config.network
                 ),
                 "use --isolation ns for a networked sandbox",
@@ -310,7 +316,7 @@ fn set_executable(_path: &Path) -> Result<()> {
 }
 
 fn unpack_error(message: impl Into<String>) -> Error {
-    Error::Image(crate::image::ImageError::Unpack(message.into()))
+    Error::Image(crate::image::ImageError::unpack(message.into()))
 }
 
 /// The flattened rootfs the bundle's `root.path` needs, from the plan.
@@ -565,6 +571,8 @@ mod tests {
             uid: 1000,
             gid: 1000,
             stdio: None,
+            stdio_streams: None,
+            ignored_signals: None,
             agent_fd: None,
             hold: false,
             writable_root: false,

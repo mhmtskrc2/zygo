@@ -28,8 +28,9 @@ systemctl --user daemon-reexec
 
 Whatever runs Zygo also has to *be* somewhere delegated, and an ssh login is
 not. **Zygo handles that half itself**: a command that builds a sandbox
-re-executes inside a transient scope of its own, the way `podman` does. One
-consequence is that `zygo doctor` from a plain ssh session reports `cgroup v2
+re-executes inside a transient scope of its own, the way `podman` does — or,
+when a supervisor is already running, `zygo run` hands the sandbox to it and
+skips the scope, which is a third faster. One consequence is that `zygo doctor` from a plain ssh session reports `cgroup v2
 … FAIL` — the truth about the cgroup it is standing in — while `zygo run` from
 the same shell works. [Troubleshooting](troubleshooting.md#no-cgroup-controllers-or-there-is-no-memorymax-here)
 has the rest.

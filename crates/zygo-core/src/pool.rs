@@ -52,7 +52,98 @@ use crate::spec::ResolvedFn;
 /// Requirement N6 is a single static binary with no runtime dependencies, so
 /// the agent cannot be a file the user is expected to have. It is written into
 /// the data directory on first use and bind-mounted into the sandbox.
-pub const PYTHON_AGENT: &str = include_str!("../../../agents/python/zygo_agent.py");
+///
+/// `../agents` is `crates/zygo-core/agents`, a symlink to the repository's
+/// `agents/` directory. It has to be reached from inside the crate rather
+/// than as `../../../agents`: `cargo package` includes only what is under the
+/// package root, so a path that climbs out of it compiles in a checkout and
+/// fails for everyone who runs `cargo install zygo-cli`.
+pub const PYTHON_AGENT: &str = include_str!("../agents/python/zygo_agent.py");
+
+/// The reference Node agent, carried the same way.
+///
+/// Node has no `fork()`, so it keeps a pool of pre-loaded workers instead of
+/// forking a zygote. Everything above that — the wire, the cgroup window,
+/// secrets, the `strict` child filter — is identical, which is the point of
+/// having a protocol rather than an interface.
+pub const NODE_AGENT: &str = include_str!("../agents/node/zygo_agent.js");
+
+/// One of the agents Zygo carries inside the binary.
+///
+/// Each is a file in the data directory, a mount inside the sandbox and an
+/// argv; nothing else about a runtime reaches the supervisor, which is what
+/// keeps adding one small.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinAgent {
+    Python,
+    Node,
+}
+
+impl BuiltinAgent {
+    /// The agent Zygo ships for this runtime, or `None` for one it does not.
+    pub fn for_runtime(runtime: &crate::spec::Runtime) -> Option<BuiltinAgent> {
+        use crate::spec::{BuiltinRuntime, Runtime};
+        match runtime {
+            Runtime::Builtin(BuiltinRuntime::Python) => Some(BuiltinAgent::Python),
+            Runtime::Builtin(BuiltinRuntime::Node) => Some(BuiltinAgent::Node),
+            _ => None,
+        }
+    }
+
+    pub fn source(self) -> &'static str {
+        match self {
+            BuiltinAgent::Python => PYTHON_AGENT,
+            BuiltinAgent::Node => NODE_AGENT,
+        }
+    }
+
+    /// Where it is written on the host, relative to the data directory.
+    pub fn host_relative(self) -> &'static str {
+        match self {
+            BuiltinAgent::Python => "agents/python/zygo_agent.py",
+            BuiltinAgent::Node => "agents/node/zygo_agent.js",
+        }
+    }
+
+    /// Where it is bind-mounted inside every sandbox.
+    ///
+    /// The extension matters: `require` and `import` both decide what a file
+    /// is by its name.
+    pub fn agent_in_sandbox(self) -> &'static str {
+        match self {
+            BuiltinAgent::Python => AGENT_IN_SANDBOX,
+            BuiltinAgent::Node => "/zygo/agent.js",
+        }
+    }
+
+    /// Where the tenant's handler is bind-mounted inside every sandbox.
+    pub fn handler_in_sandbox(self) -> &'static str {
+        match self {
+            BuiltinAgent::Python => HANDLER_IN_SANDBOX,
+            BuiltinAgent::Node => "/zygo/handler.js",
+        }
+    }
+
+    /// Argv that starts this agent inside a sandbox.
+    ///
+    /// `--fd` rather than a socket path: nothing has to exist in the
+    /// sandbox's filesystem, so no bind mount and no assumption about the
+    /// image.
+    pub fn argv(self, mode: &str) -> Vec<String> {
+        let interpreter = match self {
+            BuiltinAgent::Python => "python3",
+            BuiltinAgent::Node => "node",
+        };
+        vec![
+            interpreter.to_string(),
+            self.agent_in_sandbox().to_string(),
+            "--fd".to_string(),
+            AGENT_FD.to_string(),
+            self.handler_in_sandbox().to_string(),
+            mode.to_string(),
+        ]
+    }
+}
 
 /// How a pool is configured.
 #[derive(Debug, Clone, Default)]
@@ -113,6 +204,26 @@ impl Outcome {
     pub fn succeeded(&self) -> bool {
         self.exit_code == 0 && self.error.is_none()
     }
+}
+
+/// What a one-shot started for another process carries of that process:
+/// its three streams, whether they are one terminal, and the signals it
+/// ignores (see [`SandboxConfig::ignored_signals`]).
+pub struct ClientStreams {
+    pub stdio: [std::os::fd::OwnedFd; 3],
+    pub tty: bool,
+    pub ignored_signals: u64,
+}
+
+/// A one-shot sandbox the supervisor started for a client, not yet waited on.
+///
+/// The `pivot_root` target is carried so the waiter can remove it once the
+/// sandbox is gone — `remove_dir`, not `remove_dir_all`, for the reason
+/// `zygo run` gives: a mount that outlived its namespace makes the removal
+/// fail and the directory stay, which is the right way round.
+pub struct Oneshot {
+    pub sandbox: Box<dyn crate::backend::Sandbox>,
+    pub newroot: PathBuf,
 }
 
 /// Entries kept per function, most recent last. Bounded, because a function
@@ -287,15 +398,21 @@ pub const AGENT_FD: std::os::fd::RawFd = 3;
 /// Owns the warm sandboxes.
 pub struct Pool {
     config: PoolConfig,
-    /// Path the embedded agent was written to, once.
-    agent_path: PathBuf,
+    /// Paths the embedded agents were written to, once.
+    python_agent: PathBuf,
+    node_agent: PathBuf,
 }
 
 impl Pool {
     pub fn new(config: PoolConfig) -> Result<Pool> {
         config.paths.ensure()?;
-        let agent_path = Self::install_agent(&config.paths)?;
-        Ok(Pool { config, agent_path })
+        let python_agent = Self::install_agent(&config.paths, BuiltinAgent::Python)?;
+        let node_agent = Self::install_agent(&config.paths, BuiltinAgent::Node)?;
+        Ok(Pool {
+            config,
+            python_agent,
+            node_agent,
+        })
     }
 
     pub fn config(&self) -> &PoolConfig {
@@ -304,7 +421,15 @@ impl Pool {
 
     /// Where the embedded Python agent lives on the host.
     pub fn agent_path(&self) -> &std::path::Path {
-        &self.agent_path
+        &self.python_agent
+    }
+
+    /// Where the given embedded agent lives on the host.
+    pub fn agent_path_for(&self, agent: BuiltinAgent) -> &std::path::Path {
+        match agent {
+            BuiltinAgent::Python => &self.python_agent,
+            BuiltinAgent::Node => &self.node_agent,
+        }
     }
 
     /// Bring a function up warm and wait for its agent to announce itself.
@@ -394,19 +519,25 @@ impl Pool {
         // warm-exec — the sandbox is held and each request is a fresh process
         // running `cmd` with the event on stdin.
         let mode = match &f.runtime {
-            Some(crate::spec::Runtime::Builtin(crate::spec::BuiltinRuntime::Python)) => Mode::Agent,
+            Some(runtime) => match BuiltinAgent::for_runtime(runtime) {
+                Some(agent) => Mode::Agent(agent),
+                None => {
+                    return Err(Error::BackendUnavailable {
+                        backend: "pool",
+                        reason: format!("no warm agent for {runtime}"),
+                        remedy: "the Python and Node agents and warm-exec (`cmd`) are wired \
+                                 up so far"
+                            .into(),
+                    });
+                }
+            },
             None if !f.cmd.is_empty() => Mode::Exec,
-            other => {
+            None => {
                 return Err(Error::BackendUnavailable {
                     backend: "pool",
-                    reason: format!(
-                        "no warm agent for {}",
-                        other
-                            .as_ref()
-                            .map(|r| r.to_string())
-                            .unwrap_or_else(|| "a function with neither runtime nor cmd".into())
-                    ),
-                    remedy: "only the Python agent and warm-exec (`cmd`) are wired up so far"
+                    reason: "a function with neither runtime nor cmd".into(),
+                    remedy: "the Python and Node agents and warm-exec (`cmd`) are wired up \
+                             so far"
                         .into(),
                 });
             }
@@ -414,7 +545,7 @@ impl Pool {
 
         let mut warm = f.clone();
         warm.mounts = match mode {
-            Mode::Agent => agent_mounts(&self.agent_path, f),
+            Mode::Agent(agent) => agent_mounts(agent, self.agent_path_for(agent), f),
             Mode::Exec => f.mounts.clone(),
         };
         if let Some(venv) = &venv {
@@ -431,12 +562,12 @@ impl Pool {
             tracing::warn!("{w}");
         }
         let argv = match mode {
-            Mode::Agent => python_agent_argv(AGENT_IN_SANDBOX, HANDLER_IN_SANDBOX, f.mode.as_str()),
+            Mode::Agent(agent) => agent.argv(f.mode.as_str()),
             Mode::Exec => f.cmd.clone(),
         };
 
         let mount_points = mount::required_mount_points(&warm.mounts);
-        let overlay = crate::doctor::run(&self.config.paths)
+        let overlay = crate::doctor::cached(&self.config.paths)
             .checks
             .iter()
             .any(|c| c.name == "overlayfs (userns)" && c.status == crate::doctor::Status::Ok);
@@ -457,7 +588,7 @@ impl Pool {
         // here because the syscall numbers are the host's, handed over as
         // bytes because the agent may be written in anything.
         #[cfg(target_os = "linux")]
-        if mode == Mode::Agent
+        if matches!(mode, Mode::Agent(_))
             && let Some(prog) =
                 crate::backend::ns::seccomp::child_program(f.seccomp).map_err(|e| {
                     Error::primitive(
@@ -481,7 +612,7 @@ impl Pool {
 
         match mode {
             Mode::Exec => self.serve_exec(f, config, backend.as_ref(), tenant_cgroup),
-            Mode::Agent => {
+            Mode::Agent(_) => {
                 // A socket pair rather than a listening socket: no path,
                 // nothing on the filesystem, and the sandbox cannot reach a
                 // second one.
@@ -635,6 +766,174 @@ impl Pool {
         })))
     }
 
+    /// Start a one-shot sandbox with somebody else's standard streams.
+    ///
+    /// What `zygo run` does for itself, done here on a client's behalf —
+    /// because this process already sits in a delegated, built `zygo.slice`
+    /// and the client, on an ordinary systemd session, cannot get into one:
+    /// cgroup delegation containment forbids it (`zygo-cli/src/scope.rs`).
+    /// Measured at 45 ms for a `zygo run` from a login shell against 11 ms
+    /// from a cgroup like this one, and the difference is the whole point.
+    ///
+    /// Started and **not waited on**: this runs on the launcher thread, and
+    /// a launcher that waited would hold every other start on the machine
+    /// for as long as the program ran. The caller waits, on its own thread.
+    ///
+    /// The descriptors are the client's own stdin, stdout and stderr, and
+    /// they stay three distinct things; `tty` says they are one terminal the
+    /// sandbox should adopt as its controlling terminal. Either way they are
+    /// numbered 3 or above — they arrived over `SCM_RIGHTS` — which the
+    /// launcher's child relies on when it `dup2`s them into place.
+    #[cfg(target_os = "linux")]
+    pub fn start_oneshot(&self, f: &ResolvedFn, client: ClientStreams) -> Result<Oneshot> {
+        use std::os::fd::AsRawFd;
+
+        use crate::image::{Reference, Store};
+        use crate::sandbox::{SandboxConfig, mount};
+
+        for fd in &client.stdio {
+            if fd.as_raw_fd() < 3 {
+                return Err(Error::primitive(
+                    "stdio",
+                    "internal supervisor error",
+                    std::io::Error::other(
+                        "a received descriptor landed on 0, 1 or 2, which the child cannot \
+                         dup2 over safely",
+                    ),
+                ));
+            }
+        }
+
+        let store = Store::new(self.config.paths.clone());
+        let reference: Reference = f.image.parse()?;
+        // In the store already, like `serve`: pulling is a network operation
+        // with output of its own, and it is the client's.
+        let entry = store
+            .get(&reference)
+            .ok_or_else(|| Error::BackendUnavailable {
+                backend: "pool",
+                reason: format!("image `{}` is not in the local store", f.image),
+                remedy: format!("run `zygo pull {}`", f.image),
+            })?;
+        let entry = if f.system.is_empty() {
+            entry
+        } else {
+            crate::derive::ensure(&store, &entry, &f.system)?.image
+        };
+
+        let mut f = f.clone();
+        let venv = match &f.requirements {
+            Some(requirements) => {
+                if !requirements.is_file() {
+                    return Err(Error::Spec(crate::spec::SpecError::invalid(
+                        "requirements",
+                        format!("{} does not exist", requirements.display()),
+                    )));
+                }
+                let venv = crate::venv::ensure(&store, &entry, requirements)?;
+                f.mounts.push(venv.mount());
+                Some(venv)
+            }
+            None => None,
+        };
+
+        let net = crate::net::setup(&self.config.paths, &f.name, &f)?;
+        if let Some(mount) = net.mount.clone() {
+            f.mounts.push(mount);
+        }
+        for w in &net.warnings {
+            tracing::warn!("{w}");
+        }
+
+        // The image's own config: its default command, and — just as
+        // importantly — its `PATH`, without which a bare `python3` cannot be
+        // resolved. Read from the store's blob, never fetched.
+        let image_config: crate::image::ImageConfig =
+            serde_json::from_slice(&store.read_blob(&entry.config)?).map_err(|e| {
+                Error::primitive(
+                    "image config",
+                    "the image's config blob is malformed",
+                    std::io::Error::other(e),
+                )
+            })?;
+        let argv = if f.cmd.is_empty() {
+            let argv = image_config.default_argv();
+            if argv.is_empty() {
+                return Err(Error::Spec(crate::spec::SpecError::invalid(
+                    "cmd",
+                    format!("`{}` declares no entrypoint or cmd", f.image),
+                )));
+            }
+            argv
+        } else {
+            f.cmd.clone()
+        };
+        let mut env = image_config.env_pairs();
+        if venv.is_some() {
+            let image_path = env
+                .iter()
+                .find(|(k, _)| k == "PATH")
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default();
+            env.retain(|(k, _)| k != "PATH" && k != "VIRTUAL_ENV");
+            env.extend(crate::venv::Venv::env_over(&image_path));
+        }
+
+        let mount_points = mount::required_mount_points(&f.mounts);
+        let overlay = crate::doctor::cached(&self.config.paths)
+            .checks
+            .iter()
+            .any(|c| c.name == "overlayfs (userns)" && c.status == crate::doctor::Status::Ok);
+        let view = store.rootfs_view(&entry.layers, overlay, &mount_points)?;
+        let newroot = self.config.paths.tmp().join(format!(
+            "run-{}-{}",
+            std::process::id(),
+            next_request_id()
+        ));
+        std::fs::create_dir_all(&newroot).at(&newroot)?;
+
+        let mut config = SandboxConfig::from_resolved(&f, &view, &newroot, argv, &env);
+        config.allow_resolved = net.allowed;
+        config.pasta_pid_file = net.pid_file;
+        config.stdio_streams = Some([
+            client.stdio[0].as_raw_fd(),
+            client.stdio[1].as_raw_fd(),
+            client.stdio[2].as_raw_fd(),
+        ]);
+        let _ = client.tty; // the child adopts a terminal by trying; see `adopt_streams`
+        // The client's dispositions, not this process's: see the field.
+        config.ignored_signals = Some(client.ignored_signals);
+
+        let backend = crate::backend::for_isolation(f.isolation, &self.config.paths)?;
+        let sandbox = backend.start(&config);
+        // Held open across the start and no longer: the child has its own
+        // copies now, and these must not outlive the request in a process
+        // that spawns other things.
+        drop(client.stdio);
+        let sandbox = match sandbox {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = std::fs::remove_dir(&newroot);
+                return Err(e);
+            }
+        };
+        Ok(Oneshot { sandbox, newroot })
+    }
+
+    /// Off Linux there is nothing to start in; the same answer `serve_exec`
+    /// gives below, so a supervisor built for macOS still compiles and still
+    /// says why.
+    #[cfg(not(target_os = "linux"))]
+    pub fn start_oneshot(&self, _f: &ResolvedFn, _client: ClientStreams) -> Result<Oneshot> {
+        Err(Error::BackendUnavailable {
+            backend: "pool",
+            reason: "a one-shot sandbox enters Linux namespaces".into(),
+            remedy: "run Zygo inside a Linux VM or container; on macOS the `zygo` \
+                 binary normally forwards into one it manages"
+                .into(),
+        })
+    }
+
     #[cfg(not(target_os = "linux"))]
     fn serve_exec(
         &self,
@@ -656,18 +955,19 @@ impl Pool {
     ///
     /// Rewritten whenever the contents differ so an upgraded binary does not
     /// keep running the previous release's agent against the current protocol.
-    fn install_agent(paths: &Paths) -> Result<PathBuf> {
-        let dir = paths.data().join("agents/python");
-        std::fs::create_dir_all(&dir).at(&dir)?;
-        let path = dir.join("zygo_agent.py");
+    fn install_agent(paths: &Paths, agent: BuiltinAgent) -> Result<PathBuf> {
+        let path = paths.data().join(agent.host_relative());
+        let dir = path.parent().expect("host_relative has a directory");
+        std::fs::create_dir_all(dir).at(dir)?;
+        let name = path.file_name().expect("host_relative names a file");
 
         let current = std::fs::read_to_string(&path).unwrap_or_default();
-        if current != PYTHON_AGENT {
+        if current != agent.source() {
             // Written to a temporary file and renamed, so a sandbox starting
             // concurrently never reads a half-written agent.
-            let tmp = dir.join(format!("zygo_agent.py.{}", std::process::id()));
+            let tmp = dir.join(format!("{}.{}", name.to_string_lossy(), std::process::id()));
             let mut file = std::fs::File::create(&tmp).at(&tmp)?;
-            file.write_all(PYTHON_AGENT.as_bytes()).at(&tmp)?;
+            file.write_all(agent.source().as_bytes()).at(&tmp)?;
             file.flush().at(&tmp)?;
             drop(file);
             std::fs::rename(&tmp, &path).at(&path)?;
@@ -940,6 +1240,35 @@ impl WarmFn {
         event: serde_json::Value,
         timeout: std::time::Duration,
     ) -> Result<(Outcome, CallTiming)> {
+        self.call_script_timed(event, None, timeout)
+    }
+
+    /// Serve one request against a script that did not come with the zygote.
+    ///
+    /// The runtime-pool shape (protocol 1.1): this `WarmFn` is an interpreter
+    /// and a dependency set with no tenant code in it, and `script` is what
+    /// this one request runs. The agent hands it to the forked child, which
+    /// loads it after `GO` — so the zygote stays anonymous and two tenants
+    /// sharing it cannot reach each other through it.
+    ///
+    /// `None` is the original shape: the agent already imported a handler and
+    /// every request is a fork of that. It is faster, because the import is
+    /// not paid per request, and it is what a hot function should use.
+    pub fn call_script_timed(
+        &self,
+        event: serde_json::Value,
+        script: Option<crate::protocol::Script>,
+        timeout: std::time::Duration,
+    ) -> Result<(Outcome, CallTiming)> {
+        if let Some(s) = &script
+            && !s.is_loadable()
+        {
+            return Err(crate::spec::SpecError::invalid(
+                "script",
+                "a script must carry either a path or its source",
+            )
+            .into());
+        }
         let id = next_request_id();
         let started = Instant::now();
 
@@ -953,6 +1282,7 @@ impl WarmFn {
                 event,
                 timeout_ms: timeout.as_millis() as u64,
                 env_overrides: BTreeMap::new(),
+                script,
             },
         ) {
             Ok(reply) => reply,
@@ -2462,43 +2792,29 @@ pub fn read_ready(
     }
 }
 
-/// Argv that starts the reference Python agent inside a sandbox.
-///
-/// `--fd` rather than a socket path: nothing has to exist in the sandbox's
-/// filesystem, so no bind mount and no assumption about the image.
-pub fn python_agent_argv(
-    agent_in_sandbox: &str,
-    handler_in_sandbox: &str,
-    mode: &str,
-) -> Vec<String> {
-    vec![
-        "python3".to_string(),
-        agent_in_sandbox.to_string(),
-        "--fd".to_string(),
-        AGENT_FD.to_string(),
-        handler_in_sandbox.to_string(),
-        mode.to_string(),
-    ]
-}
-
-/// Where the agent and the handler are bind-mounted inside every sandbox.
+/// Where the Python agent and its handler are bind-mounted inside every
+/// sandbox. [`BuiltinAgent`] has the same pair for every runtime.
 pub const AGENT_IN_SANDBOX: &str = "/zygo/agent.py";
 pub const HANDLER_IN_SANDBOX: &str = "/zygo/handler.py";
 
-/// The mounts a warm Python function needs on top of its spec's own.
-pub fn agent_mounts(agent_host: &std::path::Path, f: &ResolvedFn) -> Vec<crate::spec::Mount> {
+/// The mounts a warm agent-backed function needs on top of its spec's own.
+pub fn agent_mounts(
+    agent: BuiltinAgent,
+    agent_host: &std::path::Path,
+    f: &ResolvedFn,
+) -> Vec<crate::spec::Mount> {
     use crate::spec::{Mount, MountMode};
 
     let mut mounts = f.mounts.clone();
     mounts.push(Mount {
         source: agent_host.to_path_buf(),
-        target: PathBuf::from(AGENT_IN_SANDBOX),
+        target: PathBuf::from(agent.agent_in_sandbox()),
         mode: MountMode::Ro,
     });
     if let Some(entry) = &f.entry {
         mounts.push(Mount {
             source: entry.clone(),
-            target: PathBuf::from(HANDLER_IN_SANDBOX),
+            target: PathBuf::from(agent.handler_in_sandbox()),
             mode: MountMode::Ro,
         });
     }
@@ -2508,8 +2824,8 @@ pub fn agent_mounts(agent_host: &std::path::Path, f: &ResolvedFn) -> Vec<crate::
 /// Which warm mode a function uses (design doc §3.4).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
-    /// An agent in the box forks per request.
-    Agent,
+    /// An agent in the box gives each request its own process.
+    Agent(BuiltinAgent),
     /// The sandbox is held; each request is a fresh process running `cmd`.
     Exec,
 }
@@ -3077,36 +3393,82 @@ mod tests {
     }
 
     #[test]
+    fn the_embedded_node_agent_is_the_real_one() {
+        assert!(
+            NODE_AGENT.contains("const PROTOCOL_VERSION = 1"),
+            "the embedded Node agent is not the reference agent"
+        );
+        assert!(
+            NODE_AGENT.contains("--fd"),
+            "the embedded Node agent cannot take an inherited socket"
+        );
+        // The one thing the Node agent is here to do that the example did
+        // not: honour the supervisor's child filter, one way or the other.
+        assert!(
+            NODE_AGENT.contains(crate::protocol::CHILD_SECCOMP_ENV),
+            "the embedded Node agent ignores the strict child filter"
+        );
+    }
+
+    #[test]
     fn installing_the_agent_is_idempotent_and_self_healing() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::rooted(tmp.path());
         paths.ensure().unwrap();
 
-        let first = Pool::install_agent(&paths).unwrap();
-        assert_eq!(std::fs::read_to_string(&first).unwrap(), PYTHON_AGENT);
+        for agent in [BuiltinAgent::Python, BuiltinAgent::Node] {
+            let first = Pool::install_agent(&paths, agent).unwrap();
+            assert_eq!(std::fs::read_to_string(&first).unwrap(), agent.source());
 
-        let second = Pool::install_agent(&paths).unwrap();
-        assert_eq!(first, second);
+            let second = Pool::install_agent(&paths, agent).unwrap();
+            assert_eq!(first, second);
 
-        // An agent left behind by an older build must be replaced, or the
-        // protocol version it speaks may no longer match this one.
-        std::fs::write(&first, "# stale agent from a previous release").unwrap();
-        Pool::install_agent(&paths).unwrap();
-        assert_eq!(std::fs::read_to_string(&first).unwrap(), PYTHON_AGENT);
+            // An agent left behind by an older build must be replaced, or the
+            // protocol version it speaks may no longer match this one.
+            std::fs::write(&first, "# stale agent from a previous release").unwrap();
+            Pool::install_agent(&paths, agent).unwrap();
+            assert_eq!(std::fs::read_to_string(&first).unwrap(), agent.source());
+        }
+
+        // And they are separate files: installing one must not overwrite the
+        // other.
+        assert_ne!(
+            Pool::install_agent(&paths, BuiltinAgent::Python).unwrap(),
+            Pool::install_agent(&paths, BuiltinAgent::Node).unwrap()
+        );
     }
 
     #[test]
     fn the_agent_is_started_on_an_inherited_descriptor() {
-        let argv = python_agent_argv(AGENT_IN_SANDBOX, HANDLER_IN_SANDBOX, "function");
-        assert_eq!(argv[0], "python3");
-        assert_eq!(argv[1], AGENT_IN_SANDBOX);
-        assert_eq!(argv[2], "--fd");
-        assert_eq!(argv[3], AGENT_FD.to_string());
-        assert_eq!(argv[4], HANDLER_IN_SANDBOX);
-        assert!(
-            !argv.iter().any(|a| a.contains(".sock")),
-            "a socket path would have to exist inside the sandbox: {argv:?}"
-        );
+        for (agent, interpreter) in [
+            (BuiltinAgent::Python, "python3"),
+            (BuiltinAgent::Node, "node"),
+        ] {
+            let argv = agent.argv("function");
+            assert_eq!(argv[0], interpreter);
+            assert_eq!(argv[1], agent.agent_in_sandbox());
+            assert_eq!(argv[2], "--fd");
+            assert_eq!(argv[3], AGENT_FD.to_string());
+            assert_eq!(argv[4], agent.handler_in_sandbox());
+            assert!(
+                !argv.iter().any(|a| a.contains(".sock")),
+                "a socket path would have to exist inside the sandbox: {argv:?}"
+            );
+        }
+    }
+
+    /// The extension is not decoration: `require` and `import` both decide
+    /// what a file is by its name, so a Node handler mounted at `.py` is a
+    /// handler Node will not load.
+    #[test]
+    fn each_agent_keeps_its_own_paths_in_the_sandbox() {
+        let python = BuiltinAgent::Python;
+        let node = BuiltinAgent::Node;
+        assert!(python.agent_in_sandbox().ends_with(".py"));
+        assert!(python.handler_in_sandbox().ends_with(".py"));
+        assert!(node.agent_in_sandbox().ends_with(".js"));
+        assert!(node.handler_in_sandbox().ends_with(".js"));
+        assert_ne!(python.host_relative(), node.host_relative());
     }
 
     #[test]
@@ -3116,7 +3478,11 @@ mod tests {
         let mut f = resolved(Some("/host/handler.py"));
         f.mounts = vec!["/host/cache:/cache:rw".parse().unwrap()];
 
-        let mounts = agent_mounts(std::path::Path::new("/data/agents/zygo_agent.py"), &f);
+        let mounts = agent_mounts(
+            BuiltinAgent::Python,
+            std::path::Path::new("/data/agents/zygo_agent.py"),
+            &f,
+        );
         let find = |target: &str| {
             mounts
                 .iter()
@@ -3137,7 +3503,11 @@ mod tests {
     #[test]
     fn a_warm_exec_function_needs_no_handler_mount() {
         let f = resolved(None);
-        let mounts = agent_mounts(std::path::Path::new("/data/agent.py"), &f);
+        let mounts = agent_mounts(
+            BuiltinAgent::Python,
+            std::path::Path::new("/data/agent.py"),
+            &f,
+        );
         assert!(
             !mounts
                 .iter()

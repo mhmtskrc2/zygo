@@ -384,7 +384,7 @@ impl TokenResponse {
         self.token
             .clone()
             .or_else(|| self.access_token.clone())
-            .ok_or_else(|| ImageError::Registry("token response contained no token".into()))
+            .ok_or_else(|| ImageError::registry("token response contained no token"))
     }
 }
 

@@ -83,6 +83,21 @@ of an image also pulls it, and the first run on a kernel without unprivileged
 overlayfs also flattens the image's layers — `zygo bench cold` says which of
 those happened, because a number that hides them is misleading.
 
+On a systemd login it costs more, because the shell's own cgroup cannot hold
+a sandbox and `zygo run` has to re-execute inside a transient scope first —
+about 15 ms of scope, second process and throwaway cgroup tree. When a
+supervisor is running, `zygo run` hands the sandbox to it instead and pays
+none of that:
+
+| | p50 |
+|---|---|
+| `zygo run python:3.12-slim python3 -c pass`, own scope | 43–46 ms |
+| The same, through a running supervisor | 29–30 ms |
+| Measured on | Ubuntu 24.04 VM, kernel 6.8 |
+
+`zygo run -v` says which happened: its timing line ends in `(through the
+supervisor)` when it did.
+
 ## A sandbox with a hardware boundary
 
 The `vm` backend boots a guest kernel under KVM and runs the program inside it.
@@ -98,8 +113,7 @@ the host. The first run of an image is several seconds longer because the
 store flattens it.
 
 That is the whole of what is measured: the `vm` backend has no warm path, no
-networking and no writable scratch inside the guest, so there is nothing else
-to time yet.
+networking, so there is nothing else to time yet.
 
 ## Dependencies
 
@@ -135,6 +149,31 @@ round-trips in 96 ms, nearly all of it the hop.
   and a `429` past it.
 - Receive-side bandwidth shaping, which needs an `ifb` device the test hosts do
   not have.
+
+## Reproducing them
+
+```bash
+zygo bench all          # or `make bench`, which does the container setup too
+```
+
+It runs all four measurements — the warm path, warm-exec, a cold start and
+sustained throughput — prints the machine it ran on, and then compares what it
+measured with the numbers on this page. A difference is not a failure: these
+were taken on the machines above and yours is a different one, which is why
+the machine is printed next to the numbers.
+
+Two things it does that a benchmark usually does not:
+
+- **It lifts the tenant's CPU quota for the throughput run, and only for that
+  run.** With the spec's default `cpu = 1.0` a tenant is quota-bound long
+  before the runtime is, so the number would be a measurement of the limit.
+  The latency runs keep the default quota, because there the limit is part of
+  what is being reported.
+- **It refuses to give a verdict on a disturbed host**, and exits 2 rather
+  than 0 or 1 to say which kind of non-zero it is. It samples the CPU's
+  thermal throttle counters and the Raspberry Pi's firmware flag around the
+  whole run, and the load average before it: a number taken on a machine that
+  was overheating or busy is a number about the machine.
 
 ## How these are kept honest
 

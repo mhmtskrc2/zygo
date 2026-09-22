@@ -43,7 +43,14 @@ fn die_quietly_on_a_closed_pipe() {}
 fn main() -> std::process::ExitCode {
     die_quietly_on_a_closed_pipe();
     let cli = Cli::parse();
-    init_tracing(cli.verbose, cli.json);
+    init_tracing(
+        cli.verbose,
+        cli.json,
+        matches!(
+            cli.command,
+            Command::Supervisor(cli::SupervisorCommand::Run)
+        ),
+    );
     // May replace this process: see `scope`. Before anything is opened or
     // connected, so nothing has to survive the exec.
     scope::ensure_delegated(&cli);
@@ -86,7 +93,7 @@ fn main() -> std::process::ExitCode {
 
 fn run(cli: &Cli) -> anyhow::Result<u8> {
     match &cli.command {
-        Command::Doctor => cmd::doctor::run(cli),
+        Command::Doctor { fix, yes } => cmd::doctor::run(cli, *fix, *yes),
         Command::Pull { image, platform } => cmd::image::pull(cli, image, platform.as_deref()),
         Command::Images => cmd::image::list(cli),
         Command::Image(sub) => cmd::image::maintain(cli, sub),
@@ -124,14 +131,16 @@ fn run(cli: &Cli) -> anyhow::Result<u8> {
             username,
             password_stdin,
         } => cmd::login::run(cli, registry, username.as_deref(), *password_stdin),
-        Command::Agent(crate::cli::AgentCommand::Test { binary, args }) => {
-            cmd::agent::test(cli, binary, args)
-        }
+        Command::Agent(crate::cli::AgentCommand::Test {
+            binary,
+            script,
+            args,
+        }) => cmd::agent::test(cli, binary, script.as_deref(), args),
         Command::Shell { name, command } => cmd::shell::run(cli, name, command),
     }
 }
 
-fn init_tracing(verbose: u8, json: bool) {
+fn init_tracing(verbose: u8, json: bool, keep_time: bool) {
     use tracing_subscriber::{EnvFilter, fmt};
 
     let default = match verbose {
@@ -145,6 +154,12 @@ fn init_tracing(verbose: u8, json: bool) {
 
     if json {
         builder.json().init();
+    } else if keep_time {
+        // The supervisor's log is read after the fact, against a client's
+        // timings: a line without a time cannot say whether a gate was closed
+        // before a request arrived or after it gave up, which is exactly the
+        // question the blue/green investigation needed answered.
+        builder.with_target(false).init();
     } else {
         builder.without_time().with_target(false).init();
     }

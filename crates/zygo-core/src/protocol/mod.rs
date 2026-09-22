@@ -38,6 +38,54 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// contract is in `spec/protocol.md` §3.
 pub const CHILD_SECCOMP_ENV: &str = "ZYGO_CHILD_SECCOMP";
 
+/// The code one request runs, when the zygote does not already hold it.
+///
+/// **The child loads this, after the fork.** Not the agent, and not before
+/// `GO`: a zygote that imported a tenant's script would be a zygote that
+/// tenant's next request could observe, and a zygote shared between tenants
+/// would be a place one could leave something for another. The whole point of
+/// a runtime pool is that the warm process is anonymous — an interpreter and
+/// its dependency set, and nothing of anybody's.
+///
+/// Two shapes, and the difference is who holds the bytes:
+///
+/// * `path` — the supervisor wrote the script into the sandbox before `GO`,
+///   read-only, and this names it. Content-addressed, so the same script from
+///   two tenants is one file, and an immutable one.
+/// * `source` — the text itself, on the wire. Simple, needs no store, and
+///   costs a copy of the script in every `EXEC`. For a one-off, or for an
+///   embedder that has nowhere to put a file.
+///
+/// Exactly one is set. Both being absent is the same as no `script` at all,
+/// and is refused rather than guessed at.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Script {
+    /// Where the child can read it, inside the sandbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// The script itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// `sha256:…` of the contents.
+    ///
+    /// Not a security control — the supervisor put the file there and the
+    /// child cannot reach anything else — but an identity. An agent may use
+    /// it to key a compiled-code cache *in the child*, and a log line that
+    /// carries it can say which version of a script failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    /// The entry point to call, when it is not `handler`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_point: Option<String>,
+}
+
+impl Script {
+    /// Whether this names something the child could actually load.
+    pub fn is_loadable(&self) -> bool {
+        self.path.is_some() || self.source.is_some()
+    }
+}
+
 /// A protocol message.
 ///
 /// Serialised as a JSON object with a `type` discriminator, e.g.
@@ -66,6 +114,19 @@ pub enum Message {
         timeout_ms: u64,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         env_overrides: BTreeMap<String, String>,
+        /// The code to run, when it did not come with the zygote (proto 1.1).
+        ///
+        /// Absent is the original shape and the fast path: the agent was
+        /// started with a handler, imported it once, and every request is a
+        /// fork of that. Present is the *runtime pool* shape: one zygote per
+        /// image-and-dependency-set, and the script arrives with the request.
+        ///
+        /// An embedder has ten thousand scripts and cannot hold ten thousand
+        /// zygotes — measured at 9.98 MB of PSS each, which is 97 GiB at that
+        /// count (`docs/bench-embed.md`). This field is how one zygote serves
+        /// all of them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        script: Option<Script>,
     },
 
     /// Agent → supervisor: the child exists but has not started work.
@@ -324,6 +385,7 @@ mod tests {
     #[test]
     fn exec_omits_empty_env_overrides() {
         let m = Message::Exec {
+            script: None,
             id: "01f3".into(),
             event: json!({"url": "https://example.com"}),
             timeout_ms: 30_000,

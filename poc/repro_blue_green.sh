@@ -47,6 +47,8 @@ QUEUE_WAIT_MS=${QUEUE_WAIT_MS:-5000}
 # first. It is the difference between measuring the supervisor and measuring
 # the Raspberry Pi.
 SETTLE_MS=1500
+up_clock=""
+up_done_clock=""
 HOLD_LEFT_MS=$(( HOLD_S * 1000 - SETTLE_MS ))
 WINDOW_MS=$(( QUEUE_WAIT_MS - SETTLE_MS ))
 [ "$HOLD_LEFT_MS" -lt "$WINDOW_MS" ] && WINDOW_MS=$HOLD_LEFT_MS
@@ -69,6 +71,23 @@ hmm()  { INCONCLUSIVE=$((INCONCLUSIVE+1)); say "  ----  $*"; }
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"; "$ZYGO" stop --all >/dev/null 2>&1' EXIT
 cd "$WORK" || exit 1
+# With SUPERVISOR_LOG set, the supervisor is started here, in the foreground,
+# with debug tracing to that file — instead of being auto-started by the first
+# `up` with its stderr piped to nobody. The gate logs every admission, queue,
+# wake and close against the function's name and generation, and a failing
+# round's story is in there. Without it the script measures the bug from
+# outside, which is how it went undiagnosed.
+if [ -n "${SUPERVISOR_LOG:-}" ]; then
+    ZYGO_LOG=${ZYGO_LOG:-zygo_core::supervisor=debug} zygo supervisor run >/dev/null 2>"$SUPERVISOR_LOG" &
+    SUPERVISOR_PID=$!
+    i=0
+    while [ $i -lt 100 ]; do
+        zygo supervisor status >/dev/null 2>&1 && break
+        i=$((i + 1)); sleep 0.1
+    done
+    say "supervisor pid $SUPERVISOR_PID, tracing to $SUPERVISOR_LOG"
+fi
+
 
 # The marker directory is mounted writable, because the handler writes it from
 # inside the sandbox — which is the point: a marker the host wrote would say
@@ -168,6 +187,7 @@ while [ "$round" -lt "$ROUNDS" ]; do
     # Now the queued one. It cannot run: the only slot is held for another
     # $HOLD_S seconds.
     queued_started=$(date +%s%N)
+    queued_clock=$(date -u +%H:%M:%S.%N | cut -c1-12)
     zygo exec v '{}' >"$WORK/queued.out" 2>&1 &
     queued=$!
     # Long enough for it to have connected and queued. It has nothing else it
@@ -176,12 +196,18 @@ while [ "$round" -lt "$ROUNDS" ]; do
 
     write_handler "$next"
     up_started=$(date +%s%N)
+    up_clock=$(date -u +%H:%M:%S.%N | cut -c1-12)
     # `--json` so the round can tell a replacement from a no-op: an `up` that
     # decided nothing had changed leaves the old function in place, and a
     # request queued behind it is then correctly told to retry.
     zygo --json up >"$WORK/up.out" 2>&1
     up_rc=$?
     up_ms=$(( ($(date +%s%N) - up_started) / 1000000 ))
+    up_done_clock=$(date -u +%H:%M:%S.%N | cut -c1-12)
+    # Absolute times on every round, so a round can be laid against the
+    # supervisor's own log line by line. Relative timings hid the thing that
+    # mattered: whether `up` was *invoked* before the queued request gave up.
+    say "        clocks (UTC): queued request launched ${queued_clock:-?}, up invoked ${up_clock}, up returned ${up_done_clock}"
 
     # What the supervisor believed at the moment the replacement landed. Read
     # now rather than after the round, because a later `ps` shows the settled
@@ -225,7 +251,7 @@ while [ "$round" -lt "$ROUNDS" ]; do
                 REFUSED=$((REFUSED + 1))
                 FAIL=$((FAIL + 1))
                 say "  FAIL  round $round: the queued request was refused although the replacement landed ${up_ms} ms in, with ${left_ms} ms of its wait left (it waited ${queued_ms} ms)"
-                say "        answer: $queued_out"
+                                say "        answer: $queued_out"
                 say "        up said: $(tr -d '\n' <"$WORK/up.out" | sed 's/  */ /g')"
                 say "        ps at the swap: $ps_at_swap"
             fi

@@ -1,0 +1,333 @@
+name: release
+
+# What a release is, in one place: two static Linux binaries, a macOS binary
+# that carries the Linux one it needs, checksums, two crates on crates.io and a
+# Homebrew formula with the real digests in it.
+#
+# Everything here is reachable without a tag. `workflow_dispatch` builds and
+# checks the whole thing and uploads nothing, which is how a release is
+# rehearsed — a release workflow that has only ever run on the release is the
+# one that fails on the release.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to rehearse, without the leading v (e.g. 0.1.0)"
+        required: false
+        default: "0.0.0-dev"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # What is being released, decided once so every job below agrees.
+  what:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.pick.outputs.version }}
+      tag: ${{ steps.pick.outputs.tag }}
+      publish: ${{ steps.pick.outputs.publish }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - id: pick
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = push ]; then
+            tag="${GITHUB_REF#refs/tags/}"
+            version="${tag#v}"
+            publish=true
+          else
+            version="${{ inputs.version }}"
+            tag="v$version"
+            publish=false
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "releasing $tag (publish: $publish)"
+
+          # The tag and the manifest have to agree, or `cargo publish` uploads
+          # a version nobody can `git checkout`. Only enforced for a real tag:
+          # a rehearsal is deliberately allowed to name a version that does
+          # not exist yet.
+          manifest=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "$publish" = true ] && [ "$manifest" != "$version" ]; then
+            echo "::error::the tag is $tag but Cargo.toml says $manifest"
+            exit 1
+          fi
+
+  # The two Linux binaries. Native runners rather than cross-compilation: the
+  # aarch64 build is the one that is hardest to get wrong from x86_64, and it
+  # is also the one a Raspberry Pi and an Apple Silicon Mac's VM both run.
+  linux:
+    needs: what
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    name: linux (${{ matrix.target }})
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # N6, checked by the same script `make dist-linux` runs.
+      - name: Static, and inside the size budget
+        run: sh poc/check_dist.sh target/${{ matrix.target }}/release/zygo
+
+      # It has to actually run, on this architecture, before it is a release.
+      # `doctor` is the one command that works anywhere and exercises the
+      # whole probe surface; it exits non-zero on a host that cannot run
+      # sandboxes, which a GitHub runner may well be, so its output is the
+      # check rather than its status.
+      - name: It runs
+        run: |
+          ./target/${{ matrix.target }}/release/zygo --version
+          ./target/${{ matrix.target }}/release/zygo doctor || true
+
+      - name: Archive
+        id: archive
+        shell: bash
+        run: |
+          # The directory inside the archive carries the version; the asset
+          # name does not, so that
+          # `releases/latest/download/zygo-<target>.tar.gz` is a URL that
+          # keeps working — which is the one a README can print.
+          name="zygo-${{ needs.what.outputs.version }}-${{ matrix.target }}"
+          asset="zygo-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp target/${{ matrix.target }}/release/zygo "dist/$name/"
+          cp README.md SECURITY.md "dist/$name/"
+          tar -C dist -czf "dist/$asset.tar.gz" "$name"
+          (cd dist && sha256sum "$asset.tar.gz" > "$asset.tar.gz.sha256")
+          # The bare binary too: the macOS formula and `limactl copy` both
+          # want one file, not an archive to unpack first.
+          cp target/${{ matrix.target }}/release/zygo "dist/zygo-linux-${{ matrix.target }}"
+          (cd dist && sha256sum "zygo-linux-${{ matrix.target }}" > "zygo-linux-${{ matrix.target }}.sha256")
+          cat dist/*.sha256
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/zygo-linux-*
+          if-no-files-found: error
+
+  # The macOS binary is the shim: it forwards every sandbox command into a
+  # Linux VM. It is useless without a Linux build for the same architecture,
+  # so the archive carries one — which is what `share/zygo/zygo-linux-<arch>`
+  # is, and where `shim::linux_binary` looks.
+  macos:
+    needs: [what, linux]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            arch: aarch64
+            linux_target: aarch64-unknown-linux-musl
+          - runner: macos-13
+            arch: x86_64
+            linux_target: x86_64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    name: macos (${{ matrix.arch }})
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - run: cargo build --release --locked
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist-${{ matrix.linux_target }}
+          path: linux
+
+      - name: Archive
+        shell: bash
+        run: |
+          name="zygo-${{ needs.what.outputs.version }}-${{ matrix.arch }}-apple-darwin"
+          asset="zygo-${{ matrix.arch }}-apple-darwin"
+          mkdir -p "dist/$name/bin" "dist/$name/share/zygo"
+          cp target/release/zygo "dist/$name/bin/"
+          # The name `shim::linux_binary` looks for, beside the binary at
+          # `../share/zygo/`. A Mac with no Linux build cannot run a sandbox
+          # at all, so shipping them apart would ship something that does not
+          # work.
+          cp "linux/zygo-linux-${{ matrix.linux_target }}" \
+             "dist/$name/share/zygo/zygo-linux-${{ matrix.arch }}"
+          chmod +x "dist/$name/share/zygo/zygo-linux-${{ matrix.arch }}"
+          cp README.md SECURITY.md "dist/$name/"
+          tar -C dist -czf "dist/$asset.tar.gz" "$name"
+          (cd dist && shasum -a 256 "$asset.tar.gz" > "$asset.tar.gz.sha256")
+          cat "dist/$asset.tar.gz.sha256"
+
+      # The macOS half of the product, run on macOS: the shim's decision to
+      # forward is what a Mac user meets first.
+      - name: It runs and knows it needs a VM
+        run: |
+          ./target/release/zygo --version
+          ./target/release/zygo doctor || true
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist-${{ matrix.arch }}-apple-darwin
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  # The formula, with the digests of the archives that were just built. A
+  # formula with placeholder hashes in the repository is a formula nobody can
+  # install; this renders the real one and attaches it to the release.
+  homebrew:
+    needs: [what, linux, macos]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+      - name: Render
+        env:
+          ZYGO_REPO: ${{ github.repository }}
+        run: |
+          find artifacts -name '*.sha256' -exec cat {} \;
+          sh packaging/homebrew/render.sh \
+            "${{ needs.what.outputs.version }}" artifacts > zygo.rb
+          cat zygo.rb
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: homebrew-formula
+          path: zygo.rb
+          if-no-files-found: error
+
+  # crates.io, in dependency order. `zygo-cli` cannot be packaged until
+  # `zygo-core` is in the index, so the dry run is the honest check on a
+  # rehearsal and the real publish waits for the index on a tag.
+  crates:
+    needs: what
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    # At job level, not step level: `secrets` is not available in an `if`, and
+    # a step's own `env` is not either. This is the shape that lets a fork
+    # without a token run the whole workflow and say so.
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      # The one failure mode `cargo install` has that a checkout never sees:
+      # a file the build needs that is not inside the package. The agents are
+      # reached through a symlink for exactly this reason, and this is what
+      # checks that it worked.
+      - name: zygo-core packages and builds from its own archive
+        run: cargo package -p zygo-core --locked
+
+      - name: Publish
+        if: needs.what.outputs.publish == 'true' && env.CARGO_REGISTRY_TOKEN != ''
+        run: |
+          cargo publish -p zygo-core --locked
+          # The index is not immediately consistent, and `zygo-cli` depends on
+          # what was just uploaded.
+          for i in $(seq 1 60); do
+            if cargo search zygo-core | grep -q "^zygo-core = \"${{ needs.what.outputs.version }}\""; then
+              break
+            fi
+            sleep 10
+          done
+          cargo publish -p zygo-cli --locked
+
+      - name: Say why nothing was published
+        if: needs.what.outputs.publish != 'true' || env.CARGO_REGISTRY_TOKEN == ''
+        run: |
+          if [ "${{ needs.what.outputs.publish }}" != true ]; then
+            echo "a rehearsal: packaged but not published"
+          else
+            echo "::warning::CARGO_REGISTRY_TOKEN is not set, so nothing went to crates.io"
+          fi
+
+  # The release itself. Last, so a build that fails leaves no half-release.
+  publish:
+    needs: [what, linux, macos, homebrew]
+    if: needs.what.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+
+      - name: Collect
+        shell: bash
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name '*.tar.gz' -o -name 'zygo.rb' \) \
+            -exec cp {} release/ \;
+          (cd release && sha256sum *.tar.gz > SHA256SUMS)
+          ls -l release
+          cat release/SHA256SUMS
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.what.outputs.tag }}
+          VERSION: ${{ needs.what.outputs.version }}
+          REPO: ${{ github.repository }}
+        run: |
+          cat > notes.md <<EOF
+          ## Install
+
+          \`\`\`bash
+          # Linux, one static binary
+          curl -fsSL https://github.com/$REPO/releases/download/$TAG/zygo-x86_64-unknown-linux-musl.tar.gz | tar xz
+          sudo install -m 0755 zygo-*/zygo /usr/local/bin/zygo
+
+          # macOS, with the Linux build the VM needs
+          brew install lima
+          brew install --formula ./zygo.rb
+
+          # from source
+          cargo install zygo-cli
+          \`\`\`
+
+          \`zygo doctor\` is the first thing to run anywhere: it attempts every
+          requirement on this host and prints the fix for anything missing.
+
+          Checksums are in \`SHA256SUMS\`.
+          EOF
+          gh release create "$TAG" release/* \
+            --title "$TAG" \
+            --generate-notes \
+            --notes-file notes.md

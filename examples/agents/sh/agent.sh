@@ -24,6 +24,13 @@ set -u
 WIRE=3
 HANDLER=${1:?usage: agent.sh <handler.sh>}
 
+# `sh` cannot reach `prctl`, so under `seccomp = "strict"` this agent cannot
+# give the child the filter the supervisor built for it. The protocol's rule
+# for that case is explicit: fail the request, never run it unfiltered. So a
+# `strict` function on this agent refuses everything — loudly, once per
+# request, rather than quietly running with the sandbox filter alone.
+CHILD_SECCOMP=${ZYGO_CHILD_SECCOMP:-}
+
 # Bytes, not characters — the protocol's length prefix counts bytes, and every
 # tool below has to agree. Without this, `gawk` in a UTF-8 locale encodes a
 # length byte above 127 as a *two-byte* UTF-8 sequence and every frame longer
@@ -104,6 +111,12 @@ while frame=$(read_frame); do
     EXEC)
         id=$(printf '%s' "$frame" | jq -r '.id')
         event=$(printf '%s' "$frame" | jq -c '.event')
+
+        if [ -n "$CHILD_SECCOMP" ]; then
+            error internal "$id" \
+                "ZYGO_CHILD_SECCOMP is set and sh cannot install a seccomp filter; refusing to run the request unfiltered"
+            continue
+        fi
 
         go=$(mktemp -u) && mkfifo "$go"
         out=$(mktemp) && err=$(mktemp) && res=$(mktemp)

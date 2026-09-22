@@ -153,6 +153,10 @@ impl Client {
             Request::Exec { timeout_ms, .. } => {
                 Duration::from_millis(*timeout_ms).saturating_add(REPLY_GRACE)
             }
+            // `RUN` is never sent through `send`: it is answered twice and
+            // carries descriptors, so it has methods of its own below. The
+            // arm exists so the match stays exhaustive.
+            Request::Run { .. } => CONTROL_TIMEOUT,
             // A follow is the caller's own loop of short requests; each one is
             // ordinary. Everything else reads state the supervisor has.
             _ => CONTROL_TIMEOUT,
@@ -206,6 +210,111 @@ impl Client {
     }
 }
 
+impl Client {
+    /// Ask the supervisor to run a one-shot sandbox with *this* process's
+    /// standard streams, and return its pid once it exists.
+    ///
+    /// The three descriptors follow the frame on the same connection, sent
+    /// with `SCM_RIGHTS` in the order stdin, stdout, stderr. They go
+    /// **after** the frame and **before** the reply is read, and the framing
+    /// is what makes that safe: `FrameReader` reads exactly a header and
+    /// exactly a body, never ahead, so the supervisor's reader is positioned
+    /// on the first descriptor message when it turns to receive them.
+    ///
+    /// Why the supervisor and not this process: on an ordinary systemd
+    /// session this process cannot build a cgroup where it is, and cgroup
+    /// delegation containment forbids it moving to one that would do — see
+    /// `zygo-cli/src/scope.rs`. The supervisor already lives in one.
+    ///
+    /// The pid comes back first so the caller can forward its terminal's
+    /// signals; [`Client::run_wait`] then waits for the exit.
+    #[cfg(target_os = "linux")]
+    pub fn run_start(&mut self, request: &Request, stdio: [std::os::fd::RawFd; 3]) -> Result<u32> {
+        use std::os::fd::AsRawFd;
+
+        debug_assert!(matches!(request, Request::Run { .. }));
+        self.writer
+            .write(request)
+            .map_err(|e| Error::primitive("write", "control socket", std::io::Error::other(e)))?;
+        for fd in stdio {
+            // SAFETY: a plain `sendmsg` on this process's own socket with a
+            // descriptor it owns; the helper touches nothing but its stack.
+            unsafe { crate::net::linux::send_fd(self.deadline.as_raw_fd(), fd) }
+                .map_err(|e| Error::primitive("sendmsg", "control socket", e))?;
+        }
+
+        let _ = self.deadline.set_read_timeout(Some(CONTROL_TIMEOUT));
+        let answer = self.reader.read();
+        let _ = self.deadline.set_read_timeout(None);
+        match answer {
+            Ok(Some(Response::Started { pid })) => Ok(pid),
+            Ok(Some(Response::Error { code, message })) => Err(control_error(code, message)),
+            Ok(Some(other)) => Err(unexpected(&other)),
+            Ok(None) => Err(Error::BackendUnavailable {
+                backend: "supervisor",
+                reason: "the supervisor closed the connection before the sandbox started".into(),
+                remedy: "check `zygo logs` for why it exited".into(),
+            }),
+            Err(e) => Err(Error::primitive(
+                "read",
+                "control socket",
+                std::io::Error::other(e),
+            )),
+        }
+    }
+
+    /// Wait for the sandbox [`Client::run_start`] started to exit.
+    ///
+    /// `budget` is the sandbox's own deadline plus grace, or `None` for a run
+    /// with no deadline at all — a program that is meant to run for hours
+    /// must not be reported dead by a liveness timer. The supervisor owns the
+    /// real deadline and enforces it through the cgroup either way.
+    #[cfg(target_os = "linux")]
+    pub fn run_wait(&mut self, budget: Option<Duration>) -> Result<Response> {
+        let _ = self.deadline.set_read_timeout(budget);
+        let answer = self.reader.read();
+        let _ = self.deadline.set_read_timeout(None);
+        match answer {
+            Ok(Some(response @ Response::Ran { .. })) => Ok(response),
+            Ok(Some(Response::Error { code, message })) => Err(control_error(code, message)),
+            Ok(Some(other)) => Err(unexpected(&other)),
+            Ok(None) => Err(Error::BackendUnavailable {
+                backend: "supervisor",
+                reason: "the supervisor closed the connection while the sandbox was running".into(),
+                remedy: "the sandbox was killed with it; check `zygo logs`".into(),
+            }),
+            Err(e) if is_timeout(&e) => Err(Error::BackendUnavailable {
+                backend: "supervisor",
+                reason: "the supervisor did not report the sandbox's exit within its \
+                         deadline plus grace"
+                    .into(),
+                remedy: "it is running but not replying — check `zygo logs`, and \
+                         `zygo stop --all` to restart it; report it if it repeats"
+                    .into(),
+            }),
+            Err(e) => Err(Error::primitive(
+                "read",
+                "control socket",
+                std::io::Error::other(e),
+            )),
+        }
+    }
+}
+
+/// A supervisor's `ERROR` frame, as the error the caller should see.
+#[cfg(target_os = "linux")]
+fn control_error(code: ControlError, message: String) -> Error {
+    match code {
+        ControlError::BadSpec => Error::Spec(crate::spec::SpecError::invalid("run", message)),
+        _ => Error::BackendUnavailable {
+            backend: "supervisor",
+            reason: message,
+            remedy: "run `zygo logs` on the supervisor, or run without one: `zygo stop --all`"
+                .into(),
+        },
+    }
+}
+
 /// Whether a framing error is the read timeout expiring.
 ///
 /// A socket read timeout surfaces as `WouldBlock` on Linux and `TimedOut` on
@@ -237,6 +346,7 @@ fn name_of(request: &Request) -> &'static str {
         Request::Shell { .. } => "shell",
         Request::Logs { .. } => "logs",
         Request::Warm { .. } => "warm",
+        Request::Run { .. } => "run",
     }
 }
 

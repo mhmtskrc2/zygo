@@ -175,7 +175,25 @@ pub enum Command {
     Agent(AgentCommand),
 
     /// Check whether this host can run sandboxes, and how to fix it if not.
-    Doctor,
+    Doctor {
+        /// Apply the repairs `doctor` names, after printing them and asking.
+        ///
+        /// Only the ones that really are one command: the AppArmor
+        /// restriction on unprivileged user namespaces, the AppArmor profile
+        /// confining `pasta`, cgroup delegation for your user session, and
+        /// the two egress packages. A kernel that is too old is not a fix.
+        ///
+        /// Every command is printed before anything runs, with what it costs
+        /// — two of them turn off a kernel protection for every process on
+        /// this machine, not only Zygo's.
+        #[arg(long)]
+        fix: bool,
+
+        /// With `--fix`, do not ask. For a provisioning script that has
+        /// already read what this does.
+        #[arg(long, requires = "fix")]
+        yes: bool,
+    },
 
     /// Interactive shell inside a sandbox, for debugging.
     ///
@@ -299,6 +317,21 @@ pub enum AgentCommand {
     /// honour `stdout`/`stderr`; see `examples/agents/`.
     Test {
         binary: PathBuf,
+
+        /// A script in the agent's own language, to check protocol 1.1.
+        ///
+        /// The suite sends its contents inside an `EXEC` and expects the
+        /// *child* to load it — which is what lets one warm interpreter serve
+        /// many scripts instead of one zygote per script. The file has to be
+        /// in a language the agent under test speaks, and this suite cannot
+        /// know which that is, so it asks rather than guesses. Without it the
+        /// check is skipped and says so.
+        ///
+        /// `examples/agents/conformance/script.py` and `script.js` are the
+        /// two that ship.
+        #[arg(long, value_name = "FILE")]
+        script: Option<PathBuf>,
+
         /// Arguments for the agent, after `--`.
         #[arg(last = true)]
         args: Vec<String>,
@@ -342,6 +375,22 @@ pub enum BenchCommand {
         #[arg(long, num_args = 1.., value_delimiter = ' ')]
         command: Option<Vec<String>>,
     },
+    /// Every published number, on this host, in one command.
+    ///
+    /// Runs the warm path, warm-exec, a cold start and sustained throughput,
+    /// prints the machine it ran on, and compares what it measured with what
+    /// the README and `docs/performance.md` print — so the numbers there can
+    /// be checked rather than trusted.
+    ///
+    /// It refuses to give a verdict on a host that was throttled or busy
+    /// while it ran, and exits 2 to say so. A number measured on a
+    /// thermally capped laptop is not a number about Zygo.
+    All {
+        /// Fewer iterations: a smoke test of the harness, not a measurement.
+        #[arg(long)]
+        quick: bool,
+    },
+
     /// Sustained throughput through one warm function.
     Load {
         #[arg(long, default_value_t = 10)]

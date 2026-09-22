@@ -33,3 +33,6 @@ poc/vm-out/
 # and the test plans. Useful to whoever is building Zygo and noise to whoever
 # is using it, so it lives here rather than in `docs/`, which is for readers.
 /mhmt/
+
+# The workflow-engine example writes its queue beside itself.
+examples/workflow-engine/jobs.db

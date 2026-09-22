@@ -81,8 +81,20 @@ pub unsafe fn child_main(plan: &PreparedLaunch, ready_fd: c_int, err_fd: c_int) 
     //    Done after `pivot_root` so the fd survives the root change (it is a
     //    descriptor, not a path) and before privileges are dropped, since
     //    `TIOCSCTTY` needs the process to be a session leader.
-    if let Some(fd) = plan.stdio {
+    //
+    //    Three distinct streams take precedence over one terminal: they are
+    //    the client's own stdin, stdout and stderr, handed to the supervisor
+    //    to start this sandbox on the client's behalf, and collapsing them
+    //    into one would send a program's stderr down its caller's stdout.
+    if let Some(fds) = plan.stdio_streams {
+        unsafe { adopt_streams(fds, err_fd) };
+    } else if let Some(fd) = plan.stdio {
         unsafe { adopt_terminal(fd, err_fd) };
+    }
+    //    And the caller's signal dispositions, when the program is being
+    //    started for somebody else.
+    if let Some(mask) = plan.ignored_signals {
+        unsafe { reset_signals(mask) };
     }
 
     // 5. The runtime agent's socket, at a fixed descriptor so its argv can
@@ -582,6 +594,41 @@ unsafe fn place_agent_socket(fd: c_int, err_fd: c_int) {
 /// fresh pid namespace is not the same thing — the session is inherited from
 /// the launcher, along with *its* controlling terminal, which is precisely the
 /// one the sandbox must not have.
+/// Three descriptors become stdin, stdout and stderr, each its own.
+///
+/// A new session first, as in [`adopt_terminal`]: the one inherited is the
+/// supervisor's, and a sandbox must not sit in it. Whether the terminal, if
+/// stdin is one, becomes this session's controlling terminal is then up to
+/// the kernel: it is normally the *client's shell's* already, taking it away
+/// needs `CAP_SYS_ADMIN` in the terminal's own namespace, and `TIOCSCTTY`
+/// says `EPERM`. That is fine. The three are used as plain descriptors, the
+/// terminal keeps belonging to the shell, and a Ctrl-C typed there goes
+/// where the terminal sends it — to the client, which relays it here. A
+/// pipe says `ENOTTY`, which is the other refusal that means "not
+/// applicable" rather than "failed".
+///
+/// The descriptors are numbered 3 or above by construction — they arrived
+/// over `SCM_RIGHTS`, and this process's own 0, 1 and 2 were never sent — so
+/// the three `dup2`s cannot overwrite a source before it is read. The
+/// supervisor checks that before building the plan, because this function
+/// may not: it runs between `clone3` and `execve`, where nothing may
+/// allocate or fail with a message.
+unsafe fn adopt_streams(fds: [c_int; 3], err_fd: c_int) {
+    if unsafe { libc::setsid() } < 0 {
+        fail(err_fd, Step::AdoptTerminal);
+    }
+    if unsafe { libc::ioctl(fds[0], TIOCSCTTY as _, 0) } != 0
+        && !matches!(errno(), libc::ENOTTY | libc::EPERM)
+    {
+        fail(err_fd, Step::AdoptTerminal);
+    }
+    for (target, source) in fds.iter().enumerate() {
+        if unsafe { libc::dup2(*source, target as c_int) } < 0 {
+            fail(err_fd, Step::AdoptTerminal);
+        }
+    }
+}
+
 unsafe fn adopt_terminal(fd: c_int, err_fd: c_int) {
     if unsafe { libc::setsid() } < 0 {
         fail(err_fd, Step::AdoptTerminal);
@@ -600,6 +647,37 @@ unsafe fn adopt_terminal(fd: c_int, err_fd: c_int) {
     }
     if fd > 2 {
         unsafe { libc::close(fd) };
+    }
+}
+
+/// Give the program the signal dispositions its caller has, not this
+/// process's.
+///
+/// Dispositions survive `clone3` and `SIG_IGN` survives `execve`, so a
+/// program started here for a client would otherwise run with whatever the
+/// supervisor was started with — and a supervisor a script put in the
+/// background with `&` has `SIGINT` ignored, which made Ctrl-C do nothing in
+/// every one-shot it started. `mask` is what the client ignores, bit `n - 1`
+/// for signal `n`; everything else goes back to its default, and nothing
+/// stays blocked. `SIGKILL` and `SIGSTOP` cannot be set and are skipped, and
+/// the two real-time signals libc keeps for itself refuse, which is nothing
+/// to reset either.
+unsafe fn reset_signals(mask: u64) {
+    for signal in 1..=64 {
+        if signal == libc::SIGKILL || signal == libc::SIGSTOP {
+            continue;
+        }
+        let disposition = if mask & (1u64 << (signal - 1)) != 0 {
+            libc::SIG_IGN
+        } else {
+            libc::SIG_DFL
+        };
+        unsafe { libc::signal(signal, disposition) };
+    }
+    let mut none: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigemptyset(&mut none);
+        libc::sigprocmask(libc::SIG_SETMASK, &none, std::ptr::null_mut());
     }
 }
 

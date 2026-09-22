@@ -39,8 +39,15 @@ pub enum ImageError {
     )]
     UnsafePath(String),
 
-    #[error("cannot unpack layer: {0}")]
-    Unpack(String),
+    /// A layer could not be unpacked. `source` is the underlying error when
+    /// there is one — a decoder, the filesystem — so a caller can walk the
+    /// chain; `message` is what a person reads, and already names the cause.
+    #[error("cannot unpack layer: {message}")]
+    Unpack {
+        message: String,
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    },
 
     #[error("unsupported layer media type `{0}`\n  → Zygo reads tar, tar+gzip and tar+zstd layers")]
     UnsupportedLayer(String),
@@ -57,13 +64,79 @@ pub enum ImageError {
     #[error("image `{0}` is not in the local store\n  → run `zygo pull {0}`")]
     NotPulled(String),
 
-    #[error("registry error: {0}")]
-    Registry(String),
+    /// The registry, or the way to it, failed. As with [`Unpack`]: the
+    /// message is complete on its own, and `source` is there for code that
+    /// wants to ask what kind of failure it was — a connection reset is worth
+    /// a retry where a malformed manifest is not.
+    ///
+    /// [`Unpack`]: ImageError::Unpack
+    #[error("registry error: {message}")]
+    Registry {
+        message: String,
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    },
 
     #[error(
         "registry authentication failed for {registry}: {reason}\n  → run `zygo login {registry}`"
     )]
     Auth { registry: String, reason: String },
+}
+
+impl ImageError {
+    /// An unpack failure with no underlying error to point at.
+    pub fn unpack(message: impl Into<String>) -> Self {
+        ImageError::Unpack {
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    /// An unpack failure caused by `source`, whose text is the message.
+    pub fn unpack_source(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        ImageError::Unpack {
+            message: source.to_string(),
+            source: Some(Box::new(source)),
+        }
+    }
+
+    /// An unpack failure caused by `source`, read as "`context`: `source`".
+    pub fn unpack_with(
+        context: impl std::fmt::Display,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        ImageError::Unpack {
+            message: format!("{context}: {source}"),
+            source: Some(Box::new(source)),
+        }
+    }
+
+    /// A registry failure with no underlying error to point at.
+    pub fn registry(message: impl Into<String>) -> Self {
+        ImageError::Registry {
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    /// A registry failure caused by `source`, whose text is the message.
+    pub fn registry_source(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        ImageError::Registry {
+            message: source.to_string(),
+            source: Some(Box::new(source)),
+        }
+    }
+
+    /// A registry failure caused by `source`, read as "`context`: `source`".
+    pub fn registry_with(
+        context: impl std::fmt::Display,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        ImageError::Registry {
+            message: format!("{context}: {source}"),
+            source: Some(Box::new(source)),
+        }
+    }
 }
 
 impl ImageError {

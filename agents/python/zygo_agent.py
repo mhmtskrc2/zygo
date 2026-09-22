@@ -190,6 +190,63 @@ def _run_stdin_script(path: str, event) -> object:
     return json.loads(out) if out else None
 
 
+# --------------------------------------------------------------------------
+# A script that arrives with the request (protocol 1.1)
+# --------------------------------------------------------------------------
+
+
+class ScriptError(Exception):
+    """The request named a script the child could not load."""
+
+
+def load_request_script(script: dict):
+    """Load the script an `EXEC` carried, and return its entry point.
+
+    **This runs in the child, after `GO`.** Never in the zygote: a zygote that
+    imported a tenant's script would hold that tenant's code, and a runtime
+    pool is shared — the next request could be somebody else's. Keeping the
+    load here is what lets one warm interpreter serve ten thousand scripts
+    without any of them being able to reach each other through it.
+
+    The cost is that the import is paid per request rather than once. That is
+    the trade a runtime pool makes, and it is why `entry` still exists: a hot
+    function should be warmed with its handler and forked, and only the long
+    tail should arrive this way.
+    """
+    name = "zygo_request_script"
+    entry_point = script.get("entry_point") or "handler"
+
+    source = script.get("source")
+    path = script.get("path")
+    if source is None and path is None:
+        raise ScriptError("the request's script carries neither `source` nor `path`")
+
+    if source is None:
+        try:
+            with open(path, "r") as f:
+                source = f.read()
+        except OSError as e:
+            raise ScriptError(f"cannot read {path}: {e}") from None
+
+    module = types.ModuleType(name)
+    module.__file__ = path or "<script>"
+    # Not in `sys.modules`: the child is about to exit, and a module that is
+    # registered can be found by anything else the handler imports. Nothing
+    # here should outlive the request, and this is the only copy of it.
+    try:
+        exec(compile(source, module.__file__, "exec"), module.__dict__)
+    except BaseException as exc:
+        raise ScriptError(f"the script did not load: {_handler_traceback(exc)}") from None
+
+    handler = getattr(module, entry_point, None)
+    if handler is None:
+        raise ScriptError(
+            f"{module.__file__} defines no `{entry_point}`; "
+            f"expected `def {entry_point}(event: dict)`"
+        )
+    return handler
+
+
 def has_extra_threads() -> bool:
     """Whether the handler started threads at import time.
 
@@ -250,6 +307,12 @@ def run_request(
     go_fd: int,
     child_filter: "ChildFilter | None" = None,
 ) -> None:
+    # `handler` may be `None` when this agent is a runtime pool: the zygote
+    # holds an interpreter and its dependencies and no tenant code at all, and
+    # the script arrives in the request. It is loaded below, after `GO` and
+    # after the child filter, because both of those are the supervisor's
+    # guarantees about this process and the script is the first thing that is
+    # not.
     """Run one request in the freshly forked child. Never returns."""
     exit_code = 0
     error = None
@@ -282,6 +345,18 @@ def run_request(
         # parent's seeded state and every child produces identical "random"
         # values — tokens, temp names, jitter.
         _reseed_random()
+
+        # The script, if the supervisor sent one. After the filter on purpose:
+        # under `strict` a script that tries to start a program is refused by
+        # the kernel while it is loading, not after.
+        script = request.get("script")
+        if script:
+            handler = load_request_script(script)
+        elif handler is None:
+            raise ScriptError(
+                "this agent was started without a handler, so every request must "
+                "carry a `script`"
+            )
 
         os.environ["ZYGO_REQUEST_ID"] = request.get("id", "")
         os.environ["ZYGO_DEADLINE_MS"] = str(request.get("timeout_ms", 0))
@@ -1028,6 +1103,9 @@ def oneshot(handler_path: str, mode: str) -> int:
 
 
 def main(argv: list[str]) -> int:
+    # A runtime pool announces itself the same way; what differs is that it
+    # was started with no handler, which `READY` does not need to say because
+    # the supervisor is the one that started it.
     if len(argv) >= 2 and argv[1] == "--oneshot":
         if len(argv) < 3:
             sys.stderr.write("usage: zygo_agent.py --oneshot <handler.py> [mode]\n")
@@ -1043,20 +1121,23 @@ def main(argv: list[str]) -> int:
     # no bind mount, no path that has to exist in the image, and nothing on the
     # filesystem for a second sandbox to find.
     if len(argv) >= 3 and argv[1] == "--fd":
-        if len(argv) < 4:
-            sys.stderr.write("usage: zygo_agent.py --fd <n> <handler.py> [mode]\n")
-            return 2
         sock = socket.socket(fileno=int(argv[2]))
-        handler_path = argv[3]
+        # No handler is the *runtime pool* shape: this zygote is an
+        # interpreter and its dependency set, holding no tenant code, and
+        # every request carries its own script. See `load_request_script`.
+        handler_path = argv[3] if len(argv) > 3 else None
         mode = argv[4] if len(argv) > 4 else "function"
-    elif len(argv) >= 3:
+    elif len(argv) >= 2:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.connect(argv[1])
-        handler_path = argv[2]
+        # As above: no handler is a runtime pool, and every request brings
+        # its own script.
+        handler_path = argv[2] if len(argv) > 2 else None
         mode = argv[3] if len(argv) > 3 else "function"
     else:
         sys.stderr.write(
-            "usage: zygo_agent.py (--fd <n> | <socket>) <handler.py> [mode]\n"
+            "usage: zygo_agent.py (--fd <n> | <socket>) [handler.py] [mode]\n"
+            "  with no handler, every request must carry its own `script`\n"
         )
         return 2
 
@@ -1064,7 +1145,7 @@ def main(argv: list[str]) -> int:
 
     started = time.monotonic()
     try:
-        handler = load_handler(handler_path, mode)
+        handler = load_handler(handler_path, mode) if handler_path else None
         # Decoded here, once, so a bad value is a start-up failure the
         # supervisor sees, not a per-request one — and so no child pays for
         # the `ctypes` import.
@@ -1080,7 +1161,12 @@ def main(argv: list[str]) -> int:
         return 1
     # An async handler needs an event loop in every child. Importing asyncio
     # here means the ~50 ms is paid once, at warm-up, not per request.
-    if is_async_handler(handler):
+    if handler is not None and is_async_handler(handler):
+        import asyncio  # noqa: F401
+    elif handler is None:
+        # A runtime pool cannot know whether the scripts it will be sent are
+        # async, and an `import asyncio` in a child costs ~50 ms — five times
+        # the whole warm budget. So it is paid here, once, by every pool.
         import asyncio  # noqa: F401
     imports_ms = (time.monotonic() - started) * 1000.0
 

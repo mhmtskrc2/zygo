@@ -13,6 +13,8 @@ use std::fmt;
 
 use crate::spec::Isolation;
 
+pub mod fix;
+
 /// Outcome of a single check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Status {
@@ -314,6 +316,62 @@ pub fn run(paths: &crate::Paths) -> Report {
     Report {
         checks: probe::all(paths),
     }
+}
+
+/// The same report, probed once per data directory per process.
+///
+/// [`run`] is not cheap and it is not meant to be: it *attempts* what it
+/// reports, so a kernel that has a flag and ignores it is caught here rather
+/// than in a sandbox. That costs a `fork`, an `unshare`, a `mount`, a cgroup
+/// `mkdir`, and on a host with no delegated cgroup a whole `systemd-run` — a
+/// couple of milliseconds on an idle machine and more on a busy one.
+///
+/// That is a fine price to pay once. `zygo run` was paying it **twice**: once
+/// to ask whether unprivileged overlayfs works, and once inside
+/// `backend::for_isolation`, which asks the `ns` backend whether it is
+/// available and gets the answer from the same probe.
+///
+/// **It is worth less than it looks.** An interleaved A/B of 90 runs each on
+/// kernel 6.8, idle, found no difference a measurement could see: p50 44.92 ms
+/// against 45.33 ms, mean 44.63 against 44.72. The probe is a few hundred
+/// microseconds against a `zygo run` that is tens of milliseconds, and on that
+/// path the saving is noise. It is kept because it is still one probe rather
+/// than two, it costs nothing, and the caller it actually matters for is the
+/// supervisor: `Pool::serve` probes once per function warmed, so an embedder
+/// warming five hundred scripts was paying for five hundred identical probes
+/// of a host that had not changed.
+///
+/// The number to chase on the one-shot path is elsewhere and much larger — see
+/// `crates/zygo-cli/src/scope.rs`.
+///
+/// `zygo doctor` itself calls [`run`], because a diagnostic that could return
+/// a cached answer is not one.
+pub fn cached(paths: &crate::Paths) -> Report {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    // Keyed by the data directory, because one check reads it: two `Paths`
+    // pointing at different roots are two different reports, and a
+    // supervisor started with `--data-root` must not be told about the
+    // default one's guest kernel.
+    static REPORTS: OnceLock<Mutex<HashMap<std::path::PathBuf, Report>>> = OnceLock::new();
+    let cache = REPORTS.get_or_init(|| Mutex::new(HashMap::new()));
+
+    let key = paths.data().to_path_buf();
+    // Two locks rather than one `entry`, so the probe does not run with the
+    // map held: a second thread wanting a *different* root would otherwise
+    // wait out the first one's `systemd-run`. A race here costs one extra
+    // probe and nothing else — the answer is the same either way.
+    if let Ok(map) = cache.lock()
+        && let Some(report) = map.get(&key)
+    {
+        return report.clone();
+    }
+    let report = run(paths);
+    if let Ok(mut map) = cache.lock() {
+        map.insert(key, report.clone());
+    }
+    report
 }
 
 #[cfg(target_os = "linux")]
@@ -1258,6 +1316,77 @@ mod tests {
         assert!(
             line.detail.contains(&root.path().display().to_string()),
             "the line names the given data root, not another: {line:?}"
+        );
+    }
+
+    /// The cache must be a cache, not a second implementation: the same
+    /// answer, and the second call must not probe again.
+    #[test]
+    fn the_cached_report_is_the_same_report_and_is_only_probed_once() {
+        let root = tempfile::tempdir().expect("a temp dir");
+        let paths = crate::Paths::rooted(root.path());
+
+        let fresh = run(&paths);
+        let first = cached(&paths);
+        assert_eq!(
+            fresh.checks.len(),
+            first.checks.len(),
+            "the cached report has a different shape from the real one"
+        );
+        for (a, b) in fresh.checks.iter().zip(first.checks.iter()) {
+            assert_eq!(a.name, b.name);
+        }
+
+        // The second call is the point. Timing is the only way to see it from
+        // outside, and a probe that attempts a `mount` and a cgroup `mkdir`
+        // is never as fast as a `HashMap` lookup — but the margin is left
+        // wide, because this also runs on a loaded CI runner.
+        let probed = std::time::Instant::now();
+        let _ = run(&paths);
+        let probe_time = probed.elapsed();
+
+        let looked_up = std::time::Instant::now();
+        let second = cached(&paths);
+        let lookup_time = looked_up.elapsed();
+
+        assert_eq!(first, second, "the cache returned a different report");
+        assert!(
+            lookup_time * 4 < probe_time || probe_time < std::time::Duration::from_micros(200),
+            "the second `cached` took {lookup_time:?} against a {probe_time:?} probe, \
+             so it probably probed again"
+        );
+    }
+
+    /// Two data roots are two reports: one check reads the directory, and a
+    /// supervisor started with `--data-root` must not be told about another
+    /// root's guest kernel.
+    #[test]
+    fn the_cache_is_keyed_by_the_data_directory() {
+        let a = tempfile::tempdir().expect("a temp dir");
+        let b = tempfile::tempdir().expect("a temp dir");
+        let (pa, pb) = (
+            crate::Paths::rooted(a.path()),
+            crate::Paths::rooted(b.path()),
+        );
+
+        std::fs::create_dir_all(pb.krun()).expect("the krun directory");
+        std::fs::write(pb.krun().join(crate::backend::vm::KERNEL_FILE), b"file")
+            .expect("the kernel file");
+
+        let kernel_line = |report: &Report| {
+            report
+                .checks
+                .iter()
+                .find(|c| c.name == "guest kernel")
+                .map(|c| c.status)
+        };
+        if kernel_line(&run(&pa)).is_none() {
+            return; // not Linux; there is no such line to tell apart
+        }
+        assert_ne!(
+            kernel_line(&cached(&pa)),
+            kernel_line(&cached(&pb)),
+            "both roots got one report, so the cache is keyed by nothing"
         );
     }
 

@@ -16,7 +16,7 @@ an error, not a warning.
 | `entry` | path | — | The handler file. Sets *agent* mode: the runtime loads it once and forks per request. Relative to the spec file. |
 | `cmd` | list | image's `CMD` | The program to run. With no `runtime`, sets *warm-exec* mode: a fresh process per request, event on stdin, JSON on stdout. |
 | `mode` | `function` \| `stdin` | `function` | How an agent calls the handler: `handler(event)` returning the result, or the event on stdin and the result from stdout. |
-| `runtime` | `python` | inferred from `entry` | Which agent. Only Python ships built in; anything else runs as warm-exec. |
+| `runtime` | `python`, `node` | inferred from `entry` extension | Which agent lives in the sandbox. Two ship built in; anything else runs as warm-exec, or brings its own agent (`runtime = { agent = "/path/in/sandbox" }`). |
 | `requirements` | path | — | A `requirements.txt`, installed once into a venv *inside the image* and mounted read-only at `/venv`. Keyed on the image digest and the file's bytes. |
 | `system` | list | `[]` | apt packages, installed once into a derived layer of the image. Debian package names, optionally `=version`. |
 | `nix` | list | `[]` | Declared, not implemented. |
@@ -27,7 +27,7 @@ an error, not a warning.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `isolation` | `ns` \| `vm` \| `gvisor` | `ns` | Where the boundary is. `ns` is built; `gvisor` runs one-shot sandboxes after `zygo backend install gvisor`, and refuses warm and networked ones; `vm` boots a guest and runs one-shot sandboxes, with a read-only root and no writable scratch, no network and no warm functions. |
+| `isolation` | `ns` \| `vm` \| `gvisor` | `ns` | Where the boundary is. `ns` is built; `gvisor` runs one-shot sandboxes after `zygo backend install gvisor`, and refuses warm and networked ones; `vm` boots a guest and runs one-shot sandboxes; the guest writes to a private layer over the image, bounded by `scratch`; no network and no warm functions. |
 | `seccomp` | `default` \| `strict` \| `permissive` | `default` | The syscall allowlist. See [seccomp profiles](seccomp-profiles.md). |
 
 ## Limits

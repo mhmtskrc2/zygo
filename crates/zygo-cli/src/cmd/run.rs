@@ -18,6 +18,12 @@ use crate::output::{self, Style};
 use crate::tty;
 
 pub fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<u8> {
+    // Where a one-shot run spends its time, in three phases, because "the
+    // p99 is twenty times the p50 on this host" cannot be acted on without
+    // knowing *which* twenty milliseconds became twenty seconds. `zygo bench
+    // warm` has had this breakdown from the start; the one-shot path did not,
+    // and a Raspberry Pi with a saturated SD card is where that showed.
+    let planning = std::time::Instant::now();
     let overrides = args.to_layer()?;
     let options = zygo_core::spec::ResolveOptions {
         one_shot: true,
@@ -88,6 +94,36 @@ pub fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<u8> {
         }
     };
 
+    // A running supervisor already sits in a delegated, built cgroup — the
+    // one thing this process, on an ordinary systemd session, cannot get
+    // into: it would need a transient scope, a second `zygo`, and a cgroup
+    // tree built and torn down per command, and cgroup delegation
+    // containment forbids the cheaper move (`scope.rs` has the numbers:
+    // 45 ms against 11). So when a supervisor is up the sandbox is started
+    // *there*, with this process's own three streams handed over, and this
+    // process does what it would have done anyway: forward its terminal's
+    // signals and wait.
+    //
+    // Everything up to here — the spec, the flags, the pull on first use —
+    // stays local, because the supervisor does not pull and the store is
+    // shared. Everything after is the supervisor's, resolved from the same
+    // spec and layer so the run is the run it would have been.
+    //
+    // `--tty` stays local: it builds a pty pair and relays it, and handing a
+    // terminal that already belongs to a shell's session to a sandbox that
+    // wants it as its own is a `TIOCSCTTY` the kernel refuses. `--dry-run`
+    // prints a plan and starts nothing.
+    #[cfg(target_os = "linux")]
+    if !args.dry_run
+        && !args.tty
+        && resolved.isolation == zygo_core::spec::Isolation::Ns
+        && let Ok(client) = zygo_core::supervisor::client::Client::connect(store.paths())
+    {
+        return run_through_supervisor(
+            cli, args, client, &spec, &overrides, &options, &resolved, planning,
+        );
+    }
+
     // `system = [...]` from the spec: the packages installed once, as a layer.
     let entry = if resolved.system.is_empty() {
         entry
@@ -157,7 +193,7 @@ pub fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<u8> {
     let overlay_supported = !matches!(
         resolved.isolation,
         zygo_core::spec::Isolation::Gvisor | zygo_core::spec::Isolation::Vm
-    ) && zygo_core::doctor::run(store.paths())
+    ) && zygo_core::doctor::cached(store.paths())
         .checks
         .iter()
         .any(|c| c.name == "overlayfs (userns)" && c.status == zygo_core::doctor::Status::Ok);
@@ -242,7 +278,14 @@ pub fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<u8> {
     }
 
     let backend = backend::for_isolation(resolved.isolation, store.paths())?;
+    let plan_ms = planning.elapsed().as_secs_f64() * 1000.0;
+
+    // Everything between here and `wait`: `clone3`, the mount plan,
+    // `pivot_root`, the cgroup, seccomp, Landlock, and `execve`. The program
+    // has not run one instruction of its own when this phase ends.
+    let starting = std::time::Instant::now();
     let mut sandbox = backend.start(&config)?;
+    let start_ms = starting.elapsed().as_secs_f64() * 1000.0;
 
     // The slave belongs to the sandbox now; holding it open here would keep the
     // pty alive after the sandbox exits and the relay would never see EOF.
@@ -290,13 +333,129 @@ pub fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<u8> {
         oom_killed: kernel.oom_kills > 0,
         peak_rss_kb: kernel.peak_rss_kb,
         wall_ms: started.elapsed().as_secs_f64() * 1000.0,
+        plan_ms,
+        start_ms,
     };
     if let Some(path) = &args.outcome {
         outcome.write(path)?;
     }
+    // On stderr, and only when asked: standard output belongs to the program,
+    // and a line per run is noise everywhere except the run being looked at.
+    if cli.verbose > 0 && !args.quiet {
+        eprintln!(
+            "timing: plan {plan_ms:.1} ms, start {start_ms:.1} ms, run {:.1} ms",
+            outcome.wall_ms
+        );
+    }
 
     let code = waited?;
     Ok(code.clamp(0, 255) as u8)
+}
+
+/// `zygo run`, with the sandbox started by the supervisor on this process's
+/// behalf. See the branch in [`run`] for why.
+///
+/// The conversation is `RUN` → three descriptors over `SCM_RIGHTS` →
+/// `STARTED{pid}` → … → `RAN{…}`. The pid arrives first so the terminal's
+/// signals can be forwarded while the program runs; the wait has the
+/// sandbox's own deadline plus grace as a liveness bound, and the supervisor
+/// enforces the real deadline through the cgroup either way.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn run_through_supervisor(
+    cli: &Cli,
+    args: &RunArgs,
+    mut client: zygo_core::supervisor::client::Client,
+    spec: &Spec,
+    layer: &zygo_core::spec::Layer,
+    options: &zygo_core::spec::ResolveOptions,
+    resolved: &zygo_core::spec::ResolvedFn,
+    planning: std::time::Instant,
+) -> anyhow::Result<u8> {
+    use zygo_core::supervisor::protocol::{Request, Response};
+
+    let request = Request::Run {
+        spec: Some(Box::new(spec.clone())),
+        layer: Box::new(layer.clone()),
+        // Absolute, because `.` means this process's directory and the
+        // supervisor is in another one.
+        base_dir: std::path::absolute(spec.base_dir())?,
+        allow_host_net: options.allow_host_net,
+        allow_private_net: options.allow_private_net,
+        allow_unlimited: options.allow_unlimited,
+        tty: false,
+        ignored_signals: ignored_signals(),
+    };
+    let plan_ms = planning.elapsed().as_secs_f64() * 1000.0;
+
+    let starting = std::time::Instant::now();
+    let pid = client.run_start(&request, [0, 1, 2])?;
+    let start_ms = starting.elapsed().as_secs_f64() * 1000.0;
+
+    // The sandbox is the supervisor's child, not this process's, but it is
+    // this process's terminal: a Ctrl-C typed here reaches here.
+    forward_signals(pid);
+
+    // Zero is `--timeout 0`, as long as it takes: no liveness bound either.
+    let deadline = resolved.limits.timeout.get();
+    let budget = (!deadline.is_zero()).then(|| deadline + std::time::Duration::from_secs(30));
+    let ran = client.run_wait(budget)?;
+    let Response::Ran {
+        exit_code,
+        timed_out,
+        oom_killed,
+        peak_rss_kb,
+        wall_ms,
+    } = ran
+    else {
+        anyhow::bail!("the supervisor answered {ran:?} rather than RAN");
+    };
+
+    let outcome = Outcome {
+        exit_code,
+        timed_out,
+        oom_killed,
+        peak_rss_kb,
+        wall_ms,
+        plan_ms,
+        start_ms,
+    };
+    if let Some(path) = &args.outcome {
+        outcome.write(path)?;
+    }
+    if cli.verbose > 0 && !args.quiet {
+        eprintln!(
+            "timing: plan {plan_ms:.1} ms, start {start_ms:.1} ms, run {wall_ms:.1} ms \
+             (through the supervisor)"
+        );
+    }
+    if timed_out && !args.quiet {
+        eprintln!(
+            "error: the sandbox exceeded its {:?} deadline and was killed",
+            resolved.limits.timeout.get()
+        );
+    }
+    Ok(exit_code.clamp(0, 255) as u8)
+}
+
+/// The signals this process ignores, as the mask a supervisor applies to a
+/// program it starts for us — bit `n - 1` for signal `n`.
+///
+/// A sandbox this process starts itself inherits them; one the supervisor
+/// starts would inherit the supervisor's instead, and `nohup zygo run …`
+/// has to mean the same thing either way.
+#[cfg(target_os = "linux")]
+fn ignored_signals() -> u64 {
+    let mut mask = 0u64;
+    for signal in 1..=64 {
+        // SAFETY: a query, with a null new action; `action` is a live local.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        let queried = unsafe { libc::sigaction(signal, std::ptr::null(), &mut action) } == 0;
+        if queried && action.sa_sigaction == libc::SIG_IGN {
+            mask |= 1u64 << (signal - 1);
+        }
+    }
+    mask
 }
 
 /// Why a one-shot sandbox ended, beyond its exit status.
@@ -308,7 +467,14 @@ struct Outcome {
     /// The kernel killed something here for running out of memory.
     oom_killed: bool,
     peak_rss_kb: u64,
+    /// The program's own time: from `execve` to exit, including the
+    /// backend's teardown of the sandbox afterwards.
     wall_ms: f64,
+    /// Before the sandbox: the spec, the image store, the host probe, the
+    /// rootfs view. Reads, mostly; on a slow disk this is where they show.
+    plan_ms: f64,
+    /// Building the sandbox, up to and including `execve`.
+    start_ms: f64,
 }
 
 impl Outcome {
@@ -339,28 +505,56 @@ impl Drop for Scratch {
     }
 }
 
-/// Relay `SIGINT` and `SIGTERM` to the sandbox's init process.
+/// Relay this process's terminal signals to the sandbox.
 ///
-/// Signalling pid 1 of a pid namespace is how the whole tree is reached: the
-/// kernel tears the namespace down when its init exits.
+/// The program in the sandbox is pid 1 of its pid namespace, and the kernel
+/// delivers a signal from outside a pid namespace to its init only if init
+/// has a handler for it: a Python program gets its `KeyboardInterrupt`, a
+/// `sleep` gets nothing. So each signal goes to init *and* to init's process
+/// group — the sandbox started with `setsid`, so that is everything it
+/// forked, and a child dying of `SIGINT` ends a shell the way a terminal's
+/// Ctrl-C does — and the **second** signal of any kind is a `SIGKILL` to
+/// init, which is the one signal a namespace init cannot ignore and which
+/// takes the whole namespace with it. One Ctrl-C asks; two insist.
+///
+/// The same relay serves a sandbox this process started and one a supervisor
+/// started for it: in both the pid is init's, seen from here.
 #[cfg(unix)]
 fn forward_signals(pid: u32) {
     use std::sync::atomic::{AtomicU32, Ordering};
     static TARGET: AtomicU32 = AtomicU32::new(0);
+    static DELIVERED: AtomicU32 = AtomicU32::new(0);
     TARGET.store(pid, Ordering::SeqCst);
 
     extern "C" fn relay(signal: i32) {
-        let pid = TARGET.load(Ordering::SeqCst);
-        if pid != 0 {
-            // SAFETY: `kill` is async-signal-safe, which is the whole
-            // constraint on a signal handler.
-            unsafe { libc::kill(pid as libc::pid_t, signal) };
+        let pid = TARGET.load(Ordering::SeqCst) as libc::pid_t;
+        if pid == 0 {
+            return;
+        }
+        // SAFETY: `kill` is async-signal-safe, which is the whole
+        // constraint on a signal handler; the atomics are lock-free.
+        unsafe {
+            if DELIVERED.fetch_add(1, Ordering::SeqCst) > 0 {
+                libc::kill(pid, libc::SIGKILL);
+                return;
+            }
+            libc::kill(pid, signal);
+            // `ESRCH` when init leads no group of its own — a sandbox this
+            // process started shares its group, and the terminal has already
+            // signalled that group itself.
+            libc::kill(-pid, signal);
         }
     }
 
     for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-        // SAFETY: the handler only reads an atomic and calls `kill`.
-        unsafe { libc::signal(signal, relay as *const () as libc::sighandler_t) };
+        // SAFETY: the handler only reads atomics and calls `kill`.
+        let previous = unsafe { libc::signal(signal, relay as *const () as libc::sighandler_t) };
+        // A signal this process was told to ignore — `nohup zygo run …`, or
+        // a job a script put in the background — is not one to pass on.
+        if previous == libc::SIG_IGN {
+            // SAFETY: restoring the disposition just read.
+            unsafe { libc::signal(signal, libc::SIG_IGN) };
+        }
     }
 }
 

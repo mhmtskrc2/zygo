@@ -30,7 +30,7 @@ for. Three trust classes, from the design:
 **The `vm` backend runs one-shot sandboxes.** A guest boots, the program runs
 under a kernel of its own, and the root filesystem is read-only at the device
 rather than by a mount option the guest could change. What it does not have
-yet: any writable scratch inside the guest, networking, warm functions, and
+yet: networking, warm functions, and
 its own in-guest cgroups, seccomp and Landlock — so a tenant's limits are the
 VMM's host-side cgroup and nothing finer. Until those land, T3 workloads do not have the boundary the
 design assigns them, and the honest answer for anonymous code today is a
@@ -115,16 +115,24 @@ Said plainly, because `zygo doctor` says it too:
 * **`cgroup.kill` needs 5.14.** Below it, killing a request's process tree
   falls back to freeze → signal → thaw, which is a race the freeze closes but
   which is more machinery than one write.
-* **The seccomp profiles were only recently run against real packages.**
-  The [compatibility matrix](seccomp-profiles.md) now exercises five packages
-  under `default` and `strict`, and its first run found the filter denying
-  every thread and `strict` denying the agent its own control socket. Both
-  are fixed and pinned by tests — but a control that has been run against five
-  packages has been run against five packages. The agent's forked child is
-  tightened further under `strict` (no `execve`, no new process) — by the
-  agent, at the supervisor's request, which means only agents that honour
-  `ZYGO_CHILD_SECCOMP` have it. The Python reference agent does; the Node and
-  sh examples do not.
+* **The seccomp profiles have been run against a sample, not a population.**
+  The [compatibility matrix](seccomp-profiles.md) exercises seven Python
+  packages and three Node cases under `default` and `strict`, and each round
+  of widening has found something: the filter denying every thread, `strict`
+  denying the agent its own control socket, and — when Node was added —
+  `strict` removing `socketpair`, which libuv uses for every pipe, so a
+  `strict` Node function could not start a worker at all. All are fixed and
+  pinned by tests. A control that has been run against ten cases has been run
+  against ten cases.
+
+  The agent's forked child is tightened further under `strict` (no `execve`,
+  no new process) — by the agent, at the supervisor's request. `zygo agent
+  test` now checks this rather than trusting it: an agent that ignores
+  `ZYGO_CHILD_SECCOMP` and runs the request anyway fails conformance. The
+  Python agent installs the filter; the Node agent installs it when the image
+  has the helper object and otherwise falls back to Node's permission model,
+  which is weaker against a V8 escape and says so in `READY`; the `sh`
+  example refuses the request outright.
 * **On Ubuntu 24.04 and later, Zygo asks you to turn something off.**
   `kernel.apparmor_restrict_unprivileged_userns=1` stops an unprivileged
   process mounting inside a user namespace, which is the first thing every

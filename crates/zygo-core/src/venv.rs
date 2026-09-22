@@ -220,7 +220,7 @@ fn build(store: &Store, image: &ImageEntry, requirements: &Path, dir: &Path) -> 
     let spec = build_spec(&image.reference, requirements, dir);
 
     let mount_points = crate::sandbox::mount::required_mount_points(&spec.mounts);
-    let overlay = crate::doctor::run(store.paths())
+    let overlay = crate::doctor::cached(store.paths())
         .checks
         .iter()
         .any(|c| c.name == "overlayfs (userns)" && c.status == crate::doctor::Status::Ok);

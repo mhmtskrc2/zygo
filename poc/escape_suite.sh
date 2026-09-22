@@ -249,37 +249,108 @@ else
     bad "the sandbox sees $count processes ($out)"
 fi
 
-# --- 10. privileged syscalls ------------------------------------------------
+# --- 10. privileged syscalls, under every profile ---------------------------
+#
+# The threat model names four vectors by name — `io_uring`, `userfaultfd`,
+# `bpf` and `ptrace` — and this used to attempt them under whatever profile
+# `zygo run` happened to default to, with nothing proving the attempt reached
+# the kernel at all. A syscall number that is wrong for this architecture, and
+# a `libc.syscall` that never ran, both produce "refused" and both look like a
+# result.
+#
+# So: all three profiles, and two controls.
+#
+#   * `getpid` through the *same* `libc.syscall` path. It is on every
+#     allowlist, so a non-positive answer means the mechanism is broken and
+#     nothing else in the probe is evidence.
+#   * `ptrace` under `permissive`, which is the one profile that grants it. A
+#     `ptrace` refused everywhere looks identical whether the filter is
+#     working or the number is wrong; one that is *reachable* under
+#     `permissive` and `EPERM` under the other two proves the number is right
+#     and the filter is what refuses it.
 
 say "10. reach the syscalls that bypass or undo confinement"
-out=$(py "
+
+# The probe, written once and run under each profile in turn.
+SYSCALL_PROBE=$(cat <<'PYEOF'
 import ctypes, platform
 libc = ctypes.CDLL('libc.so.6', use_errno=True)
 arm = platform.machine() == 'aarch64'
+
+# Generated from each architecture's own headers; see
+# crates/zygo-core/src/backend/ns/syscalls.rs, which `make syscall-tables`
+# regenerates. A name with the wrong number here would read as "refused".
 calls = {
-    'bpf':             280 if arm else 321,
-    'perf_event_open': 241 if arm else 298,
-    'keyctl':          219 if arm else 250,
-    'userfaultfd':     282 if arm else 323,
-    'io_uring_setup':  425,
-    'ptrace':          117 if arm else 101,
-    'process_vm_readv': 270 if arm else 310,
-    'kcmp':            272 if arm else 312,
+    'bpf':                280 if arm else 321,
+    'io_uring_enter':     426,
+    'io_uring_register':  427,
+    'io_uring_setup':     425,
+    'kcmp':               272 if arm else 312,
+    'keyctl':             219 if arm else 250,
+    'perf_event_open':    241 if arm else 298,
+    'process_vm_readv':   270 if arm else 310,
+    'ptrace':             117 if arm else 101,
+    'userfaultfd':        282 if arm else 323,
 }
+GETPID = 172 if arm else 39
+
+# Control: the same path, on a syscall every profile allows.
+if libc.syscall(GETPID) <= 0:
+    print('CONTROL-FAILED')
+    raise SystemExit
+
 reached = []
 for name, nr in sorted(calls.items()):
+    ctypes.set_errno(0)
     rc = libc.syscall(nr, 0, 0, 0, 0, 0, 0)
-    # EPERM is the seccomp filter. Anything else means the call was reached.
+    # EPERM is the seccomp filter. Anything else means the call was reached
+    # and the kernel itself answered — EFAULT or EINVAL for the null
+    # arguments above, ENOSYS where the kernel has no such call built in.
     if not (rc == -1 and ctypes.get_errno() == 1):
-        reached.append('%s(rc=%d,errno=%d)' % (name, rc, ctypes.get_errno()))
-print(';'.join(reached) if reached else 'all-refused')")
-if [ -z "$out" ]; then
-    nothing_ran "10. privileged syscalls"
-elif [ "$out" = "all-refused" ]; then
-    ok "every privileged syscall returns EPERM"
-else
-    bad "reached: $out"
-fi
+        reached.append('%s(errno=%d)' % (name, ctypes.get_errno()))
+print(';'.join(reached) if reached else 'all-refused')
+PYEOF
+)
+
+for profile in permissive default strict; do
+    out=$(zygo run --seccomp "$profile" "$IMAGE" python3 -c "$SYSCALL_PROBE" 2>/tmp/escape.err)
+    if [ -z "$out" ]; then
+        nothing_ran "10. privileged syscalls under --seccomp $profile"
+        continue
+    fi
+    if [ "$out" = CONTROL-FAILED ]; then
+        skip "10. under --seccomp $profile: getpid failed through the same path, so nothing here is evidence"
+        continue
+    fi
+
+    if [ "$profile" = permissive ]; then
+        # `permissive` adds `ptrace` and nothing else from this list. That it
+        # is reachable *here* is the proof the numbers are right.
+        case "$out" in
+            *ptrace*) ok "under --seccomp permissive, ptrace is reachable — the probe can tell reached from refused" ;;
+            all-refused) bad "ptrace was refused under permissive, which grants it: either the number is wrong or the probe never reached the kernel" ;;
+            *) bad "under permissive, ptrace was refused but $out was reached" ;;
+        esac
+        # `permissive` is the debugging profile and grants exactly two names
+        # from this probe: `ptrace` and `process_vm_readv`, both of which it
+        # is documented to. Everything else stays refused even here —
+        # `io_uring` and `userfaultfd` were reachable until this check
+        # existed, which is what removed them from `PERMISSIVE_EXTRA`.
+        rest=$(printf '%s' "$out" | tr ';' '\n' \
+            | grep -v '^ptrace' | grep -v '^process_vm_readv' | tr '\n' ' ')
+        if [ -z "$rest" ]; then
+            ok "and bpf, io_uring, userfaultfd, keyctl, perf_event_open and kcmp are refused even under permissive"
+        else
+            bad "under permissive, these were reached as well: $rest"
+        fi
+    else
+        if [ "$out" = all-refused ]; then
+            ok "under --seccomp $profile, all ten return EPERM — including io_uring, userfaultfd, bpf and ptrace"
+        else
+            bad "under --seccomp $profile, reached: $out"
+        fi
+    fi
+done
 
 # --- 11. writing through a read-only mount ----------------------------------
 

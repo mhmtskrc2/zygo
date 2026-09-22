@@ -520,7 +520,8 @@ impl Supervisor {
         let status = function.status();
         let warnings = resolved.warnings.clone();
         let entry = Arc::new(Entry {
-            gate: Gate::new(
+            gate: Gate::named(
+                name,
                 resolved.concurrency,
                 Gate::default_queue_limit(resolved.concurrency),
             ),
@@ -539,6 +540,11 @@ impl Supervisor {
             let mut functions = self.functions.lock().expect("registry");
             functions.insert(name.to_string(), Arc::clone(&entry))
         };
+        tracing::debug!(
+            function = name,
+            replaced = previous.is_some(),
+            "registered; retiring the previous entry next"
+        );
         // A cold registration under this name is superseded too, whether this
         // is the wake-up that was waiting for it or a deploy over it.
         let was_cold = self.cold.lock().expect("cold").remove(name).is_some();
@@ -699,6 +705,76 @@ impl Supervisor {
     }
 
     /// Route one request to its function.
+    /// Run a one-shot sandbox on a client's behalf, with the client's streams.
+    ///
+    /// The start goes to the launcher thread like every other start (see
+    /// [`Launcher`]); the *wait* stays here, on this connection's own thread,
+    /// because a launcher that waited would hold every other start on the
+    /// machine for as long as this program ran.
+    ///
+    /// `started` is called with the pid and the cgroup as soon as the sandbox
+    /// exists and before it is waited on, so the client can forward its
+    /// terminal's signals to it — a Ctrl-C at the client reaches the client,
+    /// and the sandbox is this process's child, not the client's — and so the
+    /// connection can kill it if the client goes away (see [`ClientWatch`]).
+    pub fn run(
+        &self,
+        spec: Option<&Spec>,
+        layer: &Layer,
+        options: &ResolveOptions,
+        client: crate::pool::ClientStreams,
+        mut started: impl FnMut(u32, Option<&std::path::Path>) -> Result<()>,
+    ) -> std::result::Result<Response, Response> {
+        let owned;
+        let spec = match spec {
+            Some(s) => s,
+            None => {
+                owned = Spec::default();
+                &owned
+            }
+        };
+        // `resolve`, not `resolve_for_serve`: this is `zygo run`'s own
+        // resolution, one-shot rules and all, so a run through the
+        // supervisor is the same run it would have been without one.
+        let resolved = spec
+            .resolve(None, layer, options)
+            .map_err(|e| Response::error(ControlError::BadSpec, e))?;
+
+        // On the launcher thread, never here: see [`Launcher`].
+        let pool = Arc::clone(&self.pool);
+        let oneshot = self
+            .launcher
+            .run(move || pool.start_oneshot(&resolved, client))
+            .map_err(|e| Response::error(ControlError::WarmFailed, e))?
+            .map_err(|e| Response::error(ControlError::WarmFailed, e))?;
+        let crate::pool::Oneshot {
+            mut sandbox,
+            newroot,
+        } = oneshot;
+
+        started(sandbox.pid(), sandbox.cgroup())
+            .map_err(|e| Response::error(ControlError::CallFailed, e))?;
+
+        let clock = Instant::now();
+        let waited = sandbox.wait();
+        // Sampled during teardown, the last moment the cgroup exists.
+        let kernel = sandbox.outcome();
+        // Its `pivot_root` target: empty once the sandbox is gone, and left
+        // in place if it is not, for the reason `zygo run` gives.
+        let _ = std::fs::remove_dir(&newroot);
+
+        Ok(Response::Ran {
+            exit_code: match &waited {
+                Ok(code) => (*code).clamp(0, 255),
+                Err(e) => e.exit_code(),
+            },
+            timed_out: waited.as_ref().err().is_some_and(Error::timed_out),
+            oom_killed: kernel.oom_kills > 0,
+            peak_rss_kb: kernel.peak_rss_kb,
+            wall_ms: clock.elapsed().as_secs_f64() * 1000.0,
+        })
+    }
+
     pub fn exec(
         &self,
         name: &str,
@@ -727,8 +803,20 @@ impl Supervisor {
                 Attempt::Closed(event) => event,
             };
             match self.lookup(name) {
-                Ok(current) if !Arc::ptr_eq(&current, &entry) => entry = current,
-                _ => break,
+                Ok(current) if !Arc::ptr_eq(&current, &entry) => {
+                    tracing::debug!(
+                        function = name,
+                        "gate closed under a request; redirecting to the replacement"
+                    );
+                    entry = current;
+                }
+                _ => {
+                    tracing::debug!(
+                        function = name,
+                        "gate closed under a request and nothing replaced it"
+                    );
+                    break;
+                }
             }
         }
         Err(Response::error(
@@ -1024,8 +1112,10 @@ impl Supervisor {
     /// held by a request in flight; the sandbox dies when the last one lets go,
     /// which is the behaviour a caller mid-request wants.
     fn retire(&self, entry: Arc<Entry>) {
+        tracing::debug!(function = %entry.resolved.name, "retire: closing the gate");
         entry.gate.close();
         let _ = entry.function.shutdown();
+        tracing::debug!(function = %entry.resolved.name, "retire: shut down");
     }
 }
 
@@ -1217,12 +1307,17 @@ fn handle(supervisor: &Supervisor, stream: UnixStream) -> Result<()> {
         return Ok(());
     }
 
+    let dup = |s: &UnixStream| {
+        s.try_clone()
+            .map_err(|e| Error::primitive("dup", "control socket", e))
+    };
+    // The socket itself, for the one request whose payload is not all in the
+    // frame: `RUN` is followed by three descriptors over `SCM_RIGHTS`, and a
+    // `FrameReader` — which reads exactly a header and exactly a body, never
+    // ahead — is positioned on the first of them when the frame is done.
+    let raw = dup(&stream)?;
     let mut reader: crate::protocol::frame::FrameReader<_, Request> =
-        crate::protocol::frame::FrameReader::new(
-            stream
-                .try_clone()
-                .map_err(|e| Error::primitive("dup", "control socket", e))?,
-        );
+        crate::protocol::frame::FrameReader::new(dup(&stream)?);
     let mut writer: crate::protocol::frame::FrameWriter<_, Response> =
         crate::protocol::frame::FrameWriter::new(stream);
 
@@ -1232,7 +1327,64 @@ fn handle(supervisor: &Supervisor, stream: UnixStream) -> Result<()> {
         .map_err(|e| Error::primitive("read", "control socket", std::io::Error::other(e)))?
     {
         let shutting_down = matches!(request, Request::Shutdown);
-        let response = dispatch(supervisor, request, &mut greeted);
+        let response = match request {
+            Request::Run {
+                spec,
+                layer,
+                base_dir,
+                allow_host_net,
+                allow_private_net,
+                allow_unlimited,
+                tty,
+                ignored_signals,
+            } if greeted => {
+                let options = ResolveOptions {
+                    allow_host_net,
+                    allow_private_net,
+                    allow_unlimited,
+                    base_dir: Some(base_dir),
+                    one_shot: true,
+                };
+                // Received before anything else, and before deciding
+                // anything: the client has already sent them, and leaving
+                // them on the socket would put the next frame out of
+                // alignment.
+                let stdio = receive_stdio(&raw);
+                match stdio {
+                    Ok(stdio) => {
+                        let watch = ClientWatch::start(&raw);
+                        let client = crate::pool::ClientStreams {
+                            stdio,
+                            tty,
+                            ignored_signals,
+                        };
+                        let ran = supervisor.run(
+                            spec.as_deref(),
+                            &layer,
+                            &options,
+                            client,
+                            |pid, cgroup| {
+                                watch.started(pid, cgroup);
+                                writer.write(&Response::Started { pid }).map_err(|e| {
+                                    Error::primitive(
+                                        "write",
+                                        "control socket",
+                                        std::io::Error::other(e),
+                                    )
+                                })
+                            },
+                        );
+                        watch.finished();
+                        merge(ran)
+                    }
+                    Err(e) => Response::error(
+                        ControlError::BadMessage,
+                        format!("RUN's descriptors did not arrive: {e}"),
+                    ),
+                }
+            }
+            other => dispatch(supervisor, other, &mut greeted),
+        };
         writer
             .write(&response)
             .map_err(|e| Error::primitive("write", "control socket", std::io::Error::other(e)))?;
@@ -1318,7 +1470,146 @@ fn dispatch(supervisor: &Supervisor, request: Request, greeted: &mut bool) -> Re
             failed,
         } => merge(supervisor.logs(&name, after, limit, failed)),
         Request::Shutdown => Response::Ok,
+        // Intercepted in `handle`, which has the socket the descriptors
+        // arrive on; a `RUN` that reaches this table was sent to a code path
+        // that cannot receive them.
+        Request::Run { .. } => Response::error(
+            ControlError::BadMessage,
+            "RUN carries descriptors and is answered before dispatch",
+        ),
     }
+}
+
+/// What happens to a `RUN` sandbox when its client goes away.
+///
+/// A sandbox `zygo run` starts itself has `PR_SET_PDEATHSIG`: when that
+/// `zygo` dies, the kernel kills the sandbox. A sandbox started here is this
+/// process's child, and the client's death is only a hang-up on its socket —
+/// so a thread watches the socket and delivers the kill the kernel would
+/// have. Without it a client killed with `SIGKILL`, or a terminal that
+/// vanished without a `SIGHUP`, left the program running to its deadline,
+/// or for ever under `--allow-unlimited`, writing into a pipe nobody read.
+///
+/// `poll` for `POLLRDHUP` only, so data on the socket does not wake it, and
+/// with a short timeout so the thread notices [`ClientWatch::finished`] and
+/// ends soon after the run does rather than living as long as the
+/// connection.
+struct ClientWatch {
+    done: Arc<AtomicBool>,
+    target: Arc<Mutex<Option<WatchTarget>>>,
+}
+
+/// The sandbox a hang-up kills: its init, and its cgroup when it has one.
+#[derive(Clone)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct WatchTarget {
+    pid: u32,
+    cgroup: Option<PathBuf>,
+}
+
+impl ClientWatch {
+    fn start(client: &UnixStream) -> ClientWatch {
+        let watch = ClientWatch {
+            done: Arc::new(AtomicBool::new(false)),
+            target: Arc::new(Mutex::new(None)),
+        };
+        // Its own descriptor, so a number the connection closes and the
+        // kernel hands to somebody else is never polled here.
+        if let Ok(own) = client.try_clone() {
+            let done = Arc::clone(&watch.done);
+            let target = Arc::clone(&watch.target);
+            std::thread::Builder::new()
+                .name("client-watch".into())
+                .spawn(move || ClientWatch::watch(own, &done, &target))
+                .ok();
+        }
+        watch
+    }
+
+    /// The sandbox exists: this is what a hang-up kills from now on.
+    fn started(&self, pid: u32, cgroup: Option<&std::path::Path>) {
+        if let Ok(mut target) = self.target.lock() {
+            *target = Some(WatchTarget {
+                pid,
+                cgroup: cgroup.map(PathBuf::from),
+            });
+        }
+    }
+
+    /// The sandbox has been reaped: nothing left to kill, and its pid may be
+    /// somebody else's soon.
+    fn finished(&self) {
+        self.done.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn watch(own: UnixStream, done: &AtomicBool, target: &Mutex<Option<WatchTarget>>) {
+        use std::os::fd::AsRawFd;
+        /// `POLLRDHUP`: the peer shut its side down. Kernel ABI since 2.6.17.
+        const POLLRDHUP: libc::c_short = 0x2000;
+        let mut pfd = libc::pollfd {
+            fd: own.as_raw_fd(),
+            events: POLLRDHUP,
+            revents: 0,
+        };
+        while !done.load(Ordering::SeqCst) {
+            pfd.revents = 0;
+            // SAFETY: `pfd` is a live local naming a descriptor this thread
+            // owns; a 250 ms timeout bounds the call.
+            let rc = unsafe { libc::poll(&mut pfd, 1, 250) };
+            let hung_up = rc > 0
+                && pfd.revents & (POLLRDHUP | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0;
+            if !hung_up {
+                continue;
+            }
+            // The start may still be queued on the launcher: wait for a pid
+            // rather than letting a sandbox that starts a moment later run
+            // for nobody.
+            while !done.load(Ordering::SeqCst) {
+                let target = target.lock().ok().and_then(|t| t.clone());
+                let Some(WatchTarget { pid, cgroup }) = target else {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                };
+                tracing::info!(pid, "RUN client went away; killing its sandbox");
+                // `cgroup.kill` takes the subtree in one write and cannot
+                // reach a reused pid; the pid is for a kernel without it.
+                let killed = cgroup
+                    .as_deref()
+                    .is_some_and(|dir| matches!(crate::cgroup::kill(dir), Ok(true)));
+                if !killed && !done.load(Ordering::SeqCst) {
+                    // SAFETY: `kill` on a pid this process has not reaped.
+                    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                }
+                return;
+            }
+            return;
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn watch(_own: UnixStream, _done: &AtomicBool, _target: &Mutex<Option<WatchTarget>>) {}
+}
+
+/// The three descriptors a `RUN` sends after its frame: stdin, stdout, stderr.
+///
+/// Each arrives as one `SCM_RIGHTS` message with one byte of payload, and
+/// `MSG_CMSG_CLOEXEC` is set at receipt, so none of them can leak into
+/// anything else this supervisor spawns.
+#[cfg(target_os = "linux")]
+fn receive_stdio(raw: &UnixStream) -> std::io::Result<[std::os::fd::OwnedFd; 3]> {
+    use std::os::fd::AsRawFd;
+    let fd = raw.as_raw_fd();
+    Ok([
+        crate::net::linux::recv_fd(fd)?,
+        crate::net::linux::recv_fd(fd)?,
+        crate::net::linux::recv_fd(fd)?,
+    ])
+}
+
+#[cfg(not(target_os = "linux"))]
+fn receive_stdio(_raw: &UnixStream) -> std::io::Result<[std::os::fd::OwnedFd; 3]> {
+    Err(std::io::Error::other("a one-shot sandbox is a Linux thing"))
 }
 
 /// Both arms of these results are already responses; the split only exists so

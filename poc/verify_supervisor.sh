@@ -1988,6 +1988,175 @@ else
 fi
 
 
+say ""
+say "\`zygo run\` through the supervisor"
+# A one-shot sandbox is started by the supervisor when one is running: the
+# client hands over its three streams and waits. Everything a script relies
+# on has to survive the detour — the exit code, both streams, stdin, the
+# outcome file, the deadline — and two things the local path gets from the
+# kernel have to be rebuilt: a Ctrl-C reaching the program, and a dead client
+# taking its sandbox with it.
+work /tmp/sup-run
+
+# Processes running exactly `sleep 30`: the sandboxes below, and nothing
+# this script runs itself.
+sandbox_sleeps() {
+    n=0
+    for d in /proc/[0-9]*; do
+        [ "$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)" = "sleep 30 " ] && n=$((n+1))
+    done
+    echo $n
+}
+
+if "$ZYGO" -v run "$IMAGE" python3 -c pass 2>&1 | grep -q "through the supervisor"; then
+    ok "a one-shot run is started by the supervisor"
+else
+    bad "a one-shot run was not routed through the running supervisor"
+fi
+exits 3 "the program's exit code comes back" "$ZYGO" run "$IMAGE" sh -c "exit 3"
+out=$("$ZYGO" run "$IMAGE" sh -c "echo out; echo err >&2" 2>/dev/null)
+err=$("$ZYGO" run "$IMAGE" sh -c "echo out; echo err >&2" 2>&1 >/dev/null)
+if [ "$out" = "out" ] && [ "$err" = "err" ]; then
+    ok "stdout and stderr stay distinct"
+else
+    bad "the streams were mixed: stdout=[$out] stderr=[$err]"
+fi
+got=$(printf 'shout\n' | "$ZYGO" run "$IMAGE" tr a-z A-Z)
+if [ "$got" = "SHOUT" ]; then
+    ok "stdin reaches the program"
+else
+    bad "stdin did not arrive: [$got]"
+fi
+exits 137 "a deadline is enforced and reported as a kill" \
+    "$ZYGO" run --timeout 1s --outcome outcome.json "$IMAGE" sleep 5
+if grep -q '"timed_out":true' outcome.json 2>/dev/null; then
+    ok "--outcome says it timed out"
+else
+    bad "--outcome did not record the timeout: $(cat outcome.json 2>/dev/null)"
+fi
+
+# Signals. Sent from Python rather than with `&` and `kill`: a job a
+# non-interactive shell puts in the background has SIGINT ignored, the client
+# would keep that, and the sandbox is given the client's dispositions — so
+# the test would be measuring the shell. `signalled SIG N cmd…` starts the
+# command with every signal at its default, sends SIG N times half a second
+# apart after a second, and prints "<exit> <seconds after the last signal>".
+signalled() {
+    python3 - "$@" <<'PY'
+import signal, subprocess, sys, time
+sig, times, argv = getattr(signal, "SIG" + sys.argv[1]), int(sys.argv[2]), sys.argv[3:]
+def defaults():
+    for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
+        signal.signal(s, signal.SIG_DFL)
+p = subprocess.Popen(argv, preexec_fn=defaults)
+time.sleep(1)
+for _ in range(times):
+    p.send_signal(sig)
+    time.sleep(0.5)
+began = time.time()
+code = p.wait()
+print(code, int(time.time() - began))
+PY
+}
+
+# Ctrl-C. The program is pid 1 of its namespace, and a namespace init only
+# receives a signal from outside if it handles it; `sh` does not handle
+# SIGINT, so the signal has to reach the sleep it forked — the process group.
+set -- $(signalled INT 1 "$ZYGO" run "$IMAGE" sh -c "sleep 30")
+if [ "$2" -lt 10 ]; then
+    ok "one Ctrl-C ends a shell and what it forked (exit $1)"
+else
+    bad "Ctrl-C did not end the run: exit $1 after $2 s"
+fi
+
+# A program that handles the signal gets it, and gets to answer.
+set -- $(signalled INT 1 "$ZYGO" run "$IMAGE" python3 -c 'import time
+try:
+    time.sleep(30)
+except KeyboardInterrupt:
+    raise SystemExit(42)')
+if [ "$1" -eq 42 ]; then
+    ok "a program that handles SIGINT receives it"
+else
+    bad "SIGINT did not reach a program that handles it: exit $1 after $2 s"
+fi
+
+# A program that ignores the first signal — `sleep` as init, no handler — is
+# killed by the second.
+set -- $(signalled INT 2 "$ZYGO" run "$IMAGE" sleep 30)
+if [ "$2" -lt 10 ]; then
+    ok "a second Ctrl-C kills a program that ignored the first (exit $1)"
+else
+    bad "two Ctrl-Cs did not end the run: exit $1 after $2 s"
+fi
+
+# A hang-up. To the client it is relayed like the others, and it reaches the
+# shell's child as one would from a terminal.
+set -- $(signalled HUP 1 "$ZYGO" run "$IMAGE" sh -c "sleep 30")
+if [ "$2" -lt 10 ]; then
+    ok "a hang-up ends a shell and what it forked (exit $1)"
+else
+    bad "SIGHUP did not end the run: exit $1 after $2 s"
+fi
+
+# `nohup zygo run …`: what the client ignores, the program ignores, whatever
+# the supervisor was started with. The same hang-up now reaches nothing.
+set -- $(signalled HUP 1 nohup "$ZYGO" run "$IMAGE" sh -c "sleep 2")
+if [ "$1" -eq 0 ]; then
+    ok "a hang-up the client ignores is not passed on"
+else
+    bad "SIGHUP reached a program under nohup: exit $1 after $2 s"
+fi
+
+# From a terminal. The terminal is the shell's, so the sandbox cannot make it
+# its own; it has to use it as three plain descriptors rather than refuse.
+python3 - "$ZYGO" "$IMAGE" <<'PY' > pty.out 2>&1
+import os, pty, select, sys, time
+z, image = sys.argv[1], sys.argv[2]
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv(z, [z, "run", image, "sh", "-c", "echo from-a-terminal"])
+out = b""
+while True:
+    r, _, _ = select.select([fd], [], [], 5)
+    if not r:
+        break
+    try:
+        d = os.read(fd, 4096)
+    except OSError:
+        break
+    if not d:
+        break
+    out += d
+_, status = os.waitpid(pid, 0)
+print(out.decode(errors="replace").strip())
+print("exit", os.waitstatus_to_exitcode(status))
+PY
+if grep -q "^from-a-terminal" pty.out && grep -q "^exit 0$" pty.out; then
+    ok "a run from a terminal uses it without owning it"
+else
+    bad "a run from a terminal failed: $(tr '\n' ' ' < pty.out | cut -c1-200)"
+fi
+
+# A client that dies takes its sandbox with it, as PDEATHSIG does locally.
+"$ZYGO" run "$IMAGE" sleep 30 &
+pid=$!
+sleep 1
+kill -KILL $pid
+wait $pid 2>/dev/null
+i=0
+while [ $i -lt 30 ]; do
+    [ "$(sandbox_sleeps)" -eq 0 ] && break
+    i=$((i+1)); sleep 0.1
+done
+if [ "$(sandbox_sleeps)" -eq 0 ]; then
+    ok "a client killed with SIGKILL takes its sandbox with it"
+else
+    bad "the sandbox outlived a client killed with SIGKILL"
+fi
+
+work /tmp/sup-work
+
 exits 0 "\`stop --all\` stops everything and the supervisor with it" "$ZYGO" stop --all
 i=0
 while [ $i -lt 50 ]; do
@@ -2020,6 +2189,10 @@ for d in /proc/[0-9]*; do
     grep -qs 'zygo\.slice' "$d/cgroup" 2>/dev/null || continue
     leftover=$((leftover+1))
     names="$names $(cat "$d/comm" 2>/dev/null)"
+    # Who they are, not only what: the parent and the arguments say which
+    # path started them, which is the question a leak leaves open.
+    pid=${d#/proc/}
+    say "        $(ps -o pid=,ppid=,etime=,args= -p "$pid" 2>/dev/null | cut -c1-140)"
 done
 if [ "$leftover" -eq 0 ]; then
     ok "no sandbox outlived the supervisor"

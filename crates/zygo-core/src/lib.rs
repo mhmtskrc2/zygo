@@ -56,6 +56,7 @@ pub mod paths;
 pub mod pool;
 pub mod protocol;
 pub mod sandbox;
+pub mod scripts;
 pub mod spec;
 pub mod supervisor;
 pub mod venv;

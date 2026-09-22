@@ -7,6 +7,18 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+readme = "../../README.md"
+keywords = ["sandbox", "container", "seccomp", "namespaces", "serverless"]
+categories = ["virtualization", "os::linux-apis", "development-tools"]
+# The agents are reached through `agents`, a symlink to the repository's own
+# `agents/` directory, because `include_str!` has to stay inside the package
+# root for `cargo install` to work. The tests and the compiled Python beside
+# them are not part of the library.
+exclude = [
+    "agents/**/__pycache__/**",
+    "agents/**/test_*.py",
+    "agents/**/*.test.js",
+]
 
 [features]
 default = ["registry"]

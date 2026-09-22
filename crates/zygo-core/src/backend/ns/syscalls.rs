@@ -502,6 +502,11 @@ pub fn number(name: &str) -> Option<u32> {
 }
 
 /// Whether this architecture is one Zygo can build a filter for.
+///
+/// Decided by the table rather than by a `cfg` of its own, so that adding an
+/// architecture is one `cfg` and one list. The lint that objects to asking a
+/// constant slice whether it is empty is objecting to exactly that.
+#[allow(clippy::const_is_empty)]
 pub fn is_supported() -> bool {
     !TABLE.is_empty() && AUDIT_ARCH != 0
 }

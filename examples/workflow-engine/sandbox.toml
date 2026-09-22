@@ -1,0 +1,23 @@
+# A workflow engine's worker: the scripts are not in this file.
+#
+# That is the point. Everything else in `examples/` declares its functions up
+# front; a workflow engine cannot, because the scripts arrive with the jobs.
+# The worker builds a `[fn.<name>]` table per script at run time and hands it
+# to `PUT /fn/<name>`, which is the same table this file would have held.
+#
+#   zygo api --allow-deploy &        # 127.0.0.1:7700, no token on loopback
+#   python3 worker.py --seed
+#
+# `--allow-deploy` is what lets an API caller create a sandbox rather than
+# only call one that exists. An API without it refuses `PUT /fn/<name>` and
+# says so, which is the right default for an API reachable by anything other
+# than your own worker.
+
+[defaults]
+image = "python:3.12-slim"
+
+[api]
+listen = "127.0.0.1:7700"
+# `none` because this listens on loopback and the worker is on the same host.
+# An API reachable from anywhere else needs `bearer` and a token.
+auth = "none"

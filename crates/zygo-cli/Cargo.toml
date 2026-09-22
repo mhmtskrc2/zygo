@@ -7,6 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+readme = "../../README.md"
+keywords = ["sandbox", "container", "seccomp", "namespaces", "serverless"]
+categories = ["command-line-utilities", "virtualization", "os::linux-apis"]
 
 [[bin]]
 name = "zygo"
@@ -36,6 +39,9 @@ bytes.workspace = true
 reqwest.workspace = true
 sha2.workspace = true
 hex.workspace = true
+# `zygo agent test` hands the `strict` child filter over the way the
+# supervisor does: base64 of the raw program.
+base64.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

@@ -243,27 +243,33 @@ pub fn refuse_what_v1_cannot_do(config: &SandboxConfig) -> Result<()> {
         remedy: remedy.to_string(),
     };
 
+    // Not "yet". Warm functions and guest networking are `ns` features by
+    // decision, recorded in docs/adr/0002-warm-paths-stay-on-ns.md: each
+    // would be a second implementation to keep correct, benchmark and defend,
+    // against the one the product rests on. `vm` is a hardware boundary for
+    // work that fits a one-shot sandbox, and these refusals are the design.
     if config.hold {
         return Err(unsupported(
-            "the vm backend cannot hold a warm sandbox yet: a request enters a guest \
-             over vsock, not through `setns`"
+            "warm functions are an `ns` feature: a request would have to enter the \
+             guest over vsock rather than through `setns` (docs/adr/0002)"
                 .into(),
-            "use --isolation ns for warm functions",
+            "use --isolation ns for warm functions; `vm` is for one-shot runs",
         ));
     }
     if config.agent_fd.is_some() {
         return Err(unsupported(
             "the runtime agent is handed its control socket as an inherited descriptor, \
-             and a guest inherits nothing from the host"
+             and a guest inherits nothing from the host (docs/adr/0002)"
                 .into(),
-            "use --isolation ns for agent runtimes",
+            "use --isolation ns for agent runtimes; `vm` is for one-shot runs",
         ));
     }
     if config.network != Network::None {
         return Err(unsupported(
             format!(
                 "the vm backend has only `network = \"none\"`; this sandbox asks for \
-                 `{}`, which needs the VMM inside Zygo's own network namespace",
+                 `{}`, which would need the VMM inside Zygo's own network namespace \
+                 and a second nftables implementation (docs/adr/0002)",
                 config.network
             ),
             "use --isolation ns for a networked sandbox",
@@ -482,6 +488,140 @@ pub fn guest_ram_mib(limits: &crate::sandbox::Limits) -> u32 {
     asked_mib.saturating_add(GUEST_KERNEL_ALLOWANCE_MIB)
 }
 
+/// A writable root for the guest that writes nothing into the shared image.
+///
+/// The directory libkrun shares as the root is the store's flattened rootfs
+/// for an image digest, used by every sandbox that runs that image. Sharing it
+/// writable let one tenant edit what the next one boots from; sharing it
+/// read-only left the guest with nowhere to write at all — no `/tmp`, because
+/// libkrun's init mounts `/dev/shm` and nothing else.
+///
+/// This gives the guest the layer the `ns` backend gives it, built on the host
+/// side: this process unshares a user and mount namespace of its own, mounts a
+/// tmpfs sized to `scratch`, and puts an overlay on it with the image as the
+/// read-only lower and a fresh upper. What the guest writes goes to the upper
+/// — RAM, bounded by `scratch`, charged to this VMM's cgroup — and the merged
+/// view is what libkrun shares, read-write. Nothing touches the lower.
+///
+/// Everything lives in this process's private mount namespace, so it vanishes
+/// when the VMM exits and there is nothing on the host to clean up. It has to
+/// happen before libkrun starts a thread: `unshare(CLONE_NEWUSER)` is refused
+/// for a multithreaded process, which is also why this is a fresh fork's
+/// first act after joining its cgroup.
+///
+/// Rootless overlayfs is Linux 5.11 and up. A host without it gets an error
+/// here, and the caller falls back to the read-only share and says so.
+#[cfg(all(feature = "vm", target_os = "linux"))]
+fn scratch_root(image: &Path, scratch_bytes: u64) -> std::result::Result<PathBuf, String> {
+    use std::ffi::CString;
+
+    let image_str = image.to_string_lossy();
+    if image_str.contains([':', ',']) {
+        return Err(format!(
+            "the image path contains a character overlay options cannot carry: {image_str}"
+        ));
+    }
+
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+    // SAFETY: a plain syscall; the process is single-threaded here (a fresh
+    // fork), which is what `CLONE_NEWUSER` requires.
+    if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) } != 0 {
+        return Err(format!(
+            "unshare(user, mount): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // A single identity mapping: this user is this user inside too. Enough
+    // to mount, and it needs no helper.
+    let _ = std::fs::write("/proc/self/setgroups", "deny");
+    std::fs::write("/proc/self/uid_map", format!("{uid} {uid} 1\n"))
+        .map_err(|e| format!("uid_map: {e}"))?;
+    std::fs::write("/proc/self/gid_map", format!("{gid} {gid} 1\n"))
+        .map_err(|e| format!("gid_map: {e}"))?;
+
+    // Mounts made here must not leak back: the new namespace starts as a
+    // copy of the parent's, and on a shared-subtree host a mount would be
+    // propagated out of it. Everything below is private.
+    let root_c = CString::new("/").expect("no NUL");
+    if unsafe {
+        libc::mount(
+            std::ptr::null(),
+            root_c.as_ptr(),
+            std::ptr::null(),
+            libc::MS_REC | libc::MS_PRIVATE,
+            std::ptr::null(),
+        )
+    } != 0
+    {
+        return Err(format!(
+            "making / private: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    // Somewhere to put the tmpfs. Over an existing directory, so nothing has
+    // to be created on the host's filesystem — and `/mnt` rather than `/tmp`,
+    // because the console-capture file a person points `ZYGO_KRUN_CONSOLE` at
+    // is usually under `/tmp`, and shadowing that would hide it from them.
+    let base = ["/mnt", "/tmp"]
+        .into_iter()
+        .map(Path::new)
+        .find(|p| p.is_dir())
+        .ok_or_else(|| "neither /mnt nor /tmp exists to hold the scratch tmpfs".to_string())?;
+    let base_c = CString::new(base.to_string_lossy().as_bytes()).expect("no NUL");
+    let tmpfs_c = CString::new("tmpfs").expect("no NUL");
+    let size_c = CString::new(format!("size={scratch_bytes},mode=0700")).expect("no NUL");
+    if unsafe {
+        libc::mount(
+            tmpfs_c.as_ptr(),
+            base_c.as_ptr(),
+            tmpfs_c.as_ptr(),
+            libc::MS_NOSUID | libc::MS_NODEV,
+            size_c.as_ptr() as *const libc::c_void,
+        )
+    } != 0
+    {
+        return Err(format!(
+            "mounting the scratch tmpfs on {}: {}",
+            base.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let upper = base.join("upper");
+    let work = base.join("work");
+    let merged = base.join("merged");
+    for dir in [&upper, &work, &merged] {
+        std::fs::create_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+
+    let overlay_c = CString::new("overlay").expect("no NUL");
+    let merged_c = CString::new(merged.to_string_lossy().as_bytes()).expect("no NUL");
+    let opts = format!(
+        "lowerdir={image_str},upperdir={},workdir={}",
+        upper.display(),
+        work.display()
+    );
+    let opts_c = CString::new(opts).expect("no NUL");
+    if unsafe {
+        libc::mount(
+            overlay_c.as_ptr(),
+            merged_c.as_ptr(),
+            overlay_c.as_ptr(),
+            0,
+            opts_c.as_ptr() as *const libc::c_void,
+        )
+    } != 0
+    {
+        return Err(format!(
+            "mounting the overlay: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(merged)
+}
+
 #[cfg(all(feature = "vm", target_os = "linux"))]
 fn child_becomes_the_vmm(
     config: &SandboxConfig,
@@ -531,6 +671,20 @@ fn child_becomes_the_vmm(
             fail(&format!("could not enter the tenant cgroup: {e}"));
         }
     }
+
+    // The guest's root, assembled now — before libkrun has made a context or
+    // a thread, because `scratch_root` unshares a user namespace and the
+    // kernel refuses that to a multithreaded process. See `scratch_root`.
+    let (root_dir, writable) = match scratch_root(rootfs, config.limits.scratch.get()) {
+        Ok(merged) => (merged, true),
+        Err(why) => {
+            tracing::warn!(
+                "no writable scratch for this guest ({why}); its root is shared read-only"
+            );
+            (rootfs.to_path_buf(), false)
+        }
+    };
+    {}
 
     // SAFETY: each of these takes plain values and pointers to strings that
     // outlive the call.
@@ -588,7 +742,16 @@ fn child_becomes_the_vmm(
         // Read-only on the *host* side, at the device, not a `ro` mount option
         // in the guest: a guest kernel is the tenant's to subvert, and a
         // remount is one syscall. The VMM refusing the write is not.
-        let root_c = cstr(&rootfs.to_string_lossy());
+        //
+        // And yet a sandbox that cannot write anywhere is not much of a
+        // sandbox, so the guest gets scratch the same way `ns` does — a
+        // private, bounded, RAM-backed layer over the shared image — with the
+        // one difference that here it is assembled on the host, in this
+        // process's own mount namespace, and handed to the guest as its root.
+        // `scratch_root` is where that is done; when it cannot be, the root is
+        // shared read-only and the guest is told so through the log rather
+        // than given a write path into the cache.
+        let root_c = cstr(&root_dir.to_string_lossy());
         let root_tag_c = cstr(ffi::KRUN_FS_ROOT_TAG);
         check(
             ffi::krun_add_virtiofs3(
@@ -596,9 +759,13 @@ fn child_becomes_the_vmm(
                 root_tag_c.as_ptr(),
                 root_c.as_ptr(),
                 ffi::ROOT_SHM_SIZE,
-                true,
+                !writable,
             ),
-            "krun_add_virtiofs3(root, read-only)",
+            if writable {
+                "krun_add_virtiofs3(root, private overlay)"
+            } else {
+                "krun_add_virtiofs3(root, read-only)"
+            },
         );
 
         let workdir_c = cstr(&config.workdir.to_string_lossy());

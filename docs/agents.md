@@ -37,7 +37,7 @@ that kills the whole process tree possible.
 zygo agent test /bin/sh -- examples/agents/sh/agent.sh examples/agents/sh/handler.sh
 ```
 
-Nine checks, run against your agent over a real socket. The agent is started
+Ten checks, run against your agent over a real socket. The agent is started
 with the control socket at descriptor 3, which is where a sandboxed agent finds
 it too, and everything after the binary is passed through as its arguments.
 
@@ -47,12 +47,16 @@ it too, and everything after the binary is passed through as its arguments.
   `zygo agent test` checks, and the five things that cost an agent its
   milliseconds. Read it before writing one.
 - [`examples/agents/sh/`](../examples/agents/sh) — a complete agent in POSIX
-  sh, about 130 lines, passing the same nine checks the Python one does. It is
-  the shortest proof that the protocol is language independent.
-- [`examples/agents/node/`](../examples/agents/node) — a Node agent with a
-  worker pool.
-- [`agents/python/`](../agents/python) — the reference agent, and its
+  sh, about 130 lines, passing the same checks the Python one does. It is the
+  shortest proof that the protocol is language independent.
+- [`agents/python/`](../agents/python) — the reference Python agent, and its
   conformance suite.
+- [`agents/node/`](../agents/node) — the reference Node agent. Node has no
+  `fork()`, so it keeps a pool of pre-loaded workers instead; everything above
+  that is identical, which is the point of having a protocol rather than an
+  interface. It also carries the forty-line C helper that lets a Node worker
+  install the `strict` child filter, because a Node process cannot reach
+  `prctl` on its own.
 - [`examples/warm-exec/go/`](../examples/warm-exec/go) — a Go program as a warm
   function, where the whole integration is a `cmd`.
 

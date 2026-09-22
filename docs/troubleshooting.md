@@ -19,9 +19,14 @@ follows is `doctor` in longer form, for when its one line was not enough.
 process create a user namespace and then refuses the first mount inside it,
 which is the first thing every sandbox does.
 
-`zygo doctor` detects it by attempting that mount and prints the fix. Read the
-[threat model](threat-model.md) before applying it: the fix turns off a
-protection for every process on the machine, not only Zygo's.
+`zygo doctor` detects it by attempting that mount and prints the fix, and
+`zygo doctor --fix` applies it — printing every command and what it costs, and
+asking first. It also writes `/etc/sysctl.d/60-zygo-userns.conf`, so the
+machine that works today still works after a reboot.
+
+Read the [threat model](threat-model.md) before applying it: the fix turns off
+a protection for every process on the machine, not only Zygo's. `--fix` says
+so, in those words, above the confirmation.
 
 **On a Mac**, and the path is outside your home directory: the Linux VM mounts
 `$HOME` and nothing else, so a path elsewhere has no counterpart inside it.
@@ -35,7 +40,8 @@ login sits in a `session-N.scope` that systemd owns, and an unprivileged
 process cannot create a cgroup inside it.
 
 Zygo re-executes itself inside a transient scope when it finds this, so it
-usually resolves itself. When it cannot:
+usually resolves itself — and when a supervisor is running, `zygo run` hands
+the sandbox to it and never needs a scope at all. When neither applies:
 
 ```bash
 systemd-run --user --scope -p Delegate=yes -- zygo run alpine:3 /bin/true
@@ -86,8 +92,13 @@ namespace. This is the distribution's policy and has nothing to do with
 
 ```bash
 sudo aa-status | grep -i passt
-sudo aa-complain /usr/bin/pasta
+sudo aa-complain /usr/bin/pasta      # or: zygo doctor --fix
 ```
+
+`zygo doctor --fix` offers this one too, when it finds the profile loaded and
+enforcing. `aa-complain` rather than unloading the profile: it stays loaded
+and keeps logging what it would have denied, and `sudo aa-enforce
+/usr/bin/pasta` puts it back.
 
 Or use `network = "none"`, the default, which needs no `pasta` at all.
 
@@ -245,13 +256,14 @@ because it is twenty megabytes against a fifteen megabyte budget. From a
 checkout, `make vm-kernel` builds it and `zygo doctor` reports it once it is
 in place.
 
-### A `vm` sandbox cannot write anywhere
+### A `vm` sandbox's root is read-only
 
-That is correct today, and it is the backend's largest gap. The guest's root
-is read-only — enforced by the VMM, because the directory behind it is the
-image cache every sandbox on that image shares — and nothing mounts a
-writable `/tmp` inside the guest yet. Use `--isolation ns` for anything that
-writes.
+Then this host cannot build the guest's private layer, and the sandbox fell
+back to sharing the image read-only — the log line starts "no writable scratch
+for this guest" and says why. The layer needs rootless overlayfs, which is
+Linux 5.11 and newer; `zygo doctor`'s `overlayfs (userns)` line is the check.
+On a host that has it, a guest writes to `/` and `/tmp` freely, up to
+`scratch`, and nothing it writes reaches the shared image.
 
 ### `KVM GICv3 creation failed, falling back to KVM GICv2`
 

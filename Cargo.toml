@@ -52,7 +52,20 @@ tempfile = "3"
 # a cargo dependency and an rlib are the whole mechanism. Optional and off by
 # default — it is a large tree, and a host without KVM has no use for it.
 #
+# A plain version here and the git source in `[patch.crates-io]` below, rather
+# than the git source here: a published crate may not name a git dependency,
+# and `cargo install zygo-cli` has to work. In this workspace the patch takes
+# over, so the build is from the pinned tag; the range is what a crates.io
+# consumer who turns the feature on would get, and 1.19.4 is not published
+# there — `make vm-build` from a checkout is the supported way to build it.
+libkrun = { version = "1.19" }
+
+# Where `libkrun` actually comes from in this workspace. `[patch]` is a
+# workspace-root section and is not part of any published manifest, so it
+# redirects the build here without following the crate to crates.io.
+#
 # Pinned to a tag, and to one whose musl build was measured: see `make vm-build`.
+[patch.crates-io]
 libkrun = { git = "https://github.com/containers/libkrun.git", tag = "v1.19.4" }
 
 [profile.release]

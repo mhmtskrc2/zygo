@@ -11,6 +11,7 @@ without mdBook.
 
 - [`sandbox.toml`](spec-reference.md)
 - [What Zygo costs](performance.md)
+- [The embedder’s benchmark](bench-embed.md)
 - [Troubleshooting](troubleshooting.md)
 
 # Security

@@ -26,9 +26,30 @@ Every timing in it was measured on one of the three machines named in
 Zygo is one static binary with no runtime dependencies.
 
 ```bash
+# Linux, from a release: x86_64 or aarch64, both static musl
+curl -fsSL https://github.com/zygo-dev/zygo/releases/latest/download/zygo-x86_64-unknown-linux-musl.tar.gz | tar xz
+sudo install -m 0755 zygo-*/zygo /usr/local/bin/zygo
+
+# macOS, through Homebrew: the shim, the Linux build it forwards into, and Lima
+brew install lima
+brew install --formula https://github.com/zygo-dev/zygo/releases/latest/download/zygo.rb
+
+# from crates.io, anywhere with a Rust toolchain
+cargo install zygo-cli
+
+# from a checkout
 cargo build --release
 ./target/release/zygo doctor
 ```
+
+Every release carries a `SHA256SUMS`, and the Homebrew formula's digests are
+computed from the same archives during the release build rather than written
+by hand.
+
+`cargo install zygo-cli` builds the default feature set. The `vm` backend is
+not in it: it links a virtual machine monitor from a pinned git tag, which a
+published crate may not name, so `make vm-build` from a checkout is the way to
+get it. `zygo doctor` says so on a host where it would otherwise be available.
 
 `zygo doctor` is the first thing to run anywhere. It probes this host for
 everything a sandbox needs, reports each one, and prints the fix for anything
@@ -225,16 +246,30 @@ cmd    = ["/app/parse"]
 ```
 
 **An agent** is for a runtime that is expensive to start. It warms once and
-forks per request, the way the Python one does. The wire protocol is language
-independent, and `zygo agent test` checks an implementation against it:
+gives each request a process of its own. Two ship built in and are chosen by
+the `entry` file's extension:
+
+```toml
+[fn.resize]
+entry = "./resize.py"      # runtime = "python": a fork of the warmed interpreter
+[fn.summarise]
+entry = "./summarise.js"   # runtime = "node": a pool of pre-loaded workers
+```
+
+Node has no `fork()` in the Unix sense, so its agent keeps workers loaded and
+parked instead — one request each, replaced off the request path. Everything
+above that is identical: the same wire, the same per-request cgroup, the same
+deadline, the same secrets.
+
+The protocol is language independent, and `zygo agent test` checks an
+implementation against it:
 
 ```bash
 zygo agent test /bin/sh -- examples/agents/sh/agent.sh examples/agents/sh/handler.sh
 ```
 
-[`examples/agents/`](../examples/agents) has the guide, a Node agent with a
-worker pool, and a complete agent in POSIX sh of about 130 lines that passes
-the same nine checks the Python one does.
+[`examples/agents/`](../examples/agents) has the guide and a complete agent in
+POSIX sh of about 130 lines that passes the same checks the shipped ones do.
 
 ---
 
@@ -583,8 +618,10 @@ zygo run --isolation gvisor python:3.12-slim python3 -c 'import platform; print(
 **`vm`** is a hardware boundary: libkrun and KVM, with a guest kernel of its
 own. It runs one-shot sandboxes — `zygo backend install vm` puts the kernel in
 place and `zygo doctor` reports it — at about 400 ms a run against `ns`'s
-40 ms on the same host. What it does not do yet: a writable `/tmp` inside the
-guest, any networking, or warm functions. Those are refused by name.
+40 ms on the same host. The guest writes to a private layer over the image,
+bounded by `scratch`, and nothing it writes reaches the shared image or the
+next sandbox. What it does not do yet: any networking, or warm functions.
+Those are refused by name.
 
 ```bash
 zygo backend list        # what this host can actually use

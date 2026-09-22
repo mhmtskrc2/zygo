@@ -228,6 +228,7 @@ impl Harness {
 
         self.writer
             .write(&Message::Exec {
+                script: None,
                 id: id.to_string(),
                 event: serde_json::Value::Null,
                 timeout_ms: 30_000,

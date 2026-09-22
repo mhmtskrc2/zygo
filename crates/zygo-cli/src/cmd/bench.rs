@@ -30,7 +30,7 @@ const WARM_P99_BUDGET_US: f64 = 10_000.0;
 const EXEC_P50_BUDGET_US: f64 = 3_000.0;
 
 pub fn run(cli: &Cli, command: &BenchCommand) -> anyhow::Result<u8> {
-    match command {
+    let measured = match command {
         BenchCommand::Warm {
             n,
             no_cgroup,
@@ -44,15 +44,27 @@ pub fn run(cli: &Cli, command: &BenchCommand) -> anyhow::Result<u8> {
             *rate,
             *cpu,
             (!cmd.is_empty()).then_some(cmd.as_slice()),
-        ),
-        BenchCommand::Cold { n, image, command } => cold(cli, *n, image, command.as_deref()),
+        )?,
+        BenchCommand::Cold { n, image, command } => cold(cli, *n, image, command.as_deref())?,
         BenchCommand::Load {
             seconds,
             concurrency,
             cpu,
-        } => load(cli, *seconds, *concurrency, *cpu),
+        } => load(cli, *seconds, *concurrency, *cpu)?,
+        BenchCommand::All { quick } => return all(cli, *quick),
+    };
+    if cli.json {
+        output::json(&measured.1)?;
     }
+    Ok(measured.0)
 }
+
+/// An exit code of its own for "these numbers are not a verdict".
+///
+/// Distinct from 1, which means a budget was missed. A caller that treats
+/// every non-zero exit as a regression would otherwise file a bug against the
+/// code when the answer was a hot laptop.
+const NOT_A_VERDICT: u8 = 2;
 
 fn warm(
     cli: &Cli,
@@ -61,7 +73,7 @@ fn warm(
     rate: Option<f64>,
     cpu: Option<f64>,
     cmd: Option<&[String]>,
-) -> anyhow::Result<u8> {
+) -> anyhow::Result<(u8, serde_json::Value)> {
     let paths = super::paths(cli);
     let pool = Pool::new(PoolConfig {
         per_request_cgroup,
@@ -190,9 +202,12 @@ fn warm(
         report.p50_budget = EXEC_P50_BUDGET_US;
         report.label = "warm-exec request overhead";
     }
-    if cli.json {
-        output::json(&report.to_json())?;
-    } else {
+    let mut json = report.to_json();
+    json["warm_ms"] = (warmup.as_secs_f64() * 1000.0).into();
+    json["imports_ms"] = status.imports_ms.into();
+    json["rss_kb"] = status.rss_kb.into();
+    json["runtime"] = status.runtime.clone().into();
+    if !cli.json {
         report.print(&style);
         print_phases(&phases);
         if cmd.is_none() {
@@ -205,7 +220,575 @@ fn warm(
     }
 
     let _ = function.shutdown();
-    Ok(u8::from(!report.within_budget()))
+    Ok((u8::from(!report.within_budget()), json))
+}
+
+// ---------------------------------------------------------------------------
+// `zygo bench all`
+// ---------------------------------------------------------------------------
+
+/// The numbers the README and `docs/performance.md` print.
+///
+/// They are here, as constants, so that `zygo bench all` compares what it
+/// measured with what is *claimed* rather than only with a budget. A published
+/// number nobody can reproduce is a number that drifts silently: the budget
+/// stays met, the documentation stays wrong, and the first person to notice is
+/// a reader who tried it.
+///
+/// Every one of these was measured in Docker Desktop's Linux VM on an Apple M1
+/// Max, except where `docs/performance.md` says otherwise. A different machine
+/// will not reproduce them, which is the point of printing the machine.
+mod published {
+    /// The warm path, at 250 requests a second.
+    pub const WARM_P50_MS: f64 = 1.70;
+    pub const WARM_P99_MS: f64 = 2.81;
+    pub const WARM_RATE: f64 = 250.0;
+    /// Sustained throughput at a concurrency of four.
+    pub const LOAD_PER_SECOND: f64 = 981.0;
+    /// A one-shot `zygo run`, image already in the store.
+    pub const COLD_P50_MS: f64 = 18.4;
+    /// Warm-exec: a fresh process entered into a held sandbox.
+    pub const EXEC_P50_MS: f64 = 2.2;
+    /// What `zygo serve` costs once, for a Python handler with no imports.
+    pub const SERVE_MS: f64 = 270.0;
+}
+
+/// How far a measurement may be from the published number before it is worth
+/// pointing at.
+///
+/// Wide on purpose. This is not a regression gate — the budgets are — it is a
+/// "the documentation is describing a different machine" detector, and a
+/// factor of two is what distinguishes that from ordinary variation between
+/// hosts.
+const PUBLISHED_TOLERANCE: f64 = 2.0;
+
+/// `zygo bench all` — every published number, on this host, in one command.
+fn all(cli: &Cli, quick: bool) -> anyhow::Result<u8> {
+    let style = Style::stdout();
+    let host = Host::describe(&super::paths(cli));
+
+    if !cli.json {
+        host.print(&style);
+        println!();
+    }
+
+    // Sampled around the whole run, not around each measurement: a machine
+    // that starts throttling during the cold-start benchmark has invalidated
+    // the warm-path numbers that came before it too, because the cause is the
+    // machine and not the order.
+    let before = Thermal::sample();
+
+    let (warm_n, cold_n, load_seconds) = if quick {
+        (500, 10, 3)
+    } else {
+        (10_000, 50, 10)
+    };
+
+    let mut results = serde_json::Map::new();
+    let mut failed = 0u8;
+
+    let mut step = |name: &str, outcome: anyhow::Result<(u8, serde_json::Value)>| {
+        match outcome {
+            Ok((code, json)) => {
+                failed |= code;
+                results.insert(name.to_string(), json);
+            }
+            Err(e) => {
+                // One measurement that cannot run must not take the other
+                // three with it: a host without `runsc` still has a warm path,
+                // and a report of three numbers and one reason beats no report.
+                eprintln!("  {} {name}: {e:#}", Style::stdout().red("could not run"));
+                failed |= 1;
+                results.insert(
+                    name.to_string(),
+                    serde_json::json!({ "error": format!("{e:#}") }),
+                );
+            }
+        }
+    };
+
+    if !cli.json {
+        println!("{}", style.bold("1/4  the warm path"));
+    }
+    step(
+        "warm",
+        warm(cli, warm_n, true, Some(published::WARM_RATE), None, None),
+    );
+
+    if !cli.json {
+        println!();
+        println!("{}", style.bold("2/4  warm-exec"));
+    }
+    let exec_cmd: Vec<String> = ["sh", "-c", "cat"].iter().map(|s| s.to_string()).collect();
+    step(
+        "warm_exec",
+        warm(
+            cli,
+            warm_n,
+            true,
+            Some(published::WARM_RATE),
+            None,
+            Some(&exec_cmd),
+        ),
+    );
+
+    if !cli.json {
+        println!();
+        println!("{}", style.bold("3/4  a cold start"));
+    }
+    step("cold", cold(cli, cold_n, "python:3.12-slim", None));
+
+    // The quota is lifted for the throughput run, and only for it. With the
+    // spec's default `cpu = 1.0` a tenant is quota-bound long before the
+    // runtime is — this host sustains about 430 requests a second and then
+    // CFS stops it — so the number would be a measurement of the limit. The
+    // latency runs above keep the default quota on purpose, because there
+    // the limit is part of what is being reported.
+    let load_cores = host.cores.clamp(1, 4) as f64;
+    if !cli.json {
+        println!();
+        println!(
+            "{}  {}",
+            style.bold("4/4  sustained throughput"),
+            style.dim(&format!(
+                "with the tenant's CPU quota raised to {load_cores:.0} cores,                  so this measures the runtime and not the quota"
+            ))
+        );
+    }
+    step("load", load(cli, load_seconds, 4, Some(load_cores)));
+
+    let after = Thermal::sample();
+    let disturbance = Thermal::compare(&before, &after, &host);
+
+    let comparison = compare_with_published(&results);
+
+    if cli.json {
+        output::json(&serde_json::json!({
+            "host": host.to_json(),
+            "results": results,
+            "published": comparison.iter().map(Claim::to_json).collect::<Vec<_>>(),
+            "disturbance": disturbance,
+            "verdict": if !disturbance.is_empty() {
+                "not a verdict: the host was throttled or busy"
+            } else if failed != 0 {
+                "a budget was missed"
+            } else {
+                "within budget"
+            },
+        }))?;
+    } else {
+        println!();
+        println!("{}", style.bold("against the published numbers"));
+        println!("  {:<34} {:>12} {:>12}", "", "published", "here");
+        for claim in &comparison {
+            let mark = if claim.close() {
+                style.green("ok")
+            } else {
+                style.yellow("differs")
+            };
+            println!(
+                "  {:<34} {:>12} {:>12}   {mark}",
+                claim.what,
+                format!("{:.2} {}", claim.published, claim.unit),
+                match claim.measured {
+                    Some(v) => format!("{v:.2} {}", claim.unit),
+                    None => "—".to_string(),
+                }
+            );
+        }
+        println!();
+        println!(
+            "{}",
+            style.dim(
+                "  * the throughput run lifts the tenant's CPU quota; the latency runs keep it.\n\
+                 \n  \
+                 \"differs\" is not a failure. These were measured on the machines in\n  \
+                 docs/performance.md; a different host produces different numbers, which\n  \
+                 is why the one above is printed. What a budget says is in each section."
+            )
+        );
+
+        println!();
+        if !disturbance.is_empty() {
+            println!("{} these numbers are not a verdict:", style.red("✗"));
+            for reason in &disturbance {
+                println!("    {}", style.yellow(reason));
+            }
+            println!(
+                "{}",
+                style.dim(
+                    "  A run on a host that was throttled or busy measures the host. \n  \
+                     Repeat it on an idle machine before drawing a conclusion."
+                )
+            );
+        } else if failed != 0 {
+            println!(
+                "{} a budget was missed; see the sections above",
+                style.red("✗")
+            );
+        } else {
+            println!(
+                "{} every budget met, on an undisturbed host",
+                style.green("✓")
+            );
+        }
+    }
+
+    if !disturbance.is_empty() {
+        return Ok(NOT_A_VERDICT);
+    }
+    Ok(failed)
+}
+
+/// One published number against what this host produced.
+struct Claim {
+    what: &'static str,
+    unit: &'static str,
+    published: f64,
+    measured: Option<f64>,
+    /// Whether a *larger* measurement is the good direction (throughput) or
+    /// the bad one (latency).
+    higher_is_better: bool,
+}
+
+impl Claim {
+    /// Whether the measurement is near enough to the claim to call it
+    /// reproduced on this host.
+    fn close(&self) -> bool {
+        let Some(measured) = self.measured else {
+            return false;
+        };
+        let (a, b) = if self.higher_is_better {
+            (self.published, measured)
+        } else {
+            (measured, self.published)
+        };
+        // Better than published is always fine; worse is compared against the
+        // tolerance.
+        a <= b * PUBLISHED_TOLERANCE
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "what": self.what,
+            "unit": self.unit,
+            "published": self.published,
+            "measured": self.measured,
+            "close": self.close(),
+        })
+    }
+}
+
+fn compare_with_published(results: &serde_json::Map<String, serde_json::Value>) -> Vec<Claim> {
+    let number =
+        |section: &str, key: &str| -> Option<f64> { results.get(section)?.get(key)?.as_f64() };
+    let micros = |section: &str, key: &str| number(section, key).map(|v| v / 1000.0);
+
+    vec![
+        Claim {
+            what: "warm request, median",
+            unit: "ms",
+            published: published::WARM_P50_MS,
+            measured: micros("warm", "p50_us"),
+            higher_is_better: false,
+        },
+        Claim {
+            what: "warm request, 99th percentile",
+            unit: "ms",
+            published: published::WARM_P99_MS,
+            measured: micros("warm", "p99_us"),
+            higher_is_better: false,
+        },
+        Claim {
+            what: "warm-exec request, median",
+            unit: "ms",
+            published: published::EXEC_P50_MS,
+            measured: micros("warm_exec", "p50_us"),
+            higher_is_better: false,
+        },
+        Claim {
+            what: "cold `zygo run`, median",
+            unit: "ms",
+            published: published::COLD_P50_MS,
+            measured: number("cold", "p50_ms"),
+            higher_is_better: false,
+        },
+        Claim {
+            what: "throughput at concurrency 4 *",
+            unit: "req/s",
+            published: published::LOAD_PER_SECOND,
+            measured: number("load", "requests_per_second"),
+            higher_is_better: true,
+        },
+        Claim {
+            what: "`zygo serve`, once",
+            unit: "ms",
+            published: published::SERVE_MS,
+            measured: number("warm", "warm_ms"),
+            higher_is_better: false,
+        },
+    ]
+}
+
+/// What the numbers are numbers *for*.
+///
+/// Printed above every run, because the single most common way a benchmark
+/// misleads is by being quoted without the machine it came from. Everything
+/// here is read, not attempted: it describes, it does not decide.
+struct Host {
+    kernel: String,
+    arch: &'static str,
+    cpu_model: String,
+    cores: usize,
+    memory_kb: Option<u64>,
+    governor: Option<String>,
+    max_mhz: Option<f64>,
+    virtualised: Option<String>,
+    data_root: String,
+    version: &'static str,
+}
+
+impl Host {
+    fn describe(paths: &zygo_core::paths::Paths) -> Host {
+        Host {
+            kernel: read_first_line("/proc/sys/kernel/osrelease")
+                .unwrap_or_else(|| std::env::consts::OS.to_string()),
+            arch: std::env::consts::ARCH,
+            cpu_model: cpu_model().unwrap_or_else(|| "unknown".into()),
+            cores: std::thread::available_parallelism()
+                .map(std::num::NonZeroUsize::get)
+                .unwrap_or(0),
+            memory_kb: meminfo("MemTotal"),
+            governor: read_first_line("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),
+            max_mhz: read_first_line("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")
+                .and_then(|v| v.parse::<f64>().ok())
+                .map(|khz| khz / 1000.0),
+            virtualised: virtualisation(),
+            data_root: paths.data().display().to_string(),
+            version: env!("CARGO_PKG_VERSION"),
+        }
+    }
+
+    fn print(&self, style: &Style) {
+        println!("{}", style.bold("the machine these numbers are about"));
+        let line = |k: &str, v: String| println!("  {:<12} {v}", style.dim(k));
+        line("zygo", format!("{} ({})", self.version, self.arch));
+        line("kernel", self.kernel.clone());
+        line(
+            "cpu",
+            format!(
+                "{} × {}{}",
+                self.cores,
+                self.cpu_model,
+                match self.max_mhz {
+                    Some(mhz) => format!(", up to {mhz:.0} MHz"),
+                    None => String::new(),
+                }
+            ),
+        );
+        if let Some(kb) = self.memory_kb {
+            line("memory", format!("{:.1} GiB", kb as f64 / 1024.0 / 1024.0));
+        }
+        if let Some(g) = &self.governor {
+            line("governor", g.clone());
+        }
+        if let Some(v) = &self.virtualised {
+            line("virtual", v.clone());
+        }
+        line("data root", self.data_root.clone());
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "zygo": self.version,
+            "arch": self.arch,
+            "kernel": self.kernel,
+            "cpu_model": self.cpu_model,
+            "cores": self.cores,
+            "memory_kb": self.memory_kb,
+            "governor": self.governor,
+            "max_mhz": self.max_mhz,
+            "virtualised": self.virtualised,
+            "data_root": self.data_root,
+        })
+    }
+}
+
+/// What the machine was doing to itself while the numbers were taken.
+///
+/// Two sources, because they catch different things and neither is everywhere:
+/// the x86 per-core throttle counters in `/sys`, and the Raspberry Pi's
+/// firmware flag, which is the only place an undervolted Pi says so. The load
+/// average is not throttling at all, but a benchmark that shared the machine
+/// with a compile is no more of a verdict than one that overheated.
+struct Thermal {
+    core_throttles: u64,
+    pi_flags: Option<u32>,
+    loadavg1: Option<f64>,
+}
+
+impl Thermal {
+    fn sample() -> Thermal {
+        Thermal {
+            core_throttles: core_throttle_count(),
+            pi_flags: pi_throttled_flags(),
+            loadavg1: read_first_line("/proc/loadavg")
+                .and_then(|l| l.split_whitespace().next()?.parse().ok()),
+        }
+    }
+
+    /// Reasons these numbers are not a verdict. Empty is the good answer.
+    fn compare(before: &Thermal, after: &Thermal, host: &Host) -> Vec<String> {
+        let mut reasons = Vec::new();
+
+        if after.core_throttles > before.core_throttles {
+            reasons.push(format!(
+                "the CPU throttled {} time(s) during the run (/sys/devices/system/cpu/*/thermal_throttle)",
+                after.core_throttles - before.core_throttles
+            ));
+        }
+
+        // The Pi's firmware word: bit 0 under-voltage now, bit 1 frequency
+        // capped now, bit 2 throttled now, bit 3 soft temperature limit; the
+        // same four at bits 16-19 mean "since boot". Only the live bits are
+        // held against the run — a Pi that browned out last Tuesday is not
+        // this measurement's problem.
+        for (sample, when) in [(before, "before"), (after, "after")] {
+            if let Some(flags) = sample.pi_flags
+                && flags & 0xF != 0
+            {
+                reasons.push(format!(
+                    "the firmware reports under-voltage or capped frequency {when} the run \
+                     (vcgencmd get_throttled = {flags:#x})"
+                ));
+            }
+        }
+
+        // Half the cores busy with something else is enough to move a
+        // percentile. Read before the run: afterwards it includes the run.
+        if let Some(load) = before.loadavg1
+            && host.cores > 0
+            && load > host.cores as f64 / 2.0
+        {
+            reasons.push(format!(
+                "the machine was already busy when the run started (load {load:.2} \
+                 on {} cores)",
+                host.cores
+            ));
+        }
+
+        reasons
+    }
+}
+
+/// The sum of every per-core and per-package throttle counter the kernel
+/// keeps. x86 only; aarch64 has no equivalent, so the Pi's firmware flag is
+/// what covers the other architecture Zygo is measured on.
+fn core_throttle_count() -> u64 {
+    let Ok(entries) = std::fs::read_dir("/sys/devices/system/cpu") else {
+        return 0;
+    };
+    let mut total = 0;
+    for entry in entries.flatten() {
+        for name in ["core_throttle_count", "package_throttle_count"] {
+            let path = entry.path().join("thermal_throttle").join(name);
+            if let Ok(text) = std::fs::read_to_string(&path)
+                && let Ok(n) = text.trim().parse::<u64>()
+            {
+                total += n;
+            }
+        }
+    }
+    total
+}
+
+/// `vcgencmd get_throttled`, where the tool exists.
+///
+/// It prints `throttled=0x50005`. Absent everywhere but a Raspberry Pi, and
+/// absent there too unless `libraspberrypi-bin` is installed — which is why
+/// this is `Option` rather than a zero.
+fn pi_throttled_flags() -> Option<u32> {
+    let output = std::process::Command::new("vcgencmd")
+        .arg("get_throttled")
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let value = text.trim().strip_prefix("throttled=")?;
+    let digits = value.strip_prefix("0x").unwrap_or(value);
+    u32::from_str_radix(digits, 16).ok()
+}
+
+fn read_first_line(path: &str) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    Some(text.lines().next()?.trim().to_string())
+}
+
+fn meminfo(key: &str) -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    text.lines()
+        .find(|l| l.starts_with(key))?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+/// What kind of processor this is, in the words of whichever file has them.
+///
+/// `/proc/cpuinfo` answers on x86 with `model name` and on a Raspberry Pi with
+/// `Model`, and answers with neither inside a LinuxKit aarch64 VM — where the
+/// device tree is the only place with a name. Three sources, because the line
+/// this feeds is the difference between "these numbers are about a Pi" and
+/// "these numbers are about an M1", and `unknown` is the one answer that helps
+/// nobody.
+fn cpu_model() -> Option<String> {
+    if let Ok(text) = std::fs::read_to_string("/proc/cpuinfo") {
+        for key in ["model name", "Model", "Hardware", "cpu model", "Processor"] {
+            if let Some(line) = text
+                .lines()
+                .find(|l| l.trim_start().starts_with(key) && l.contains(':'))
+                && let Some((_, value)) = line.split_once(':')
+                && !value.trim().is_empty()
+            {
+                return Some(value.trim().to_string());
+            }
+        }
+    }
+    // The device tree, where there is one. The strings are NUL-terminated.
+    for path in [
+        "/sys/firmware/devicetree/base/model",
+        "/proc/device-tree/model",
+    ] {
+        if let Ok(bytes) = std::fs::read(path) {
+            let text = String::from_utf8_lossy(&bytes)
+                .trim_end_matches('\0')
+                .trim()
+                .to_string();
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+    }
+    None
+}
+
+/// What this is running inside, where the kernel says so.
+///
+/// `systemd-detect-virt` is the accurate answer and is not always installed;
+/// the DMI product name is the fallback and is enough to tell a laptop from
+/// Docker Desktop's LinuxKit VM, which is the distinction that matters for
+/// every number here.
+fn virtualisation() -> Option<String> {
+    if let Ok(output) = std::process::Command::new("systemd-detect-virt").output()
+        && output.status.success()
+    {
+        let what = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !what.is_empty() && what != "none" {
+            return Some(what);
+        }
+        return None;
+    }
+    read_first_line("/sys/class/dmi/id/product_name")
 }
 
 /// Requirement N2: a cold `run` with the image already in the store.
@@ -220,7 +803,12 @@ const LOAD_TARGET_PER_SECOND: f64 = 600.0;
 /// about: starting a Python interpreter and exiting. The image must already be
 /// in the store, because N2 is explicitly about the cached case — pulling is a
 /// network measurement and belongs nowhere near this number.
-fn cold(cli: &Cli, n: u32, image: &str, command: Option<&[String]>) -> anyhow::Result<u8> {
+fn cold(
+    cli: &Cli,
+    n: u32,
+    image: &str,
+    command: Option<&[String]>,
+) -> anyhow::Result<(u8, serde_json::Value)> {
     use zygo_core::image::{Reference, Store};
     use zygo_core::sandbox::SandboxConfig;
 
@@ -254,7 +842,7 @@ fn cold(cli: &Cli, n: u32, image: &str, command: Option<&[String]>) -> anyhow::R
         },
     )?;
 
-    let overlay = zygo_core::doctor::run(&paths)
+    let overlay = zygo_core::doctor::cached(&paths)
         .checks
         .iter()
         .any(|c| c.name == "overlayfs (userns)" && c.status == zygo_core::doctor::Status::Ok);
@@ -295,20 +883,19 @@ fn cold(cli: &Cli, n: u32, image: &str, command: Option<&[String]>) -> anyhow::R
     let q = |p: f64| percentile(&samples, p);
     let p50 = q(50.0);
 
-    if cli.json {
-        output::json(&serde_json::json!({
-            "image": image,
-            "command": argv,
-            "runs": n,
-            "p50_ms": p50,
-            "p90_ms": q(90.0),
-            "p99_ms": q(99.0),
-            "max_ms": samples.last().copied().unwrap_or(0.0),
-            "budget_ms": COLD_BUDGET_MS,
-            "pass": p50 < COLD_BUDGET_MS,
-            "rootfs": if overlay { "overlayfs" } else { "flattened" },
-        }))?;
-    } else {
+    let json = serde_json::json!({
+        "image": image,
+        "command": argv,
+        "runs": n,
+        "p50_ms": p50,
+        "p90_ms": q(90.0),
+        "p99_ms": q(99.0),
+        "max_ms": samples.last().copied().unwrap_or(0.0),
+        "budget_ms": COLD_BUDGET_MS,
+        "pass": p50 < COLD_BUDGET_MS,
+        "rootfs": if overlay { "overlayfs" } else { "flattened" },
+    });
+    if !cli.json {
         println!("cold start over {n} runs, image already in the store");
         println!(
             "  p50 {:>7.1} ms   p90 {:>7.1}   p99 {:>7.1}   max {:>7.1}",
@@ -340,7 +927,7 @@ fn cold(cli: &Cli, n: u32, image: &str, command: Option<&[String]>) -> anyhow::R
         }
     }
     let within_budget = p50 < COLD_BUDGET_MS;
-    Ok(u8::from(!within_budget))
+    Ok((u8::from(!within_budget), json))
 }
 
 /// `zygo bench load` — sustained throughput through one warm function.
@@ -351,7 +938,12 @@ fn cold(cli: &Cli, n: u32, image: &str, command: Option<&[String]>) -> anyhow::R
 /// request was spent waiting for the connection, which is the difference
 /// between "the machine is busy" and "the callers are queueing behind each
 /// other".
-fn load(cli: &Cli, seconds: u32, concurrency: u32, cpu: Option<f64>) -> anyhow::Result<u8> {
+fn load(
+    cli: &Cli,
+    seconds: u32,
+    concurrency: u32,
+    cpu: Option<f64>,
+) -> anyhow::Result<(u8, serde_json::Value)> {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -454,17 +1046,15 @@ fn load(cli: &Cli, seconds: u32, concurrency: u32, cpu: Option<f64>) -> anyhow::
     lock_us.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
 
     let met = report.per_second >= LOAD_TARGET_PER_SECOND;
-    if cli.json {
-        let mut json = report.to_json();
-        json["concurrency"] = concurrency.into();
-        json["failures"] = failures.into();
-        json["target_per_second"] = LOAD_TARGET_PER_SECOND.into();
-        json["meets_target"] = met.into();
-        json["lock_p50_us"] = percentile(&lock_us, 50.0).into();
-        json["lock_max_us"] = lock_us.last().copied().unwrap_or(0.0).into();
-        json["requests_per_client"] = per_worker.clone().into();
-        output::json(&json)?;
-    } else {
+    let mut json = report.to_json();
+    json["concurrency"] = concurrency.into();
+    json["failures"] = failures.into();
+    json["target_per_second"] = LOAD_TARGET_PER_SECOND.into();
+    json["meets_target"] = met.into();
+    json["lock_p50_us"] = percentile(&lock_us, 50.0).into();
+    json["lock_max_us"] = lock_us.last().copied().unwrap_or(0.0).into();
+    json["requests_per_client"] = per_worker.clone().into();
+    if !cli.json {
         println!(
             "sustained load: {concurrency} clients, {:.1}s, empty handler",
             elapsed.as_secs_f64()
@@ -492,7 +1082,7 @@ fn load(cli: &Cli, seconds: u32, concurrency: u32, cpu: Option<f64>) -> anyhow::
     }
 
     let _ = function.shutdown();
-    Ok(u8::from(!met))
+    Ok((u8::from(!met), json))
 }
 
 /// Show how the work was split between clients.

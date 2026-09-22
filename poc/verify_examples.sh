@@ -122,7 +122,7 @@ say ""
 say "the example specs"
 # Every example ships a `sandbox.toml`; each has to resolve, or the README
 # beside it is describing something that does not run.
-for example in webhook agent-tool warm-exec/go; do
+for example in webhook agent-tool warm-exec/go workflow-engine; do
     if "$ZYGO" spec -f "$SRC/examples/$example/sandbox.toml" validate >/dev/null 2>&1; then
         ok "examples/$example/sandbox.toml validates"
     else
@@ -154,6 +154,68 @@ if "$ZYGO" up >/tmp/up-tool.log 2>&1; then
 else
     bad "agent-tool up: $(grep -v '^$' /tmp/up-tool.log | tail -3 | tr '\n' ' ' | cut -c1-200)"
 fi
+
+
+# The workflow-engine worker, end to end: `zygo api --allow-deploy`, a queue
+# of jobs against two scripts in two languages, and one fork per run. This is
+# the only example whose functions do not exist until it runs, and the only
+# one that exercises the Node agent through the supervisor rather than
+# through `zygo agent test`.
+say ""
+say "a workflow engine's worker"
+mkdir -p /tmp/wf-example && cp -r "$SRC/examples/workflow-engine/." /tmp/wf-example/
+mkdir -p /tmp/wf-sdk && cp -r "$SRC/sdk/python/src/." /tmp/wf-sdk/
+cd /tmp/wf-example || exit 1
+rm -f jobs.db
+"$ZYGO" pull python:3.12-slim >/dev/null 2>&1
+"$ZYGO" pull node:22-slim >/dev/null 2>&1
+# Through the harness wrapper, like every other long-lived process here: an
+# API started straight from the shell lands in a cgroup with no delegated
+# controllers, and every `PUT /fn/<name>` then fails with "the ns backend is
+# not available on this host".
+zygo api --allow-deploy >/tmp/wf-api.log 2>&1 &
+wf_api=$!
+i=0
+while [ $i -lt 150 ]; do
+    python3 -c "
+import sys, urllib.request
+try:
+    urllib.request.urlopen('http://127.0.0.1:7700/health', timeout=1).read()
+except Exception:
+    sys.exit(1)
+" >/dev/null 2>&1 && break
+    i=$((i+1)); sleep 0.1
+done
+if ! kill -0 "$wf_api" 2>/dev/null; then
+    bad "zygo api did not start: $(tail -3 /tmp/wf-api.log | tr '\n' ' ' | cut -c1-200)"
+else
+    if PYTHONPATH=/tmp/wf-sdk python3 worker.py --seed 10 >/tmp/wf-worker.out 2>/tmp/wf-worker.err; then
+        ok "20 jobs across a Python and a Node script all completed"
+    else
+        bad "the worker: $(tail -4 /tmp/wf-worker.err | tr '\n' ' ' | cut -c1-240)"
+    fi
+    case "$(cat /tmp/wf-worker.out)" in
+        *'"completed": 20'*) ok "every job reached the completed state" ;;
+        *) bad "job states: $(cat /tmp/wf-worker.out | cut -c1-160)" ;;
+    esac
+    # Both languages really ran: the Python script normalises and the Node
+    # one summarises, and each has a field only it produces.
+    if grep -q '"rate"' /tmp/wf-worker.err 2>/dev/null || \
+       python3 -c "
+import sqlite3, sys
+rows = dict(sqlite3.connect('jobs.db').execute(
+    'SELECT script, count(*) FROM jobs WHERE state = \"completed\" '
+    'AND result LIKE \"%rate%\" OR result LIKE \"%skus%\" GROUP BY script'))
+sys.exit(0 if len(rows) == 2 else 1)
+" 2>/dev/null; then
+        ok "both the Python and the Node script produced their own results"
+    else
+        bad "one of the two scripts produced nothing"
+    fi
+    kill "$wf_api" 2>/dev/null
+    wait "$wf_api" 2>/dev/null
+fi
+cd /tmp || exit 1
 
 "$ZYGO" stop --all >/dev/null 2>&1
 say ""

@@ -21,7 +21,17 @@ use crate::spec::{Layer, Spec};
 /// Separate from [`crate::protocol::PROTOCOL_VERSION`]: a third-party agent and
 /// the CLI evolve independently, and tying them together would mean an agent
 /// author had to care about `zygo ps`.
-pub const CONTROL_VERSION: u32 = 1;
+///
+/// A supervisor that does not know a request drops the connection, which a
+/// client sees as a reset with no explanation; the version is what turns that
+/// into "stop the running supervisor". It is checked for equality, so a
+/// supervisor left running across an upgrade answers every command with the
+/// mismatch — except `zygo run`, which only *asks* whether a supervisor will
+/// take the sandbox and, told no, builds one itself.
+///
+/// - v2: `RUN`, `STARTED` and `RAN` — a one-shot sandbox started by the
+///   supervisor on the client's streams.
+pub const CONTROL_VERSION: u32 = 2;
 
 /// CLI → supervisor.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -73,6 +83,47 @@ pub enum Request {
         name: String,
         event: serde_json::Value,
         timeout_ms: u64,
+    },
+
+    /// Run a one-shot sandbox here, on the client's behalf.
+    ///
+    /// Why a one-shot goes through a supervisor at all: on an ordinary systemd
+    /// session `zygo run` cannot build a cgroup where it starts, so it
+    /// re-executes itself in a transient scope — about 34 ms of a 45 ms run,
+    /// and unavoidable from that process, because cgroup delegation
+    /// containment forbids it moving anywhere better (`zygo-cli/src/scope.rs`
+    /// has the measurements and the proof). The supervisor is the one process
+    /// on the machine already sitting in a delegated, built `zygo.slice`. It
+    /// forks the sandbox there instead, with the client's own standard
+    /// streams: the client sends its three descriptors over the connection
+    /// with `SCM_RIGHTS` immediately after this frame, in order — stdin,
+    /// stdout, stderr.
+    ///
+    /// The image must already be in the store, like `SERVE`; pulling is the
+    /// client's job and its output.
+    ///
+    /// Answered twice: `STARTED` with the sandbox's pid as soon as it exists,
+    /// so the client can forward the terminal's signals to it, and `RAN`
+    /// when it has exited.
+    Run {
+        spec: Option<Box<Spec>>,
+        layer: Box<Layer>,
+        base_dir: std::path::PathBuf,
+        allow_host_net: bool,
+        allow_private_net: bool,
+        allow_unlimited: bool,
+        /// The three descriptors that follow are one terminal, not three
+        /// streams: the child adopts it as its controlling terminal.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        tty: bool,
+        /// The signals the client ignores, bit `n - 1` for signal `n`: the
+        /// program gets these as `SIG_IGN` and every other signal as its
+        /// default, whatever the supervisor's own dispositions are. What
+        /// `nohup zygo run …` means, kept; what a supervisor started with
+        /// `&` from a script would otherwise pass on — `SIGINT` ignored, so
+        /// that Ctrl-C did nothing in any run it started — dropped.
+        #[serde(default)]
+        ignored_signals: u64,
     },
 
     /// Everything `zygo ps` shows.
@@ -174,6 +225,29 @@ pub enum Response {
     /// A request ran. `outcome.succeeded()` says whether the handler liked it.
     Executed {
         outcome: Box<Outcome>,
+    },
+
+    /// A `RUN` sandbox exists and is about to `execve`.
+    ///
+    /// Sent before the sandbox runs so the client can forward its terminal's
+    /// signals to the right pid; a Ctrl-C at the client would otherwise reach
+    /// nothing, because the sandbox is the supervisor's child, not the
+    /// client's. The pid is init's, as the client sees it; init leads its own
+    /// process group, so `kill(-pid)` reaches everything it forked.
+    Started {
+        pid: u32,
+    },
+
+    /// A `RUN` sandbox has exited. The same fields `zygo run --outcome`
+    /// writes, because they are the same facts.
+    Ran {
+        exit_code: i32,
+        /// The supervisor's deadline killed it.
+        timed_out: bool,
+        /// The kernel killed something in it for running out of memory.
+        oom_killed: bool,
+        peak_rss_kb: u64,
+        wall_ms: f64,
     },
 
     Functions {
@@ -320,6 +394,16 @@ mod tests {
                 timeout_ms: 30_000,
             },
             Request::List,
+            Request::Run {
+                spec: None,
+                layer: Box::default(),
+                base_dir: "/work".into(),
+                allow_host_net: false,
+                allow_private_net: true,
+                allow_unlimited: false,
+                tty: false,
+                ignored_signals: 1 << (libc::SIGHUP - 1),
+            },
             Request::Stop {
                 name: Some("resize".into()),
             },
@@ -587,6 +671,7 @@ mod tests {
         // The whole point of two protocols: tenant code that gets hold of the
         // agent socket still cannot say anything the supervisor will act on.
         let exec = crate::protocol::Message::Exec {
+            script: None,
             id: "1".into(),
             event: serde_json::Value::Null,
             timeout_ms: 1000,

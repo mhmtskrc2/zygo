@@ -434,6 +434,24 @@ pub const BASE_ALLOWLIST: &[&str] = &[
 /// Syscalls `permissive` adds back. Roughly Docker's default profile: enough to
 /// debug a package that the tighter profiles break, and nothing that Docker
 /// itself would refuse.
+///
+/// It overlaps [`NEVER_ALLOWED`] on purpose and only where it must — `ptrace`,
+/// `setns`, `unshare`, `mount`, `umount2`, `pivot_root`,
+/// `process_vm_readv`/`writev` — because that is what this profile is *for*:
+/// debugging inside the sandbox, and Zygo's own derived-layer builds, where
+/// `dpkg` needs `mknod` and `chroot`. A `permissive` sandbox is a weaker
+/// sandbox and the documentation says so.
+///
+/// `io_uring_*` and `userfaultfd` were here and are not any more. The escape
+/// suite runs every appendix-B vector against all three profiles now, and
+/// found them reachable under this one; the comment above claimed they were
+/// what Docker allows, and Docker removed io_uring from its default profile
+/// in 20.10.18 (moby#43991) for the same reason appendix B excludes it — it
+/// is a large, fast-moving kernel surface reachable with no capability at
+/// all. `userfaultfd` was wider here than in Docker, which grants it only
+/// with `CAP_SYS_PTRACE`; a Zygo sandbox holds no capabilities, so "as Docker
+/// does" meant "always". Neither is needed to debug a package or to run
+/// `apt-get`.
 pub const PERMISSIVE_EXTRA: &[&str] = &[
     "clone3",
     "personality",
@@ -445,10 +463,6 @@ pub const PERMISSIVE_EXTRA: &[&str] = &[
     "mount",
     "umount2",
     "pivot_root",
-    "io_uring_setup",
-    "io_uring_enter",
-    "io_uring_register",
-    "userfaultfd",
     "sync",
     "syncfs",
     "mknod",
@@ -475,16 +489,20 @@ pub const PERMISSIVE_EXTRA: &[&str] = &[
 /// a socket it cannot `recvfrom` is a supervisor it cannot hear. Transferring
 /// bytes on a descriptor a process was handed is not a capability; opening
 /// one is, and that is what stays removed.
+///
+/// Deliberately **not** `socketpair` either, for the same reason one step
+/// further on. A socketpair is two ends of one channel, both created here and
+/// reachable from nowhere else: it is `pipe2` with a nicer API, and it grants
+/// no more reach than `pipe2` does. Removing it looked free until the Node
+/// agent was run under `strict` and could not start a single worker —
+/// libuv creates *every* stdio pipe and every IPC channel with
+/// `socketpair()`, so a Node process under this profile cannot spawn a child
+/// it can hear at all (`spawn EPERM`, before any handler code). CPython uses
+/// `pipe2` and never noticed. What `strict` is for is a function that cannot
+/// reach the network; `socket`, `connect`, `bind`, `listen` and `accept4` are
+/// what reach it, and those stay removed.
 pub const STRICT_REMOVED: &[&str] = &[
-    "socket",
-    "socketpair",
-    "connect",
-    "bind",
-    "listen",
-    "accept4",
-    "ptrace",
-    "mount",
-    "umount2",
+    "socket", "connect", "bind", "listen", "accept4", "ptrace", "mount", "umount2",
 ];
 
 /// What a runtime agent's *forked child* additionally loses under `strict`.
@@ -580,12 +598,20 @@ pub fn encode(prog: &[SockFilter]) -> Vec<u8> {
 /// filter that denied every `fork`.
 pub const SPECIAL_CASED: &[&str] = &["clone"];
 
-/// Syscalls that must never be reachable, whatever the profile
-/// (design doc appendix B).
+/// Syscalls that must never be reachable (design doc appendix B).
 ///
-/// Nothing grants these — they are simply absent from every allowlist. The
-/// constant exists so a test can assert that, rather than the absence being
-/// something a reader has to verify by reading 190 names.
+/// Nothing in `default` or `strict` grants these — they are simply absent from
+/// both allowlists. The constant exists so a test can assert that, rather than
+/// the absence being something a reader has to verify by reading 190 names.
+///
+/// `permissive` is the documented exception and is not a tenant profile: it
+/// exists to debug a package the tighter profiles break, and to run Zygo's own
+/// derived-layer builds, so it grants `ptrace`, `setns`, `unshare`, `mount`,
+/// `umount2`, `pivot_root` and `process_vm_readv`/`writev` from this list. The
+/// test below asserts exactly that set, so a syscall joining
+/// [`PERMISSIVE_EXTRA`] by accident fails rather than widening the profile
+/// quietly — which is how `io_uring` and `userfaultfd` came to be reachable
+/// there.
 pub const NEVER_ALLOWED: &[&str] = &[
     "bpf",
     "io_uring_setup",
@@ -888,6 +914,44 @@ mod tests {
     /// Appendix B's exclusions are the point of the whole profile. If one of
     /// them ever appears in an allowlist, the sandbox has a hole that reading
     /// 190 names would not reveal.
+    /// What `permissive` is allowed to grant from [`NEVER_ALLOWED`], exactly.
+    ///
+    /// Not "some of them": the list. `io_uring_setup`, `io_uring_enter`,
+    /// `io_uring_register` and `userfaultfd` were in `PERMISSIVE_EXTRA` and
+    /// are not in this set, which is what the escape suite found when it
+    /// started running appendix B's vectors against all three profiles.
+    const PERMISSIVE_MAY_GRANT: &[&str] = &[
+        "ptrace",
+        "setns",
+        "unshare",
+        "mount",
+        "umount2",
+        "pivot_root",
+        "process_vm_readv",
+        "process_vm_writev",
+    ];
+
+    #[test]
+    fn permissive_grants_exactly_the_forbidden_syscalls_it_is_documented_to() {
+        let allowed = allowed_names(SeccompProfile::Permissive);
+        // Sorted, because the order here is `NEVER_ALLOWED`'s and carries no
+        // meaning; what is being asserted is the set.
+        let mut granted: Vec<&str> = NEVER_ALLOWED
+            .iter()
+            .copied()
+            .filter(|name| allowed.contains(name))
+            .collect();
+        granted.sort_unstable();
+        let mut documented = PERMISSIVE_MAY_GRANT.to_vec();
+        documented.sort_unstable();
+        assert_eq!(
+            granted, documented,
+            "`permissive` grants a different set of appendix B's exclusions than \
+             it is documented to. Adding one is a decision, not a detail: this \
+             profile is what `apt` builds run under."
+        );
+    }
+
     #[test]
     fn the_forbidden_syscalls_are_absent_from_default_and_strict() {
         for profile in [SeccompProfile::Default, SeccompProfile::Strict] {
@@ -904,19 +968,20 @@ mod tests {
     #[test]
     fn strict_removes_the_socket_family() {
         let strict = allowed_names(SeccompProfile::Strict);
-        for name in [
-            "socket",
-            "socketpair",
-            "connect",
-            "bind",
-            "listen",
-            "ptrace",
-        ] {
+        for name in ["socket", "connect", "bind", "listen", "ptrace"] {
             assert!(
                 !strict.contains(&name),
                 "{name} survived the strict profile"
             );
         }
+        // But not `socketpair`, which reaches nothing: it is `pipe2` with a
+        // nicer API, and libuv builds every Node stdio pipe out of one. A
+        // `strict` Node function could not start a worker while it was
+        // removed.
+        assert!(
+            strict.contains(&"socketpair"),
+            "strict removed socketpair, which is how Node makes a pipe"
+        );
         // But the sandbox still has to be able to run and exit — and an agent
         // has to be able to use the control socket it was handed. `strict`
         // once removed `recvfrom`, and every strict function died before its

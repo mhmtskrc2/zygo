@@ -163,7 +163,9 @@ impl Backend for NsBackend {
             );
         }
 
-        let report = doctor::run(&self.paths);
+        // Cached: `for_isolation` asks this on every `run`, `serve` and
+        // `exec`, and the probe it runs is the expensive kind.
+        let report = doctor::cached(&self.paths);
         if report.supports(Isolation::Ns) {
             return Availability::Available;
         }

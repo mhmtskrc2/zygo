@@ -64,6 +64,7 @@ Sent after the handler has been loaded and the warm-up is complete.
 | `imports_ms` | float | One-time warm-up cost. Reported by `zygo ps`. |
 | `rss_kb` | int | Resident memory after warm-up — the per-tenant cost. |
 | `runtime` | string | Free-form `name/version`, for diagnostics only. |
+| `child_filter` | string | Optional. How the agent is honouring `ZYGO_CHILD_SECCOMP`: `seccomp`, an implementation-defined name for an equivalent, or `none`. Diagnostics only. |
 
 A supervisor that sees an unknown `proto` refuses the agent rather than guessing.
 
@@ -83,6 +84,50 @@ request in flight finishes. The agent never receives a value, so an agent
 cannot leak one: it is not in `EXEC`, not in the zygote's memory, and not on
 this connection. An agent needs to do nothing for secrets to work, and must
 not try to — the files appear before `GO` and are the child's to read.
+
+#### `script` — the runtime pool shape (1.1)
+
+`EXEC` may carry the code to run:
+
+```json
+{"type":"EXEC","id":"01f3","event":{…},"timeout_ms":30000,
+ "script":{"source":"def handler(event): …","digest":"sha256:…"}}
+```
+
+Absent is the original shape and the fast path: the agent was started with a
+handler, imported it once, and every request is a fork of that.
+
+Present is the **runtime pool**: one zygote per image-and-dependency-set,
+holding no tenant code at all, and the script arrives with the request. An
+embedder has ten thousand scripts and cannot hold ten thousand zygotes — a
+warm one costs about 10 MB of proportional memory, which is 97 GiB at that
+count ([`docs/bench-embed.md`](../docs/bench-embed.md)). This field is how one
+zygote serves all of them.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `source` | string | The script itself. Needs no store; costs a copy per `EXEC`. |
+| `path` | string | Where the supervisor put it inside the sandbox, read-only, before `GO`. |
+| `digest` | string | `sha256:…` of the contents. An identity, not a control — the supervisor wrote the file and the child can reach nothing else. |
+| `entry_point` | string | What to call. Default `handler`. |
+
+Exactly one of `source` and `path` is set.
+
+**The child loads it, after `GO`.** Not the agent, and not before: a zygote
+that imported a tenant's script would hold that tenant's code, and a pool is
+shared, so the next request could be somebody else's. The whole value of a
+pool is that the warm process is anonymous — an interpreter and its
+dependencies, and nothing of anybody's. Under `strict`, load it *after*
+installing `ZYGO_CHILD_SECCOMP` too, so a script that tries to start a program
+is refused by the kernel while it is loading rather than after.
+
+The cost is that the load is paid per request instead of once. That is the
+trade, and it is why `entry` still exists: warm a hot function with its
+handler and fork it, and let the long tail arrive this way.
+
+Implementing this is **optional**. An agent that does not know the field
+ignores it, as §5 requires, and serves the handler it was warmed with;
+`zygo agent test` reports that as "functions only" rather than as a failure.
 
 ### `FORKED` — agent → supervisor
 
@@ -175,11 +220,18 @@ are what `zygo agent test <binary> -- [args…]` checks: it starts the agent wit
 the control socket at descriptor 3 and runs the conversation against it.
 
 The handler the agent is started with has to satisfy a small contract, or there
-is nothing the suite can assert about the answers — return the event unchanged,
-write `event.stdout` to stdout and `event.stderr` to stderr when they are
-strings. [`examples/agents/`](../examples/agents) has one per agent, and a
-complete agent in POSIX sh to check the suite against something that is not
-Python.
+is nothing the suite can assert about the answers:
+
+* return the event unchanged;
+* write `event.stdout` to stdout and `event.stderr` to stderr when they are
+  strings;
+* when `event.spawn` is a string, start a **program** that prints it — which
+  is what the `strict` child filter takes away, and so what the suite has to
+  be able to attempt.
+
+[`examples/agents/conformance/`](../examples/agents/conformance) has one per
+language, and [`examples/agents/sh/`](../examples/agents/sh) is a complete
+agent in POSIX sh, to check the suite against something that is not Python.
 
 1. **One process per request.** Every request runs in its own process, or at
    minimum a pid that can be moved into its own cgroup.
@@ -200,19 +252,31 @@ Python.
    dies there takes every request in flight with it. (An announced length past
    the 32 MiB cap is different: nothing was consumed, the stream cannot be
    resynchronised, and closing the connection is the only correct answer.)
+7. **`ZYGO_CHILD_SECCOMP` is installed, or the request is failed.** When the
+   supervisor sets it, the value is base64 of a raw seccomp-bpf program
+   (`struct sock_filter[]`, the host's byte order) that the *child* is to
+   install — `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog)` after
+   `PR_SET_NO_NEW_PRIVS` — after `GO` and before any handler code. It is how
+   the `strict` profile removes `execve` and process creation from the child
+   without removing them from the agent. A value the agent cannot decode is a
+   start-up `ERROR`.
+
+   There are exactly two conforming answers: install it, or fail the request.
+   Running the request anyway, with the sandbox's filter alone, is the third
+   and it is not allowed — a `strict` function whose agent quietly ignored
+   this variable is a function whose author asked for a tightening and did not
+   get it. `zygo agent test` checks this by starting a second copy of the
+   agent with the variable set and asking the handler to `spawn`; the `sh`
+   and Node example agents both failed it silently until it existed.
+
+   A language that cannot reach `prctl` can still conform. The Node agent
+   ships a forty-line shared object whose constructor installs the program,
+   and falls back to Node's own permission model — no child processes, no
+   native addons, no WASI — when the image has no such object; it says which
+   in `READY`. The `sh` agent refuses every request instead, which is the
+   other conforming answer.
 
 ### Strongly recommended
-
-- **Honour `ZYGO_CHILD_SECCOMP`.** When the supervisor sets it, the value is
-  base64 of a raw seccomp-bpf program (`struct sock_filter[]`, the host's byte
-  order) that the *child* is to install — `prctl(PR_SET_SECCOMP,
-  SECCOMP_MODE_FILTER, &prog)` after `PR_SET_NO_NEW_PRIVS` — after `GO` and
-  before any handler code. It is how the `strict` profile removes `execve`
-  and process creation from the child without removing them from the agent.
-  An agent that cannot install it must fail the request, not run it
-  unfiltered; a value it cannot decode is a start-up `ERROR`. An agent that
-  does not implement this is still conforming, and its documentation should
-  say so, because a `strict` function on it has the sandbox filter only.
 - **Import nothing lazily on the request path.** Every module the child touches
   must already be loaded in the agent, so the child inherits it through
   copy-on-write. This is the easiest mistake to make and the most expensive: in
@@ -262,6 +326,12 @@ subtree; the agent observes the child's death and reports it as a `DONE` with
 
 `proto` is incremented only for a breaking change. Adding an **optional** field
 is not breaking — implementations must ignore fields they do not recognise.
+
+That is why the script-carrying `EXEC` above is called 1.1 and still announces
+`proto: 1`: an agent written before it existed ignores the field and keeps
+working, and a supervisor that sends one to such an agent gets the agent's own
+handler back rather than an error. The version number is for the day something
+*removes* or *changes the meaning of* a field, and nothing has.
 
 Conformance fixtures live in `spec/fixtures/` and are exercised by both the Rust
 tests and `agents/python/test_zygo_agent.py`.

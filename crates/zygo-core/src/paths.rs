@@ -124,6 +124,10 @@ impl Paths {
     pub fn tmp(&self) -> PathBuf {
         self.data.join("tmp")
     }
+    /// Scripts that arrive with requests, by content digest (protocol 1.1).
+    pub fn scripts(&self) -> PathBuf {
+        self.data.join("scripts")
+    }
     pub fn venv_cache(&self) -> PathBuf {
         self.data.join("cache/venvs")
     }

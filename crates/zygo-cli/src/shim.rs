@@ -60,7 +60,9 @@ pub const INSTANCE: &str = "zygo";
 pub fn runs_on_the_host(command: &Command) -> bool {
     matches!(
         command,
-        Command::Completion { .. } | Command::Doctor | Command::Agent(AgentCommand::Test { .. })
+        Command::Completion { .. }
+            | Command::Doctor { .. }
+            | Command::Agent(AgentCommand::Test { .. })
     )
 }
 
