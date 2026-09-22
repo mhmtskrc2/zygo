@@ -33,6 +33,8 @@ pub fn run(cli: &Cli, name: &str, follow: bool, tail: u32, failed: bool) -> anyh
             after,
             limit,
             failed,
+            // The CLI is the operator at a terminal; see `zygo exec`.
+            tenant: None,
         })?;
         let (entries, next) = match response {
             Response::Logs { entries, next, .. } => (entries, next),

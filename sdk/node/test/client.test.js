@@ -374,6 +374,64 @@ test('a script is sent as itself, and its digest comes back', async () => {
   }
 });
 
+test('a secret arrives once, and the listing never carries one', async () => {
+  const api = await FakeApi.start();
+  api.answer('POST', '/tenants/acme/tokens', 201, {
+    token: { id: 'tok_1a2b3c4d5e6f', tenant: 'acme', created_ms: 1 },
+    secret: 'zygo_deadbeef',
+  });
+  api.answer('GET', '/tokens', 200, {
+    tokens: [{ id: 'tok_1a2b3c4d5e6f', tenant: 'acme', created_ms: 1 }],
+  });
+  api.answer('DELETE', '/tokens/tok_1a2b3c4d5e6f', 200, { revoked: true });
+  const client = connect(api.url, { token: null });
+  try {
+    const minted = await client.mintToken('acme');
+    assert.equal(minted.secret, 'zygo_deadbeef');
+    assert.equal(minted.token.tenant, 'acme');
+    assert.equal(api.requests[0].path, '/tenants/acme/tokens');
+
+    const tokens = await client.tokens();
+    assert.deepEqual(tokens.map((t) => t.id), ['tok_1a2b3c4d5e6f']);
+    await client.revokeToken('tok_1a2b3c4d5e6f');
+  } finally {
+    client.close();
+    await api.close();
+  }
+});
+
+test('an operator token is minted on its own route and names nobody', async () => {
+  const api = await FakeApi.start();
+  api.answer('POST', '/tokens', 201, {
+    token: { id: 'tok_000000000000', created_ms: 1 },
+    secret: 'zygo_x',
+  });
+  const client = connect(api.url, { token: null });
+  try {
+    const minted = await client.mintToken();
+    assert.equal(minted.token.tenant, undefined, 'an operator token names nobody');
+    assert.equal(api.requests[0].path, '/tokens');
+  } finally {
+    client.close();
+    await api.close();
+  }
+});
+
+test('acting for a tenant is a header on the same connection', async () => {
+  const api = await FakeApi.start();
+  api.answer('GET', '/fn', 200, { functions: [] });
+  const client = connect(api.url, { token: null });
+  try {
+    await client.functions();
+    await client.forTenant('acme').functions();
+    assert.equal(api.requests[0].headers['x-zygo-tenant'], undefined);
+    assert.equal(api.requests[1].headers['x-zygo-tenant'], 'acme');
+  } finally {
+    client.close();
+    await api.close();
+  }
+});
+
 test('a script the host does not have is a NotFound', async () => {
   const api = await FakeApi.start();
   const digest = 'sha256:' + 'a'.repeat(64);

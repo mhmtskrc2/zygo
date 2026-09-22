@@ -445,6 +445,7 @@ impl Server {
             name: name.clone(),
             event,
             timeout_ms,
+            tenant: None,
         })? {
             Reply::Executed { outcome } => {
                 let mut out = String::new();
@@ -498,6 +499,7 @@ impl Server {
             after: 0,
             limit,
             failed,
+            tenant: None,
         })? {
             Reply::Logs { entries, .. } if entries.is_empty() => Ok("No log entries.".into()),
             Reply::Logs { entries, .. } => {

@@ -16,6 +16,7 @@ pub mod shell;
 pub mod spec;
 pub mod stats;
 pub mod supervisor;
+pub mod token;
 
 use zygo_core::Paths;
 

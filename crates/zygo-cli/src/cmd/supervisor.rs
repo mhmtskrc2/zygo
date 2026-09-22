@@ -611,6 +611,7 @@ pub fn exec(cli: &Cli, args: &ExecArgs) -> anyhow::Result<u8> {
                 .context("which function? `zygo exec <name> '<json>'`")?,
             event,
             timeout_ms,
+            tenant: None,
         },
     };
     let response = client.send(&request)?;
@@ -1074,6 +1075,7 @@ mod tests {
     fn ps_renders_a_status_table() {
         // Guards the column order, which is the part a script would parse.
         let f = Status {
+            tenant: "default".into(),
             name: "resize".into(),
             image: String::new(),
             state: SandboxState::Warm,

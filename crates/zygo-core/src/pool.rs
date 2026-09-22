@@ -378,6 +378,15 @@ pub struct Status {
     /// that predates the field.
     #[serde(default)]
     pub image: String,
+    /// Whose function this is, as [`crate::spec::resolve`] settled it —
+    /// `"default"` when nobody said.
+    ///
+    /// Here so that a listing can be filtered to one customer: the supervisor
+    /// enforces ownership on every route that *acts* on a function, and this
+    /// is what lets the route that only *shows* them do the same. Defaulted
+    /// for answers from a supervisor that predates the field.
+    #[serde(default)]
+    pub tenant: String,
     pub state: SandboxState,
     pub runtime: String,
     /// Resident memory reported at warm-up.
@@ -737,6 +746,7 @@ impl Pool {
 
                 Ok(Function::Agent(Box::new(WarmFn {
                     name: f.name.clone(),
+                    tenant: f.tenant.clone(),
                     image: f.image.clone(),
                     conn,
                     replies: Mutex::new(Some(replies)),
@@ -801,6 +811,7 @@ impl Pool {
 
         Ok(Function::Exec(Box::new(WarmExec {
             name: f.name.clone(),
+            tenant: f.tenant.clone(),
             image: f.image.clone(),
             init_pid: sandbox.pid(),
             secrets_dir,
@@ -1029,6 +1040,8 @@ impl Pool {
 /// One warm function: a sandbox with an agent in it, waiting.
 pub struct WarmFn {
     name: String,
+    /// See [`Status::tenant`].
+    tenant: String,
     /// See [`Status::image`].
     image: String,
     /// The supervisor's end of the connection to the agent.
@@ -1234,6 +1247,7 @@ impl WarmFn {
         let counters = self.counters.lock().expect("counters");
         Status {
             name: self.name.clone(),
+            tenant: self.tenant.clone(),
             image: self.image.clone(),
             state: self.state(),
             runtime: self.runtime.clone(),
@@ -2275,6 +2289,8 @@ fn write_request_file_at(
 #[cfg(target_os = "linux")]
 pub struct WarmExec {
     name: String,
+    /// See [`Status::tenant`].
+    tenant: String,
     /// See [`Status::image`].
     image: String,
     /// Host pid of the held init: the process whose death means the sandbox
@@ -2320,6 +2336,7 @@ impl WarmExec {
         let counters = self.counters.lock().expect("counters");
         Status {
             name: self.name.clone(),
+            tenant: self.tenant.clone(),
             image: self.image.clone(),
             state: self.state(),
             runtime: "exec".into(),

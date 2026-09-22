@@ -292,6 +292,7 @@ mod tests {
             api_requests: 12,
             api_errors: 1,
             functions: vec![Status {
+                tenant: "default".into(),
                 name: "resize".into(),
                 image: String::new(),
                 state: SandboxState::Warm,

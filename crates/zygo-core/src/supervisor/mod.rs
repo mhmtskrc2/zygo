@@ -1085,6 +1085,13 @@ impl Supervisor {
         };
 
         let stopped = self.stop_everything_for(id);
+        // Before the record goes, not after: a token whose tenant no longer
+        // exists would resolve to a customer nobody can see, and "the tenant
+        // is gone but their key still opens the door" is the failure this
+        // whole layer exists to prevent.
+        crate::tokens::Tokens::new(&self.paths)
+            .revoke_tenants(id)
+            .map_err(|e| Response::error(ControlError::CallFailed, e))?;
         let removed_scripts = store
             .remove(id)
             .map_err(|e| Response::error(ControlError::CallFailed, e))?
@@ -1107,6 +1114,58 @@ impl Supervisor {
             removed_scripts,
             stopped,
         })
+    }
+
+    /// Mint an API token, and answer with the secret exactly once.
+    ///
+    /// Minting for a tenant registers that tenant if it is new, like
+    /// `PutScript` does: onboarding a customer should be one call, not two in
+    /// an order the embedder has to remember.
+    pub fn mint_token(&self, tenant: Option<&str>) -> std::result::Result<Response, Response> {
+        let kind = match tenant {
+            Some(id) => {
+                crate::tenants::Tenants::new(&self.paths)
+                    .create(id)
+                    .map_err(|e| Response::error(ControlError::BadSpec, e))?;
+                crate::tokens::TokenKind::Tenant {
+                    tenant: id.to_string(),
+                }
+            }
+            None => crate::tokens::TokenKind::Operator,
+        };
+        let minted = crate::tokens::Tokens::new(&self.paths)
+            .mint(kind)
+            .map_err(|e| Response::error(ControlError::BadSpec, e))?;
+        Ok(Response::Tokens {
+            tokens: vec![minted.token],
+            secret: Some(minted.secret),
+        })
+    }
+
+    /// Every token, hashes and all. The secret is not in the store to return.
+    pub fn list_tokens(&self) -> std::result::Result<Response, Response> {
+        let tokens = crate::tokens::Tokens::new(&self.paths)
+            .list()
+            .map_err(|e| Response::error(ControlError::CallFailed, e))?;
+        Ok(Response::Tokens {
+            tokens,
+            secret: None,
+        })
+    }
+
+    /// Revoke one. The record stays, marked, so a log line naming it still
+    /// resolves to something.
+    pub fn revoke_token(&self, id: &str) -> std::result::Result<Response, Response> {
+        crate::tokens::valid_token_id(id).map_err(|e| Response::error(ControlError::BadSpec, e))?;
+        let store = crate::tokens::Tokens::new(&self.paths);
+        match store.revoke(id) {
+            Ok(true) => self.list_tokens(),
+            Ok(false) => Err(Response::error(
+                ControlError::NotFound,
+                format!("no token `{id}`"),
+            )),
+            Err(e) => Err(Response::error(ControlError::CallFailed, e)),
+        }
     }
 
     /// Stop every function and pool that belongs to a tenant. Returns their
@@ -1273,6 +1332,44 @@ impl Supervisor {
     /// A cold function is still registered, so a request for it is not a
     /// mistake to report — it is a cold start to pay. The caller sees a slower
     /// request, which is exactly the trade `cold_after` was configured to make.
+    /// Refuse a function that belongs to a different customer.
+    ///
+    /// `caller` is `None` for the operator, who may reach anything on their
+    /// own host. A tenant gets exactly one answer for "no such function" and
+    /// for "that one is somebody else's", because the difference between them
+    /// is a fact about another customer — the same rule `script_for_request`
+    /// follows for digests, and for the same reason.
+    ///
+    /// Checked here rather than in the API: the supervisor is the authority on
+    /// what a function is and who it belongs to, and a boundary enforced only
+    /// in the process that happens to be in front of it is a boundary that
+    /// moves the day something else talks to this socket.
+    fn owned_by(&self, name: &str, caller: Option<&str>) -> std::result::Result<(), Response> {
+        let Some(caller) = caller else {
+            return Ok(());
+        };
+        let owner = self
+            .functions
+            .lock()
+            .expect("registry")
+            .get(name)
+            .map(|e| e.resolved.tenant.clone())
+            .or_else(|| {
+                self.cold
+                    .lock()
+                    .expect("cold")
+                    .get(name)
+                    .map(|c| c.resolved.tenant.clone())
+            });
+        match owner {
+            Some(owner) if owner == caller => Ok(()),
+            _ => Err(Response::error(
+                ControlError::NotFound,
+                format!("no function named `{name}`; `zygo serve` it first"),
+            )),
+        }
+    }
+
     fn lookup(&self, name: &str) -> std::result::Result<Arc<Entry>, Response> {
         if let Some(entry) = self.functions.lock().expect("registry").get(name) {
             return Ok(Arc::clone(entry));
@@ -1665,16 +1762,30 @@ fn dispatch(supervisor: &Supervisor, request: Request, greeted: &mut bool) -> Re
             name,
             event,
             timeout_ms,
-        } => merge(supervisor.exec(&name, event, Duration::from_millis(timeout_ms))),
+            tenant,
+        } => merge(
+            supervisor
+                .owned_by(&name, tenant.as_deref())
+                .and_then(|()| supervisor.exec(&name, event, Duration::from_millis(timeout_ms))),
+        ),
         Request::Stop { name } => merge(supervisor.stop(name.as_deref())),
-        Request::Warm { name } => merge(supervisor.warm(&name)),
+        Request::Warm { name, tenant } => merge(
+            supervisor
+                .owned_by(&name, tenant.as_deref())
+                .and_then(|()| supervisor.warm(&name)),
+        ),
         Request::Shell { name } => merge(supervisor.shell(&name)),
         Request::Logs {
             name,
             after,
             limit,
             failed,
-        } => merge(supervisor.logs(&name, after, limit, failed)),
+            tenant,
+        } => merge(
+            supervisor
+                .owned_by(&name, tenant.as_deref())
+                .and_then(|()| supervisor.logs(&name, after, limit, failed)),
+        ),
         Request::ServeRuntime {
             name,
             spec,
@@ -1719,6 +1830,9 @@ fn dispatch(supervisor: &Supervisor, request: Request, greeted: &mut bool) -> Re
         Request::CreateTenant { id } => merge(supervisor.create_tenant(&id)),
         Request::Tenants { id } => merge(supervisor.tenants(id.as_deref())),
         Request::DeleteTenant { id } => merge(supervisor.delete_tenant(&id)),
+        Request::MintToken { tenant } => merge(supervisor.mint_token(tenant.as_deref())),
+        Request::Tokens => merge(supervisor.list_tokens()),
+        Request::RevokeToken { id } => merge(supervisor.revoke_token(&id)),
         Request::GetScript { digest } => merge(supervisor.get_script(&digest)),
         Request::DeleteScript { digest } => merge(supervisor.delete_script(&digest)),
         Request::Shutdown => Response::Ok,
@@ -1984,6 +2098,7 @@ mod tests {
 
         let status = Status {
             name: "resize".into(),
+            tenant: crate::spec::resolve::DEFAULT_TENANT.into(),
             image: String::new(),
             state: crate::sandbox::SandboxState::Cold,
             runtime: "python/3.12".into(),
@@ -2133,6 +2248,7 @@ mod tests {
     fn cold_status(name: &str) -> Status {
         Status {
             name: name.into(),
+            tenant: crate::spec::resolve::DEFAULT_TENANT.into(),
             image: String::new(),
             state: crate::sandbox::SandboxState::Cold,
             runtime: "python/3.12".into(),
@@ -2458,6 +2574,7 @@ mod tests {
                 name: "x".into(),
                 event: serde_json::Value::Null,
                 timeout_ms: 1,
+                tenant: None,
             },
         ] {
             let response = dispatch(&supervisor, request, &mut greeted);
@@ -2674,6 +2791,182 @@ mod tests {
         assert!(
             store.contains(&parse(&shared).unwrap()),
             "a script another tenant still refers to was deleted"
+        );
+    }
+
+    /// A tenant may only reach the functions that are theirs.
+    ///
+    /// The other half of `a_tenant_cannot_run_another_tenants_script_by_digest`:
+    /// a pool call is refused by digest, and a warm function is refused by
+    /// name. Both answer `not_found`, because the difference between "no such
+    /// function" and "not yours" is a fact about another customer.
+    ///
+    /// Registered cold, which is the part of the registry a test can build
+    /// without a kernel: `owned_by` reads the same two maps a warm one is in.
+    #[test]
+    fn a_tenant_cannot_reach_another_tenants_function_by_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let supervisor = Supervisor::new(paths(&dir)).expect("supervisor");
+
+        let mut resolved = resolved_fn("resize");
+        resolved.tenant = "acme".into();
+        supervisor.cold.lock().expect("cold").insert(
+            "resize".into(),
+            Cold {
+                resolved,
+                secrets: BTreeMap::new(),
+                sources: Sources::default(),
+                last_status: cold_status("resize"),
+                since: Instant::now(),
+            },
+        );
+
+        // The operator reaches everything on their own host.
+        assert!(supervisor.owned_by("resize", None).is_ok());
+        assert!(supervisor.owned_by("resize", Some("acme")).is_ok());
+
+        for stranger in ["globex", crate::spec::resolve::DEFAULT_TENANT] {
+            let refused = supervisor
+                .owned_by("resize", Some(stranger))
+                .expect_err("another tenant's function");
+            match refused {
+                Response::Error { code, message } => {
+                    assert_eq!(code, ControlError::NotFound);
+                    assert!(
+                        !message.contains("acme"),
+                        "the refusal named the owner: {message}"
+                    );
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+
+        // And a name nobody served is refused identically, which is what
+        // makes the two indistinguishable from outside.
+        let message = |response| match response {
+            Response::Error { message, .. } => message,
+            other => panic!("{other:?}"),
+        };
+        let missing = message(
+            supervisor
+                .owned_by("resize-2", Some("acme"))
+                .expect_err("no such function"),
+        );
+        let stranger = message(
+            supervisor
+                .owned_by("resize", Some("globex"))
+                .expect_err("somebody else's"),
+        );
+        assert_eq!(
+            missing.replace("resize-2", "resize"),
+            stranger,
+            "the two refusals differ, so one can be told from the other"
+        );
+    }
+
+    /// A token is minted once, resolves, and stops resolving when revoked.
+    #[test]
+    fn a_token_round_trips_through_the_control_protocol() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let supervisor = Supervisor::new(paths(&dir)).expect("supervisor");
+        let mut greeted = true;
+
+        let (id, secret) = match dispatch(
+            &supervisor,
+            Request::MintToken {
+                tenant: Some("acme".into()),
+            },
+            &mut greeted,
+        ) {
+            Response::Tokens { tokens, secret } => (
+                tokens.first().expect("a token").id.clone(),
+                secret.expect("the secret is on the mint"),
+            ),
+            other => panic!("{other:?}"),
+        };
+
+        // Minting for a tenant registered it, so an embedder onboarding a
+        // customer makes one call rather than two in the right order.
+        match dispatch(
+            &supervisor,
+            Request::Tenants {
+                id: Some("acme".into()),
+            },
+            &mut greeted,
+        ) {
+            Response::Tenants { tenants, .. } => assert_eq!(tenants.len(), 1),
+            other => panic!("{other:?}"),
+        }
+
+        let store = crate::tokens::Tokens::new(supervisor.paths());
+        assert_eq!(
+            store
+                .resolve(&secret)
+                .expect("resolve")
+                .and_then(|t| t.tenant().map(str::to_string)),
+            Some("acme".into())
+        );
+
+        // A listing never carries a secret, whatever it carries.
+        match dispatch(&supervisor, Request::Tokens, &mut greeted) {
+            Response::Tokens { tokens, secret } => {
+                assert_eq!(tokens.len(), 1);
+                assert!(secret.is_none(), "a listing answered with a secret");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        assert!(matches!(
+            dispatch(
+                &supervisor,
+                Request::RevokeToken { id: id.clone() },
+                &mut greeted
+            ),
+            Response::Tokens { .. }
+        ));
+        assert!(
+            store.resolve(&secret).expect("resolve").is_none(),
+            "a revoked token still resolves"
+        );
+        assert!(matches!(
+            dispatch(&supervisor, Request::RevokeToken { id }, &mut greeted),
+            Response::Tokens { .. }
+        ));
+    }
+
+    /// Deleting a tenant takes their keys with their code.
+    #[test]
+    fn deleting_a_tenant_revokes_their_tokens() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let supervisor = Supervisor::new(paths(&dir)).expect("supervisor");
+        let mut greeted = true;
+        let mint = |tenant: &str, greeted: &mut bool| match dispatch(
+            &supervisor,
+            Request::MintToken {
+                tenant: Some(tenant.into()),
+            },
+            greeted,
+        ) {
+            Response::Tokens { secret, .. } => secret.expect("a secret"),
+            other => panic!("{other:?}"),
+        };
+        let acme = mint("acme", &mut greeted);
+        let globex = mint("globex", &mut greeted);
+
+        dispatch(
+            &supervisor,
+            Request::DeleteTenant { id: "acme".into() },
+            &mut greeted,
+        );
+
+        let store = crate::tokens::Tokens::new(supervisor.paths());
+        assert!(
+            store.resolve(&acme).expect("resolve").is_none(),
+            "the deleted tenant's key still opens the door"
+        );
+        assert!(
+            store.resolve(&globex).expect("resolve").is_some(),
+            "another tenant's token went with it"
         );
     }
 

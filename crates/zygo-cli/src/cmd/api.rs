@@ -372,7 +372,7 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<Full<B
         ));
     }
 
-    authorise(&req, api)?;
+    let actor = authorise(&req, api)?;
 
     let path = req.uri().path().to_string();
     let segments: Vec<&str> = path
@@ -381,10 +381,10 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<Full<B
         .filter(|s| !s.is_empty())
         .collect();
 
-    let actor = Actor::of(&req)?;
+    let tenant = actor.tenant().map(str::to_string);
 
     match (req.method(), segments.as_slice()) {
-        (&Method::GET, ["fn"]) => list(api).await,
+        (&Method::GET, ["fn"]) => list(api, tenant).await,
         (&Method::POST, ["tenants"]) => {
             actor.operator_only("creating a tenant")?;
             let body = read_body(req).await?;
@@ -395,14 +395,36 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<Full<B
             tenants(api, None).await
         }
         (&Method::GET, ["tenants", id]) => {
-            actor.operator_only("reading a tenant")?;
-            tenants(api, Some(id.to_string())).await
+            // A tenant reading *itself* is not a leak, and it is how a client
+            // discovers which scripts it registered. Any other id is.
+            let id = id.to_string();
+            if actor.tenant() != Some(id.as_str()) {
+                actor.operator_only("reading another tenant")?;
+            }
+            tenants(api, Some(id)).await
         }
         (&Method::DELETE, ["tenants", id]) => {
             let id = id.to_string();
-            actor.operator_only("deleting a tenant")?;
-            deployable(api)?;
+            actor.may_deploy()?;
             delete_tenant(api, id).await
+        }
+        (&Method::POST, ["tenants", id, "tokens"]) => {
+            let id = id.to_string();
+            actor.may_deploy()?;
+            mint_token(api, Some(id)).await
+        }
+        (&Method::POST, ["tokens"]) => {
+            actor.may_deploy()?;
+            mint_token(api, None).await
+        }
+        (&Method::GET, ["tokens"]) => {
+            actor.may_deploy()?;
+            list_tokens(api).await
+        }
+        (&Method::DELETE, ["tokens", id]) => {
+            let id = id.to_string();
+            actor.may_deploy()?;
+            revoke_token(api, id).await
         }
         (&Method::GET, ["metrics"]) => metrics(api).await,
         (&Method::GET, ["version"]) => Ok(json(
@@ -411,37 +433,38 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<Full<B
                 "version": env!("CARGO_PKG_VERSION"),
                 "api": API_VERSION,
                 "control": zygo_core::supervisor::CONTROL_VERSION,
-                "deploy": api.deploy,
+                // What *this* caller may do, not what the flag says: a tenant
+                // token asking is told the truth about its own request.
+                "deploy": actor.deploy && actor.is_operator(),
             }),
         )),
         (&Method::PUT, ["fn", name]) => {
             let name = name.to_string();
-            let tenant = actor.tenant().map(str::to_string);
-            deployable(api)?;
+            actor.may_deploy()?;
             let body = read_body(req).await?;
             serve_fn(api, name, &body, tenant).await
         }
         (&Method::DELETE, ["fn", name]) => {
             let name = name.to_string();
-            deployable(api)?;
+            actor.may_deploy()?;
             stop(api, name).await
         }
         (&Method::POST, ["run"]) => {
-            deployable(api)?;
+            actor.may_deploy()?;
             let body = read_body(req).await?;
             one_shot(api, &body).await
         }
         (&Method::GET, ["fn", name, "logs"]) => {
             let name = name.to_string();
             let query = req.uri().query().unwrap_or("").to_string();
-            logs(api, name, &query).await
+            logs(api, name, &query, tenant).await
         }
         (&Method::POST, ["fn", name]) => {
             let name = name.to_string();
             let timeout_ms = timeout_header(&req)?;
             let body = read_body(req).await?;
             let event = parse_event(&body)?;
-            exec(api, name, event, timeout_ms).await
+            exec(api, name, event, timeout_ms, tenant).await
         }
         (&Method::POST, ["fn", name, "batch"]) => {
             let name = name.to_string();
@@ -453,39 +476,42 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<Full<B
                     format!("body must be a JSON array of events: {e}"),
                 )
             })?;
-            batch(api, name, events, timeout_ms).await
+            batch(api, name, events, timeout_ms, tenant).await
         }
-        (&Method::GET, ["fn", name, "stats"]) => stats(api, name.to_string()).await,
-        (&Method::POST, ["fn", name, "warm"]) => warm(api, name.to_string()).await,
-        (&Method::GET, ["runtimes"]) => runtimes(api).await,
+        (&Method::GET, ["fn", name, "stats"]) => stats(api, name.to_string(), tenant).await,
+        (&Method::POST, ["fn", name, "warm"]) => warm(api, name.to_string(), tenant).await,
+        (&Method::GET, ["runtimes"]) => runtimes(api, tenant).await,
         (&Method::POST, ["runtimes"]) => {
-            deployable(api)?;
-            let tenant = actor.tenant().map(str::to_string);
+            actor.may_deploy()?;
             let body = read_body(req).await?;
             serve_runtime(api, &body, tenant).await
         }
         (&Method::DELETE, ["runtimes", name]) => {
             let name = name.to_string();
-            deployable(api)?;
+            actor.may_deploy()?;
             stop_runtime(api, name).await
         }
         (&Method::POST, ["runtimes", name, "call"]) => {
             let name = name.to_string();
-            let tenant = actor.tenant().map(str::to_string);
             let timeout_ms = timeout_header(&req)?;
             let body = read_body(req).await?;
             call_runtime(api, name, &body, timeout_ms, tenant).await
         }
+        // Not gated on deploy, and this is the change tokens paid for:
+        // registering a script for yourself is what a tenant token is *for*.
+        // The bytes are inert — running them needs a pool the operator
+        // declared — and the digest is theirs alone from here on.
         (&Method::PUT, ["scripts"]) => {
-            deployable(api)?;
-            let tenant = actor.tenant().map(str::to_string);
             let body = read_body(req).await?;
             put_script(api, &body, tenant).await
         }
         (&Method::GET, ["scripts", digest]) => get_script(api, digest.to_string()).await,
+        // Still the operator's: the store is shared by digest, so forgetting
+        // one byte-identical script forgets it for every tenant that
+        // registered the same bytes.
         (&Method::DELETE, ["scripts", digest]) => {
             let digest = digest.to_string();
-            deployable(api)?;
+            actor.may_deploy()?;
             delete_script(api, digest).await
         }
         (_, ["fn", ..])
@@ -494,6 +520,7 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<Full<B
         | (_, ["run"])
         | (_, ["runtimes", ..])
         | (_, ["tenants", ..])
+        | (_, ["tokens", ..])
         | (_, ["scripts", ..]) => Err(HttpError::new(
             StatusCode::METHOD_NOT_ALLOWED,
             format!("{} {}", req.method(), path),
@@ -505,35 +532,103 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<Full<B
     }
 }
 
-/// Who a request acts for.
+/// Who a request acts for, and what they may do.
 ///
 /// Everything below `/fn`, `/runtimes` and `/scripts` belongs to somebody: an
-/// embedder's customer, or the operator themselves. Today the answer comes
-/// from `X-Zygo-Tenant`, which is trusted because holding the bearer token is
-/// already the whole of this API's authority — there is one token and it is
-/// the operator's.
+/// embedder's customer, or the operator themselves. The answer comes from the
+/// **token**, which is the only part of a request the caller cannot choose.
+/// `X-Zygo-Tenant` is still read, but only as an operator saying which of
+/// their customers they are acting for; a tenant token's own id wins, and a
+/// header that disagrees with it is refused rather than ignored.
 ///
-/// **That changes in roadmap 2.2**, where a token belongs to a tenant and the
-/// answer comes from the token instead. The shape is here now so that every
-/// route already asks "whose is this?" and only the *answer* has to move: a
-/// tenant token will resolve to `Tenant`, an operator token to `Operator`,
-/// and the header will be honoured only for an operator acting on somebody's
-/// behalf.
+/// Three ways a request gets here:
+///
+/// * **No auth at all.** A `0600` unix socket or loopback, where whoever can
+///   reach it is already this user. Operator, with `--allow-deploy` deciding
+///   whether they may create sandboxes.
+/// * **The bootstrap token**, `ZYGO_API_TOKEN`. Operator, same flag, same
+///   answer — which is what keeps a setup that predates tokens working.
+/// * **A minted token.** Operator or tenant, as the store says. A minted
+///   operator token deploys unconditionally: minting one already required
+///   deploy rights, so the decision was made when it was created.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Actor {
-    /// The operator: whoever runs this API. May create tenants and runtimes.
-    Operator,
-    /// One tenant, named in the request.
-    Tenant(String),
+struct Actor {
+    /// `None` is the operator.
+    tenant: Option<String>,
+    /// May create and destroy sandboxes, scripts and tokens.
+    deploy: bool,
 }
 
-/// The header a caller names a tenant with.
+/// The header an operator names a tenant with.
 const TENANT_HEADER: &str = "x-zygo-tenant";
 
 impl Actor {
-    fn of(req: &Request<Incoming>) -> Result<Actor, HttpError> {
+    fn tenant(&self) -> Option<&str> {
+        self.tenant.as_deref()
+    }
+
+    fn is_operator(&self) -> bool {
+        self.tenant.is_none()
+    }
+
+    /// Refuse a route that is the operator's alone.
+    ///
+    /// Creating and deleting tenants is not something a tenant does, and
+    /// neither is listing them: a customer that could enumerate the other
+    /// customers is a leak, whatever the limits say.
+    fn operator_only(&self, what: &str) -> Result<(), HttpError> {
+        match &self.tenant {
+            None => Ok(()),
+            Some(id) => Err(HttpError::new(
+                StatusCode::FORBIDDEN,
+                format!("{what} is the operator's, and this request acts for tenant `{id}`"),
+            )),
+        }
+    }
+
+    /// The gate on everything that creates or destroys a sandbox.
+    ///
+    /// A 403 rather than a 404: pretending the route does not exist would send
+    /// an SDK author looking for a typo, when the answer is a flag on the
+    /// server or the kind of token they hold.
+    fn may_deploy(&self) -> Result<(), HttpError> {
+        if self.deploy {
+            return self.operator_only("deploying");
+        }
+        Err(HttpError::new(
+            StatusCode::FORBIDDEN,
+            match &self.tenant {
+                Some(id) => format!(
+                    "serving, stopping and running are the operator's, and this \
+                     request acts for tenant `{id}`\n  \
+                     → a tenant token registers scripts and calls; it does not \
+                     name images, mounts or commands"
+                ),
+                None => "this API may only call functions that are already served\n  \
+                     → start it with `zygo api --allow-deploy`, or present an \
+                     operator token minted with `zygo token mint`, to let callers \
+                     serve, stop and run — which is running arbitrary code as the \
+                     user it runs as"
+                    .to_string(),
+            },
+        ))
+    }
+}
+
+/// Resolve the bearer token to an actor, refusing one that resolves to nobody.
+///
+/// Authentication and authorisation in one pass, deliberately: two functions
+/// meant a route could read the actor without having checked the token, and
+/// the second one to be added would have been the one that forgot.
+///
+/// The token store is read from disk on every request rather than cached. That
+/// is a few microseconds against a warm call's two milliseconds, and it is what
+/// makes `DELETE /tokens/<id>` take effect on the next request instead of
+/// whenever something decided to refresh.
+fn authorise(req: &Request<Incoming>, api: &Api) -> Result<Actor, HttpError> {
+    let header = || -> Result<Option<String>, HttpError> {
         let Some(value) = req.headers().get(TENANT_HEADER) else {
-            return Ok(Actor::Operator);
+            return Ok(None);
         };
         let id = value
             .to_str()
@@ -546,56 +641,74 @@ impl Actor {
             .trim();
         zygo_core::tenants::valid_id(id)
             .map_err(|e| HttpError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
-        Ok(Actor::Tenant(id.to_string()))
-    }
-
-    fn tenant(&self) -> Option<&str> {
-        match self {
-            Actor::Operator => None,
-            Actor::Tenant(id) => Some(id),
-        }
-    }
-
-    /// Refuse a route that is the operator's alone.
-    ///
-    /// Creating and deleting tenants is not something a tenant does, and
-    /// neither is listing them: a customer that could enumerate the other
-    /// customers is a leak, whatever the limits say.
-    fn operator_only(&self, what: &str) -> Result<(), HttpError> {
-        match self {
-            Actor::Operator => Ok(()),
-            Actor::Tenant(id) => Err(HttpError::new(
-                StatusCode::FORBIDDEN,
-                format!(
-                    "{what} is the operator's, and this request names tenant `{id}`\n  \
-                     → drop the X-Zygo-Tenant header to act as the operator"
-                ),
-            )),
-        }
-    }
-}
-
-/// Bearer auth, when it is on.
-///
-/// The comparison does not stop at the first differing byte. On loopback the
-/// timing side channel is academic, but the API is allowed on other addresses
-/// with a token, and there it is not.
-fn authorise(req: &Request<Incoming>, api: &Api) -> Result<(), HttpError> {
-    let Some(expected) = &api.token else {
-        return Ok(());
+        Ok(Some(id.to_string()))
     };
+
+    // No authentication: the listener is a `0600` socket or loopback, so the
+    // caller is this user, and this user is the operator.
+    let Some(bootstrap) = &api.token else {
+        return Ok(Actor {
+            tenant: header()?,
+            deploy: api.deploy,
+        });
+    };
+
     let presented = req
         .headers()
         .get(hyper::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::trim);
-    match presented {
-        Some(token) if constant_time_eq(token.as_bytes(), expected.as_bytes()) => Ok(()),
-        _ => Err(HttpError::new(
-            StatusCode::UNAUTHORIZED,
-            "missing or wrong bearer token",
-        )),
+        .map(str::trim)
+        .ok_or_else(|| HttpError::new(StatusCode::UNAUTHORIZED, "missing bearer token"))?;
+
+    // The bootstrap token first, and with a comparison that does not stop at
+    // the first differing byte. On loopback the timing side channel is
+    // academic, but the API is allowed on other addresses with a token, and
+    // there it is not.
+    if constant_time_eq(presented.as_bytes(), bootstrap.as_bytes()) {
+        return Ok(Actor {
+            tenant: header()?,
+            deploy: api.deploy,
+        });
+    }
+
+    let token = zygo_core::tokens::Tokens::new(&api.paths)
+        .resolve(presented)
+        .map_err(|e| HttpError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
+        .ok_or_else(|| {
+            HttpError::new(
+                StatusCode::UNAUTHORIZED,
+                "wrong or revoked bearer token".to_string(),
+            )
+        })?;
+
+    match token.tenant() {
+        // An operator token: the header names which customer they act for.
+        None => Ok(Actor {
+            tenant: header()?,
+            deploy: true,
+        }),
+        // A tenant token: the id comes from the token, and a header that
+        // disagrees is refused rather than quietly dropped. A client that
+        // thinks it is acting for somebody else should be told it is not.
+        Some(id) => {
+            if let Some(named) = header()?
+                && named != id
+            {
+                return Err(HttpError::new(
+                    StatusCode::FORBIDDEN,
+                    format!(
+                        "this token is tenant `{id}`'s and the request names `{named}`\n  \
+                         → drop the X-Zygo-Tenant header; only an operator token \
+                         may act for another tenant"
+                    ),
+                ));
+            }
+            Ok(Actor {
+                tenant: Some(id.to_string()),
+                deploy: false,
+            })
+        }
     }
 }
 
@@ -708,12 +821,14 @@ async fn exec(
     name: String,
     event: serde_json::Value,
     timeout_ms: u64,
+    tenant: Option<String>,
 ) -> Result<Response<Full<Bytes>>, HttpError> {
     let reply = control(api, move |c| {
         Ok(c.send(&Control::Exec {
             name,
             event,
             timeout_ms,
+            tenant,
         })?)
     })
     .await?;
@@ -730,6 +845,7 @@ async fn batch(
     name: String,
     events: Vec<serde_json::Value>,
     timeout_ms: u64,
+    tenant: Option<String>,
 ) -> Result<Response<Full<Bytes>>, HttpError> {
     if events.len() > MAX_BATCH {
         return Err(HttpError::new(
@@ -750,6 +866,7 @@ async fn batch(
     let permits = Arc::new(tokio::sync::Semaphore::new(BATCH_IN_FLIGHT));
     let calls = events.into_iter().map(|event| {
         let name = name.clone();
+        let tenant = tenant.clone();
         let api = Arc::clone(api);
         let permits = Arc::clone(&permits);
         async move {
@@ -762,6 +879,7 @@ async fn batch(
                     name,
                     event,
                     timeout_ms,
+                    tenant,
                 })?)
             })
             .await;
@@ -807,36 +925,71 @@ where
     out
 }
 
-async fn list(api: &Arc<Api>) -> Result<Response<Full<Bytes>>, HttpError> {
-    let reply = control(api, |c| Ok(c.send(&Control::List)?)).await?;
-    match reply {
-        Reply::Functions { functions } => Ok(json(
-            StatusCode::OK,
-            &serde_json::json!({ "functions": functions }),
-        )),
-        other => Ok(reply_to_response(other)),
+/// One customer's functions, or every one of them for the operator.
+///
+/// Filtered here rather than in the supervisor, unlike the routes that *act*
+/// on a function: this is the operator's own process reading the operator's
+/// own registry, and the question "which of these may this caller see?" is one
+/// only the side that resolved the token can answer. Every route that does
+/// something to a function is checked at the supervisor, where it belongs.
+fn mine(
+    functions: Vec<zygo_core::pool::Status>,
+    tenant: Option<&str>,
+) -> Vec<zygo_core::pool::Status> {
+    match tenant {
+        None => functions,
+        Some(id) => functions.into_iter().filter(|f| f.tenant == id).collect(),
     }
 }
 
-async fn stats(api: &Arc<Api>, name: String) -> Result<Response<Full<Bytes>>, HttpError> {
+async fn list(api: &Arc<Api>, tenant: Option<String>) -> Result<Response<Full<Bytes>>, HttpError> {
     let reply = control(api, |c| Ok(c.send(&Control::List)?)).await?;
     match reply {
-        Reply::Functions { functions } => match functions.into_iter().find(|f| f.name == name) {
-            Some(f) => Ok(json(
+        Reply::Functions { functions } => {
+            let functions = mine(functions, tenant.as_deref());
+            Ok(json(
                 StatusCode::OK,
-                &serde_json::to_value(f).unwrap_or_default(),
-            )),
-            None => Err(HttpError::new(
-                StatusCode::NOT_FOUND,
-                format!("no function named `{name}`"),
-            )),
-        },
+                &serde_json::json!({ "functions": functions }),
+            ))
+        }
         other => Ok(reply_to_response(other)),
     }
 }
 
-async fn warm(api: &Arc<Api>, name: String) -> Result<Response<Full<Bytes>>, HttpError> {
-    let reply = control(api, move |c| Ok(c.send(&Control::Warm { name })?)).await?;
+async fn stats(
+    api: &Arc<Api>,
+    name: String,
+    tenant: Option<String>,
+) -> Result<Response<Full<Bytes>>, HttpError> {
+    let reply = control(api, |c| Ok(c.send(&Control::List)?)).await?;
+    match reply {
+        Reply::Functions { functions } => {
+            match mine(functions, tenant.as_deref())
+                .into_iter()
+                .find(|f| f.name == name)
+            {
+                Some(f) => Ok(json(
+                    StatusCode::OK,
+                    &serde_json::to_value(f).unwrap_or_default(),
+                )),
+                // The same answer a name nobody served gets: whose function
+                // `name` is, is a fact about another customer.
+                None => Err(HttpError::new(
+                    StatusCode::NOT_FOUND,
+                    format!("no function named `{name}`"),
+                )),
+            }
+        }
+        other => Ok(reply_to_response(other)),
+    }
+}
+
+async fn warm(
+    api: &Arc<Api>,
+    name: String,
+    tenant: Option<String>,
+) -> Result<Response<Full<Bytes>>, HttpError> {
+    let reply = control(api, move |c| Ok(c.send(&Control::Warm { name, tenant })?)).await?;
     Ok(reply_to_response(reply))
 }
 
@@ -905,9 +1058,21 @@ async fn serve_runtime(
     Ok(reply_to_response(reply))
 }
 
-async fn runtimes(api: &Arc<Api>) -> Result<Response<Full<Bytes>>, HttpError> {
+async fn runtimes(
+    api: &Arc<Api>,
+    tenant: Option<String>,
+) -> Result<Response<Full<Bytes>>, HttpError> {
     let reply = control(api, |c| Ok(c.send(&Control::Runtimes)?)).await?;
-    Ok(reply_to_response(reply))
+    match (reply, tenant) {
+        (Reply::Runtimes { runtimes }, Some(id)) => {
+            let runtimes: Vec<_> = runtimes.into_iter().filter(|r| r.tenant == id).collect();
+            Ok(json(
+                StatusCode::OK,
+                &serde_json::json!({ "runtimes": runtimes }),
+            ))
+        }
+        (other, _) => Ok(reply_to_response(other)),
+    }
 }
 
 async fn stop_runtime(api: &Arc<Api>, name: String) -> Result<Response<Full<Bytes>>, HttpError> {
@@ -1066,6 +1231,54 @@ async fn delete_tenant(api: &Arc<Api>, id: String) -> Result<Response<Full<Bytes
     }
 }
 
+/// `POST /tenants/<id>/tokens` and `POST /tokens`: mint one.
+///
+/// `201`, and the only response in this API that carries a secret. It is not
+/// stored, so it cannot be fetched again — a client that drops it has to
+/// revoke the token and mint another, which is the same bargain every
+/// credential worth the name makes.
+async fn mint_token(
+    api: &Arc<Api>,
+    tenant: Option<String>,
+) -> Result<Response<Full<Bytes>>, HttpError> {
+    let reply = control(api, move |c| Ok(c.send(&Control::MintToken { tenant })?)).await?;
+    match reply {
+        Reply::Tokens { tokens, secret } => Ok(json(
+            StatusCode::CREATED,
+            &serde_json::json!({ "token": tokens.first(), "secret": secret }),
+        )),
+        other => Ok(reply_to_response(other)),
+    }
+}
+
+/// `GET /tokens`: every token, hashes and all, never a secret.
+async fn list_tokens(api: &Arc<Api>) -> Result<Response<Full<Bytes>>, HttpError> {
+    let reply = control(api, |c| Ok(c.send(&Control::Tokens)?)).await?;
+    match reply {
+        Reply::Tokens { tokens, .. } => Ok(json(
+            StatusCode::OK,
+            &serde_json::json!({ "tokens": tokens }),
+        )),
+        other => Ok(reply_to_response(other)),
+    }
+}
+
+/// `DELETE /tokens/<id>`: revoke one, from the next request onwards.
+async fn revoke_token(api: &Arc<Api>, id: String) -> Result<Response<Full<Bytes>>, HttpError> {
+    let wanted = id.clone();
+    let reply = control(api, move |c| Ok(c.send(&Control::RevokeToken { id })?)).await?;
+    match reply {
+        Reply::Tokens { tokens, .. } => Ok(json(
+            StatusCode::OK,
+            &serde_json::json!({
+                "revoked": true,
+                "token": tokens.iter().find(|t| t.id == wanted),
+            }),
+        )),
+        other => Ok(reply_to_response(other)),
+    }
+}
+
 async fn put_script(
     api: &Arc<Api>,
     body: &[u8],
@@ -1134,22 +1347,6 @@ async fn delete_script(api: &Arc<Api>, digest: String) -> Result<Response<Full<B
         )),
         other => Ok(reply_to_response(other)),
     }
-}
-
-/// The gate on everything that creates or destroys a sandbox.
-///
-/// A 403 rather than a 404: pretending the route does not exist would send an
-/// SDK author looking for a typo, when the answer is a flag on the server.
-fn deployable(api: &Api) -> Result<(), HttpError> {
-    if api.deploy {
-        return Ok(());
-    }
-    Err(HttpError::new(
-        StatusCode::FORBIDDEN,
-        "this API may only call functions that are already served\n  \
-         → start it with `zygo api --allow-deploy` to let callers serve, stop \
-         and run, which is running arbitrary code as the user it runs as",
-    ))
 }
 
 /// What `PUT /fn/<name>` accepts: the same inputs `zygo serve` sends, minus
@@ -1250,6 +1447,7 @@ async fn logs(
     api: &Arc<Api>,
     name: String,
     query: &str,
+    tenant: Option<String>,
 ) -> Result<Response<Full<Bytes>>, HttpError> {
     let params = Query::parse(query);
     let after = params.number("after")?.unwrap_or(0);
@@ -1263,6 +1461,7 @@ async fn logs(
             after,
             limit,
             failed,
+            tenant,
         })?)
     })
     .await?;
@@ -1808,20 +2007,16 @@ mod tests {
     /// The message has to name that flag, because nothing else can.
     #[test]
     fn deploy_is_off_until_it_is_asked_for() {
-        let api = |deploy| Api {
-            paths: zygo_core::Paths::rooted(std::env::temp_dir().join("zygo-api-test")),
-            exe: std::path::PathBuf::from("/nonexistent/zygo"),
-            token: None,
+        let operator = |deploy| Actor {
+            tenant: None,
             deploy,
-            clients: std::sync::Mutex::new(Vec::new()),
-            started: Instant::now(),
-            requests: AtomicU64::new(0),
-            errors: AtomicU64::new(0),
         };
 
-        assert!(deployable(&api(true)).is_ok());
+        assert!(operator(true).may_deploy().is_ok());
 
-        let refused = deployable(&api(false)).expect_err("a call-only API refuses");
+        let refused = operator(false)
+            .may_deploy()
+            .expect_err("a call-only API refuses");
         assert_eq!(refused.status, StatusCode::FORBIDDEN);
         assert!(
             refused.body["error"]
@@ -1831,6 +2026,59 @@ mod tests {
             "the refusal has to name the flag: {:?}",
             refused.body
         );
+    }
+
+    /// A tenant token never deploys, whatever the flag says.
+    ///
+    /// The flag decides whether *the operator* may create sandboxes. A tenant
+    /// asking is refused for a different reason, and told so: naming an image,
+    /// a mount and a command is running arbitrary code as the host user, which
+    /// is not something one customer gets to do because another is trusted.
+    #[test]
+    fn a_tenant_never_deploys_however_the_api_was_started() {
+        for deploy in [true, false] {
+            let refused = Actor {
+                tenant: Some("acme".into()),
+                deploy,
+            }
+            .may_deploy()
+            .expect_err("a tenant cannot deploy");
+            assert_eq!(refused.status, StatusCode::FORBIDDEN);
+            let message = refused.body["error"].as_str().expect("a message");
+            assert!(message.contains("acme"), "{message}");
+            assert!(
+                !message.contains("--allow-deploy"),
+                "a tenant cannot act on that advice: {message}"
+            );
+        }
+    }
+
+    /// Listing is scoped by the token, not by what the caller asked for.
+    #[test]
+    fn a_listing_shows_one_tenant_their_own_functions_only() {
+        let status = |name: &str, tenant: &str| zygo_core::pool::Status {
+            name: name.into(),
+            tenant: tenant.into(),
+            image: String::new(),
+            state: zygo_core::sandbox::SandboxState::Warm,
+            runtime: "python/3.12".into(),
+            rss_kb: 0,
+            imports_ms: 0.0,
+            requests: 0,
+            failures: 0,
+        };
+        let all = vec![
+            status("resize", "acme"),
+            status("resize-2", "globex"),
+            status("internal", "default"),
+        ];
+
+        let operator = mine(all.clone(), None);
+        assert_eq!(operator.len(), 3, "the operator sees the host");
+
+        let acme = mine(all, Some("acme"));
+        assert_eq!(acme.len(), 1);
+        assert_eq!(acme[0].name, "resize");
     }
 
     /// A request body may not remove a guarantee, whatever the deploy gate

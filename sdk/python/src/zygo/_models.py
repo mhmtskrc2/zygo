@@ -135,6 +135,57 @@ class Tenant:
 
 
 @dataclass(frozen=True)
+class Token:
+    """One API token, as the server holds it — never the secret.
+
+    ``tenant`` is ``None`` for an operator token, which may create tenants and
+    pools and mint more tokens; a tenant token registers scripts and calls, for
+    its own tenant only.
+
+    The secret exists once, in the answer to :meth:`~zygo.Client.mint_token`,
+    and is not stored anywhere: the server keeps a SHA-256 of it. A client that
+    loses one revokes it and mints another.
+    """
+
+    id: str
+    tenant: Optional[str] = None
+    created_ms: int = 0
+    revoked_ms: Optional[int] = None
+
+    @property
+    def revoked(self) -> bool:
+        return self.revoked_ms is not None
+
+    @classmethod
+    def parse(cls, raw: Dict[str, Any]) -> "Token":
+        revoked = raw.get("revoked_ms")
+        return cls(
+            id=str(raw.get("id", "")),
+            tenant=raw.get("tenant"),
+            created_ms=int(raw.get("created_ms", 0)),
+            revoked_ms=int(revoked) if revoked is not None else None,
+        )
+
+
+@dataclass(frozen=True)
+class Minted:
+    """A token and the one copy of its secret.
+
+    Keep ``secret``: nothing can produce it again.
+    """
+
+    token: Token
+    secret: str
+
+    @classmethod
+    def parse(cls, raw: Dict[str, Any]) -> "Minted":
+        return cls(
+            token=Token.parse(raw.get("token") or {}),
+            secret=str(raw.get("secret", "")),
+        )
+
+
+@dataclass(frozen=True)
 class Runtime:
     """One runtime pool: several anonymous zygotes any script can run in.
 

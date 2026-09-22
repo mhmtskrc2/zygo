@@ -18,7 +18,18 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from ._endpoint import Endpoint, resolve
 from ._errors import NotFound, SpecError, TransportError, ZygoError, from_response
-from ._models import Function, LogPage, Result, Run, Runtime, Script, Served, Tenant
+from ._models import (
+    Function,
+    LogPage,
+    Minted,
+    Result,
+    Run,
+    Runtime,
+    Script,
+    Served,
+    Tenant,
+    Token,
+)
 
 #: Largest answer read into memory. The API's own request limit is the same
 #: order, and an answer past it is a bug rather than a large result.
@@ -268,12 +279,47 @@ class Client:
         """
         return self._request("DELETE", f"/tenants/{_escape(id)}")
 
+    def mint_token(self, tenant: Optional[str] = None) -> Minted:
+        """Mint an API token, and get its secret — once.
+
+        Without ``tenant`` this is an **operator** token: tenants, functions,
+        pools, and more tokens. With one it is that tenant's, and it may
+        register scripts and call, for itself only. Minting for a tenant
+        registers the tenant if it is new.
+
+        The secret is in the answer and nowhere else. The server keeps a
+        SHA-256, so it cannot be fetched again; keep it or revoke it.
+
+        Operator-only, and needs deploy rights.
+        """
+        path = "/tokens" if tenant is None else f"/tenants/{_escape(tenant)}/tokens"
+        return Minted.parse(self._request("POST", path))
+
+    def tokens(self) -> List[Token]:
+        """Every token this host holds, revoked ones included. Never a secret."""
+        body = self._request("GET", "/tokens")
+        return [Token.parse(t) for t in body.get("tokens", [])]
+
+    def revoke_token(self, id: str) -> Dict[str, Any]:
+        """Revoke one, from the next request onwards.
+
+        The record stays, marked with when it went, so an id in a log line
+        still resolves to something.
+        """
+        return self._request("DELETE", f"/tokens/{_escape(id)}")
+
     def for_tenant(self, id: str) -> "Client":
         """A view of this client that acts for one tenant.
 
         Every call through it carries the tenant, so scripts are registered
         against them and pool calls may only name their own. The connection is
         shared — this is a header, not a second client.
+
+        For an **operator** token: the header says which of your customers you
+        are acting for. A **tenant** token already names its tenant and does
+        not need this — and the server refuses a header that disagrees with
+        the token rather than ignoring it, so a client that thinks it is
+        acting for somebody else is told it is not.
         """
         view = Client.__new__(Client)
         view.__dict__.update(self.__dict__)

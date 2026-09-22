@@ -313,6 +313,65 @@ class ScriptTests(unittest.TestCase):
             self.assertEqual(api.requests, [])
 
 
+class TokenTests(unittest.TestCase):
+    """Who a request acts for, and where the answer comes from."""
+
+    def test_a_secret_arrives_once_and_the_listing_never_carries_one(self) -> None:
+        with FakeApi() as api:
+            api.answer(
+                "POST",
+                "/tenants/acme/tokens",
+                201,
+                {
+                    "token": {"id": "tok_1a2b3c4d5e6f", "tenant": "acme", "created_ms": 1},
+                    "secret": "zygo_deadbeef",
+                },
+            )
+            api.answer(
+                "GET",
+                "/tokens",
+                200,
+                {"tokens": [{"id": "tok_1a2b3c4d5e6f", "tenant": "acme", "created_ms": 1}]},
+            )
+            api.answer("DELETE", "/tokens/tok_1a2b3c4d5e6f", 200, {"revoked": True})
+            with zygo.connect(api.url) as client:
+                minted = client.mint_token("acme")
+                self.assertEqual(minted.secret, "zygo_deadbeef")
+                self.assertEqual(minted.token.tenant, "acme")
+                self.assertFalse(minted.token.revoked)
+
+                listed = client.tokens()
+                self.assertEqual([t.id for t in listed], ["tok_1a2b3c4d5e6f"])
+                client.revoke_token("tok_1a2b3c4d5e6f")
+
+        self.assertEqual(api.requests[0]["path"], "/tenants/acme/tokens")
+
+    def test_an_operator_token_is_minted_on_its_own_route(self) -> None:
+        # No tenant, so no tenant in the path: an operator token belongs to
+        # the host rather than to one of its customers.
+        with FakeApi() as api:
+            api.answer(
+                "POST",
+                "/tokens",
+                201,
+                {"token": {"id": "tok_000000000000", "created_ms": 1}, "secret": "zygo_x"},
+            )
+            with zygo.connect(api.url) as client:
+                minted = client.mint_token()
+                self.assertIsNone(minted.token.tenant, "an operator token names nobody")
+        self.assertEqual(api.requests[0]["path"], "/tokens")
+
+    def test_acting_for_a_tenant_is_a_header_on_the_same_connection(self) -> None:
+        with FakeApi() as api:
+            api.answer("GET", "/fn", 200, {"functions": []})
+            with zygo.connect(api.url) as client:
+                client.functions()
+                client.for_tenant("acme").functions()
+
+        self.assertNotIn("x-zygo-tenant", api.requests[0]["headers"])
+        self.assertEqual(api.requests[1]["headers"]["x-zygo-tenant"], "acme")
+
+
 class OutcomeTests(unittest.TestCase):
     """Why a one-shot sandbox ended, which the exit code cannot carry.
 

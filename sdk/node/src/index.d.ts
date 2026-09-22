@@ -127,6 +127,22 @@ export interface Tenant {
   scripts: string[];
 }
 
+/**
+ * One API token, as the server holds it — never the secret.
+ *
+ * `tenant` is absent on an operator token, which may create tenants and pools
+ * and mint more tokens; a tenant token registers scripts and calls, for its own
+ * tenant only.
+ */
+export interface Token {
+  id: string;
+  /** Absent for an operator token. */
+  tenant?: string;
+  created_ms: number;
+  /** When it was revoked, if it was. A revoked token stops resolving. */
+  revoked_ms?: number;
+}
+
 /** A script the host holds, named by the SHA-256 of its bytes. */
 export interface Script {
   /** `sha256:…`, which is the script's name everywhere else. */
@@ -249,6 +265,17 @@ export declare class Client {
   deleteTenant(id: string): Promise<{ deleted: boolean; removed_scripts: string[]; stopped: string[] }>;
   /** A view of this client that acts for one tenant. */
   forTenant(id: string): Client;
+
+  /**
+   * Mint a token and get its secret, once. Operator-only, needs deploy rights.
+   *
+   * Pass a tenant id for a tenant token, or nothing for an operator token.
+   */
+  mintToken(tenant?: string | null): Promise<{ token: Token; secret: string }>;
+  /** Every token, revoked ones included. Never a secret. Operator-only. */
+  tokens(): Promise<Token[]>;
+  /** Revoke one, from the next request onwards. Operator-only. */
+  revokeToken(id: string): Promise<{ revoked: boolean; token: Token | null }>;
 
   /** Needs an API started with `--allow-deploy`. */
   serveRuntime(name: string, layer: Layer, options?: { baseDir?: string }): Promise<Record<string, unknown>>;

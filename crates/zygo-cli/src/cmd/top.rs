@@ -210,6 +210,7 @@ mod tests {
 
     fn status(name: &str, requests: u64, failures: u64) -> Status {
         Status {
+            tenant: "default".into(),
             name: name.into(),
             image: String::new(),
             state: SandboxState::Warm,

@@ -105,6 +105,9 @@ impl RuntimePool {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RuntimeStatus {
     pub name: String,
+    /// Whose pool this is. See [`crate::pool::Status::tenant`].
+    #[serde(default)]
+    pub tenant: String,
     pub image: String,
     /// What the agent announced, e.g. `python/3.12.4`. Empty until one is warm.
     pub runtime: String,
@@ -163,6 +166,7 @@ impl Supervisor {
             .map(|z| z.function.status())
             .unwrap_or_else(|| crate::pool::Status {
                 name: name.to_string(),
+                tenant: resolved.tenant.clone(),
                 image: resolved.image.clone(),
                 state: crate::sandbox::SandboxState::Cold,
                 runtime: String::new(),
@@ -526,6 +530,7 @@ impl Supervisor {
                 let zygotes = pool.zygotes.lock().expect("zygotes");
                 let mut status = RuntimeStatus {
                     name,
+                    tenant: pool.resolved.tenant.clone(),
                     image: pool.resolved.image.clone(),
                     runtime: String::new(),
                     warm: 0,

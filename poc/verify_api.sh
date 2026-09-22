@@ -1,14 +1,17 @@
 #!/bin/sh
 # The HTTP API end to end, driven by the client that ships with it.
 #
-# Two runs of the same driver against two listeners: one started with
-# `--allow-deploy` and one without, because the difference between them is the
-# API's whole security posture and "it is refused" is only worth asserting
-# beside "it works when allowed".
+# Three runs of the same driver against three listeners:
 #
-# The unix socket is the transport a local caller actually uses — no port, no
-# token, permissions the kernel enforces — and it is the one the client
-# implements differently, so it is the one checked here.
+#   1. `--allow-deploy`, no auth — the whole API, working.
+#   2. call-only, no auth — the same calls, refused, because "it is refused"
+#      is only worth asserting beside "it works when allowed".
+#   3. bearer auth with a bootstrap token — scoped tokens, which the other two
+#      cannot test: with no token there is nothing to resolve a tenant from.
+#
+# The unix socket is the transport a local caller actually uses — no port,
+# permissions the kernel enforces — and it is the one the client implements
+# differently, so it is the one checked here.
 #
 # Run:  make verify-api-linux
 set -u
@@ -36,10 +39,12 @@ export PYTHONPATH
 WORK=$(mktemp -d)
 SOCK=$WORK/api.sock
 SOCK_CALL_ONLY=$WORK/api-call-only.sock
+SOCK_TOKENS=$WORK/api-tokens.sock
 
 cleanup() {
     [ -n "${API_PID:-}" ] && kill "$API_PID" 2>/dev/null
     [ -n "${API_CALL_ONLY_PID:-}" ] && kill "$API_CALL_ONLY_PID" 2>/dev/null
+    [ -n "${API_TOKENS_PID:-}" ] && kill "$API_TOKENS_PID" 2>/dev/null
     "$ZYGO" stop --all >/dev/null 2>&1
     rm -rf "$WORK"
 }
@@ -47,21 +52,27 @@ trap cleanup EXIT
 
 "$ZYGO" pull "$IMAGE" >/dev/null 2>&1
 
-# Both listeners run in the harness's cgroup, like every other long-lived
+# Every listener runs in the harness's cgroup, like every other long-lived
 # process here: the API spawns `zygo run` children and they need somewhere to
 # build a slice.
+#
+# $1 is the socket, $2 the auth mode (`--no-auth` or empty, in which case
+# ZYGO_API_TOKEN must be set), and the rest are the API's own flags.
 start_api() {
     socket=$1
-    shift
+    auth=$2
+    shift 2
     sh -c '
-        root=$1; socket=$2; shift 2
+        root=$1; socket=$2; auth=$3; shift 3
         if [ -d "$root/launch/zygo.slice/system" ]; then
             echo $$ > "$root/launch/zygo.slice/system/cgroup.procs" 2>/dev/null
         else
             echo $$ > "$root/launch/cgroup.procs" 2>/dev/null
         fi
-        exec "$@" --listen "unix://$socket" --no-auth
-    ' _ "$ZYGO_HARNESS_ROOT" "$socket" "$ZYGO" api "$@" >"$WORK/api.log" 2>&1 &
+        # `$auth` is unquoted on purpose: empty means "bearer", which is the
+        # default, and an empty quoted argument would be an unparseable flag.
+        exec "$@" --listen "unix://$socket" $auth
+    ' _ "$ZYGO_HARNESS_ROOT" "$socket" "$auth" "$ZYGO" api "$@" >>"$WORK/api.log" 2>&1 &
     echo $!
 }
 
@@ -75,7 +86,7 @@ wait_for() {
     return 1
 }
 
-API_PID=$(start_api "$SOCK" --allow-deploy)
+API_PID=$(start_api "$SOCK" --no-auth --allow-deploy)
 if ! wait_for "$SOCK"; then
     echo "  the API did not come up:" >&2
     tail -10 "$WORK/api.log" >&2
@@ -88,11 +99,27 @@ status=$?
 kill "$API_PID" 2>/dev/null
 API_PID=
 
-API_CALL_ONLY_PID=$(start_api "$SOCK_CALL_ONLY")
+API_CALL_ONLY_PID=$(start_api "$SOCK_CALL_ONLY" --no-auth)
 if wait_for "$SOCK_CALL_ONLY"; then
     python3 "$SRC/poc/api_driver.py" --call-only "$SOCK_CALL_ONLY" || status=1
 else
     echo "  FAIL  the call-only API did not come up" >&2
+    tail -10 "$WORK/api.log" >&2
+    status=1
+fi
+kill "$API_CALL_ONLY_PID" 2>/dev/null
+API_CALL_ONLY_PID=
+
+# The bootstrap operator token: the same variable an existing deployment
+# already sets, which is what keeps one working across this change.
+ZYGO_API_TOKEN=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+export ZYGO_API_TOKEN
+
+API_TOKENS_PID=$(start_api "$SOCK_TOKENS" "" --allow-deploy)
+if wait_for "$SOCK_TOKENS"; then
+    python3 "$SRC/poc/api_driver.py" --tokens "$SOCK_TOKENS" "$IMAGE" || status=1
+else
+    echo "  FAIL  the token API did not come up" >&2
     tail -10 "$WORK/api.log" >&2
     status=1
 fi

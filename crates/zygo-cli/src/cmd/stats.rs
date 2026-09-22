@@ -81,6 +81,7 @@ pub fn run(cli: &Cli, name: Option<&str>) -> anyhow::Result<u8> {
     };
     functions.extend(pools.iter().map(|p| Status {
         name: p.name.clone(),
+        tenant: p.tenant.clone(),
         image: p.image.clone(),
         state: if p.warm > 0 {
             SandboxState::Warm
@@ -114,6 +115,7 @@ pub fn run(cli: &Cli, name: Option<&str>) -> anyhow::Result<u8> {
             after: 0,
             limit: WHOLE_LOG,
             failed: false,
+            tenant: None,
         })? {
             Response::Logs { entries, .. } => entries,
             // A function that went away between the two questions is not an
@@ -280,6 +282,7 @@ mod tests {
 
     fn status() -> Status {
         Status {
+            tenant: "default".into(),
             name: "f".into(),
             image: String::new(),
             state: SandboxState::Warm,

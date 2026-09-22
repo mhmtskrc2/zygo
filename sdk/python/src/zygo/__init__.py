@@ -42,12 +42,14 @@ from ._models import (
     LogEntry,
     LogPage,
     Metrics,
+    Minted,
     Result,
     Run,
     Runtime,
     Script,
     Served,
     Tenant,
+    Token,
 )
 from ._sync import Client, FunctionHandle, connect
 
@@ -64,12 +66,14 @@ __all__ = [
     "LogEntry",
     "LogPage",
     "Metrics",
+    "Minted",
     "Result",
     "Run",
     "Runtime",
     "Script",
     "Served",
     "Tenant",
+    "Token",
     # failures
     "AuthError",
     "Busy",

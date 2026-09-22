@@ -558,8 +558,12 @@ out = client.fn("resize")({"url": "..."})
 
 The API starts **call-only**: a token reaches the functions somebody declared
 in a spec file and nothing else. `--allow-deploy` adds serving, stopping and
-one-shot runs, which together are a shell rather than an API. See
-[the SDKs](sdk.md).
+one-shot runs, which together are a shell rather than an API.
+
+`ZYGO_API_TOKEN` is the operator's. For an embedder with customers,
+`zygo token mint --tenant acme` prints a token that registers scripts and
+calls **for that customer only** — the tenant comes from the token, not from
+anything the caller can set. See [the SDKs](sdk.md).
 
 ### Giving it to an agent
 

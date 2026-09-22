@@ -357,6 +357,9 @@ fn name_of(request: &Request) -> &'static str {
         Request::DeleteTenant { .. } => "deleting a tenant",
         Request::GetScript { .. } => "looking a script up",
         Request::DeleteScript { .. } => "removing a script",
+        Request::MintToken { .. } => "minting a token",
+        Request::Tokens => "listing the tokens",
+        Request::RevokeToken { .. } => "revoking a token",
     }
 }
 
@@ -539,6 +542,7 @@ mod tests {
             name: "x".into(),
             event: serde_json::Value::Null,
             timeout_ms: 5_000,
+            tenant: None,
         });
         assert_eq!(exec, Duration::from_secs(5) + REPLY_GRACE);
 
@@ -630,6 +634,7 @@ mod tests {
                 name: "nope".into(),
                 event: serde_json::Value::Null,
                 timeout_ms: 1_000,
+                tenant: None,
             })
             .expect("a response, whatever it says");
         assert!(matches!(

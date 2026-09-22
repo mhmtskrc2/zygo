@@ -66,30 +66,43 @@ executes.
 
 ## What the clients can do
 
-| | Python | Node | Needs `--allow-deploy` |
-|---|---|---|---|
-| Call a warm function | `client.call(name, event)` | `client.call(name, event)` | no |
-| A callable for one function | `client.fn(name)` | `client.fn(name)` | no |
-| Several events at once | `client.batch(name, events)` | `client.batch(name, events)` | no |
-| List functions | `client.functions()` | `client.functions()` | no |
-| Counters | `client.stats(name)` | `client.stats(name)` | no |
-| Warm one now | `client.warm(name)` | `client.warm(name)` | no |
-| Recent log | `client.logs(name)` | `client.logs(name)` | no |
-| Version | `client.version()` | `client.version()` | no |
-| Look a script up | `client.script(digest)` | `client.script(digest)` | no |
-| Act for a tenant | `client.for_tenant(id)` | `client.forTenant(id)` | no |
-| List tenants (operator) | `client.tenants()` | `client.tenants()` | no |
-| Run a script in a pool | `client.run_script(runtime, script)` | `client.runScript(runtime, script)` | no |
-| List runtime pools | `client.runtimes()` | `client.runtimes()` | no |
-| Serve a function | `client.serve(name, layer)` | `client.serve(name, layer)` | **yes** |
-| Stop one | `client.stop(name)` | `client.stop(name)` | **yes** |
-| One-shot sandbox | `client.run(image, cmd)` | `client.run(image, cmd)` | **yes** |
-| Register a script | `client.put_script(source)` | `client.putScript(source)` | **yes** |
-| Forget a script | `client.delete_script(digest)` | `client.deleteScript(digest)` | **yes** |
-| Create a tenant (operator) | `client.create_tenant(id)` | `client.createTenant(id)` | no |
-| Delete one (operator) | `client.delete_tenant(id)` | `client.deleteTenant(id)` | **yes** |
-| Serve a runtime pool | `client.serve_runtime(name, layer)` | `client.serveRuntime(name, layer)` | **yes** |
-| Stop one | `client.stop_runtime(name)` | `client.stopRuntime(name)` | **yes** |
+**Who** is the token the call is made with: a *tenant* token is one customer's,
+an *operator* token is the host's. **Deploy** marks the calls that need an API
+started with `--allow-deploy`, or an operator token minted deliberately — they
+name images, mounts and commands, which is running code as the user Zygo runs
+as.
+
+| | Python | Node | Who | Deploy |
+|---|---|---|---|---|
+| Call a warm function | `client.call(name, event)` | `client.call(name, event)` | either | no |
+| A callable for one function | `client.fn(name)` | `client.fn(name)` | either | no |
+| Several events at once | `client.batch(name, events)` | `client.batch(name, events)` | either | no |
+| List functions | `client.functions()` | `client.functions()` | either | no |
+| Counters | `client.stats(name)` | `client.stats(name)` | either | no |
+| Warm one now | `client.warm(name)` | `client.warm(name)` | either | no |
+| Recent log | `client.logs(name)` | `client.logs(name)` | either | no |
+| Version | `client.version()` | `client.version()` | either | no |
+| Register a script | `client.put_script(source)` | `client.putScript(source)` | either | no |
+| Look a script up | `client.script(digest)` | `client.script(digest)` | either | no |
+| Run a script in a pool | `client.run_script(runtime, script)` | `client.runScript(runtime, script)` | either | no |
+| List runtime pools | `client.runtimes()` | `client.runtimes()` | either | no |
+| Read a tenant | `client.tenant(id)` | `client.tenant(id)` | own, or operator | no |
+| Act for a tenant | `client.for_tenant(id)` | `client.forTenant(id)` | operator | no |
+| List tenants | `client.tenants()` | `client.tenants()` | operator | no |
+| Create a tenant | `client.create_tenant(id)` | `client.createTenant(id)` | operator | no |
+| Serve a function | `client.serve(name, layer)` | `client.serve(name, layer)` | operator | **yes** |
+| Stop one | `client.stop(name)` | `client.stop(name)` | operator | **yes** |
+| One-shot sandbox | `client.run(image, cmd)` | `client.run(image, cmd)` | operator | **yes** |
+| Forget a script | `client.delete_script(digest)` | `client.deleteScript(digest)` | operator | **yes** |
+| Delete a tenant | `client.delete_tenant(id)` | `client.deleteTenant(id)` | operator | **yes** |
+| Serve a runtime pool | `client.serve_runtime(name, layer)` | `client.serveRuntime(name, layer)` | operator | **yes** |
+| Stop one | `client.stop_runtime(name)` | `client.stopRuntime(name)` | operator | **yes** |
+| Mint a token | `client.mint_token(tenant)` | `client.mintToken(tenant)` | operator | **yes** |
+| List tokens | `client.tokens()` | `client.tokens()` | operator | **yes** |
+| Revoke one | `client.revoke_token(id)` | `client.revokeToken(id)` | operator | **yes** |
+
+A listing is scoped to the caller: `functions()` and `runtimes()` through a
+tenant token show that tenant's, and nobody else's names.
 
 A one-shot run answers with more than an exit code, because the exit code
 cannot carry what a caller needs:
@@ -137,10 +150,58 @@ What a tenant gets:
   both lists, because neither can be reconstructed afterwards.
 
 Listing or creating tenants is the **operator's**: a customer that could
-enumerate the other customers is a leak whatever the limits say. Today the
-tenant is named by the `X-Zygo-Tenant` header, which is trusted because
-holding the bearer token is already this API's whole authority. Per-tenant
-tokens are the next piece of work, and then the token answers instead.
+enumerate the other customers is a leak whatever the limits say. A tenant may
+read its own record, which is how a client discovers what it registered.
+
+## Tokens
+
+A tenant is only worth having if the server can tell whose request this is
+without being told. That is what a token is: the one part of a request the
+caller cannot choose.
+
+```python
+operator = zygo.connect(url, token=os.environ["ZYGO_API_TOKEN"])
+minted = operator.mint_token("acme")        # POST /tenants/acme/tokens
+print(minted.secret)                        # the only time this exists
+
+acme = zygo.connect(url, token=minted.secret)
+acme.put_script(source)                     # registered against acme, no header
+```
+
+```js
+const minted = await operator.mintToken('acme');
+const acme = connect(url, { token: minted.secret });
+```
+
+Two kinds, deliberately not a scope lattice:
+
+* **Operator** (`mint_token()`, no tenant). Whoever runs this Zygo: tenants,
+  functions, pools, and more tokens.
+* **Tenant** (`mint_token(id)`). One customer: registers scripts for itself,
+  calls the pools and functions the operator declared, reads its own record —
+  and cannot see that any other tenant exists.
+
+What follows from that:
+
+* **The secret exists once.** The server keeps a SHA-256, so `client.tokens()`
+  can list every token on the host without being a way to steal one, and
+  nothing can print a secret again. Lose one and you revoke it and mint
+  another.
+* **`X-Zygo-Tenant` is the operator's.** `for_tenant(id)` says which of *your*
+  customers you are acting for. A tenant token already names its tenant, and a
+  header that disagrees with it is **refused**, not ignored — a client that
+  thinks it is acting for somebody else should be told it is not.
+* **Revocation is immediate.** The next request with a revoked token is a
+  401; the record stays, marked, so an id in a log line still resolves to
+  something.
+* **Deleting a tenant takes their keys** along with the scripts only they
+  referred to.
+
+`ZYGO_API_TOKEN` is the **bootstrap operator token**: the same variable an
+existing deployment already sets, with the same rights it already had, which
+is what keeps one working across this change. On the host, `zygo token mint`,
+`zygo token ls` and `zygo token revoke <id>` do the same three things without
+an HTTP round trip.
 
 ## Runtime pools
 
@@ -201,9 +262,10 @@ with the script would make every tenant's code readable by anyone who could
 guess what it was. `client.delete_script(digest)` forgets one.
 
 Registering a script does not make it runnable on its own — a request still has
-to name something to run it *in*. Runtime pools, which is what a registered
-script is for, are the next piece of work; until they land the store is
-reachable and empty of consequence.
+to name something to run it *in*, which is a runtime pool the operator
+declared. That is why `put_script` is not behind the deploy gate: a tenant
+registering its own code runs nothing by doing so, and the digest is theirs
+from then on.
 
 ## The deploy gate
 
@@ -212,21 +274,28 @@ declared in a spec file and nothing else, which is the shape most deployments
 want: the boundary lives in a file that was reviewed.
 
 `--allow-deploy` adds `PUT /fn/<name>`, `DELETE /fn/<name>`, `POST /run`,
-`PUT /scripts`, `DELETE /scripts/<hash>`, `POST /runtimes` and
-`DELETE /runtimes/<name>`. The first three let a caller name
+`DELETE /scripts/<hash>`, `POST /runtimes`, `DELETE /runtimes/<name>`,
+`DELETE /tenants/<id>` and the token routes. The first three let a caller name
 any image, any mount and any command, which is running arbitrary code as the
 user the API runs as — a shell, not an API. Turn it on for a local SDK or an
 embedder you control, and think twice anywhere else.
 
-Registering a script and creating a pool are behind the same gate for now, and
-for registering that is a placeholder rather than a judgement: a script nobody
-can run is not a widened boundary, but a *tenant* registering one is exactly
-what per-tenant tokens are for, and those do not exist yet. Creating a pool is
-a deploy in its own right — it names an image and mounts. `GET /scripts/<hash>`,
-`GET /runtimes` and `POST /runtimes/<name>/call` are not gated: calling a pool
-somebody else declared is exactly what a call-only token is for.
+Creating a pool is a deploy in its own right — it names an image and mounts.
+Deleting a script is gated because the store is shared by digest: forgetting
+one script forgets it for every tenant that registered the same bytes.
+`PUT /scripts`, `GET /scripts/<hash>`, `GET /runtimes` and
+`POST /runtimes/<name>/call` are not gated — registering code that needs a pool
+to run, and calling a pool somebody else declared, is exactly what a call-only
+token is for.
 
-Without it, those calls raise `AuthError` and the message names the flag.
+A **tenant token never deploys**, whatever the flag says: the flag decides what
+the operator may do, and one customer does not get to name an image because
+another is trusted. An **operator token** minted with `zygo token mint` does,
+unconditionally — minting it already required deploy rights, so the decision
+was made when it was created.
+
+Without those rights, the calls raise `AuthError`, and the message names the
+flag for an operator and says what a tenant token is for instead.
 
 Two things stay off even then, because a request body must not be able to
 remove a guarantee: host networking and private-range egress are refused over
@@ -301,6 +370,12 @@ zygo up                            # warm what sandbox.toml declares
 zygo api --allow-deploy &          # 127.0.0.1:7700
 
 python -c "import zygo; print(zygo.connect().functions())"
+```
+
+For one customer rather than the whole host:
+
+```bash
+zygo token mint --tenant acme      # prints the secret, once
 ```
 
 The test suites do **not** need any of that. Both run against a stand-in API

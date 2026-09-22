@@ -500,11 +500,20 @@ def call_only(socket_path: str) -> int:
         else:
             bad("healthz on a call-only API")
 
+        # Registering is *not* on the list, and that is the change scoped
+        # tokens paid for: a script nobody can run is not a widened boundary,
+        # and registering one for yourself is what a tenant token is for.
+        # Running it still needs a pool an operator declared.
+        try:
+            client.put_script("x = 1\n")
+            ok("PUT /scripts is allowed: registering a script runs nothing")
+        except zygo.ZygoError as e:
+            bad("PUT /scripts was refused on a call-only API", f"{type(e).__name__}: {e}")
+
         for what, call in (
             ("POST /run", lambda: client.run("alpine:3", ["true"])),
             ("PUT /fn/<name>", lambda: client.serve("x", {"image": "alpine:3", "cmd": ["true"]}, base_dir="/tmp")),
             ("DELETE /fn/<name>", lambda: client.stop("x")),
-            ("PUT /scripts", lambda: client.put_script("x = 1\n")),
             ("DELETE /scripts/<hash>", lambda: client.delete_script("sha256:" + "c" * 64)),
             (
                 "POST /runtimes",
@@ -525,9 +534,178 @@ def call_only(socket_path: str) -> int:
     return 0
 
 
+def tokens(socket_path: str, image: str) -> int:
+    """Scoped tokens, against a listener that actually checks one.
+
+    Every other phase runs `--no-auth`, where the caller is the operator
+    because they reached a `0600` socket. That is the right default and it is
+    also why it cannot test this: with no token there is nothing to resolve.
+    So this phase gets a listener with bearer auth and a bootstrap token, and
+    asks the only question tokens exist to answer — *whose request is this?*
+    """
+    import zygo
+
+    url = f"unix://{socket_path}"
+    bootstrap = os.environ["ZYGO_API_TOKEN"]
+    print("\nscoped tokens")
+    print(f"  {url}")
+
+    with zygo.connect(url, token=bootstrap, timeout=600) as operator:
+        try:
+            version = operator.version()
+        except zygo.ZygoError as e:
+            print(f"\n  the API is not reachable, so nothing below would mean anything:\n  {e}")
+            return 1
+        if version.get("deploy") is True:
+            ok("the bootstrap token is the operator, and it may deploy")
+        else:
+            bad("GET /version with the bootstrap token", json.dumps(version))
+
+        with zygo.connect(url, token="zygo_not-a-token") as stranger:
+            try:
+                stranger.functions()
+                bad("a token nobody minted was accepted")
+            except zygo.AuthError:
+                ok("a token nobody minted is refused")
+
+        # --- minting ---------------------------------------------------------
+
+        minted = operator.mint_token("acme")
+        if minted.secret and minted.token.tenant == "acme":
+            ok("a tenant token is minted, and the secret comes back with it")
+        else:
+            bad("POST /tenants/<id>/tokens", minted)
+
+        if any(t.id == minted.token.id for t in operator.tokens()):
+            ok("it is on the list")
+        else:
+            bad("GET /tokens", operator.tokens())
+        if all(minted.secret not in json.dumps(t.__dict__) for t in operator.tokens()):
+            ok("and the list does not carry the secret — the store has a hash")
+        else:
+            bad("a listing carried a secret")
+
+        # Minting for a tenant registers it, so onboarding is one call.
+        if operator.tenant("acme").id == "acme":
+            ok("minting for a new tenant registered the tenant")
+        else:
+            bad("the tenant was not registered by the mint")
+
+        globex = operator.mint_token("globex")
+
+        # --- what a tenant token is --------------------------------------------
+
+        acme = zygo.connect(url, token=minted.secret, timeout=600)
+        other = zygo.connect(url, token=globex.secret, timeout=600)
+
+        # No header anywhere below. The tenant comes from the token, which is
+        # the whole point: it is the one part of a request a caller cannot
+        # choose.
+        theirs = acme.put_script("def handler(event):\n    return {'from': 'acme'}\n")
+        if operator.tenant("acme").scripts == [theirs.sha256]:
+            ok("a tenant token registers scripts against its own tenant, with no header")
+        else:
+            bad("PUT /scripts with a tenant token", operator.tenant("acme").scripts)
+
+        if acme.tenant("acme").id == "acme":
+            ok("a tenant may read its own record")
+        else:
+            bad("GET /tenants/<own id> with a tenant token")
+
+        for what, call in (
+            ("list the tenants", lambda: acme.tenants()),
+            ("read another tenant", lambda: acme.tenant("globex")),
+            ("create a runtime pool", lambda: acme.serve_runtime("x", {"image": image, "agent": "python"})),
+            ("serve a function", lambda: acme.serve("x", {"image": image, "cmd": ["true"]}, base_dir="/tmp")),
+            ("run a one-shot sandbox", lambda: acme.run("alpine:3", ["true"])),
+            ("mint itself a token", lambda: acme.mint_token()),
+            ("list the tokens", lambda: acme.tokens()),
+            ("revoke a token", lambda: acme.revoke_token(globex.token.id)),
+            ("delete a tenant", lambda: acme.delete_tenant("globex")),
+        ):
+            try:
+                call()
+                bad(f"a tenant token could {what}")
+            except zygo.AuthError:
+                ok(f"a tenant token cannot {what}")
+            except zygo.ZygoError as e:
+                bad(f"`{what}` failed with the wrong kind of error", f"{type(e).__name__}: {e}")
+
+        # A token names its tenant; a header that disagrees is refused rather
+        # than ignored, so a client that thinks it is somebody else is told.
+        try:
+            acme.for_tenant("globex").put_script("x = 1\n")
+            bad("a tenant token acted for another tenant by sending a header")
+        except zygo.AuthError:
+            ok("a header that disagrees with the token is refused, not ignored")
+
+        # --- a digest is still not a capability --------------------------------
+
+        pool = operator.serve_runtime("shared", {"image": image, "agent": "python", "timeout": "20s"})
+        if pool.get("warm", 0) >= 1:
+            ok("an operator's pool is warm, and a tenant token may call it")
+        else:
+            bad("POST /runtimes", pool)
+
+        out = acme.run_script("shared", theirs.sha256, {})
+        if out.result.get("from") == "acme":
+            ok("the tenant that registered a script can run it")
+        else:
+            bad("the owner's own script", out)
+
+        try:
+            other.run_script("shared", theirs.sha256, {})
+            bad("a tenant token ran another tenant's script by naming its digest")
+        except zygo.NotFound:
+            ok("another tenant's token naming that digest is refused as `not found`")
+
+        # --- revocation --------------------------------------------------------
+
+        operator.revoke_token(minted.token.id)
+        try:
+            acme.functions()
+            bad("a revoked token still works")
+        except zygo.AuthError:
+            ok("a revoked token stops working on the very next request")
+
+        if any(t.id == minted.token.id and t.revoked for t in operator.tokens()):
+            ok("and it is still listed, marked revoked, so an id in a log resolves")
+        else:
+            bad("a revoked token vanished from the list", operator.tokens())
+
+        # Deleting a customer takes their keys with their code.
+        operator.delete_tenant("globex")
+        try:
+            other.functions()
+            bad("a deleted tenant's token still works")
+        except zygo.AuthError:
+            ok("deleting a tenant revokes its tokens")
+
+        # --- an operator token the operator minted ------------------------------
+
+        second = operator.mint_token()
+        if second.token.tenant is None:
+            ok("an operator token names nobody")
+        else:
+            bad("POST /tokens", second)
+        with zygo.connect(url, token=second.secret, timeout=600) as deputy:
+            if deputy.version().get("deploy") is True and isinstance(deputy.tenants(), list):
+                ok("and it may do what the operator may: deploy, and see the tenants")
+            else:
+                bad("a minted operator token could not act as one")
+
+        acme.close()
+        other.close()
+        operator.stop_runtime("shared")
+        operator.delete_tenant("acme")
+    return 0
+
+
 if __name__ == "__main__":
     if sys.argv[1] == "--call-only":
         status = call_only(sys.argv[2])
+    elif sys.argv[1] == "--tokens":
+        status = tokens(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else "python:3.12-slim")
     else:
         status = main()
     print(f"\n  {PASS} passed, {FAIL} failed")

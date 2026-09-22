@@ -63,7 +63,8 @@ const MAX_BODY = 64 * 1024 * 1024;
 export class Client {
   /**
    * @param {string} [url]
-   * @param {{token?: string|null, timeout?: number}} [options]
+   * @param {{token?: string|null, timeout?: number, tenant?: string|null,
+   *          agent?: import('http').Agent}} [options]
    */
   constructor(url, options = {}) {
     this.endpoint = resolve(url);
@@ -74,6 +75,8 @@ export class Client {
     // is the function's own `timeout` and the supervisor enforces it, so a
     // client that gives up first only loses the answer.
     this.timeout = options.timeout ?? 300_000;
+    /** Sent as `X-Zygo-Tenant`; set by {@link Client#forTenant}. */
+    this._tenantId = options.tenant ?? null;
 
     // Keep-alive is what keeps this client's overhead off the warm path: a
     // fresh connection per call would cost more than a warm request does. The
@@ -81,7 +84,10 @@ export class Client {
     // requests rather than a queue behind one socket.
     const transport = this.endpoint.tls ? https : http;
     this._transport = transport;
-    this._agent = new transport.Agent({ keepAlive: true, maxSockets: 64 });
+    // `agent` is how `forTenant` shares this pool rather than opening a
+    // second one. Undocumented on purpose: it is an internal seam, not a
+    // knob, and passing a foreign agent here is a way to lose keep-alive.
+    this._agent = options.agent ?? new transport.Agent({ keepAlive: true, maxSockets: 64 });
   }
 
   /** Close every pooled connection. Calling it twice is harmless. */
@@ -281,17 +287,66 @@ export class Client {
   }
 
   /**
+   * Mint an API token, and get its secret — once.
+   *
+   * Without `tenant` this is an **operator** token: tenants, functions, pools,
+   * and more tokens. With one it is that tenant's, and it may register scripts
+   * and call, for itself only. Minting for a tenant registers the tenant if it
+   * is new.
+   *
+   * The secret is in the answer and nowhere else. The server keeps a SHA-256
+   * of it, so it cannot be fetched again; keep it or revoke it.
+   *
+   * Operator-only, and needs deploy rights.
+   */
+  async mintToken(tenant = null) {
+    const path = tenant == null ? '/tokens' : `/tenants/${esc(tenant)}/tokens`;
+    const body = await this.#request('POST', path);
+    return { token: body.token ?? {}, secret: body.secret ?? '' };
+  }
+
+  /** Every token this host holds, revoked ones included. Never a secret. */
+  async tokens() {
+    const body = await this.#request('GET', '/tokens');
+    return body.tokens ?? [];
+  }
+
+  /**
+   * Revoke one, from the next request onwards.
+   *
+   * The record stays, marked with when it went, so an id in a log line still
+   * resolves to something.
+   */
+  async revokeToken(id) {
+    return this.#request('DELETE', `/tokens/${esc(id)}`);
+  }
+
+  /**
    * A view of this client that acts for one tenant.
    *
    * Every call through it carries the tenant, so scripts are registered
    * against them and pool calls may only name their own. The connection is
    * shared — this is a header, not a second client.
+   *
+   * For an **operator** token: the header says which of your customers you are
+   * acting for. A **tenant** token already names its tenant and does not need
+   * this — and the server refuses a header that disagrees with the token
+   * rather than ignoring it.
    */
   forTenant(id) {
-    const view = Object.create(Object.getPrototypeOf(this));
-    Object.assign(view, this);
-    view._tenantId = id;
-    return view;
+    // A real `new Client`, not a copy of this one's properties: the request
+    // path is a private class field, which `Object.assign` does not carry, so
+    // a view built that way looked like a client and threw `Receiver must be
+    // an instance of class Client` on its first call.
+    //
+    // The connection pool is passed rather than rebuilt, so this stays a
+    // header on the same client. Closing either closes both.
+    return new Client(this.endpoint.url, {
+      token: this.token,
+      timeout: this.timeout,
+      tenant: id,
+      agent: this._agent,
+    });
   }
 
   /**

@@ -39,7 +39,10 @@ use crate::spec::{Layer, Spec};
 /// - v5: `CREATE_TENANT`, `TENANTS`, `DELETE_TENANT`, and a `tenant` on
 ///   everything that acts for one — the embedder's customers as a first-class
 ///   object rather than a word for "function".
-pub const CONTROL_VERSION: u32 = 5;
+/// - v6: `MINT_TOKEN`, `TOKENS`, `REVOKE_TOKEN` and their answer — API tokens
+///   that say whose request this is, so the tenant comes from something the
+///   caller cannot choose rather than from a header.
+pub const CONTROL_VERSION: u32 = 6;
 
 /// CLI → supervisor.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -86,21 +89,34 @@ pub enum Request {
         if_changed: bool,
         /// Whose function this is. `None` is the operator's own.
         ///
-        /// What it decides today is the cgroup the sandbox lives in and who
-        /// `DELETE /tenants/<id>` stops. It does **not** yet namespace the
-        /// name: the registry is keyed by name alone, which is sound only
-        /// while the operator is the one choosing every name. When a tenant
-        /// token can serve a function (roadmap 2.2), the key has to become
-        /// the pair or two customers will collide on `resize`.
+        /// What it decides is the cgroup the sandbox lives in, who may call
+        /// it (see `Exec::tenant`), and who `DELETE /tenants/<id>` stops.
+        ///
+        /// It does **not** namespace the *name*: the registry is keyed by
+        /// name alone. That is sound because only an operator serves — a
+        /// tenant token registers scripts and calls, and `may_deploy` in the
+        /// API refuses it everything that names an image, a mount or a
+        /// command. So every name on this host was chosen by one person, and
+        /// two customers cannot collide on `resize` because neither of them
+        /// picked it. The day a tenant token can serve, the key has to become
+        /// the pair; nothing else here changes.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tenant: Option<String>,
     },
 
     /// Call a warm function.
+    ///
+    /// `tenant` is who is asking. `None` is the operator, who may call
+    /// anything; a tenant may only call its own, and a name belonging to
+    /// somebody else answers `not_found` — the same answer a name that was
+    /// never served gets, because "it exists but is not yours" is a fact about
+    /// another customer.
     Exec {
         name: String,
         event: serde_json::Value,
         timeout_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tenant: Option<String>,
     },
 
     /// Run a one-shot sandbox here, on the client's behalf.
@@ -180,6 +196,10 @@ pub enum Request {
         limit: u32,
         #[serde(default)]
         failed: bool,
+        /// Who is asking. See `Exec::tenant`; a log is a function's output,
+        /// which is the most directly readable thing a customer owns.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tenant: Option<String>,
     },
 
     /// Make a registered function warm now, without calling it.
@@ -188,7 +208,13 @@ pub enum Request {
     /// is paused, is brought back so the first real request does not pay for
     /// it. A function that was never served is `not_found` — this warms, it
     /// does not register.
-    Warm { name: String },
+    Warm {
+        name: String,
+        /// Who is asking. See `Exec::tenant`; warming costs memory, so it is
+        /// not something to let one customer spend on another's behalf.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tenant: Option<String>,
+    },
 
     /// Register a script, and get back the name the store gave it.
     ///
@@ -267,6 +293,29 @@ pub enum Request {
     /// Forget a tenant: its functions and pools stop, and the scripts nothing
     /// else refers to are removed with it.
     DeleteTenant { id: String },
+
+    /// Mint an API token. `tenant: None` mints an operator token.
+    ///
+    /// The answer carries the secret, and this is the only frame that ever
+    /// does: the store keeps a hash, so a second `TOKENS` could not produce
+    /// it again even if something asked.
+    ///
+    /// Minting for a tenant creates that tenant if it does not exist, for the
+    /// same reason `PUT_SCRIPT` does — an embedder onboarding a customer
+    /// should not have to get two calls in the right order.
+    MintToken {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tenant: Option<String>,
+    },
+
+    /// Every token this host holds, hashes and all — never a secret.
+    ///
+    /// Revoked ones included, because "was this token revoked, and when?" is
+    /// the question somebody reading a log line has.
+    Tokens,
+
+    /// Revoke one by its public id. `not_found` if no token has that id.
+    RevokeToken { id: String },
 }
 
 fn default_log_limit() -> u32 {
@@ -417,6 +466,21 @@ pub enum Response {
         stopped: Vec<String>,
     },
 
+    /// Answer to `MintToken`, `Tokens` and `RevokeToken`.
+    ///
+    /// One shape for all three, like `Tenants`. A mint answers with the one
+    /// token it made and the secret beside it; a list answers with all of them
+    /// and no secret.
+    Tokens {
+        tokens: Vec<crate::tokens::Token>,
+        /// The secret, in the clear, on the one frame that carries it.
+        ///
+        /// Nothing stores this. A client that does not keep it has lost the
+        /// token, and the only remedy is to mint another and revoke this one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        secret: Option<String>,
+    },
+
     /// Answer to `PutScript` and `GetScript`.
     Script {
         /// `sha256:…`, which is the script's name everywhere else.
@@ -541,6 +605,7 @@ mod tests {
                 name: "resize".into(),
                 event: serde_json::json!({ "url": "https://example.com" }),
                 timeout_ms: 30_000,
+                tenant: Some("acme".into()),
             },
             Request::List,
             Request::Run {
@@ -561,6 +626,7 @@ mod tests {
             Request::Ping,
             Request::Warm {
                 name: "resize".into(),
+                tenant: None,
             },
             Request::Shell {
                 name: "resize".into(),
@@ -570,6 +636,7 @@ mod tests {
                 after: 17,
                 limit: 20,
                 failed: true,
+                tenant: Some("acme".into()),
             },
             Request::PutScript {
                 source: "def handler(event):\n    return event\n".into(),
@@ -605,6 +672,14 @@ mod tests {
             Request::CreateTenant { id: "acme".into() },
             Request::Tenants { id: None },
             Request::DeleteTenant { id: "acme".into() },
+            Request::MintToken {
+                tenant: Some("acme".into()),
+            },
+            Request::MintToken { tenant: None },
+            Request::Tokens,
+            Request::RevokeToken {
+                id: "tok_1a2b3c4d5e6f".into(),
+            },
             Request::Runtimes,
             Request::StopRuntime {
                 name: "py312".into(),
@@ -635,6 +710,7 @@ mod tests {
             Response::Functions {
                 functions: vec![Status {
                     name: "resize".into(),
+                    tenant: "acme".into(),
                     image: String::new(),
                     state: crate::sandbox::SandboxState::Warm,
                     runtime: "python3.12".into(),
@@ -666,6 +742,18 @@ mod tests {
                 removed_scripts: vec!["sha256:abc".into()],
                 stopped: vec!["resize".into()],
             },
+            Response::Tokens {
+                tokens: vec![crate::tokens::Token {
+                    id: "tok_1a2b3c4d5e6f".into(),
+                    kind: crate::tokens::TokenKind::Tenant {
+                        tenant: "acme".into(),
+                    },
+                    created_ms: 1_700_000_000_000,
+                    revoked_ms: None,
+                    hash: "sha256:abc".into(),
+                }],
+                secret: Some("zygo_deadbeef".into()),
+            },
             Response::RuntimeServed {
                 name: "py312".into(),
                 runtime: "python/3.12.4".into(),
@@ -679,6 +767,7 @@ mod tests {
             Response::Runtimes {
                 runtimes: vec![crate::supervisor::runtime::RuntimeStatus {
                     name: "py312".into(),
+                    tenant: "acme".into(),
                     image: "python:3.12-slim".into(),
                     runtime: "python/3.12.4".into(),
                     warm: 2,

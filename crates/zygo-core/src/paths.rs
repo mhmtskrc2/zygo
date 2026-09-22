@@ -137,6 +137,18 @@ impl Paths {
     pub fn tenants(&self) -> PathBuf {
         self.data.join("tenants")
     }
+    /// API tokens, hashed, in one file.
+    ///
+    /// Beside the tenants and for the same reason: a token outlives the
+    /// supervisor that minted it, and an embedder who lost their customers'
+    /// tokens on a restart would have an outage, not an inconvenience.
+    ///
+    /// One file rather than a directory, because every resolution reads the
+    /// whole set and a directory walk per request is the wrong shape. It is
+    /// `0600`; [`crate::tokens`] sets that before the file is in place.
+    pub fn tokens(&self) -> PathBuf {
+        self.data.join("tokens.json")
+    }
     pub fn venv_cache(&self) -> PathBuf {
         self.data.join("cache/venvs")
     }

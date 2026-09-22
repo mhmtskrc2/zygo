@@ -213,6 +213,20 @@ pub enum Command {
     /// Run the HTTP API in the foreground.
     Api(ApiArgs),
 
+    /// Mint, list and revoke API tokens.
+    ///
+    /// A token is how `zygo api` answers "whose request is this?" with
+    /// something the caller cannot choose. An **operator** token is the
+    /// host's: it creates tenants, serves functions and pools, and mints
+    /// more. A **tenant** token is one customer's: it registers scripts and
+    /// calls, for itself only.
+    ///
+    /// The secret is printed once, at creation, and is not stored — only its
+    /// hash is, so nothing here can print it again. Losing one means revoking
+    /// it and minting another.
+    #[command(subcommand)]
+    Token(TokenCommand),
+
     /// Serve Zygo's tools to an agent over the Model Context Protocol.
     ///
     /// Speaks JSON-RPC on standard input and output, which is what an agent
@@ -248,6 +262,32 @@ pub enum Command {
     Completion {
         /// bash, zsh, fish, elvish or powershell.
         shell: clap_complete::Shell,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TokenCommand {
+    /// Mint one, and print the secret. This is the only time it exists.
+    Mint {
+        /// Mint it for a tenant rather than for the operator.
+        ///
+        /// The tenant is registered if it is new, so onboarding a customer is
+        /// one command.
+        #[arg(long)]
+        tenant: Option<String>,
+    },
+
+    /// Every token this host holds, revoked ones included.
+    #[command(visible_alias = "list")]
+    Ls,
+
+    /// Revoke one, from the next request onwards.
+    ///
+    /// The record stays, marked with when it went, so a log line naming the
+    /// id still resolves to something.
+    Revoke {
+        /// The token's public id, as `zygo token ls` prints it.
+        id: String,
     },
 }
 
