@@ -23,8 +23,27 @@ while [ $i -lt 100 ]; do
     i=$((i+1)); sleep 0.1
 done
 
+# The pool mode calls over the API, because that is the path an embedder uses
+# and because a `zygo exec` per call would measure process start-up rather than
+# the request. One API for the whole run, on a unix socket in this container.
+case " $* " in
+    *" --pool "*)
+        API_SOCK=/tmp/bench-density-api.sock
+        rm -f "$API_SOCK"
+        zygo api --listen "unix://$API_SOCK" --no-auth --allow-deploy \
+            >/tmp/api-density.log 2>&1 &
+        API_PID=$!
+        i=0
+        while [ $i -lt 100 ] && [ ! -S "$API_SOCK" ]; do
+            i=$((i+1)); sleep 0.1
+        done
+        set -- "$@" --api "unix://$API_SOCK"
+        ;;
+esac
+
 python3 "$SRC/poc/bench_density.py" "$@"
 status=$?
+[ -n "${API_PID:-}" ] && kill "$API_PID" 2>/dev/null
 
 echo
 harness_verdict

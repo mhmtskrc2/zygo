@@ -368,6 +368,10 @@ bench-embed: poc/zygo-linux-musl
 # What one more warm script costs this host. The number an embedder with ten
 # thousand scripts asks first, and the one Phase 1 of the embedded-runtime
 # roadmap (docs/adr/0001-embedded-runtime.md) is meant to change.
+#
+#   ARGS="--scripts 32"            a zygote per script, the Phase 0 shape
+#   ARGS="--pool --scripts 1000"   one runtime pool, the Phase 1 shape, with
+#                                  a warm function as the control
 bench-density: poc/zygo-linux-musl
 	docker run --rm --privileged -v "$(PWD):/src:ro" \
 		-e ZYGO_DATA_HOME=/tmp/zdata-density python:3.12-slim \

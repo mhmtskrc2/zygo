@@ -190,6 +190,58 @@ zygote per **runtime** rather than per script, with the script arriving in the
 flat: 1 000 distinct scripts, one runtime, resident memory that does not grow
 with the script count.
 
+## The same question of a runtime pool
+
+Phase 1 is built, so the same benchmark can be asked of it:
+
+```bash
+make bench-density ARGS="--pool --scripts 1000"
+```
+
+A thousand distinct scripts — the same distinct-constant sources, registered
+once each with `PUT /scripts` and then called by digest — through **one**
+runtime pool. Every call goes over the HTTP API, because that is the path an
+embedder uses and because a `zygo exec` per call would measure process
+start-up instead.
+
+| | one zygote per script | one runtime pool |
+|---|---|---|
+| 1 000 scripts, proportional memory | ~9.7 GiB (extrapolated from the slope) | **29.4 MB, measured** |
+| One more script | 9.98 MB | **0.0 kB** |
+| Zygotes | 1 000 | **1** |
+
+The slope is not "small", it is **zero**: the checkpoint at 125 scripts and
+the checkpoint at 1 000 read the same 29.4 MB, because the pool's zygote holds
+an interpreter and a dependency set and the scripts are never in it. That is
+the whole of what Phase 1 set out to change, and it is a measurement rather
+than an argument.
+
+### The latency half is not settled
+
+| Raspberry Pi 5, 1 000 scripts | p50 | p99 |
+|---|---|---|
+| Pool, by digest, over the API | 6.28 ms | 26.10 ms |
+| **Control**: a warm function, same API, same host, same 1 000 calls | 4.29 ms | 21.29 ms |
+| The pool's own cost | +1.99 ms | +4.81 ms |
+
+The roadmap's exit criterion is p99 under 5 ms, and neither column is inside
+it — including the one with no pool in it at all. That is the finding: what
+this instrument measures is a Python client making a thousand serial HTTP
+calls on a four-core machine, and the warm path's own published figures (1.70
+ms at p50, 2.81 ms at p99) come from `zygo bench warm`, which measures the
+request rather than the round trip and drives it at 250 requests a second.
+
+So the honest reading is the *difference*: a pooled call costs about two
+milliseconds more at p50 than a warmed handler on the same host through the
+same client, which is what writing the script into the sandbox and loading it
+in the child costs. Whether that lands under 5 ms end to end is a question for
+`zygo bench warm` with a pool mode, which does not exist yet. **Phase 1's exit
+is therefore half-declared: the slope passes outright, the latency is
+unmeasured against the budget.**
+
+(For comparison, the same run inside Docker Desktop's VM: p50 3.38 ms, p99
+14.74 ms, slope 0.0 kB. Faster cores, nested virtualisation, same conclusion.)
+
 ## The other finding: `zygo run` pays for a cgroup it throws away
 
 Not part of the gate, but it came out of the same work and it is the largest
