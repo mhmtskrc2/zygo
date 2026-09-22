@@ -216,7 +216,39 @@ an interpreter and a dependency set and the scripts are never in it. That is
 the whole of what Phase 1 set out to change, and it is a measurement rather
 than an argument.
 
-### The latency half is not settled
+### The latency half, settled
+
+```bash
+zygo bench warm --pool --scripts 1000     # or `make bench`, which runs it
+```
+
+A thousand distinct scripts, a **different one on every request**, each called
+once before anything is measured, at 250 requests a second — the same
+instrument, rate and host as the published warm-path figures:
+
+| Docker Desktop's VM | p50 | p99 |
+|---|---|---|
+| A warm function | 1.42 ms | 2.12 ms |
+| A pooled script | 2.07 ms | 2.92 ms |
+| **What the pool costs** | **+0.65 ms** | **+0.80 ms** |
+
+**Phase 1's exit criterion is met**: p99 2.92 ms against a budget of 5 ms,
+with a slope of zero. The two-thirds of a millisecond the pool adds is
+writing the script into the sandbox and the child compiling it; the phase
+breakdown puts it in `run` (`GO`→`DONE`), where the load happens, and not in
+`fork` or `admit`.
+
+### The same thing measured badly, and why it read as a failure
+
+The first attempt measured this over the HTTP API with a Python client making
+a thousand serial calls, and reported p50 6.28 ms / p99 25.24 ms on a
+Raspberry Pi — outside the budget by a factor of five. What saved the
+conclusion was the control in the same run: a warm *function*, no pool
+involved, measured 4.28 / 20.99 through the same client on the same host. A
+budget the control cannot meet either is not a measurement of the thing under
+test.
+
+The numbers are kept here because the pair is the point:
 
 | Raspberry Pi 5, 1 000 scripts | p50 | p99 |
 |---|---|---|
@@ -230,23 +262,19 @@ within a millisecond, which is what rules the storage out — that card has
 stalled this machine on I/O before, and a tail measured on it is worth nothing
 until something says it was not the disk.
 
-The roadmap's exit criterion is p99 under 5 ms, and neither column is inside
-it — including the one with no pool in it at all. That is the finding: what
-this instrument measures is a Python client making a thousand serial HTTP
-calls on a four-core machine, and the warm path's own published figures (1.70
-ms at p50, 2.81 ms at p99) come from `zygo bench warm`, which measures the
-request rather than the round trip and drives it at 250 requests a second.
+Neither column is inside the 5 ms budget, including the one with no pool in
+it at all — so what this instrument measures is a Python client making a
+thousand serial HTTP calls on a four-core machine, not the request path the
+budget was written against. The pool's own cost is the difference, and even
+that reads high here (+2.08 ms against the +0.65 ms the direct measurement
+finds) because HTTP variance lands in both columns.
 
-So the honest reading is the *difference*: a pooled call costs about two
-milliseconds more at p50 than a warmed handler on the same host through the
-same client, which is what writing the script into the sandbox and loading it
-in the child costs. Whether that lands under 5 ms end to end is a question for
-`zygo bench warm` with a pool mode, which does not exist yet. **Phase 1's exit
-is therefore half-declared: the slope passes outright, the latency is
-unmeasured against the budget.**
+Worth keeping as a caution about instruments, and as the number an embedder
+calling over HTTP from Python will actually see on a Raspberry Pi. It is not
+the number the phase gate is written in.
 
-(For comparison, the same run inside Docker Desktop's VM: p50 3.38 ms, p99
-14.74 ms, slope 0.0 kB. Faster cores, nested virtualisation, same conclusion.)
+(The same run inside Docker Desktop's VM: p50 3.38 ms, p99 14.74 ms, slope
+0.0 kB.)
 
 ## The other finding: `zygo run` pays for a cgroup it throws away
 

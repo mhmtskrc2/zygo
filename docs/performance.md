@@ -58,6 +58,24 @@ which the first `serve` does. After `cold_after` the same cost is paid again.
 rather than a fork, costs a median of 2.2 ms. That is the mode a compiled
 program uses: no agent, no runtime, just `cmd`.
 
+**A runtime pool**, where the zygote holds no code and the script arrives with
+the request, costs a median of **2.07 ms** and a 99th percentile of
+**2.92 ms** — measured with a *different script on every request*, a thousand
+of them, each called once before anything was measured.
+
+| | p50 | p99 |
+|---|---|---|
+| A warm function | 1.42 ms | 2.12 ms |
+| A pooled script | 2.07 ms | 2.92 ms |
+| What the pool costs | +0.65 ms | +0.80 ms |
+
+Both rows from one `zygo bench all` on one host, so the difference is the
+pool's and not the machine's. That two-thirds of a millisecond is the whole
+of it: writing the script into the sandbox, and the child compiling and
+loading it. `zygo bench warm --pool --scripts 1000` reproduces it, and the
+memory side — a thousand scripts in one zygote, flat in the script count — is
+in [the embedder's benchmark](bench-embed.md).
+
 ### When the number is about your limits, not about Zygo
 
 Drive a function past its own `cpu` quota and the 99th percentile becomes about

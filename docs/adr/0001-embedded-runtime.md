@@ -74,6 +74,7 @@ so that a phase cannot be declared done by whoever is doing it.
 |---|---|
 | 0 Prove the wedge | the warm fork's p50 is at least 10× under the best one-shot runner on an import-heavy script, measured on one host, published with the commands |
 | 1 Runtime zygotes | 1 000 distinct scripts on one runtime, p99 under 5 ms after each script's first call, resident memory flat in the number of scripts |
+| | **Met.** p99 **2.92 ms** with a different script on every request (`zygo bench warm --pool --scripts 1000`), and **29.4 MB in one zygote** for a thousand scripts — a slope of **0.0 kB** per script, against 9.98 MB for a zygote each. Both in [`bench-embed.md`](../bench-embed.md), both reproducible by `make bench` and `make bench-density ARGS="--pool --scripts 1000"`. |
 | 2 Embedder API | a plugin host can be written against the HTTP API alone — no `sandbox.toml`, no files on the Zygo host |
 | 3 Runtimes | the same plugin host runs a Python and a JavaScript plugin through one API with one set of limits |
 | 4 Deployability | `kubectl apply` of the example on a stock cluster gives a green readiness probe and a passing `zygo agent test` inside the pod |

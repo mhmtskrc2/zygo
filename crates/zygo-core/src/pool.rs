@@ -2874,13 +2874,26 @@ impl Function {
         script: Option<crate::protocol::Script>,
         timeout: std::time::Duration,
     ) -> Result<Outcome> {
+        self.call_script_timed(event, script, timeout)
+            .map(|(outcome, _)| outcome)
+    }
+
+    /// The same, reporting where the request's time went.
+    ///
+    /// What `zygo bench warm --pool` measures: the phases are the same three
+    /// a function's request has, so the two shapes can be compared line by
+    /// line rather than only at the total.
+    pub fn call_script_timed(
+        &self,
+        event: serde_json::Value,
+        script: Option<crate::protocol::Script>,
+        timeout: std::time::Duration,
+    ) -> Result<(Outcome, CallTiming)> {
         match self {
-            Function::Agent(f) => f
-                .call_script_timed(event, script, timeout)
-                .map(|(outcome, _)| outcome),
+            Function::Agent(f) => f.call_script_timed(event, script, timeout),
             #[cfg(target_os = "linux")]
             Function::Exec(f) => match script {
-                None => f.call_timed(event, timeout).map(|(outcome, _)| outcome),
+                None => f.call_timed(event, timeout),
                 Some(_) => Err(Error::BackendUnavailable {
                     backend: "pool",
                     reason: "a warm-exec function cannot be given a script".into(),

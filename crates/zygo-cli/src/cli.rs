@@ -369,6 +369,22 @@ pub enum BenchCommand {
         /// CPU quota for the tenant, in cores. Defaults to the spec's `1.0`.
         #[arg(long)]
         cpu: Option<f64>,
+        /// Measure a **runtime pool** instead of a function: one warm zygote
+        /// holding no code, and a different script with every request.
+        ///
+        /// This is the embedded-runtime shape, and the comparison that matters
+        /// is against the same command without the flag — the difference is
+        /// what writing the script into the sandbox and loading it in the
+        /// child costs.
+        #[arg(long, conflicts_with = "cmd")]
+        pool: bool,
+        /// How many distinct scripts the pool cycles through, with `--pool`.
+        ///
+        /// Distinct so nothing can cache one and serve it as another, and
+        /// every one is called once before the measurement starts — the
+        /// roadmap's "p99 after the first call to each".
+        #[arg(long, default_value_t = 1000, requires = "pool")]
+        scripts: u32,
         /// Measure warm-exec instead of the agent: the sandbox is held and this
         /// command runs per request, reading the event on stdin. Given after
         /// `--`, so its own flags are not mistaken for ours:

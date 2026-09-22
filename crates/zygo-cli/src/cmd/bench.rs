@@ -29,6 +29,15 @@ const WARM_P99_BUDGET_US: f64 = 10_000.0;
 /// exactly why interpreters get an agent instead.
 const EXEC_P50_BUDGET_US: f64 = 3_000.0;
 
+/// The embedded-runtime roadmap's exit criterion for a runtime pool: a
+/// request's p99 under 5 ms, with a different script every time.
+///
+/// A p99 rather than a p50, because that is what the roadmap asks and because
+/// it is the number an embedder's own tail depends on. It is checked here as
+/// a p50 budget too — set to the same figure — so a pool whose median is
+/// already outside it is not reported as passing on a quiet percentile.
+const POOL_P99_BUDGET_US: f64 = 5_000.0;
+
 pub fn run(cli: &Cli, command: &BenchCommand) -> anyhow::Result<u8> {
     let measured = match command {
         BenchCommand::Warm {
@@ -36,6 +45,8 @@ pub fn run(cli: &Cli, command: &BenchCommand) -> anyhow::Result<u8> {
             no_cgroup,
             rate,
             cpu,
+            pool,
+            scripts,
             cmd,
         } => warm(
             cli,
@@ -44,6 +55,7 @@ pub fn run(cli: &Cli, command: &BenchCommand) -> anyhow::Result<u8> {
             *rate,
             *cpu,
             (!cmd.is_empty()).then_some(cmd.as_slice()),
+            pool.then_some(*scripts),
         )?,
         BenchCommand::Cold { n, image, command } => cold(cli, *n, image, command.as_deref())?,
         BenchCommand::Load {
@@ -66,6 +78,7 @@ pub fn run(cli: &Cli, command: &BenchCommand) -> anyhow::Result<u8> {
 /// code when the answer was a hot laptop.
 const NOT_A_VERDICT: u8 = 2;
 
+#[allow(clippy::too_many_arguments)]
 fn warm(
     cli: &Cli,
     n: u32,
@@ -73,6 +86,7 @@ fn warm(
     rate: Option<f64>,
     cpu: Option<f64>,
     cmd: Option<&[String]>,
+    pool_scripts: Option<u32>,
 ) -> anyhow::Result<(u8, serde_json::Value)> {
     let paths = super::paths(cli);
     let pool = Pool::new(PoolConfig {
@@ -86,18 +100,34 @@ fn warm(
     let handler = dir.path().join("handler.py");
     std::fs::write(&handler, "def handler(event):\n    return None\n")?;
 
+    // The pool's scripts: the same empty handler, with a distinct constant in
+    // each source so nothing can be deduped or cached across them. Built up
+    // front, because building one is not what is being measured.
+    let scripts: Vec<zygo_core::protocol::Script> = (0..pool_scripts.unwrap_or(0))
+        .map(|i| {
+            zygo_core::protocol::Script::inline(format!(
+                "CONSTANT = {i}\n\n\ndef handler(event):\n    return None\n"
+            ))
+        })
+        .collect();
+
     let spec = Spec::default();
     let resolved = spec.resolve(
         None,
         &Layer {
-            entry: cmd.is_none().then(|| handler.clone()),
+            entry: (cmd.is_none() && pool_scripts.is_none()).then(|| handler.clone()),
             cmd: cmd.map(<[String]>::to_vec),
-            image: cmd.is_some().then(|| "python:3.12-slim".to_string()),
+            image: (cmd.is_some() || pool_scripts.is_some())
+                .then(|| "python:3.12-slim".to_string()),
+            runtime: pool_scripts.map(|_| {
+                zygo_core::spec::Runtime::Builtin(zygo_core::spec::BuiltinRuntime::Python)
+            }),
             cpu: cpu.map(zygo_core::spec::Cpu),
             ..Default::default()
         },
         &ResolveOptions {
             one_shot: true,
+            pool: pool_scripts.is_some(),
             ..Default::default()
         },
     )?;
@@ -136,9 +166,24 @@ fn warm(
 
     // A short warm-up run first: the first few requests pay for page faults in
     // the interpreter that every later one inherits.
+    //
+    // With a pool, every script is called once before anything is measured.
+    // That is the roadmap's "p99 after the first call to each", and it is the
+    // honest shape either way: a first call pays for whatever a first call
+    // pays for, and an embedder's tenth thousandth does not.
     let settle = (n / 20).clamp(50, 500);
-    for _ in 0..settle {
-        function.call(serde_json::Value::Null)?;
+    if scripts.is_empty() {
+        for _ in 0..settle {
+            function.call(serde_json::Value::Null)?;
+        }
+    } else {
+        for script in &scripts {
+            function.call_script_with_timeout(
+                serde_json::Value::Null,
+                Some(script.clone()),
+                Duration::from_secs(30),
+            )?;
+        }
     }
 
     let mut samples = Vec::with_capacity(n as usize);
@@ -164,8 +209,18 @@ fn warm(
             }
         }
         let t0 = Instant::now();
-        let (outcome, timing) =
-            function.call_timed(serde_json::Value::Null, Duration::from_secs(30))?;
+        // A different script every time, cycling: the point of a pool is that
+        // request *n* and request *n+1* are different tenants' code, and a
+        // benchmark that sent one script ten thousand times would be
+        // measuring a cache nobody has.
+        let (outcome, timing) = match scripts.is_empty() {
+            true => function.call_timed(serde_json::Value::Null, Duration::from_secs(30))?,
+            false => function.call_script_timed(
+                serde_json::Value::Null,
+                Some(scripts[i as usize % scripts.len()].clone()),
+                Duration::from_secs(30),
+            )?,
+        };
         samples.push(t0.elapsed().as_secs_f64() * 1e6);
         phases.push(timing);
         // What the child says it spent inside the handler. The difference
@@ -202,7 +257,15 @@ fn warm(
         report.p50_budget = EXEC_P50_BUDGET_US;
         report.label = "warm-exec request overhead";
     }
+    if !scripts.is_empty() {
+        report.p50_budget = POOL_P99_BUDGET_US;
+        report.p99_budget = POOL_P99_BUDGET_US;
+        report.label = "pooled script request overhead";
+    }
     let mut json = report.to_json();
+    if !scripts.is_empty() {
+        json["scripts"] = scripts.len().into();
+    }
     json["warm_ms"] = (warmup.as_secs_f64() * 1000.0).into();
     json["imports_ms"] = status.imports_ms.into();
     json["rss_kb"] = status.rss_kb.into();
@@ -249,6 +312,10 @@ mod published {
     pub const COLD_P50_MS: f64 = 18.4;
     /// Warm-exec: a fresh process entered into a held sandbox.
     pub const EXEC_P50_MS: f64 = 2.2;
+    /// A runtime pool, a different script with every request, at the same
+    /// rate. The roadmap's exit criterion for Phase 1 is the p99 under 5 ms.
+    pub const POOL_P50_MS: f64 = 2.07;
+    pub const POOL_P99_MS: f64 = 2.92;
     /// What `zygo serve` costs once, for a Python handler with no imports.
     pub const SERVE_MS: f64 = 270.0;
 }
@@ -308,16 +375,24 @@ fn all(cli: &Cli, quick: bool) -> anyhow::Result<u8> {
     };
 
     if !cli.json {
-        println!("{}", style.bold("1/4  the warm path"));
+        println!("{}", style.bold("1/5  the warm path"));
     }
     step(
         "warm",
-        warm(cli, warm_n, true, Some(published::WARM_RATE), None, None),
+        warm(
+            cli,
+            warm_n,
+            true,
+            Some(published::WARM_RATE),
+            None,
+            None,
+            None,
+        ),
     );
 
     if !cli.json {
         println!();
-        println!("{}", style.bold("2/4  warm-exec"));
+        println!("{}", style.bold("2/5  warm-exec"));
     }
     let exec_cmd: Vec<String> = ["sh", "-c", "cat"].iter().map(|s| s.to_string()).collect();
     step(
@@ -329,12 +404,37 @@ fn all(cli: &Cli, quick: bool) -> anyhow::Result<u8> {
             Some(published::WARM_RATE),
             None,
             Some(&exec_cmd),
+            None,
+        ),
+    );
+
+    // The embedded-runtime shape, beside the function it is measured against:
+    // the same instrument, the same host, the same rate, and a different
+    // script with every request. The pair is the only honest way to say what
+    // a pool costs — an absolute number would be about the machine.
+    if !cli.json {
+        println!();
+        println!(
+            "{}",
+            style.bold("3/5  a runtime pool, a different script each request")
+        );
+    }
+    step(
+        "pool",
+        warm(
+            cli,
+            warm_n,
+            true,
+            Some(published::WARM_RATE),
+            None,
+            None,
+            Some(if quick { 50 } else { 1_000 }),
         ),
     );
 
     if !cli.json {
         println!();
-        println!("{}", style.bold("3/4  a cold start"));
+        println!("{}", style.bold("4/5  a cold start"));
     }
     step("cold", cold(cli, cold_n, "python:3.12-slim", None));
 
@@ -349,7 +449,7 @@ fn all(cli: &Cli, quick: bool) -> anyhow::Result<u8> {
         println!();
         println!(
             "{}  {}",
-            style.bold("4/4  sustained throughput"),
+            style.bold("5/5  sustained throughput"),
             style.dim(&format!(
                 "with the tenant's CPU quota raised to {load_cores:.0} cores,                  so this measures the runtime and not the quota"
             ))
@@ -504,6 +604,20 @@ fn compare_with_published(results: &serde_json::Map<String, serde_json::Value>) 
             unit: "ms",
             published: published::EXEC_P50_MS,
             measured: micros("warm_exec", "p50_us"),
+            higher_is_better: false,
+        },
+        Claim {
+            what: "pooled script request, median",
+            unit: "ms",
+            published: published::POOL_P50_MS,
+            measured: micros("pool", "p50_us"),
+            higher_is_better: false,
+        },
+        Claim {
+            what: "pooled script request, 99th percentile",
+            unit: "ms",
+            published: published::POOL_P99_MS,
+            measured: micros("pool", "p99_us"),
             higher_is_better: false,
         },
         Claim {
@@ -1189,6 +1303,9 @@ struct Report {
     quota: Option<CpuAccounting>,
     /// The p50 budget this run is judged against: the agent's or warm-exec's.
     p50_budget: f64,
+    /// The tail's budget. A pool's is the roadmap's 5 ms rather than the warm
+    /// path's 10 ms, because that is the number Phase 1's exit is written in.
+    p99_budget: f64,
     label: &'static str,
 }
 
@@ -1209,6 +1326,7 @@ impl Report {
             elapsed,
             quota,
             p50_budget: WARM_P50_BUDGET_US,
+            p99_budget: WARM_P99_BUDGET_US,
             label: "warm request overhead",
         }
     }
@@ -1233,7 +1351,7 @@ impl Report {
     /// the phase-0 report records twice under test methodology. It is not a
     /// pass either: the p99 simply was not measured, which the output says.
     fn within_budget(&self) -> bool {
-        self.p50 < self.p50_budget && (!self.p99_is_meaningful() || self.p99 < WARM_P99_BUDGET_US)
+        self.p50 < self.p50_budget && (!self.p99_is_meaningful() || self.p99 < self.p99_budget)
     }
 
     /// How much of the budget is left. The number worth watching: the first
@@ -1273,10 +1391,10 @@ impl Report {
         if self.p99_is_meaningful() {
             println!(
                 "  p99 < {:.0} µs  {}",
-                WARM_P99_BUDGET_US,
+                self.p99_budget,
                 verdict(
-                    self.p99 < WARM_P99_BUDGET_US,
-                    if self.p99 < WARM_P99_BUDGET_US {
+                    self.p99 < self.p99_budget,
+                    if self.p99 < self.p99_budget {
                         "PASS"
                     } else {
                         "FAIL"
@@ -1286,7 +1404,7 @@ impl Report {
         } else {
             println!(
                 "  p99 < {:.0} µs  {}",
-                WARM_P99_BUDGET_US,
+                self.p99_budget,
                 style.yellow("NOT MEASURED — the tenant was at its CPU quota")
             );
         }
@@ -1375,7 +1493,7 @@ impl Report {
             "max_us": self.max,
             "mean_us": self.mean,
             "requests_per_second": self.per_second,
-            "budget": { "p50_us": self.p50_budget, "p99_us": WARM_P99_BUDGET_US },
+            "budget": { "p50_us": self.p50_budget, "p99_us": self.p99_budget },
             "headroom_p50_percent": self.headroom_percent(),
             "pass": self.within_budget(),
             "p99_measured": self.p99_is_meaningful(),
