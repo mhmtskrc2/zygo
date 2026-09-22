@@ -199,6 +199,36 @@ Implementing this is **optional**, like `script`. An agent that ignores the
 field answers the `DONE` it always did, and `zygo agent test` reports that as
 not implementing 1.3 rather than as a failure.
 
+#### `workspace` — this request's own directory (1.5)
+
+```json
+{"type":"EXEC","id":"01f3","event":{…},"timeout_ms":30000,
+ "workspace":"/work/9f2c1d4ea7b0..."}
+```
+
+Where the supervisor put the files this request's caller sent, and where the
+handler leaves whatever it wants back. An agent that implements it puts the
+path in `ZYGO_WORKSPACE` **and makes it the child's working directory**, so a
+handler that writes `out.txt` writes it where the caller will collect it.
+
+**It is not a fixed path, and it cannot be.** Making one path — `/work` — mean
+a different directory to each request needs a mount namespace per request, and
+a forked child cannot create one: measured on 6.12, a child at uid 1000 has no
+`CAP_SYS_ADMIN` in the sandbox's user namespace and `unshare(CLONE_NEWNS)`
+returns `EPERM`, with the most permissive seccomp profile making no difference.
+It is the user namespace, not a filter.
+
+What separates one request's files from another's in the same sandbox is
+therefore three things rather than a namespace, and they are named here because
+the first two are weaker: the parent directory is `0311` so it cannot be
+listed, the name is 128 random bits rather than the request id, and the
+directory is removed when the request ends. An agent must not go looking
+around the parent, and must not assume the directory outlives the `DONE`.
+
+Implementing this is **optional**. An agent that ignores the field runs the
+handler wherever it already was; a supervisor that sent one gets a handler that
+cannot find its files, which is a failed request rather than a wrong answer.
+
 ### `CHUNK` — child → agent → supervisor (1.3)
 
 ```json
@@ -452,7 +482,12 @@ agent in POSIX sh, to check the suite against something that is not Python.
     1.4 sends `PING` with a request's id while that request runs, and does not
     withhold it because the child *looks* idle — it cannot tell. An agent that
     sends none is conforming.
-11. **A script's digest is checked, if there is one.** An agent that implements
+11. **A workspace is entered, if there is one.** An agent that implements the
+    1.5 `workspace` field sets `ZYGO_WORKSPACE` and makes the directory the
+    child's working directory before any handler code. It must not look
+    outside it: the parent holds other requests' directories, including other
+    tenants'.
+12. **A script's digest is checked, if there is one.** An agent that implements
    the 1.1 `script` field and is given a `digest` hashes the bytes it is about
    to load and refuses them with `ERROR` / `handler_load` unless they match.
    Hash *what was read*, not the file again: reading twice is a window for the
@@ -547,6 +582,10 @@ That is why the script-carrying `EXEC` above is called 1.1 and still announces
 working, and a supervisor that sends one to such an agent gets the agent's own
 handler back rather than an error. The version number is for the day something
 *removes* or *changes the meaning of* a field, and nothing has.
+
+`EXEC`'s `workspace` is 1.5 on the same terms: an agent that does not know it
+ignores the field, and a supervisor that sent one gets a handler that cannot
+find its files — a failed request, not a wrong answer.
 
 `PING`'s `id` is 1.4 on the same terms: a supervisor that does not know it
 sees the `PING` it always saw, and an agent that does not send one is bounded

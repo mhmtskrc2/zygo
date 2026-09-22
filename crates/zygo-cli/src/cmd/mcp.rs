@@ -451,6 +451,7 @@ impl Server {
             // show it output before it finishes.
             key: None,
             stream: false,
+            workspace: None,
         })? {
             Reply::Executed { outcome } => {
                 let mut out = String::new();

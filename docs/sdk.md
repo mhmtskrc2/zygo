@@ -84,6 +84,9 @@ as.
 | Version | `client.version()` | `client.version()` | either | no |
 | Register a script | `client.put_script(source)` | `client.putScript(source)` | either | no |
 | Stop a running request | `client.cancel(id)` | `client.cancel(id)` | own, or operator | no |
+| Store a blob | `client.put_blob(tar)` | `client.putBlob(tar)` | either | no |
+| Look one up | `client.blob(digest)` | `client.blob(digest)` | either | no |
+| Forget one | `client.delete_blob(digest)` | `client.deleteBlob(digest)` | operator | **yes** |
 | Watch a call's output | `client.stream(name, event)` | `client.stream(name, event)` | either | no |
 | The same, for a pool | `client.stream_script(rt, script)` | `client.streamScript(rt, script)` | either | no |
 | Look a script up | `client.script(digest)` | `client.script(digest)` | either | no |
@@ -205,6 +208,75 @@ existing deployment already sets, with the same rights it already had, which
 is what keeps one working across this change. On the host, `zygo token mint`,
 `zygo token ls` and `zygo token revoke <id>` do the same three things without
 an HTTP round trip.
+
+## Files in and out
+
+A handler that converts a document needs the document, and the caller needs
+what comes back. Neither belongs in a JSON event:
+
+```python
+tar = make_tar({"in.pdf": pdf_bytes})
+
+out = client.run_script("convert", script, {"to": "png"},
+                        workspace={"inline": base64.b64encode(tar).decode()},
+                        out=True)
+
+open("result.tar", "wb").write(out.workspace)   # already decoded
+```
+
+```js
+const out = await client.runScript('convert', script, { to: 'png' }, {
+  workspace: { inline: tar.toString('base64') },
+  out: true,
+});
+```
+
+The handler is **started in** its own directory and told where it is:
+
+```python
+def handler(event):
+    with open("in.pdf", "rb") as f:        # the caller's files are just here
+        ...
+    open("out.png", "wb").write(rendered)  # and this comes back with `out=1`
+    return {"pages": 3}
+```
+
+For the case an embedder actually has — the same fixture across a thousand
+calls — send it once:
+
+```python
+blob = client.put_blob(tar)                       # PUT /blobs, idempotent
+client.run_script("convert", script, event, workspace={"blob": blob.sha256})
+```
+
+A warm function's body is the event itself, with nowhere to put a workspace, so
+there it is `client.call(name, event, workspace=blob.sha256, out=True)` — a
+*blob* only, because an inline tar in a URL would be a megabyte of base64 in a
+request line.
+
+### What keeps one request's files from another's
+
+Not a mount namespace, and the reason is measured rather than assumed: a forked
+child runs at an unprivileged uid with no `CAP_SYS_ADMIN` in the sandbox's user
+namespace, so `unshare(CLONE_NEWNS)` is `EPERM` — with the most permissive
+seccomp profile, so it is the namespace and not a filter. One path cannot mean
+a different directory to each request.
+
+What is there instead, stated plainly because the first two are weaker than a
+namespace would be:
+
+* **`/work` cannot be listed** (`0311`), so a request cannot enumerate its
+  neighbours — the suite checks this by trying.
+* **The directory's name is 128 random bits**, not the request id, which is a
+  counter.
+* **It is removed when the request ends**, whatever the request did, so the
+  window is one request long — also checked.
+
+And every archive is unpacked rather than trusted: files and directories only
+(**no symlinks, no hard links** — that is how an archive writes outside the
+directory it was unpacked into), no `..`, no absolute paths, modes Zygo's
+rather than the archive's, and caps on entries and bytes counted as they are
+written rather than read from a header an archive is free to lie in.
 
 ## Watching a request
 

@@ -152,6 +152,8 @@ class Client:
         *,
         timeout: Optional[float] = None,
         key: Optional[str] = None,
+        workspace: Optional[str] = None,
+        out: bool = False,
     ) -> Result:
         """Call a warm function and return what its handler returned.
 
@@ -170,7 +172,12 @@ class Client:
         headers = _timeout_header(timeout)
         if key is not None:
             headers["x-zygo-request-key"] = key
-        body = self._request("POST", f"/fn/{_escape(name)}", body=event, headers=headers)
+        body = self._request(
+            "POST",
+            f"/fn/{_escape(name)}{_workspace_query(workspace, out)}",
+            body=event,
+            headers=headers,
+        )
         return Result.parse(body)
 
     def batch(
@@ -353,6 +360,28 @@ class Client:
             "POST", f"/runtimes/{_escape(runtime)}/call?stream=1", payload, headers
         )
 
+    def put_blob(self, tar: bytes) -> Script:
+        """Store a tar this host will hold under its digest.
+
+        For the case an embedder actually has: the same fixture, the same
+        model weights, the same input document across a thousand calls. Sent
+        once, named with ``workspace=`` on every call after — the bargain
+        :meth:`put_script` makes for code.
+
+        The body is the tar itself, not JSON around it.
+        """
+        body = self._request("PUT", "/blobs", raw_body=tar, binary=True)
+        return Script.parse(body)
+
+    def blob(self, digest: str) -> Script:
+        """Whether this host holds a blob, and how big it is."""
+        return Script.parse(self._request("GET", f"/blobs/{_escape_digest(digest)}"))
+
+    def delete_blob(self, digest: str) -> bool:
+        """Forget a blob. Operator-only: the store is shared by digest."""
+        body = self._request("DELETE", f"/blobs/{_escape_digest(digest)}")
+        return bool(body.get("deleted", False))
+
     def cancel(self, request_id: str) -> Dict[str, Any]:
         """Stop a request that is running.
 
@@ -459,6 +488,8 @@ class Client:
         entry_point: Optional[str] = None,
         timeout: Optional[float] = None,
         key: Optional[str] = None,
+        workspace: Optional[Dict[str, Any]] = None,
+        out: bool = False,
     ) -> Result:
         """Run one script in a pool.
 
@@ -478,12 +509,14 @@ class Client:
         }
         if entry_point is not None:
             payload["entry_point"] = entry_point
+        if workspace is not None:
+            payload["workspace"] = dict(workspace)
         headers = _timeout_header(timeout)
         if key is not None:
             headers["x-zygo-request-key"] = key
         body = self._request(
             "POST",
-            f"/runtimes/{_escape(runtime)}/call",
+            f"/runtimes/{_escape(runtime)}/call{'?out=1' if out else ''}",
             body=payload,
             headers=headers,
         )
@@ -587,19 +620,23 @@ class Client:
         headers: Optional[Dict[str, str]] = None,
         authenticated: bool = True,
         raw_body: Optional[bytes] = None,
+        binary: bool = False,
     ) -> Any:
         if self._closed:
             raise ZygoError("this client has been closed")
 
-        # `raw_body` is for the one route whose body is not JSON: a script is
-        # a file, and wrapping its bytes in a JSON string to unwrap them again
-        # is a transformation with no reader.
+        # `raw_body` is for the routes whose body is not JSON: a script is a
+        # file and a blob is a tar, and wrapping either in a JSON string to
+        # unwrap it again is a transformation with no reader. `binary` is the
+        # difference between the two — a script is text, a tar is not.
         payload = raw_body if raw_body is not None else (
             None if body is None else json.dumps(body).encode()
         )
         sent = {"accept": "application/json"}
         if raw_body is not None:
-            sent["content-type"] = "text/plain; charset=utf-8"
+            sent["content-type"] = (
+                "application/octet-stream" if binary else "text/plain; charset=utf-8"
+            )
         elif payload is not None:
             sent["content-type"] = "application/json"
         if authenticated and self.token:
@@ -747,6 +784,24 @@ def _stream_lines(response: "http.client.HTTPResponse") -> "Iterator[bytes]":
         line = line.strip()
         if line:
             yield line
+
+
+def _workspace_query(blob: Optional[str], out: bool) -> str:
+    """`?workspace=…&out=1`, for the route whose body is the event itself.
+
+    A function is called with its event as the whole body, so there is nowhere
+    in it to put a workspace. Only a *blob* can be named here — an inline tar
+    in a URL would be a megabyte of base64 in a request line, which every
+    proxy in between has an opinion about. Use a pool's body for that.
+    """
+    parts = []
+    if blob is not None:
+        if not blob.startswith("sha256:"):
+            raise SpecError(f"`{blob}` is not a blob digest; store one with put_blob()")
+        parts.append(f"workspace={blob}")
+    if out:
+        parts.append("out=1")
+    return f"?{'&'.join(parts)}" if parts else ""
 
 
 def _request_key() -> str:

@@ -154,6 +154,8 @@ pub const MANAGED_TARGETS: &[&str] = &[
     // spec mount here would either shadow it or be shadowed by it, and either
     // way somebody's code would not be where the `EXEC` said it was.
     crate::pool::SCRIPT_DIR_IN_SANDBOX,
+    // And where a request's own files go, for the same reason.
+    WORKSPACE_DIR,
 ];
 
 /// image itself lacks. Derived from the same list the plan uses, so the two
@@ -187,6 +189,15 @@ pub fn required_mount_points(mounts: &[Mount]) -> Vec<MountPoint> {
 ///
 /// `newroot` is the staging directory the root is assembled in; the launcher
 /// `pivot_root`s into it afterwards.
+/// Where per-request workspaces live inside the sandbox.
+///
+/// A caller's files arrive under `<WORKSPACE_DIR>/<random>`, and the handler
+/// is told which one is its own through `ZYGO_WORKSPACE`. It is not `/work`
+/// itself, and could not be: making one path mean a different directory to
+/// each request needs a mount namespace per request, and a forked child does
+/// not have the capability to create one — see the comment at the mount.
+pub const WORKSPACE_DIR: &str = "/work";
+
 pub fn plan(
     newroot: impl Into<PathBuf>,
     rootfs: &RootfsView,
@@ -253,6 +264,28 @@ pub fn plan(
         target: inside("/run"),
         options: "size=1048576,mode=755".to_string(),
         flags: flags::NOSUID | flags::NODEV | flags::NOEXEC,
+    });
+    // Per-request workspaces: the files a caller sent with a request, and the
+    // ones the handler leaves for it to collect.
+    //
+    // A tmpfs, so the bytes are billed to this sandbox's memory cgroup and
+    // bounded with everything else it writes, rather than landing on the
+    // host's disk where nothing counts them. Sized from `scratch` for the
+    // same reason `/tmp` is.
+    //
+    // **`0311`, so it cannot be listed.** One sandbox serves several requests
+    // and, in a pool, several tenants; each gets a directory here whose name
+    // is 128 random bits. A child cannot enumerate its neighbours and cannot
+    // guess one, which is the boundary available — a *mount* namespace per
+    // request is not: measured on 6.12, a forked child at uid 1000 has no
+    // `CAP_SYS_ADMIN` in the sandbox's user namespace and `unshare(CLONE_NEWNS)`
+    // is `EPERM`, with `--seccomp permissive` making no difference. The
+    // directory is also removed when its request ends, so the window is one
+    // request long.
+    ops.push(MountOp::Tmpfs {
+        target: inside(WORKSPACE_DIR),
+        options: format!("size={},mode=311", limits.scratch.get()),
+        flags: flags::NOSUID | flags::NODEV,
     });
 
     // 6. User bind mounts, parents before children so a nested mount is not

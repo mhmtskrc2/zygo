@@ -49,7 +49,33 @@ use crate::spec::{Layer, Spec};
 ///   request is answered many times — chunks as they are produced, then the
 ///   `EXECUTED` — which `RUN` already established as a shape this protocol
 ///   allows.
-pub const CONTROL_VERSION: u32 = 8;
+/// - v9: `PUT_BLOB`, `GET_BLOB`, `DELETE_BLOB` and a `workspace` on `EXEC` and
+///   `EXEC_SCRIPT` — files in and out of one request.
+pub const CONTROL_VERSION: u32 = 9;
+
+/// The files one request brings with it and takes away (v9).
+///
+/// `inline` and `blob` are two ways to say the same thing — a tar — and
+/// exactly one of them may be set. `inline` is the one-off; `blob` is the
+/// shape to build on, because an embedder calling a thousand times with the
+/// same fixture should send it once.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceRequest {
+    /// A tar, base64. JSON cannot carry bytes, and a second transport for the
+    /// one route that needs one is more moving parts than the encoding costs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline: Option<String>,
+    /// `sha256:…` of a blob this host already holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob: Option<String>,
+    /// Pack the directory up and send it back with the answer.
+    ///
+    /// Its own flag rather than something implied by having sent files: a
+    /// request that only *reads* its input should not pay to have it packed
+    /// again, and most do.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub collect: bool,
+}
 
 /// CLI → supervisor.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -142,6 +168,9 @@ pub enum Request {
         /// byte-for-byte unaffected — the `EXEC` does not even carry the flag.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         stream: bool,
+        /// Files in and out of this request (v9).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace: Option<WorkspaceRequest>,
     },
 
     /// Run a one-shot sandbox here, on the client's behalf.
@@ -260,6 +289,19 @@ pub enum Request {
         tenant: Option<String>,
     },
 
+    /// Store bytes a caller will name by digest later.
+    ///
+    /// The same bargain `PutScript` makes, for data rather than code: sent
+    /// once, named on every call after. `tar` is base64 on the wire for the
+    /// reason `WorkspaceRequest::inline` gives.
+    PutBlob { tar: String },
+
+    /// Whether the store holds this blob, and how big it is.
+    GetBlob { digest: String },
+
+    /// Forget a blob. `not_found` if it was never stored.
+    DeleteBlob { digest: String },
+
     /// Whether the store holds this digest, and how big it is.
     GetScript { digest: String },
 
@@ -304,6 +346,9 @@ pub enum Request {
         /// See `Exec::stream`.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         stream: bool,
+        /// See `Exec::workspace`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace: Option<WorkspaceRequest>,
     },
 
     /// Everything `zygo top` shows about the pools.
@@ -682,6 +727,7 @@ mod tests {
                 tenant: Some("acme".into()),
                 key: Some("job-4711".into()),
                 stream: true,
+                workspace: None,
             },
             Request::List,
             Request::Run {
@@ -746,6 +792,7 @@ mod tests {
                 tenant: Some("acme".into()),
                 key: None,
                 stream: false,
+                workspace: None,
             },
             Request::CreateTenant { id: "acme".into() },
             Request::Tenants { id: None },
@@ -926,6 +973,7 @@ mod tests {
             id: "00000001".into(),
             cancelled: false,
             stuck: false,
+            workspace: None,
             exit_code: 0,
             result: serde_json::json!({ "ok": true, "n": 3 }),
             stdout: "hello\n".into(),
@@ -955,6 +1003,7 @@ mod tests {
             id: "00000002".into(),
             cancelled: true,
             stuck: false,
+            workspace: None,
             exit_code: 1,
             result: serde_json::Value::Null,
             stdout: String::new(),
@@ -1093,6 +1142,7 @@ mod tests {
             timeout_ms: 1000,
             env_overrides: Default::default(),
             stream: false,
+            workspace: None,
         };
         let bytes = crate::protocol::frame::encode(&exec).expect("encode");
         assert!(

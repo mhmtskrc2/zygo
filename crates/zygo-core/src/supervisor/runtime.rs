@@ -270,6 +270,23 @@ impl Supervisor {
         key: Option<&str>,
         sink: Option<crate::pool::ChunkSink<'_>>,
     ) -> std::result::Result<Response, Response> {
+        self.exec_script_full(name, script, event, timeout, tenant, key, sink, None)
+    }
+
+    /// The whole of what one request to a pool can carry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn exec_script_full(
+        &self,
+        name: &str,
+        script: Script,
+        event: serde_json::Value,
+        timeout: Duration,
+        tenant: Option<&str>,
+        key: Option<&str>,
+        sink: Option<crate::pool::ChunkSink<'_>>,
+        workspace: Option<crate::supervisor::protocol::WorkspaceRequest>,
+    ) -> std::result::Result<Response, Response> {
+        let workspace = self.resolve_workspace(workspace)?;
         let script = self.script_for_request(script, tenant)?;
         let pool = self.runtime_named(name)?;
 
@@ -309,7 +326,8 @@ impl Supervisor {
         // owner is the only answer to "who may cancel this?".
         let outcome = zygote
             .function
-            .call_script_as(event, Some(script), timeout, tenant, key, sink)
+            .call_full(event, Some(script), timeout, tenant, key, sink, workspace)
+            .map(|(outcome, _)| outcome)
             .map_err(|e| Response::error(ControlError::CallFailed, e));
         drop(permit);
 

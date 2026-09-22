@@ -160,7 +160,8 @@ export class Client {
     if (key) headers['x-zygo-request-key'] = key;
     const stop = this.#onAbort(options.signal, key);
     try {
-      const body = await this.#request('POST', `/fn/${esc(name)}`, { body: event, headers });
+      const path = `/fn/${esc(name)}${workspaceQuery(options.workspace, options.out)}`;
+      const body = await this.#request('POST', path, { body: event, headers });
       return parseResult(body);
     } finally {
       stop();
@@ -227,6 +228,33 @@ export class Client {
     } finally {
       stop();
     }
+  }
+
+  /**
+   * Store a tar this host will hold under its digest.
+   *
+   * For the case an embedder actually has: the same fixture across a thousand
+   * calls. Sent once, named with `workspace` on every call after — the bargain
+   * {@link putScript} makes for code. The body is the tar itself.
+   */
+  async putBlob(tar) {
+    const body = await this.#request('PUT', '/blobs', {
+      rawBody: Buffer.from(tar),
+      binary: true,
+    });
+    return { sha256: String(body.sha256 ?? ''), size: Number(body.size ?? 0), existed: Boolean(body.existed) };
+  }
+
+  /** Whether this host holds a blob, and how big it is. */
+  async blob(digest) {
+    const body = await this.#request('GET', `/blobs/${escDigest(digest)}`);
+    return { sha256: String(body.sha256 ?? ''), size: Number(body.size ?? 0), existed: true };
+  }
+
+  /** Forget a blob. Operator-only: the store is shared by digest. */
+  async deleteBlob(digest) {
+    const body = await this.#request('DELETE', `/blobs/${escDigest(digest)}`);
+    return Boolean(body.deleted);
   }
 
   /**
@@ -510,21 +538,20 @@ export class Client {
    * host can put the file in the sandbox instead of sending it through the
    * zygote.
    */
-  async runScript(runtime, script, event = null, { entryPoint, timeout, key, signal } = {}) {
+  async runScript(runtime, script, event = null, { entryPoint, timeout, key, signal, workspace, out } = {}) {
     const body = {
       script: script.startsWith('sha256:') ? script : { source: script },
       event,
     };
     if (entryPoint !== undefined) body.entry_point = entryPoint;
+    if (workspace !== undefined) body.workspace = workspace;
     const name = key || (signal ? requestKey() : undefined);
     const headers = timeoutHeader(timeout);
     if (name) headers['x-zygo-request-key'] = name;
     const stop = this.#onAbort(signal, name);
     try {
-      const answer = await this.#request('POST', `/runtimes/${esc(runtime)}/call`, {
-        body,
-        headers,
-      });
+      const path = `/runtimes/${esc(runtime)}/call${out ? '?out=1' : ''}`;
+      const answer = await this.#request('POST', path, { body, headers });
       return parseResult(answer);
     } finally {
       stop();
@@ -618,14 +645,19 @@ export class Client {
     });
   }
 
-  #request(method, path, { body = undefined, headers = {}, authenticated = true, rawBody = undefined } = {}) {
+  #request(method, path, { body = undefined, headers = {}, authenticated = true, rawBody = undefined, binary = false } = {}) {
     // `rawBody` is for the one route whose body is not JSON: a script is a
     // file, and wrapping its bytes in a JSON string to unwrap them again is a
     // transformation with no reader.
     const payload = rawBody !== undefined ? rawBody : body === undefined ? null : Buffer.from(JSON.stringify(body));
     const sent = { accept: 'application/json', ...headers };
     if (payload !== null) {
-      sent['content-type'] = rawBody !== undefined ? 'text/plain; charset=utf-8' : 'application/json';
+      sent['content-type'] =
+        rawBody === undefined
+          ? 'application/json'
+          : binary
+            ? 'application/octet-stream'
+            : 'text/plain; charset=utf-8';
       sent['content-length'] = String(payload.length);
     }
     if (authenticated && this.token) sent.authorization = `Bearer ${this.token}`;
@@ -753,10 +785,30 @@ async function readJson(response) {
   }
 }
 
+/// `?workspace=…&out=1`, for the route whose body is the event itself.
+///
+/// Only a *blob* can be named here: an inline tar in a URL would be a megabyte
+/// of base64 in a request line, which every proxy in between has an opinion
+/// about. Use a pool's body for that.
+function workspaceQuery(blob, out) {
+  const parts = [];
+  if (blob !== undefined && blob !== null) {
+    if (typeof blob !== 'string' || !blob.startsWith('sha256:')) {
+      throw new SpecError(`\`${blob}\` is not a blob digest; store one with putBlob()`);
+    }
+    parts.push(`workspace=${blob}`);
+  }
+  if (out) parts.push('out=1');
+  return parts.length ? `?${parts.join('&')}` : '';
+}
+
 function parseResult(raw) {
   return {
     result: raw.result ?? null,
     requestId: String(raw.request_id ?? ''),
+    // Already decoded: a caller wanting files back should get files, not an
+    // encoding to undo.
+    workspace: typeof raw.workspace === 'string' ? Buffer.from(raw.workspace, 'base64') : null,
     stdout: String(raw.stdout ?? ''),
     stderr: String(raw.stderr ?? ''),
     metrics: {

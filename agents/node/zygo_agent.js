@@ -459,6 +459,31 @@ function worker(argv) {
   process.on('message', async (message) => {
     if (message.type !== 'run') return;
 
+    // This request's own directory, if it has one (proto 1.5). The handler is
+    // told where it is and started *in* it, so a handler that writes
+    // `out.txt` writes it somewhere the caller will collect rather than
+    // somewhere the next request will find.
+    //
+    // `chdir` and not a mount: making one path mean a different directory to
+    // each request needs a mount namespace per request, and a forked child
+    // has no capability to create one. The path is unguessable instead.
+    if (message.workspace) {
+      process.env.ZYGO_WORKSPACE = message.workspace;
+      try {
+        process.chdir(message.workspace);
+      } catch (e) {
+        process.send({
+          type: 'result',
+          ok: false,
+          error: `the supervisor said this request's workspace is ${message.workspace}, and it cannot be entered: ${(e && e.message) || e}`,
+          wall_ms: 0,
+          cpu_ms: 0,
+          peak_rss_kb: 0,
+        }, () => process.exit(1));
+        return;
+      }
+    }
+
     process.env.ZYGO_REQUEST_ID = message.id || '';
     process.env.ZYGO_DEADLINE_MS = String(message.timeout_ms || 0);
     for (const [key, value] of Object.entries(message.env_overrides || {})) {
@@ -752,6 +777,7 @@ class Agent {
       env_overrides: message.env_overrides,
       script: message.script,
       stream: Boolean(message.stream),
+      workspace: message.workspace,
     };
     const w = this._idle.shift();
     if (w) return this._dispatch(request, w);
@@ -777,6 +803,7 @@ class Agent {
       env_overrides: w.request.env_overrides,
       script: w.request.script,
       stream: w.request.stream,
+      workspace: w.request.workspace,
     });
   }
 

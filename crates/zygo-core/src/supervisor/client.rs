@@ -414,6 +414,9 @@ fn name_of(request: &Request) -> &'static str {
         Request::Tenants { .. } => "listing the tenants",
         Request::DeleteTenant { .. } => "deleting a tenant",
         Request::GetScript { .. } => "looking a script up",
+        Request::PutBlob { .. } => "storing a blob",
+        Request::GetBlob { .. } => "looking a blob up",
+        Request::DeleteBlob { .. } => "removing a blob",
         Request::DeleteScript { .. } => "removing a script",
         Request::MintToken { .. } => "minting a token",
         Request::Tokens => "listing the tokens",
@@ -604,6 +607,7 @@ mod tests {
             tenant: None,
             key: None,
             stream: false,
+            workspace: None,
         });
         assert_eq!(exec, Duration::from_secs(5) + REPLY_GRACE);
 
@@ -698,6 +702,7 @@ mod tests {
                 tenant: None,
                 key: None,
                 stream: false,
+                workspace: None,
             })
             .expect("a response, whatever it says");
         assert!(matches!(

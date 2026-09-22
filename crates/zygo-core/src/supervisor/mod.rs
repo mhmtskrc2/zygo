@@ -38,7 +38,7 @@ use crate::pool::{Function, Pool, PoolConfig, Status};
 use crate::spec::{Layer, ResolveOptions, ResolvedFn, Spec};
 
 pub use gate::{Gate, Rejected};
-pub use protocol::{CONTROL_VERSION, Change, ControlError, Request, Response};
+pub use protocol::{CONTROL_VERSION, Change, ControlError, Request, Response, WorkspaceRequest};
 pub use runtime::RuntimeStatus;
 
 /// How long a request waits for a concurrency slot before it is told to retry.
@@ -800,11 +800,25 @@ impl Supervisor {
     pub fn exec_streaming(
         &self,
         name: &str,
-        mut event: serde_json::Value,
+        event: serde_json::Value,
         timeout: Duration,
         key: Option<&str>,
         sink: Option<crate::pool::ChunkSink<'_>>,
     ) -> std::result::Result<Response, Response> {
+        self.exec_full(name, event, timeout, key, sink, None)
+    }
+
+    /// The whole of what one request to a warm function can carry.
+    pub fn exec_full(
+        &self,
+        name: &str,
+        mut event: serde_json::Value,
+        timeout: Duration,
+        key: Option<&str>,
+        sink: Option<crate::pool::ChunkSink<'_>>,
+        workspace: Option<crate::supervisor::protocol::WorkspaceRequest>,
+    ) -> std::result::Result<Response, Response> {
+        let workspace = self.resolve_workspace(workspace)?;
         let mut entry = self.lookup(name)?;
 
         // At most one redirect. A gate closes for two reasons — the function was
@@ -822,7 +836,7 @@ impl Supervisor {
                 entry = self.rewarm(name, &entry)?;
             }
 
-            event = match self.attempt(&entry, name, event, timeout, key, sink) {
+            event = match self.attempt(&entry, name, event, timeout, key, sink, workspace.clone()) {
                 Attempt::Done(response) => return response,
                 Attempt::Closed(event) => event,
             };
@@ -850,6 +864,7 @@ impl Supervisor {
     }
 
     /// One pass through a function's gate and, if admitted, its sandbox.
+    #[allow(clippy::too_many_arguments)]
     fn attempt(
         &self,
         entry: &Entry,
@@ -858,6 +873,7 @@ impl Supervisor {
         timeout: Duration,
         key: Option<&str>,
         sink: Option<crate::pool::ChunkSink<'_>>,
+        workspace: Option<crate::pool::Workspace>,
     ) -> Attempt {
         let permit = match entry.gate.enter(QUEUE_WAIT) {
             Ok(permit) => permit,
@@ -891,7 +907,8 @@ impl Supervisor {
 
         let outcome = entry
             .function
-            .call_keyed(event, timeout, key, sink)
+            .call_full(event, None, timeout, None, key, sink, workspace)
+            .map(|(outcome, _)| outcome)
             .map_err(|e| Response::error(ControlError::CallFailed, e));
         drop(permit);
         // After the call, not before: the clock should measure how long the
@@ -1190,6 +1207,112 @@ impl Supervisor {
                 started,
             }),
             None => Err(missing()),
+        }
+    }
+
+    /// Turn a request's `workspace` into the bytes the pool will unpack.
+    ///
+    /// A `blob` is read from the store here, on the supervisor's side, rather
+    /// than travelling again: that is the whole point of having sent it once.
+    /// `inline` is decoded here for the same reason the store's `get` hashes —
+    /// the sooner a bad input is refused, the less of the request has run.
+    fn resolve_workspace(
+        &self,
+        request: Option<crate::supervisor::protocol::WorkspaceRequest>,
+    ) -> std::result::Result<Option<crate::pool::Workspace>, Response> {
+        let Some(request) = request else {
+            return Ok(None);
+        };
+        if request.inline.is_some() && request.blob.is_some() {
+            return Err(Response::error(
+                ControlError::BadSpec,
+                "a workspace is `inline` or `blob`, not both",
+            ));
+        }
+
+        let inbox = match (&request.inline, &request.blob) {
+            (Some(encoded), _) => Some(
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
+                    .map_err(|e| {
+                        Response::error(
+                            ControlError::BadSpec,
+                            format!("`workspace.inline` is not base64: {e}"),
+                        )
+                    })?,
+            ),
+            (_, Some(digest)) => {
+                let parsed = crate::scripts::ScriptDigest::parse(digest)
+                    .map_err(|e| Response::error(ControlError::BadSpec, e))?;
+                match crate::blobs::BlobStore::new(&self.paths)
+                    .get(&parsed)
+                    .map_err(|e| Response::error(ControlError::CallFailed, e))?
+                {
+                    Some(bytes) => Some(bytes),
+                    None => {
+                        return Err(Response::error(
+                            ControlError::NotFound,
+                            format!("no blob {digest}"),
+                        ));
+                    }
+                }
+            }
+            (None, None) => None,
+        };
+
+        Ok(Some(crate::pool::Workspace {
+            inbox,
+            collect: request.collect,
+        }))
+    }
+
+    /// Store a blob a caller will name by digest later.
+    pub fn put_blob(&self, encoded: &str) -> std::result::Result<Response, Response> {
+        let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
+            .map_err(|e| {
+                Response::error(
+                    ControlError::BadSpec,
+                    format!("the body is not base64: {e}"),
+                )
+            })?;
+        let size = bytes.len() as u64;
+        let (digest, existed) = crate::blobs::BlobStore::new(&self.paths)
+            .put(&bytes)
+            .map_err(|e| Response::error(ControlError::BadSpec, e))?;
+        Ok(Response::Script {
+            digest: digest.to_string(),
+            size,
+            existed,
+        })
+    }
+
+    /// Whether the store holds this blob, and how big it is.
+    pub fn get_blob(&self, digest: &str) -> std::result::Result<Response, Response> {
+        let parsed = crate::scripts::ScriptDigest::parse(digest)
+            .map_err(|e| Response::error(ControlError::BadSpec, e))?;
+        let store = crate::blobs::BlobStore::new(&self.paths);
+        match store.size(&parsed) {
+            Some(size) => Ok(Response::Script {
+                digest: parsed.to_string(),
+                size,
+                existed: true,
+            }),
+            None => Err(Response::error(
+                ControlError::NotFound,
+                format!("no blob {parsed}"),
+            )),
+        }
+    }
+
+    pub fn delete_blob(&self, digest: &str) -> std::result::Result<Response, Response> {
+        let parsed = crate::scripts::ScriptDigest::parse(digest)
+            .map_err(|e| Response::error(ControlError::BadSpec, e))?;
+        match crate::blobs::BlobStore::new(&self.paths).remove(&parsed) {
+            Ok(true) => Ok(Response::Ok),
+            Ok(false) => Err(Response::error(
+                ControlError::NotFound,
+                format!("no blob {parsed}"),
+            )),
+            Err(e) => Err(Response::error(ControlError::CallFailed, e)),
         }
     }
 
@@ -1772,6 +1895,7 @@ fn handle(supervisor: &Supervisor, stream: UnixStream) -> Result<()> {
                 tenant,
                 key,
                 stream: true,
+                workspace,
             } if greeted => {
                 // Borrowed for the length of the call and released before the
                 // final answer is written. One thread, so uncontended: the
@@ -1782,12 +1906,13 @@ fn handle(supervisor: &Supervisor, stream: UnixStream) -> Result<()> {
                 let answered = supervisor
                     .owned_by(&name, tenant.as_deref())
                     .and_then(|()| {
-                        supervisor.exec_streaming(
+                        supervisor.exec_full(
                             &name,
                             event,
                             Duration::from_millis(timeout_ms),
                             key.as_deref(),
                             Some(&sink),
+                            workspace,
                         )
                     });
                 merge(answered)
@@ -1800,10 +1925,11 @@ fn handle(supervisor: &Supervisor, stream: UnixStream) -> Result<()> {
                 tenant,
                 key,
                 stream: true,
+                workspace,
             } if greeted => {
                 let out = std::sync::Mutex::new(&mut writer);
                 let sink = chunk_sink(&out);
-                merge(supervisor.exec_script_streaming(
+                merge(supervisor.exec_script_full(
                     &runtime,
                     script,
                     event,
@@ -1811,6 +1937,7 @@ fn handle(supervisor: &Supervisor, stream: UnixStream) -> Result<()> {
                     tenant.as_deref(),
                     key.as_deref(),
                     Some(&sink),
+                    workspace,
                 ))
             }
             other => dispatch(supervisor, other, &mut greeted),
@@ -1914,15 +2041,18 @@ fn dispatch(supervisor: &Supervisor, request: Request, greeted: &mut bool) -> Re
             tenant,
             key,
             stream: _,
+            workspace,
         } => merge(
             supervisor
                 .owned_by(&name, tenant.as_deref())
                 .and_then(|()| {
-                    supervisor.exec(
+                    supervisor.exec_full(
                         &name,
                         event,
                         Duration::from_millis(timeout_ms),
                         key.as_deref(),
+                        None,
+                        workspace,
                     )
                 }),
         ),
@@ -1973,13 +2103,16 @@ fn dispatch(supervisor: &Supervisor, request: Request, greeted: &mut bool) -> Re
             tenant,
             key,
             stream: _,
-        } => merge(supervisor.exec_script(
+            workspace,
+        } => merge(supervisor.exec_script_full(
             &runtime,
             script,
             event,
             Duration::from_millis(timeout_ms),
             tenant.as_deref(),
             key.as_deref(),
+            None,
+            workspace,
         )),
         Request::Runtimes => Response::Runtimes {
             runtimes: supervisor.runtimes(),
@@ -1995,6 +2128,9 @@ fn dispatch(supervisor: &Supervisor, request: Request, greeted: &mut bool) -> Re
         Request::Tokens => merge(supervisor.list_tokens()),
         Request::RevokeToken { id } => merge(supervisor.revoke_token(&id)),
         Request::Cancel { id, tenant } => merge(supervisor.cancel(&id, tenant.as_deref())),
+        Request::PutBlob { tar } => merge(supervisor.put_blob(&tar)),
+        Request::GetBlob { digest } => merge(supervisor.get_blob(&digest)),
+        Request::DeleteBlob { digest } => merge(supervisor.delete_blob(&digest)),
         Request::GetScript { digest } => merge(supervisor.get_script(&digest)),
         Request::DeleteScript { digest } => merge(supervisor.delete_script(&digest)),
         Request::Shutdown => Response::Ok,
@@ -2744,6 +2880,7 @@ mod tests {
                 tenant: None,
                 key: None,
                 stream: false,
+                workspace: None,
             },
         ] {
             let response = dispatch(&supervisor, request, &mut greeted);
@@ -3190,6 +3327,7 @@ mod tests {
                 tenant: Some("b".into()),
                 key: None,
                 stream: false,
+                workspace: None,
             },
             &mut greeted,
         );
@@ -3217,6 +3355,7 @@ mod tests {
                 tenant: Some("a".into()),
                 key: None,
                 stream: false,
+                workspace: None,
             },
             &mut greeted,
         );

@@ -655,6 +655,119 @@ def main() -> int:
         client.delete_script(patient.sha256)
         client.stop_runtime("patient")
 
+        # --- files in and out ------------------------------------------------
+        #
+        # Two claims. A request gets the files its caller sent and can leave
+        # files to be collected; and one request's directory is not another's,
+        # which is the part that has to be checked rather than described.
+        print("\nworkspaces")
+
+        import base64
+        import io
+        import tarfile
+
+        def make_tar(files):
+            buffer = io.BytesIO()
+            with tarfile.open(fileobj=buffer, mode="w") as archive:
+                for name, body in files.items():
+                    info = tarfile.TarInfo(name)
+                    info.size = len(body)
+                    archive.addfile(info, io.BytesIO(body))
+            return buffer.getvalue()
+
+        client.serve_runtime(
+            "files", {"image": image, "agent": "python", "timeout": "60s"}
+        )
+
+        # A handler that reads what it was given and writes what it was asked
+        # for, using the working directory the agent put it in.
+        worker = client.put_script(
+            "import os\n\n\ndef handler(event):\n"
+            "    here = os.environ.get('ZYGO_WORKSPACE', '')\n"
+            "    seen = sorted(os.listdir('.'))\n"
+            "    body = open('in.txt').read() if os.path.exists('in.txt') else ''\n"
+            "    with open('out.txt', 'w') as f:\n"
+            "        f.write(body.upper())\n"
+            "    return {'cwd': os.getcwd(), 'env': here, 'saw': seen}\n"
+        )
+
+        out = client.run_script(
+            "files",
+            worker.sha256,
+            {},
+            workspace={"inline": base64.b64encode(make_tar({"in.txt": b"hello"})).decode()},
+            out=True,
+        )
+        if out.result["saw"] == ["in.txt"]:
+            ok("a request's files are there, and only its own")
+        else:
+            bad("the workspace did not arrive", out.result)
+
+        if out.result["cwd"] == out.result["env"] and out.result["env"].startswith("/work/"):
+            ok(f"the handler starts in it, and ZYGO_WORKSPACE says where ({out.result['env']})")
+        else:
+            bad("the working directory is not the workspace", out.result)
+
+        if out.workspace:
+            back = tarfile.open(fileobj=io.BytesIO(out.workspace))
+            names = sorted(m.name for m in back.getmembers())
+            body = back.extractfile("out.txt").read()
+            if names == ["in.txt", "out.txt"] and body == b"HELLO":
+                ok("and what it left comes back as a tar")
+            else:
+                bad("the collected workspace is wrong", f"{names} {body!r}")
+        else:
+            bad("nothing came back for ?out=1")
+
+        # Sent once, named many times: the point of a blob.
+        blob = client.put_blob(make_tar({"in.txt": b"from a blob"}))
+        again = client.put_blob(make_tar({"in.txt": b"from a blob"}))
+        if blob.sha256 == again.sha256 and again.existed:
+            ok("the same tar is one blob, stored once")
+        else:
+            bad("PUT /blobs is not idempotent", f"{blob} {again}")
+
+        out = client.run_script("files", worker.sha256, {}, workspace={"blob": blob.sha256}, out=True)
+        if out.result["saw"] == ["in.txt"]:
+            ok("and a call can name it instead of sending it again")
+        else:
+            bad("a blob workspace did not arrive", out.result)
+
+        # The isolation claim. Two requests in the same pool: neither may see
+        # the other's directory, and `/work` itself cannot be listed.
+        snooper = client.put_script(
+            "import os\n\n\ndef handler(event):\n"
+            "    try:\n"
+            "        return {'listed': sorted(os.listdir('/work'))}\n"
+            "    except OSError as e:\n"
+            "        return {'refused': e.strerror}\n"
+        )
+        # `out=True` alone: a request with no files in and a directory of its
+        # own anyway, which is what a handler that only produces something
+        # needs.
+        snoop = client.run_script("files", snooper.sha256, {}, out=True)
+        if snoop.result.get("refused"):
+            ok(f"/work cannot be listed from inside ({snoop.result['refused']})")
+        else:
+            bad("a request listed every workspace in its sandbox", snoop.result)
+
+        # And it is gone afterwards: the same path, asked for a second time.
+        vanished = client.run_script(
+            "files",
+            "import os\n\n\ndef handler(event):\n"
+            "    return {'exists': os.path.exists(event['path'])}\n",
+            {"path": out.result["env"]},
+        )
+        if vanished.result == {"exists": False}:
+            ok("and a finished request's workspace is gone")
+        else:
+            bad("a workspace outlived its request", vanished.result)
+
+        client.delete_blob(blob.sha256)
+        client.delete_script(worker.sha256)
+        client.delete_script(snooper.sha256)
+        client.stop_runtime("files")
+
         # --- the ceilings ----------------------------------------------------
         print("\nceilings")
 

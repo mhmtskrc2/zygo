@@ -602,6 +602,7 @@ pub fn exec(cli: &Cli, args: &ExecArgs) -> anyhow::Result<u8> {
             // command that also prints the result has to do anyway.
             key: None,
             stream: false,
+            workspace: None,
             runtime: runtime.clone(),
             script: script_for(args)?,
             event,
@@ -613,6 +614,7 @@ pub fn exec(cli: &Cli, args: &ExecArgs) -> anyhow::Result<u8> {
         None => Request::Exec {
             key: None,
             stream: false,
+            workspace: None,
             name: args
                 .name
                 .clone()
@@ -957,6 +959,7 @@ mod tests {
             id: "00000001".into(),
             cancelled: false,
             stuck: false,
+            workspace: None,
             exit_code,
             result: serde_json::Value::Null,
             stdout: String::new(),

@@ -66,7 +66,9 @@ use hyper_util::rt::TokioIo;
 use zygo_core::pool::Outcome;
 use zygo_core::spec::{ApiAuth, Layer, Spec};
 use zygo_core::supervisor::client::Client;
-use zygo_core::supervisor::{ControlError, Request as Control, Response as Reply};
+use zygo_core::supervisor::{
+    ControlError, Request as Control, Response as Reply, WorkspaceRequest,
+};
 
 use crate::cli::{ApiArgs, Cli};
 use crate::output::Style;
@@ -546,9 +548,31 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<ApiBod
             let name = name.to_string();
             let timeout_ms = timeout_header(&req)?;
             let key = request_key(&req)?;
+            let query = Query::parse(req.uri().query().unwrap_or(""));
+            let streaming = query.flag("stream")?;
+            let out = query.flag("out")?;
+            // A function's body is the event itself, with nowhere in it to
+            // put a workspace, so the query string is where one is named. A
+            // pool's body is JSON and has room for both.
+            let workspace = with_out(query.blob("workspace")?, out);
             let body = read_body(req).await?;
             let event = parse_event(&body)?;
-            exec(api, name, event, timeout_ms, tenant, key).await
+            if streaming {
+                return exec_streaming(
+                    api,
+                    Control::Exec {
+                        name,
+                        event,
+                        timeout_ms,
+                        tenant,
+                        key,
+                        stream: true,
+                        workspace,
+                    },
+                )
+                .await;
+            }
+            exec(api, name, event, timeout_ms, tenant, key, workspace).await
         }
         (&Method::POST, ["fn", name, "batch"]) => {
             let name = name.to_string();
@@ -579,9 +603,11 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<ApiBod
             let name = name.to_string();
             let timeout_ms = timeout_header(&req)?;
             let key = request_key(&req)?;
-            let streaming = Query::parse(req.uri().query().unwrap_or("")).flag("stream")?;
+            let query = Query::parse(req.uri().query().unwrap_or(""));
+            let streaming = query.flag("stream")?;
+            let out = query.flag("out")?;
             let body = read_body(req).await?;
-            call_runtime(api, name, &body, timeout_ms, tenant, key, streaming).await
+            call_runtime(api, name, &body, timeout_ms, tenant, key, streaming, out).await
         }
         // Not gated on deploy, and this is the change tokens paid for:
         // registering a script for yourself is what a tenant token is *for*.
@@ -590,6 +616,19 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<ApiBod
         (&Method::PUT, ["scripts"]) => {
             let body = read_body(req).await?;
             put_script(api, &body, tenant).await
+        }
+        // Blobs, on the same terms scripts are: registering bytes runs
+        // nothing, so a tenant token may. Forgetting one is the operator's,
+        // because the store is shared by digest.
+        (&Method::PUT, ["blobs"]) => {
+            let body = read_body(req).await?;
+            put_blob(api, &body).await
+        }
+        (&Method::GET, ["blobs", digest]) => get_blob(api, digest.to_string()).await,
+        (&Method::DELETE, ["blobs", digest]) => {
+            let digest = digest.to_string();
+            actor.may_deploy()?;
+            delete_blob(api, digest).await
         }
         (&Method::GET, ["scripts", digest]) => get_script(api, digest.to_string()).await,
         // Still the operator's: the store is shared by digest, so forgetting
@@ -608,6 +647,7 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<ApiBod
         | (_, ["runtimes", ..])
         | (_, ["tenants", ..])
         | (_, ["tokens", ..])
+        | (_, ["blobs", ..])
         | (_, ["scripts", ..]) => Err(HttpError::new(
             StatusCode::METHOD_NOT_ALLOWED,
             format!("{} {}", req.method(), path),
@@ -1041,6 +1081,7 @@ fn line(value: &serde_json::Value) -> Bytes {
     Bytes::from(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn exec(
     api: &Arc<Api>,
     name: String,
@@ -1048,6 +1089,7 @@ async fn exec(
     timeout_ms: u64,
     tenant: Option<String>,
     key: Option<String>,
+    workspace: Option<WorkspaceRequest>,
 ) -> Result<Response<ApiBody>, HttpError> {
     let reply = control(api, move |c| {
         Ok(c.send(&Control::Exec {
@@ -1057,6 +1099,7 @@ async fn exec(
             tenant,
             key,
             stream: false,
+            workspace,
         })?)
     })
     .await?;
@@ -1117,6 +1160,10 @@ async fn batch(
                     // requests' output on one connection with nothing to tell
                     // them apart. Call them one at a time to watch them.
                     stream: false,
+                    // And a workspace on a batch would be one directory
+                    // several requests wrote into at once, which is the thing
+                    // a per-request workspace exists not to be.
+                    workspace: None,
                 })?)
             })
             .await;
@@ -1350,6 +1397,49 @@ struct CallRuntimeRequest {
     /// The function to call, when it is not `handler`.
     #[serde(default)]
     entry_point: Option<String>,
+    /// Files for this request. See [`WorkspaceBody`].
+    #[serde(default)]
+    workspace: Option<WorkspaceBody>,
+}
+
+/// What `workspace` on a call body accepts.
+///
+/// `inline` is a tar as base64 and `blob` is one this host already holds;
+/// exactly one of them, because two would be two answers to "what is in the
+/// directory". `?out=1` on the query string asks for it back, and is a query
+/// parameter rather than a field so that a call with no body at all can ask.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceBody {
+    #[serde(default)]
+    inline: Option<String>,
+    #[serde(default)]
+    blob: Option<String>,
+}
+
+impl From<WorkspaceBody> for WorkspaceRequest {
+    fn from(body: WorkspaceBody) -> WorkspaceRequest {
+        WorkspaceRequest {
+            inline: body.inline,
+            blob: body.blob,
+            collect: false,
+        }
+    }
+}
+
+/// Fold `?out=1` into whatever the body asked for.
+fn with_out(workspace: Option<WorkspaceRequest>, out: bool) -> Option<WorkspaceRequest> {
+    match (workspace, out) {
+        (Some(w), out) => Some(WorkspaceRequest { collect: out, ..w }),
+        // `?out=1` alone is a request with no files in and its directory back:
+        // a handler that only *produces* something still needs somewhere to
+        // put it.
+        (None, true) => Some(WorkspaceRequest {
+            collect: true,
+            ..WorkspaceRequest::default()
+        }),
+        (None, false) => None,
+    }
 }
 
 /// `"sha256:…"` or `{"source": "…"}`.
@@ -1360,6 +1450,26 @@ enum ScriptRef {
     Source { source: String },
 }
 
+/// Every route whose body can name a path on the host Zygo runs on.
+///
+/// Kept as a list rather than a comment because it is the thing a tenant token
+/// must never reach: a host path is how a caller reads the operator's disk,
+/// and `deny_unknown_fields` on every request body is what stops one appearing
+/// somewhere else by accident.
+///
+/// All three are behind [`Actor::may_deploy`], which a tenant token never
+/// passes — the check is not "reject paths for tenants" but "a tenant does not
+/// reach the routes that have them". `POST /runtimes/<name>/call` is
+/// deliberately not here: [`ScriptRef`] is a digest or a source, and
+/// `crate::protocol::Script`'s own `path` field is the *supervisor's* to set
+/// once it has written the file into the sandbox.
+#[cfg(test)]
+const ROUTES_THAT_NAME_A_HOST_PATH: &[&str] = &[
+    "PUT /fn/<name>", // `base_dir`, and the layer's mounts and `entry`
+    "POST /runtimes", // `base_dir`
+    "POST /run",      // the layer's mounts and `cmd`
+];
+
 #[allow(clippy::too_many_arguments)]
 async fn call_runtime(
     api: &Arc<Api>,
@@ -1369,6 +1479,7 @@ async fn call_runtime(
     tenant: Option<String>,
     key: Option<String>,
     streaming: bool,
+    out: bool,
 ) -> Result<Response<ApiBody>, HttpError> {
     let request: CallRuntimeRequest = serde_json::from_slice(body).map_err(|e| {
         HttpError::new(
@@ -1399,6 +1510,7 @@ async fn call_runtime(
         timeout_ms,
         tenant,
         stream: streaming,
+        workspace: with_out(request.workspace.map(Into::into), out),
     };
     if streaming {
         return exec_streaming(api, call).await;
@@ -1529,6 +1641,55 @@ async fn revoke_token(api: &Arc<Api>, id: String) -> Result<Response<ApiBody>, H
                 "revoked": true,
                 "token": tokens.iter().find(|t| t.id == wanted),
             }),
+        )),
+        other => Ok(reply_to_response(other)),
+    }
+}
+
+/// `PUT /blobs`: the body **is** the tar, and the answer is its name.
+///
+/// Not JSON around it, for the reason `PUT /scripts` gives: a blob is bytes,
+/// the caller has them as bytes, and wrapping them to unwrap them again is a
+/// transformation with no reader. It is the one route whose body is binary.
+async fn put_blob(api: &Arc<Api>, body: &[u8]) -> Result<Response<ApiBody>, HttpError> {
+    if body.is_empty() {
+        return Err(HttpError::new(
+            StatusCode::BAD_REQUEST,
+            "the body is empty; it should be the tar itself",
+        ));
+    }
+    // Base64 only for the control socket, which is JSON. The HTTP side of
+    // this route never encodes anything.
+    let tar = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, body);
+    let reply = control(api, move |c| Ok(c.send(&Control::PutBlob { tar })?)).await?;
+    match reply {
+        Reply::Script {
+            digest,
+            size,
+            existed,
+        } => Ok(json(
+            if existed {
+                StatusCode::OK
+            } else {
+                StatusCode::CREATED
+            },
+            &serde_json::json!({ "sha256": digest, "size": size, "existed": existed }),
+        )),
+        other => Ok(reply_to_response(other)),
+    }
+}
+
+async fn get_blob(api: &Arc<Api>, digest: String) -> Result<Response<ApiBody>, HttpError> {
+    let reply = control(api, move |c| Ok(c.send(&Control::GetBlob { digest })?)).await?;
+    Ok(reply_to_response(reply))
+}
+
+async fn delete_blob(api: &Arc<Api>, digest: String) -> Result<Response<ApiBody>, HttpError> {
+    let reply = control(api, move |c| Ok(c.send(&Control::DeleteBlob { digest })?)).await?;
+    match reply {
+        Reply::Ok => Ok(json(
+            StatusCode::OK,
+            &serde_json::json!({ "deleted": true }),
         )),
         other => Ok(reply_to_response(other)),
     }
@@ -1756,6 +1917,24 @@ impl<'a> Query<'a> {
                 )
             }),
         }
+    }
+
+    /// A `sha256:…` blob named on the query string, as a workspace request.
+    ///
+    /// For `POST /fn/<name>`, whose body is the event and has nowhere to put
+    /// one. Only a *blob* can be named this way — an inline tar in a URL
+    /// would be a megabyte of base64 in a request line, which every proxy
+    /// between here and the caller has an opinion about.
+    fn blob(&self, key: &str) -> Result<Option<WorkspaceRequest>, HttpError> {
+        let Some(digest) = self.get(key).filter(|d| !d.is_empty()) else {
+            return Ok(None);
+        };
+        zygo_core::scripts::ScriptDigest::parse(digest)
+            .map_err(|e| HttpError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
+        Ok(Some(WorkspaceRequest {
+            blob: Some(digest.to_string()),
+            ..WorkspaceRequest::default()
+        }))
     }
 
     fn flag(&self, key: &str) -> Result<bool, HttpError> {
@@ -2161,16 +2340,19 @@ fn outcome_to_json(outcome: Outcome) -> (StatusCode, serde_json::Value) {
             }),
         );
     }
-    (
-        StatusCode::OK,
-        serde_json::json!({
-            "result": outcome.result,
-            "request_id": id,
-            "stdout": outcome.stdout,
-            "stderr": outcome.stderr,
-            "metrics": metrics,
-        }),
-    )
+    let mut body = serde_json::json!({
+        "result": outcome.result,
+        "request_id": id,
+        "stdout": outcome.stdout,
+        "stderr": outcome.stderr,
+        "metrics": metrics,
+    });
+    // Only when `?out=1` asked. A caller that did not gets exactly the answer
+    // it always got, down to the absent key.
+    if let Some(tar) = outcome.workspace {
+        body["workspace"] = tar.into();
+    }
+    (StatusCode::OK, body)
 }
 
 fn json(status: StatusCode, body: &serde_json::Value) -> Response<ApiBody> {
@@ -2193,6 +2375,7 @@ mod tests {
             id: "00000001".into(),
             cancelled: false,
             stuck: false,
+            workspace: None,
             exit_code: if error.is_some() { 1 } else { 0 },
             result: serde_json::json!({ "ok": true }),
             stdout: "hi\n".into(),
@@ -2349,6 +2532,25 @@ mod tests {
     /// asking is refused for a different reason, and told so: naming an image,
     /// a mount and a command is running arbitrary code as the host user, which
     /// is not something one customer gets to do because another is trusted.
+    /// A tenant token cannot reach any route whose body names a host path.
+    ///
+    /// The audit 2.6 asks for, as a test rather than a reading: if a fourth
+    /// route ever grows a path, this is the list it has to be added to, and
+    /// the assertion below is what says it must be gated.
+    #[test]
+    fn nothing_that_names_a_host_path_is_reachable_by_a_tenant() {
+        let tenant = Actor {
+            tenant: Some("acme".into()),
+            deploy: true,
+        };
+        for route in ROUTES_THAT_NAME_A_HOST_PATH {
+            let refused = tenant
+                .may_deploy()
+                .expect_err(&format!("{route} was allowed"));
+            assert_eq!(refused.status, StatusCode::FORBIDDEN, "{route}");
+        }
+    }
+
     #[test]
     fn a_tenant_never_deploys_however_the_api_was_started() {
         for deploy in [true, false] {

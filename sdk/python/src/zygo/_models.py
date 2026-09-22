@@ -7,6 +7,7 @@ is reachable without waiting for this package to catch up.
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -49,15 +50,22 @@ class Result:
     #: and because the same id arrives in the ``X-Zygo-Request-Id`` header of a
     #: call that is still in flight.
     request_id: str = ""
+    #: The request's workspace as a tar, when ``out=True`` asked for it.
+    #:
+    #: Already decoded from the base64 the API sends: a caller wanting files
+    #: back should get files, not an encoding to undo.
+    workspace: Optional[bytes] = None
 
     @classmethod
     def parse(cls, raw: Dict[str, Any]) -> "Result":
+        packed = raw.get("workspace")
         return cls(
             result=raw.get("result"),
             stdout=str(raw.get("stdout", "")),
             stderr=str(raw.get("stderr", "")),
             metrics=Metrics.parse(raw.get("metrics")),
             request_id=str(raw.get("request_id", "")),
+            workspace=base64.b64decode(packed) if isinstance(packed, str) else None,
         )
 
 

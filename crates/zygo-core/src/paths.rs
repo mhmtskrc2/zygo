@@ -128,6 +128,18 @@ impl Paths {
     pub fn scripts(&self) -> PathBuf {
         self.data.join("scripts")
     }
+    /// Blobs a caller sent once and names by digest, for workspaces.
+    ///
+    /// Beside the scripts and deliberately not in with them: a script is text
+    /// with a kilobyte limit and a blob is arbitrary bytes with a megabyte
+    /// one, and one store holding both would take the looser of every rule.
+    ///
+    /// Named `blob_store` rather than `blobs`, which an image's layers took
+    /// first — a name that means two things in one struct is a name somebody
+    /// eventually reads the wrong way.
+    pub fn blob_store(&self) -> PathBuf {
+        self.data.join("blobs")
+    }
     /// Tenants, one JSON file each.
     ///
     /// Under `data` rather than `run`, because a tenant outlives the

@@ -234,6 +234,7 @@ impl Harness {
                 timeout_ms: 30_000,
                 env_overrides: Default::default(),
                 stream: false,
+                workspace: None,
             })
             .expect("EXEC");
 

@@ -387,6 +387,7 @@ fn exec(id: &str, event: serde_json::Value) -> Message {
         timeout_ms: 30_000,
         env_overrides: Default::default(),
         stream: false,
+        workspace: None,
     }
 }
 
@@ -949,6 +950,7 @@ fn ran_the_script(
         env_overrides: Default::default(),
         script: Some(script),
         stream: false,
+        workspace: None,
     })?;
 
     let done = loop {
@@ -1240,6 +1242,7 @@ fn one_script_request(
         env_overrides: Default::default(),
         script: Some(script),
         stream: false,
+        workspace: None,
     })?;
     await_done(agent, id)
 }
@@ -1329,6 +1332,7 @@ fn stream_check(agent: &mut Agent) -> anyhow::Result<Outcome> {
         env_overrides: Default::default(),
         script: None,
         stream: true,
+        workspace: None,
     })?;
 
     let forked = agent.recv_matching("FORKED", |m| matches!(m, Message::Forked { .. }))?;

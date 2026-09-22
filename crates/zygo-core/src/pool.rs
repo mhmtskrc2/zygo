@@ -230,6 +230,14 @@ pub struct Outcome {
     /// the signal knows which.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cancelled: bool,
+    /// The request's workspace, packed as a tar, when `?out=1` asked for it.
+    ///
+    /// Base64, because this crosses a JSON control socket and then a JSON HTTP
+    /// answer. A tar is bytes and JSON has no way to carry bytes; the
+    /// alternative is a second transport for the one route that needs one,
+    /// which is more moving parts than the encoding costs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
     /// The request's own id, which is what `DELETE /requests/<id>` names.
     ///
     /// Returned with the answer as well as in a header, so a caller that kept
@@ -391,6 +399,43 @@ impl Requests {
 /// holding up the request that is writing to it. The supervisor's own
 /// implementation writes one control frame and returns.
 pub type ChunkSink<'a> = &'a (dyn Fn(crate::protocol::Stream, &str) + Send + Sync);
+
+/// What a request brings with it and takes away.
+///
+/// `inbox` is a tar the caller sent, unpacked into the request's own directory
+/// before the handler runs. `collect` asks for the directory back as a tar
+/// when the handler is done — which is a separate question, because a request
+/// that only *reads* its input should not pay to have it packed again.
+#[derive(Debug, Clone, Default)]
+pub struct Workspace {
+    pub inbox: Option<Vec<u8>>,
+    pub collect: bool,
+}
+
+impl Workspace {
+    /// Whether this request needs a directory at all.
+    fn wanted(&self) -> bool {
+        self.inbox.is_some() || self.collect
+    }
+}
+
+/// One request's directory inside the sandbox, removed when this is dropped.
+///
+/// Held for the whole request by the thread serving it, so the directory goes
+/// on every path out — including the ones where the request failed or was
+/// killed. A workspace that outlived its request would be a neighbour's to
+/// find, and the window is meant to be one request long.
+struct WorkspaceLease {
+    /// The directory as *this* process can reach it, through the sandbox's
+    /// `/proc/<pid>/root`.
+    host: PathBuf,
+}
+
+impl Drop for WorkspaceLease {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.host);
+    }
+}
 
 /// How long a request may go without the agent saying it is still alive.
 ///
@@ -1581,7 +1626,7 @@ impl WarmFn {
         caller: Option<&str>,
         key: Option<&str>,
     ) -> Result<(Outcome, CallTiming)> {
-        self.call_streaming(event, script, timeout, caller, key, None)
+        self.call_streaming(event, script, timeout, caller, key, None, None)
     }
 
     /// The same, with output delivered as it is produced (proto 1.3).
@@ -1591,6 +1636,7 @@ impl WarmFn {
     /// does: the `EXEC` then does not ask for chunks, the child captures its
     /// output the way it always has, and not one extra frame crosses the
     /// socket.
+    #[allow(clippy::too_many_arguments)]
     pub fn call_streaming(
         &self,
         event: serde_json::Value,
@@ -1599,6 +1645,7 @@ impl WarmFn {
         caller: Option<&str>,
         key: Option<&str>,
         sink: Option<ChunkSink<'_>>,
+        workspace: Option<Workspace>,
     ) -> Result<(Outcome, CallTiming)> {
         if let Some(s) = &script
             && !s.is_loadable()
@@ -1632,6 +1679,18 @@ impl WarmFn {
         // what takes the file away again.
         let (script, _script) = self.place_script(script);
 
+        // The caller's files, unpacked into a directory of this request's own
+        // before the `EXEC` names it. Like the script, the directory only has
+        // to exist by `GO` — but the `EXEC` has to carry the path, so it is
+        // made here. The lease removes it on every path out of this function.
+        let (workspace_path, _workspace) = match self.place_workspace(workspace.as_ref()) {
+            Ok(placed) => placed,
+            Err(e) => {
+                self.record(false);
+                return Err(e);
+            }
+        };
+
         // Registering and writing are one step, and nothing is held afterwards:
         // the agent can be serving several requests at once, so the only
         // exclusive moment is the write itself.
@@ -1644,6 +1703,7 @@ impl WarmFn {
                 env_overrides: BTreeMap::new(),
                 script,
                 stream: sink.is_some(),
+                workspace: workspace_path.clone(),
             },
         ) {
             Ok(reply) => reply,
@@ -1882,6 +1942,8 @@ impl WarmFn {
                 timed_out,
                 cancelled,
                 stuck,
+                // Filled in below, once the handler has finished writing.
+                workspace: None,
             }),
             Message::Error { code, message, .. } => {
                 Err(Error::from(ProtocolError::Agent { code, message }))
@@ -1894,6 +1956,27 @@ impl WarmFn {
             }
         };
         let done = Instant::now();
+
+        // Collected before the lease is dropped, which is what removes the
+        // directory. A request that asked for its files back and whose handler
+        // failed still gets them: the handler may have written the reason.
+        let collected = match (&workspace, &_workspace) {
+            (Some(w), Some(lease)) if w.collect => match crate::workspace::pack(&lease.host) {
+                Ok(tar) => Some(base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    tar,
+                )),
+                Err(e) => {
+                    tracing::warn!(function = %self.name, error = %e, "cannot pack the workspace");
+                    None
+                }
+            },
+            _ => None,
+        };
+        let outcome = outcome.map(|o| Outcome {
+            workspace: collected,
+            ..o
+        });
 
         // Secrets go before the cgroup: the lease is dropped explicitly here so
         // the files are gone by the time `release` is measured, and so nothing
@@ -1984,6 +2067,47 @@ impl WarmFn {
     /// nothing at all.
     fn enforce_deadline(&self, request_cgroup: Option<&std::path::Path>, host_pid: u32) {
         kill_request(request_cgroup, host_pid);
+    }
+
+    /// Make this request its own directory inside the sandbox, if it has one.
+    ///
+    /// Written through `/proc/<pid>/root`, the same way secrets are: the
+    /// supervisor is outside the sandbox and this is how it reaches in. The
+    /// name is 128 random bits rather than the request id — see
+    /// [`crate::workspace`] for why that, and not a mount namespace, is what
+    /// keeps one request's files from another's.
+    fn place_workspace(
+        &self,
+        workspace: Option<&Workspace>,
+    ) -> Result<(Option<String>, Option<WorkspaceLease>)> {
+        let Some(workspace) = workspace.filter(|w| w.wanted()) else {
+            return Ok((None, None));
+        };
+
+        let name = crate::workspace::new_name()?;
+        let root = PathBuf::from(format!("/proc/{}/root", self.agent_host_pid));
+        let host = root
+            .join(crate::sandbox::mount::WORKSPACE_DIR.trim_start_matches('/'))
+            .join(&name);
+        std::fs::create_dir(&host).at(&host)?;
+        // The lease from here on, so a failed unpack still removes what it
+        // half-wrote rather than leaving it for the next request to find.
+        let lease = WorkspaceLease { host: host.clone() };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o700)).at(&host)?;
+        }
+
+        if let Some(tar) = &workspace.inbox {
+            crate::workspace::unpack(tar, &host)?;
+        }
+
+        let inside = format!(
+            "{}/{name}",
+            crate::sandbox::mount::WORKSPACE_DIR.trim_end_matches('/')
+        );
+        Ok((Some(inside), Some(lease)))
     }
 
     /// Stop a request this sandbox is running.
@@ -3174,6 +3298,7 @@ fn into_outcome(
         id: String::new(),
         cancelled: false,
         stuck: false,
+        workspace: None,
         exit_code,
         result,
         stdout: if error.is_some() {
@@ -3332,7 +3457,7 @@ impl Function {
     ) -> Result<Outcome> {
         match self {
             Function::Agent(f) => f
-                .call_streaming(event, None, timeout, None, key, sink)
+                .call_streaming(event, None, timeout, None, key, sink, None)
                 .map(|(o, _)| o),
             #[cfg(target_os = "linux")]
             Function::Exec(_) => self.call_with_timeout(event, timeout),
@@ -3429,8 +3554,25 @@ impl Function {
         key: Option<&str>,
         sink: Option<ChunkSink<'_>>,
     ) -> Result<(Outcome, CallTiming)> {
+        self.call_full(event, script, timeout, caller, key, sink, None)
+    }
+
+    /// The whole of what one request can carry. Everything above narrows it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn call_full(
+        &self,
+        event: serde_json::Value,
+        script: Option<crate::protocol::Script>,
+        timeout: std::time::Duration,
+        caller: Option<&str>,
+        key: Option<&str>,
+        sink: Option<ChunkSink<'_>>,
+        workspace: Option<Workspace>,
+    ) -> Result<(Outcome, CallTiming)> {
         match self {
-            Function::Agent(f) => f.call_streaming(event, script, timeout, caller, key, sink),
+            Function::Agent(f) => {
+                f.call_streaming(event, script, timeout, caller, key, sink, workspace)
+            }
             #[cfg(target_os = "linux")]
             Function::Exec(f) => match script {
                 None => f.call_timed(event, timeout),
@@ -4715,6 +4857,7 @@ mod tests {
             id: "00000001".into(),
             cancelled: false,
             stuck: false,
+            workspace: None,
             exit_code: 0,
             result: serde_json::Value::Null,
             stdout: String::new(),

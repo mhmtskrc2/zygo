@@ -171,6 +171,20 @@ pub enum Message {
         /// measured.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         stream: bool,
+        /// This request's own directory inside the sandbox (proto 1.5).
+        ///
+        /// Where the caller's files were unpacked and where the handler leaves
+        /// whatever it wants back. The agent hands the path to the child in
+        /// `ZYGO_WORKSPACE` and makes it the child's working directory.
+        ///
+        /// **Not `/work`**, and it could not be: making one path mean a
+        /// different directory to each request needs a mount namespace per
+        /// request, and a forked child has no capability to create one —
+        /// measured, see `crate::workspace`. The name is 128 random bits and
+        /// `/work` cannot be listed, so a neighbour in the same sandbox can
+        /// neither find it nor guess it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace: Option<String>,
     },
 
     /// Agent → supervisor: the child exists but has not started work.
@@ -537,6 +551,7 @@ mod tests {
             timeout_ms: 30_000,
             env_overrides: BTreeMap::new(),
             stream: false,
+            workspace: None,
         };
         let text = serde_json::to_string(&m).unwrap();
         assert!(!text.contains("env_overrides"), "{text}");

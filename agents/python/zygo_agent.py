@@ -461,6 +461,26 @@ def run_request(
             (lambda value: chunk("progress", value)) if streaming else None,
         )
 
+        # This request's own directory, if it has one (proto 1.5). The
+        # handler is told where it is and started *in* it, so a handler that
+        # writes `out.txt` writes it somewhere the caller will collect rather
+        # than somewhere the next request will find.
+        #
+        # `chdir` and not a mount: making one path mean a different directory
+        # to each request needs a mount namespace per request, and a forked
+        # child has no capability to create one — measured, see the Rust
+        # `workspace` module. The path is unguessable instead.
+        workspace = request.get("workspace")
+        if workspace:
+            os.environ["ZYGO_WORKSPACE"] = workspace
+            try:
+                os.chdir(workspace)
+            except OSError as exc:
+                raise ScriptError(
+                    f"the supervisor said this request's workspace is {workspace}, "
+                    f"and it cannot be entered: {exc}"
+                ) from exc
+
         os.environ["ZYGO_REQUEST_ID"] = request.get("id", "")
         os.environ["ZYGO_DEADLINE_MS"] = str(request.get("timeout_ms", 0))
         for key, val in (request.get("env_overrides") or {}).items():

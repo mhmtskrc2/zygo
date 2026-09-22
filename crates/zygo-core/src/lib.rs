@@ -44,6 +44,7 @@
 extern crate krun;
 
 pub mod backend;
+pub mod blobs;
 pub mod cgroup;
 pub mod derive;
 pub mod doctor;
@@ -62,6 +63,7 @@ pub mod supervisor;
 pub mod tenants;
 pub mod tokens;
 pub mod venv;
+pub mod workspace;
 
 pub use error::{Error, Result};
 pub use paths::Paths;

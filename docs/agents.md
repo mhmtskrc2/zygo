@@ -76,6 +76,14 @@ is a day: without it, a request stuck in the first minute of a six-hour budget
 would hold its slot for the rest of it. An agent that sends none is bounded by
 the deadline as before, and is skipped rather than failed.
 
+Protocol 1.5 adds a `workspace` on `EXEC`: the directory this request's files
+are in. An agent puts it in `ZYGO_WORKSPACE` and makes it the child's working
+directory. It is not a fixed path and cannot be — a forked child has no
+capability to create the mount namespace that would make one path mean
+different directories to different requests, which is measured rather than
+assumed. The parent holds other requests' directories, including other
+tenants', so an agent must not look around it.
+
 ## What there is to read
 
 - [`examples/agents/`](../examples/agents) — the contract in short form, what

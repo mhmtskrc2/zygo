@@ -45,6 +45,12 @@
       "message": {"type": "GO", "id": "01f3"}
     },
     {
+      "name": "exec-with-a-workspace",
+      "direction": "supervisor -> agent",
+      "canonical": true,
+      "message": {"type": "EXEC", "id": "01f8", "event": {"format": "pdf"}, "timeout_ms": 60000, "workspace": "/work/9f2c1d4ea7b03e5188c6a4d20f7b1e93"}
+    },
+    {
       "name": "exec-streaming",
       "direction": "supervisor -> agent",
       "canonical": true,
