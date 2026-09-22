@@ -1,0 +1,1109 @@
+{
+  "components": {
+    "schemas": {
+      "Error": {
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "error": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "bearer": {
+        "description": "An operator or tenant token. `zygo token mint`.",
+        "scheme": "bearer",
+        "type": "http"
+      }
+    }
+  },
+  "info": {
+    "license": {
+      "name": "Apache-2.0"
+    },
+    "summary": "Warm sandboxes over HTTP.",
+    "title": "Zygo",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/blobs": {
+      "put": {
+        "operationId": "putBlobs",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "Store a tar for workspaces; the body is the tar. Idempotent by digest.",
+        "x-zygo-deploy": false,
+        "x-zygo-who": "any"
+      }
+    },
+    "/blobs/{digest}": {
+      "delete": {
+        "operationId": "deleteBlobsDigest",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "digest",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "Forget a blob. The store is shared by digest.",
+        "x-zygo-deploy": true,
+        "x-zygo-who": "operator"
+      },
+      "get": {
+        "operationId": "getBlobsDigest",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "digest",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "Whether this host holds a blob, and how big it is.",
+        "x-zygo-deploy": false,
+        "x-zygo-who": "any"
+      }
+    },
+    "/drain": {
+      "post": {
+        "operationId": "postDrain",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "Stop admitting, finish what is running, then exit.",
+        "x-zygo-deploy": true,
+        "x-zygo-who": "operator"
+      }
+    },
+    "/fn": {
+      "get": {
+        "operationId": "getFn",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "Warm functions. A tenant token sees its own.",
+        "x-zygo-deploy": false,
+        "x-zygo-who": "any"
+      }
+    },
+    "/fn/{name}": {
+      "delete": {
+        "operationId": "deleteFnName",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "Stop a function.",
+        "x-zygo-deploy": true,
+        "x-zygo-who": "operator"
+      },
+      "post": {
+        "operationId": "postFnName",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "Call a warm function. `?stream=1` for NDJSON, `?out=1` for the workspace back.",
+        "x-zygo-deploy": false,
+        "x-zygo-who": "any"
+      },
+      "put": {
+        "operationId": "putFnName",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "Warm a function, replacing whatever held the name.",
+        "x-zygo-deploy": true,
+        "x-zygo-who": "operator"
+      }
+    },
+    "/fn/{name}/batch": {
+      "post": {
+        "operationId": "postFnNameBatch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "Several events at once; each element carries its own status.",
+        "x-zygo-deploy": false,
+        "x-zygo-who": "any"
+      }
+    },
+    "/fn/{name}/logs": {
+      "get": {
+        "operationId": "getFnNameLogs",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "A function's recent log.",
+        "x-zygo-deploy": false,
+        "x-zygo-who": "any"
+      }
+    },
+    "/fn/{name}/stats": {
+      "get": {
+        "operationId": "getFnNameStats",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "One function's counters.",
+        "x-zygo-deploy": false,
+        "x-zygo-who": "any"
+      }
+    },
+    "/fn/{name}/warm": {
+      "post": {
+        "operationId": "postFnNameWarm",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "Bring a registered function up without calling it.",
+        "x-zygo-deploy": false,
+        "x-zygo-who": "any"
+      }
+    },
+    "/healthz": {
+      "get": {
+        "operationId": "getHealthz",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "Whether this host should be sent work.",
+        "x-zygo-deploy": false,
+        "x-zygo-who": "any"
+      }
+    },
+    "/metrics": {
+      "get": {
+        "operationId": "getMetrics",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "Prometheus text exposition.",
+        "x-zygo-deploy": false,
+        "x-zygo-who": "any"
+      }
+    },
+    "/requests/{id}": {
+      "delete": {
+        "operationId": "deleteRequestsId",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "Stop a running request, by its id or the key it was called with.",
+        "x-zygo-deploy": false,
+        "x-zygo-who": "any"
+      }
+    },
+    "/run": {
+      "post": {
+        "operationId": "postRun",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "One-shot sandbox. Names an image and a command, so it is a shell.",
+        "x-zygo-deploy": true,
+        "x-zygo-who": "operator"
+      }
+    },
+    "/runtimes": {
+      "get": {
+        "operationId": "getRuntimes",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "Runtime pools. A tenant token sees its own.",
+        "x-zygo-deploy": false,
+        "x-zygo-who": "any"
+      },
+      "post": {
+        "operationId": "postRuntimes",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "Register a runtime pool: an image and a dependency set, no code.",
+        "x-zygo-deploy": true,
+        "x-zygo-who": "operator"
+      }
+    },
+    "/runtimes/{name}": {
+      "delete": {
+        "operationId": "deleteRuntimesName",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "Stop a pool and drop its zygotes.",
+        "x-zygo-deploy": true,
+        "x-zygo-who": "operator"
+      }
+    },
+    "/runtimes/{name}/call": {
+      "post": {
+        "operationId": "postRuntimesNameCall",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "Run one script in a pool. `?stream=1`, `?out=1`.",
+        "x-zygo-deploy": false,
+        "x-zygo-who": "any"
+      }
+    },
+    "/scripts": {
+      "put": {
+        "operationId": "putScripts",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "Register a script; the body is the script. Idempotent by digest.",
+        "x-zygo-deploy": false,
+        "x-zygo-who": "any"
+      }
+    },
+    "/scripts/{digest}": {
+      "delete": {
+        "operationId": "deleteScriptsDigest",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "digest",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "Forget a script. The store is shared by digest.",
+        "x-zygo-deploy": true,
+        "x-zygo-who": "operator"
+      },
+      "get": {
+        "operationId": "getScriptsDigest",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "digest",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "Whether this host holds a script, and how big it is.",
+        "x-zygo-deploy": false,
+        "x-zygo-who": "any"
+      }
+    },
+    "/tenants": {
+      "get": {
+        "operationId": "getTenants",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "Every tenant this host holds.",
+        "x-zygo-deploy": false,
+        "x-zygo-who": "operator"
+      },
+      "post": {
+        "operationId": "postTenants",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "Register a tenant, or find the one already registered.",
+        "x-zygo-deploy": false,
+        "x-zygo-who": "operator"
+      }
+    },
+    "/tenants/{id}": {
+      "delete": {
+        "operationId": "deleteTenantsId",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "Forget a tenant: its work stops and its scripts, tokens and secrets go.",
+        "x-zygo-deploy": true,
+        "x-zygo-who": "operator"
+      },
+      "get": {
+        "operationId": "getTenantsId",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "One tenant. A tenant may read its own.",
+        "x-zygo-deploy": false,
+        "x-zygo-who": "tenant-or-operator"
+      }
+    },
+    "/tenants/{id}/limits": {
+      "patch": {
+        "operationId": "patchTenantsIdLimits",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "What a tenant may not exceed. These only narrow.",
+        "x-zygo-deploy": true,
+        "x-zygo-who": "operator"
+      }
+    },
+    "/tenants/{id}/secrets": {
+      "get": {
+        "operationId": "getTenantsIdSecrets",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "A tenant's secret **names**. Values cannot be read back.",
+        "x-zygo-deploy": false,
+        "x-zygo-who": "tenant-or-operator"
+      }
+    },
+    "/tenants/{id}/secrets/{name}": {
+      "delete": {
+        "operationId": "deleteTenantsIdSecretsName",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "Forget a secret.",
+        "x-zygo-deploy": true,
+        "x-zygo-who": "operator"
+      },
+      "put": {
+        "operationId": "putTenantsIdSecretsName",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "Store a secret; the body is the value. Encrypted at rest.",
+        "x-zygo-deploy": true,
+        "x-zygo-who": "operator"
+      }
+    },
+    "/tenants/{id}/tokens": {
+      "post": {
+        "operationId": "postTenantsIdTokens",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "Mint a token for a tenant. The secret is in the answer, once.",
+        "x-zygo-deploy": true,
+        "x-zygo-who": "operator"
+      }
+    },
+    "/tokens": {
+      "get": {
+        "operationId": "getTokens",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "Every token, hashes and all. Never a secret.",
+        "x-zygo-deploy": true,
+        "x-zygo-who": "operator"
+      },
+      "post": {
+        "operationId": "postTokens",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "Mint an operator token. The secret is in the answer, once.",
+        "x-zygo-deploy": true,
+        "x-zygo-who": "operator"
+      }
+    },
+    "/tokens/{id}": {
+      "delete": {
+        "operationId": "deleteTokensId",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "Revoke a token, from the next request onwards.",
+        "x-zygo-deploy": true,
+        "x-zygo-who": "operator"
+      }
+    },
+    "/version": {
+      "get": {
+        "operationId": "getVersion",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "the call succeeded"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "a failure, as JSON with an `error` and often a `code`"
+          }
+        },
+        "summary": "Zygo's version, the HTTP surface's, and the control protocol's.",
+        "x-zygo-deploy": false,
+        "x-zygo-who": "any"
+      }
+    }
+  },
+  "security": [
+    {
+      "bearer": []
+    }
+  ],
+  "servers": [
+    {
+      "url": "http://127.0.0.1:7700"
+    }
+  ],
+  "x-zygo-api": 1
+}

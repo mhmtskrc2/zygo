@@ -691,6 +691,24 @@ Both clients pool connections and are safe to share between threads or tasks.
 That is not an optimisation detail: one connection would serialise concurrent
 callers behind a socket, and the warm path is measured in milliseconds.
 
+## The document
+
+```bash
+zygo api --openapi > openapi.json
+```
+
+OpenAPI 3.1 for the build that printed it, and `spec/openapi.json` in the
+repository is the committed copy. `info.version` is Zygo's release;
+`x-zygo-api` is the surface version — the one a client checks, which moves only
+when an operation is removed or renamed. Adding a route does not move it,
+because an older client does not call one it has never heard of.
+
+It is hand-written, and two tests read the router's own source to make sure it
+stays true: one fails when a route is not in the document, the other when the
+document names a route that is gone. Both SDKs have a third, over every
+operation, so a route added without a client method is a test failure rather
+than something an embedder discovers.
+
 ## Versioning
 
 `GET /version` reports three numbers:

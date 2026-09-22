@@ -603,6 +603,14 @@ pub struct ApiArgs {
     #[command(flatten)]
     pub spec_file: SpecFileArgs,
 
+    /// Print the OpenAPI 3.1 document for this build and exit.
+    ///
+    /// Hand-written rather than derived, and kept honest by a test that reads
+    /// the router's own source: a route added without a summary somebody
+    /// could write a client from is a test failure.
+    #[arg(long)]
+    pub openapi: bool,
+
     /// Where to listen: `HOST:PORT`, or `unix://PATH`. Overrides `[api] listen`.
     #[arg(long)]
     pub listen: Option<String>,

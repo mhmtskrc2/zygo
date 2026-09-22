@@ -254,6 +254,13 @@ struct Api {
 }
 
 pub fn run(cli: &Cli, args: &ApiArgs) -> anyhow::Result<u8> {
+    // Before anything is read or bound: printing the document is a question
+    // about this binary, not about a host.
+    if args.openapi {
+        crate::output::json(&super::openapi::document())?;
+        return Ok(0);
+    }
+
     let spec = Spec::discover(args.spec_file.path())?.unwrap_or_default();
     // No `[api]` section means the documented defaults: loopback, bearer.
     let api_spec = spec.api.clone().unwrap_or_default();

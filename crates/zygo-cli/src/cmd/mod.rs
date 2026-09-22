@@ -10,6 +10,7 @@ pub mod login;
 pub mod logs;
 pub mod mcp;
 pub mod oneshot;
+pub mod openapi;
 pub mod otlp;
 pub mod run;
 pub mod secrets;
