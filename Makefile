@@ -106,6 +106,11 @@ conformance: build
 # every request's script. The two paths through the worker are different
 # enough that passing one says little about the other: the pool shape loads
 # tenant code in the child, after the fork, under the child filter.
+#
+# The pool run's proto-1.1 script is the **TypeScript** one, which is where
+# `.ts` support is checked end to end: no build step, the digest over the
+# source as uploaded, and an `enum` in it so that a runtime which only blanks
+# type annotations cannot pass.
 conformance-node: poc/zygo-linux-musl
 	docker run --rm -v "$(PWD):/src:ro" node:22-slim \
 		/src/poc/zygo-linux-musl agent test node \
@@ -115,7 +120,7 @@ conformance-node: poc/zygo-linux-musl
 	docker run --rm -v "$(PWD):/src:ro" node:22-slim \
 		/src/poc/zygo-linux-musl agent test node \
 		--pool-script /src/examples/agents/conformance/handler.js \
-		--script /src/examples/agents/conformance/script.js \
+		--script /src/examples/agents/conformance/script.ts \
 		--script-spawn /src/examples/agents/conformance/spawn.js -- \
 		/src/agents/node/zygo_agent.js
 

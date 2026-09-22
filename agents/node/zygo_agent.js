@@ -23,6 +23,10 @@
 // `module.exports.handler` — returning the result, or a promise of it.
 // Anything it writes to stdout or stderr is captured and returned separately.
 //
+// The handler, and a script that arrives with a request, may be TypeScript:
+// the types come off as the module loads, in the child, with no build step and
+// nothing cached between requests. See `compileModule`.
+//
 // Pure standard library, on purpose: it is loaded into every Node sandbox and
 // its own start-up cost is paid by every tenant.
 
@@ -298,6 +302,130 @@ class Ring {
 // Handler loading
 // ---------------------------------------------------------------------------
 
+/// Drop the one warning Zygo provokes on the tenant's behalf.
+///
+/// `Module.stripTypeScriptTypes` is experimental, so the first call prints an
+/// `ExperimentalWarning` to stderr — and in a worker, stderr is the *request's*
+/// stderr, captured and returned to whoever called it. A caller who uploaded a
+/// `.ts` script would find a line in their output about a Node API they have
+/// never heard of, on their first request and not the second.
+///
+/// Only that one: every other warning, including a tenant's own, goes to the
+/// listeners that were there. Removing the default listener is the only way —
+/// `emitWarning` prints unless it is gone — and it is put back by forwarding.
+///
+/// Installed once, per worker, before anything can strip.
+function hideTheTypeStrippingWarning() {
+  const existing = process.listeners('warning');
+  process.removeAllListeners('warning');
+  process.on('warning', (warning) => {
+    if (
+      warning &&
+      warning.name === 'ExperimentalWarning' &&
+      /stripTypeScriptTypes/.test(warning.message || '')
+    ) {
+      return;
+    }
+    for (const listener of existing) listener(warning);
+  });
+}
+
+/// TypeScript with the types taken out, or `null` if this runtime cannot.
+///
+/// No bundler, no build step and nothing in the request path but a parse:
+/// `Module.stripTypeScriptTypes` is Node's own (22.13 and later), and where
+/// there is none the image's dependency set may have `amaro`, which is what
+/// Node uses underneath.
+///
+/// `strip` first and `transform` only if that refuses, because they differ in
+/// what they cost the *tenant*: strip mode blanks types in place, so every
+/// line and column in a stack trace is still the line and column of the file
+/// they uploaded. Transform mode rewrites — it is what an `enum`, a namespace
+/// or a parameter property needs — and a stack trace through one no longer
+/// points where the tenant is looking. Most scripts pay nothing for that.
+function typeStripper() {
+  const Module = require('module');
+  if (typeof Module.stripTypeScriptTypes === 'function') {
+    return (source) => {
+      try {
+        return Module.stripTypeScriptTypes(source, { mode: 'strip' });
+      } catch (e) {
+        if (e && e.code === 'ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX') {
+          return Module.stripTypeScriptTypes(source, { mode: 'transform' });
+        }
+        throw e;
+      }
+    };
+  }
+  try {
+    // Only if the image has it. Not vendored: `amaro` is a megabyte of
+    // WebAssembly, and this file is loaded into every Node sandbox Zygo runs.
+    const amaro = require('amaro');
+    return (source) => amaro.transformSync(source, { mode: 'transform' }).code;
+  } catch {
+    return null;
+  }
+}
+
+/// What to add to a syntax error on a runtime that cannot strip types at all.
+///
+/// Said rather than guessed at: this agent does not know whether the file it
+/// failed to compile was TypeScript, and a runtime with no stripper would
+/// otherwise report a `.ts` handler as a plain syntax error on line 1 —
+/// leaving the reader to work out that the Node in their image is too old.
+function whyThereIsNoTypeScript() {
+  return (
+    `\n(no TypeScript support here: \`module.stripTypeScriptTypes\` arrived in ` +
+    `Node 22.13 and this is ${process.versions.node}, and the image has no ` +
+    `\`amaro\` — if this file is TypeScript, that is why)`
+  );
+}
+
+/// Compile one module, in TypeScript or in JavaScript, and return its exports.
+///
+/// There is no file extension to go on: a script arrives at
+/// `/run/script/<digest>` or as bytes on the wire, and the digest is over what
+/// the tenant uploaded rather than over anything this agent produces. So the
+/// language is decided by what the source *is*: valid JavaScript is valid
+/// TypeScript, so it is compiled as JavaScript, and only a `SyntaxError` —
+/// raised before a single line of the module body has run — is grounds for
+/// trying again with the types taken out.
+///
+/// The retry is conditional on stripping having *changed* something, which is
+/// what keeps this from being a guess. A file with no type annotations comes
+/// back from the stripper byte for byte, so a genuine JavaScript syntax error
+/// is reported as itself rather than as a TypeScript one — and a module whose
+/// body throws a `SyntaxError` of its own (a `JSON.parse` of bad input, say)
+/// cannot be run twice, because a file that compiled cannot also have types in
+/// it to strip.
+function compileModule(source, filename) {
+  const Module = require('module');
+  const loaded = new Module(filename, null);
+  loaded.filename = filename;
+  loaded.paths = Module._nodeModulePaths(path.dirname(filename));
+  try {
+    loaded._compile(source, filename);
+  } catch (e) {
+    if (!(e instanceof SyntaxError)) throw e;
+    const strip = typeStripper();
+    if (!strip) {
+      e.message += whyThereIsNoTypeScript();
+      throw e;
+    }
+    let stripped;
+    try {
+      stripped = strip(source);
+    } catch {
+      // Not valid TypeScript either. The JavaScript error is the one that
+      // describes the file, so it is the one that is reported.
+      throw e;
+    }
+    if (stripped === source) throw e;
+    loaded._compile(stripped, filename);
+  }
+  return loaded.exports;
+}
+
 /// Load the script an `EXEC` carried, and return its entry point.
 ///
 /// **This runs in the worker, not the agent.** A worker serves one request and
@@ -311,7 +439,6 @@ class Ring {
 /// and a fresh context has none of it. The module is deliberately *not* put in
 /// `require.cache`: nothing here should outlive the request.
 function loadRequestScript(script) {
-  const Module = require('module');
   const filename = script.path || '/zygo/request-script.js';
   const entryPoint = script.entry_point || 'handler';
 
@@ -329,12 +456,7 @@ function loadRequestScript(script) {
   checkDigest(raw, script.digest, script.path);
   const source = raw.toString('utf8');
 
-  const loaded = new Module(filename, null);
-  loaded.filename = filename;
-  loaded.paths = Module._nodeModulePaths(path.dirname(filename));
-  loaded._compile(source, filename);
-
-  const exported = loaded.exports;
+  const exported = compileModule(source, filename);
   const handler =
     typeof exported === 'function' ? exported : exported && exported[entryPoint];
   if (typeof handler !== 'function') {
@@ -376,12 +498,24 @@ function checkDigest(raw, digest, scriptPath) {
   }
 }
 
+/// A handler file that is TypeScript, and so needs compiling rather than
+/// `require`ing.
+///
+/// Node will `require` a `.ts` file itself from 22.18, but only in strip
+/// mode — a handler with an `enum` in it fails there and works here, and one
+/// contract for both `entry = "handler.ts:handler"` and a `.ts` script in an
+/// `EXEC` is worth more than reusing the loader.
+const TYPESCRIPT_SUFFIX = /\.(ts|cts)$/;
+
 function loadHandler(handlerPath, mode) {
-  const loaded = require(path.resolve(handlerPath));
+  const resolved = path.resolve(handlerPath);
+  const loaded = TYPESCRIPT_SUFFIX.test(resolved)
+    ? compileModule(fs.readFileSync(resolved, 'utf8'), resolved)
+    : require(resolved);
   if (mode === 'stdin') {
     // Windmill-style scripts: the module body is the program, and re-running
     // it per request is the contract.
-    return (event) => runStdinScript(path.resolve(handlerPath), event);
+    return (event) => runStdinScript(resolved, event);
   }
   const handler = typeof loaded === 'function' ? loaded : loaded && loaded.handler;
   if (typeof handler !== 'function') {
@@ -472,6 +606,7 @@ function writeStdioSynchronously() {
 
 function worker(argv) {
   writeStdioSynchronously();
+  hideTheTypeStrippingWarning();
 
   const filterArg = argv.indexOf(CHILD_FILTER_ARG);
   if (filterArg >= 0) {

@@ -243,6 +243,73 @@ test('an inline script is checked against its digest too', () => {
   assert.strictEqual(agent.loadRequestScript({ source })(), 'inline');
 });
 
+test('a script with types and an enum runs, and its digest is over what was uploaded', () => {
+  // Types are the easy half: Node strips those itself. An `enum` is the half
+  // that needs the transform, and it is in here because a tenant who writes
+  // TypeScript writes TypeScript, not the subset that happens to blank out.
+  const source = [
+    'enum Size { Small = 1, Large = 2 }',
+    'interface Order { item: string; size: Size }',
+    'export function handler(event: Order): { item: string; units: number } {',
+    '  const units: number = event.size === Size.Large ? 2 : 1;',
+    '  return { item: event.item, units };',
+    '}',
+    '',
+  ].join('\n');
+
+  // Over the source as uploaded, not over the JavaScript this agent makes of
+  // it: the supervisor hashes what the tenant sent, and a digest over anything
+  // else would fail on every request.
+  const handler = agent.loadRequestScript({ source, digest: digestOf(source) });
+  assert.deepStrictEqual(handler({ item: 'desk', size: 2 }), { item: 'desk', units: 2 });
+});
+
+test('a handler file may be TypeScript too', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zygo-agent-'));
+  const handler = path.join(dir, 'handler.ts');
+  fs.writeFileSync(
+    handler,
+    'enum Mode { One = 1 }\n' +
+      'export function handler(event: { n: number }): number {\n' +
+      '  return event.n + Mode.One;\n' +
+      '}\n'
+  );
+  try {
+    assert.strictEqual(agent.loadHandler(handler, 'function')({ n: 41 }), 42);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('JavaScript that is simply broken is reported as JavaScript', () => {
+  // The language is decided by what the source is, not by a file extension
+  // there is none of — so the danger is a JavaScript syntax error being
+  // reported as a TypeScript one, or worse, stripped into something that runs.
+  // Stripping a file with no types in it returns it unchanged, which is what
+  // this leans on.
+  assert.throws(
+    () => agent.loadRequestScript({ source: 'module.exports = function ( {\n' }),
+    (e) => e instanceof SyntaxError && !/TypeScript/i.test(e.message)
+  );
+});
+
+test('a module whose body throws is not compiled a second time', () => {
+  // A `SyntaxError` raised *by the body* — `JSON.parse` of bad input is the
+  // everyday one — must not send the loader back for a second `_compile`,
+  // which would run every side effect above it twice.
+  const source = [
+    'globalThis.__zygoRanTwice = (globalThis.__zygoRanTwice || 0) + 1;',
+    "JSON.parse('{');",
+    '',
+  ].join('\n');
+  try {
+    assert.throws(() => agent.loadRequestScript({ source }), SyntaxError);
+    assert.strictEqual(globalThis.__zygoRanTwice, 1);
+  } finally {
+    delete globalThis.__zygoRanTwice;
+  }
+});
+
 test('a signal is reported by its own number, not as SIGKILL whatever happened', () => {
   if (process.platform === 'win32') return;
   assert.strictEqual(agent.signalNumber('SIGKILL'), os.constants.signals.SIGKILL);

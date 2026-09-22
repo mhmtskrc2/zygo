@@ -14,7 +14,7 @@ an error, not a warning.
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `image` | reference | — (required) | An OCI image: `python:3.12-slim`, `ghcr.io/org/app:1.2`, or a digest. Pulled on first use by `run`; `serve`/`up` need it pulled already. |
-| `entry` | path | — | The handler file. Sets *agent* mode: the runtime loads it once and forks per request. Relative to the spec file. |
+| `entry` | path | — | The handler file. Sets *agent* mode: the runtime loads it once and forks per request. Relative to the spec file. A `.ts` file is loaded as TypeScript, types stripped on load, with no build step and no bundler. |
 | `cmd` | list | image's `CMD` | The program to run. With no `runtime`, sets *warm-exec* mode: a fresh process per request, event on stdin, JSON on stdout. |
 | `mode` | `function` \| `stdin` | `function` | How an agent calls the handler: `handler(event)` returning the result, or the event on stdin and the result from stdout. |
 | `runtime` | `python`, `node` | inferred from `entry` extension | Which agent lives in the sandbox. Two ship built in; anything else runs as warm-exec, or brings its own agent (`runtime = { agent = "/path/in/sandbox" }`). |

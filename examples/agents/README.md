@@ -107,12 +107,18 @@ the checks above are asked unchanged. It carries a digest, which the child is
 required to verify before it loads anything — `--script` is what checks that a
 digest which does *not* match is refused.
 
+The script `make conformance-node` sends in the pool run is
+[`conformance/script.ts`](conformance/script.ts), because that is where
+TypeScript is checked end to end: the file goes up as it was written, the
+digest is over those bytes, and the `enum` in it is there so that a runtime
+which only blanks type annotations cannot pass.
+
 ## What is here
 
 | | |
 |---|---|
 | [`sh/`](sh) | A complete agent in POSIX sh + `jq`, about 130 lines including its comments. It exists to keep the "language independent" claim honest, and it passes the same suite the Python agent does. It cannot reach `prctl`, so under `strict` it refuses every request rather than running one unfiltered — the protocol's other conforming answer. |
-| [`conformance/`](conformance) | The echo handlers, one per language, that `zygo agent test` expects. |
+| [`conformance/`](conformance) | The echo handlers, one per language, that `zygo agent test` expects, and the scripts `--script` sends — including a TypeScript one. |
 
 The two agents Zygo *ships* are not here — they are in
 [`../../agents/`](../../agents), because they are shipped code rather than

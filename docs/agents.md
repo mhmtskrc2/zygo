@@ -103,6 +103,51 @@ tenants', so an agent must not look around it.
 - [`examples/warm-exec/go/`](../examples/warm-exec/go) — a Go program as a warm
   function, where the whole integration is a `cmd`.
 
+## TypeScript, without a build step
+
+A `.ts` handler and a `.ts` script both run as they are. There is no compile
+step, no bundler and nothing cached between requests: the types are stripped
+as the module loads, in the child, after the fork — which is the same place
+and the same moment a `.js` script is compiled.
+
+```toml
+[fn.resize]
+image = "node:22-slim"
+entry = "./resize.ts"     # `runtime` is inferred from the extension
+```
+
+or, over the API, by uploading the TypeScript itself:
+
+```python
+script = client.put_script(open("resize.ts").read())
+client.run_script("node-pool", script.sha256, {"url": "..."})
+```
+
+Three things are worth knowing:
+
+* **The digest is over the source as uploaded.** Not over the JavaScript the
+  agent makes of it, which would differ between Node versions and break every
+  request. The check a child does before it loads a script is the check that
+  makes `/run/script/<digest>` safe on a shared uid, and it is unchanged here.
+* **`enum`, namespaces and parameter properties work.** They are code rather
+  than annotation, so they need Node's `transform` mode rather than the
+  `strip` mode it enables by default; the agent asks for `strip` first and
+  falls back, because strip mode leaves every line and column where the
+  tenant wrote it and transform mode does not.
+* **There is no file extension on the wire.** A script arrives as
+  `/run/script/<digest>` or as bytes, so the agent decides by what the source
+  *is*: valid JavaScript is valid TypeScript, so it compiles as JavaScript
+  first and only a `SyntaxError` — raised before a line of the module body has
+  run — sends it back to strip types and try again. A file with no types in it
+  comes back from the stripper unchanged, which is how a plain JavaScript
+  syntax error stays a JavaScript one.
+
+It needs Node 22.13 or later, which is where `module.stripTypeScriptTypes`
+arrives. Below that the agent uses `amaro` if the image's dependency set has
+it, and otherwise says so rather than running the file as JavaScript. Amaro is
+not vendored: it is a megabyte of WebAssembly, and this agent is loaded into
+every Node sandbox Zygo runs.
+
 ## A handler that computes without yielding
 
 A request that spends three seconds in a tight loop is the case where an
