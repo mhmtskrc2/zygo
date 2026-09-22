@@ -25,6 +25,12 @@ __pycache__/
 
 # Built by `make examples-go-linux`
 /examples/warm-exec/go/bin/
+
+# The binary `make oci-image` copies into the image's build context. The
+# Dockerfile takes it from there rather than compiling a second time, so that
+# the image holds the binary the size and static-linking checks were run
+# against — but it is still a build artefact.
+/packaging/oci/zygo
 # The guest kernel and the V1 probe's log: built by `make vm-kernel` and
 # `make vm-probe`, 24 MB of artefact that a checkout should rebuild.
 poc/vm-out/

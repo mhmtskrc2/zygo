@@ -138,7 +138,15 @@ brew install lima && brew install --formula \
 
 # or from source, anywhere
 cargo install zygo-cli
+
+# or the container image, which needs no privileges and three specific things
+docker run --security-opt seccomp=unconfined --security-opt systempaths=unconfined \
+    --cgroupns=host --cgroup-parent=/zygo -v /sys/fs/cgroup/zygo:/sys/fs/cgroup/zygo:rw \
+    -p 7700:7700 -e ZYGO_API_TOKEN=... ghcr.io/zygo-dev/zygo
 ```
+
+[`packaging/oci/`](packaging/oci) says what those three are and why; `zygo
+doctor` names any that are missing, in the container or on a host.
 
 ```bash
 zygo doctor                                   # can this host run sandboxes?
@@ -341,6 +349,7 @@ agents/node          the reference Node agent: a worker pool, not a fork
 spec/protocol.md     the wire protocol
 sdk/python           the Python client, and the async one beside it
 sdk/node             the Node client, with types and no build step
+packaging/oci        the container image, and a worker image built on it
 ```
 
 ## Development

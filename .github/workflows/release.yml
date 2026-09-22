@@ -276,8 +276,143 @@ jobs:
           fi
 
   # The release itself. Last, so a build that fails leaves no half-release.
+  # The container image, one per architecture, then one manifest list over
+  # both. Built from the binary the `linux` job already produced and checked
+  # (`poc/check_dist.sh`): compiling a second time inside Docker would put a
+  # *different* binary in the image from the one that was size-checked and
+  # run, which is the one thing a release image must not do.
+  #
+  # Pushed only on a real tag. `workflow_dispatch` builds it, runs it and
+  # uploads nothing, which is how this job is rehearsed.
+  oci:
+    needs: [what, linux]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    name: oci (${{ matrix.arch }})
+    permissions:
+      contents: read
+      packages: write
+      id-token: write          # cosign, keyless
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist
+
+      - name: The binary the linux job checked
+        run: |
+          install -m 0755 "dist/zygo-linux-${{ matrix.target }}" packaging/oci/zygo
+          packaging/oci/zygo --version
+
+      - name: Build
+        run: |
+          docker build -f packaging/oci/Dockerfile \
+            -t "zygo:${{ matrix.arch }}" packaging/oci
+
+      # It has to run before it is pushed. Not the full suite — that is CI's
+      # job — but the image's own contract: a non-root user, `/healthz`, and
+      # the four programs egress needs.
+      - name: It runs
+        run: |
+          sudo mkdir -p /sys/fs/cgroup/zygo-oci
+          for c in memory pids cpu; do
+            echo "+$c" | sudo tee /sys/fs/cgroup/cgroup.subtree_control >/dev/null || true
+          done
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          OCI_IMAGE=zygo:${{ matrix.arch }} sh poc/verify_oci.sh
+
+      - name: Log in to ghcr.io
+        if: needs.what.outputs.publish == 'true'
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      # By digest, not by tag: the manifest list below refers to each
+      # architecture by its digest, and a tag per architecture would be a tag
+      # somebody could pull by mistake.
+      - name: Push
+        id: push
+        if: needs.what.outputs.publish == 'true'
+        env:
+          REPO: ghcr.io/${{ github.repository_owner }}/zygo
+          VERSION: ${{ needs.what.outputs.version }}
+        run: |
+          repo=$(echo "$REPO" | tr '[:upper:]' '[:lower:]')
+          docker tag "zygo:${{ matrix.arch }}" "$repo:$VERSION-${{ matrix.arch }}"
+          docker push "$repo:$VERSION-${{ matrix.arch }}"
+          digest=$(docker inspect --format '{{index .RepoDigests 0}}' \
+            "$repo:$VERSION-${{ matrix.arch }}" | cut -d@ -f2)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "$repo@$digest"
+
+      - uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3
+        if: needs.what.outputs.publish == 'true'
+
+      # Keyless: the signature is bound to this workflow and this tag, so
+      # there is no key to keep and none to leak. `packaging/oci/README.md`
+      # has the `cosign verify` that checks it.
+      - name: Sign
+        if: needs.what.outputs.publish == 'true'
+        env:
+          REPO: ghcr.io/${{ github.repository_owner }}/zygo
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          repo=$(echo "$REPO" | tr '[:upper:]' '[:lower:]')
+          cosign sign --yes "$repo@$DIGEST"
+
+  # One tag over both architectures, so `docker pull ghcr.io/…/zygo` works on
+  # either without anybody naming one.
+  oci-manifest:
+    needs: [what, oci]
+    if: needs.what.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3
+
+      - name: The manifest list, and `latest`
+        env:
+          REPO: ghcr.io/${{ github.repository_owner }}/zygo
+          VERSION: ${{ needs.what.outputs.version }}
+        run: |
+          repo=$(echo "$REPO" | tr '[:upper:]' '[:lower:]')
+          for tag in "$VERSION" latest; do
+            docker manifest create "$repo:$tag" \
+              "$repo:$VERSION-amd64" "$repo:$VERSION-arm64"
+            digest=$(docker manifest push "$repo:$tag")
+            echo "$repo:$tag -> $digest"
+            # The list itself, as well as each architecture's image: `docker
+            # pull ghcr.io/…/zygo:0.1.0` resolves to the list, and that is
+            # what anybody verifying has in their hand.
+            cosign sign --yes "$repo@$digest"
+          done
+
   publish:
-    needs: [what, linux, macos, homebrew]
+    needs: [what, linux, macos, homebrew, oci]
     if: needs.what.outputs.publish == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -305,6 +440,7 @@ jobs:
           TAG: ${{ needs.what.outputs.tag }}
           VERSION: ${{ needs.what.outputs.version }}
           REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
         run: |
           cat > notes.md <<EOF
           ## Install
@@ -320,6 +456,22 @@ jobs:
 
           # from source
           cargo install zygo-cli
+          \`\`\`
+
+          Or the container image, for \`linux/amd64\` and \`linux/arm64\`:
+
+          \`\`\`bash
+          docker pull ghcr.io/$OWNER/zygo:$VERSION
+          \`\`\`
+
+          It needs no privileges and three specific things —
+          \`packaging/oci/README.md\` has them, and \`zygo doctor\` names any
+          that are missing. Signed with cosign, keyless:
+
+          \`\`\`bash
+          cosign verify ghcr.io/$OWNER/zygo:$VERSION \\
+            --certificate-identity-regexp '^https://github\.com/.*/\.github/workflows/release\.yml@refs/tags/' \\
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
           \`\`\`
 
           \`zygo doctor\` is the first thing to run anywhere: it attempts every

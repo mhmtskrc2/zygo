@@ -1,0 +1,54 @@
+# A worker image: Zygo, plus the runtimes your customers' code needs.
+#
+# The base image holds Zygo and nothing else — no Python, no Node, no
+# dependency sets. That is deliberate: a sandbox runs inside an **OCI image of
+# its own**, pulled into Zygo's store, so what is installed here has nothing
+# to do with what a handler can import. Zygo needs an interpreter in the
+# *image a function names*, not in the container Zygo runs in.
+#
+# What a worker image is for, then, is the other two things:
+#
+#   * the images your functions name, pulled at build time so that a cold
+#     start on a fresh pod is not a registry round trip;
+#   * whatever your own control plane needs beside Zygo.
+#
+#     docker build -f packaging/oci/Dockerfile.worker -t my-worker .
+#
+# Nothing here is required. A worker that pulls its images on first use works;
+# it is slower exactly once per image per node.
+
+ARG ZYGO_IMAGE=ghcr.io/zygo/zygo:latest
+FROM ${ZYGO_IMAGE}
+
+# Back to root for the build, and back to 65532 at the end. Everything below
+# writes into the data directory, which belongs to that uid.
+USER 0:0
+
+# The images this worker's functions run in. `zygo pull` writes them into
+# `$ZYGO_DATA_HOME/images`, which is the same store the running supervisor
+# reads — so a pod that starts with these baked in never waits for a registry.
+#
+# The trade is image size against cold start, and it is a real one:
+# `python:3.12-slim` is about 45 MB compressed. Pull the ones you actually
+# serve rather than a catalogue.
+RUN zygo pull python:3.12-slim \
+    && zygo pull node:22-slim \
+    && chown -R 65532:65532 /var/lib/zygo
+
+# A dependency set can be baked in the same way, if every tenant shares one —
+# but most do not, and `POST /deps` exists so each can send their own. See
+# `docs/sdk.md`.
+#
+# RUN zygo ... # nothing here yet: dependency sets are keyed on an image
+#              # digest and arrive over the API.
+
+USER 65532:65532
+
+# The API, and on a worker it is usually deploy-capable: the thing in front of
+# it is your control plane rather than a customer.
+#
+#   * `--allow-deploy` lets the control plane declare pools and functions.
+#   * `ZYGO_API_TOKEN` is the operator's token; mint per-tenant ones from it.
+#   * `ZYGO_SECRETS_KEY` is what per-tenant secrets are sealed with. Without
+#     it, secrets are refused rather than stored in the clear.
+CMD ["api", "--listen", "0.0.0.0:7700", "--allow-deploy"]

@@ -5,7 +5,7 @@
         repro-blue-green-linux verify-api-linux verify-plugin-host vm-build vm-probe vm-kernel \
         verify-vm-pi use-cases-linux vm-use-cases-linux \
         syscall-tables conformance conformance-node conformance-node-seccomp \
-        examples-go-linux \
+        examples-go-linux oci-image verify-oci \
         seccomp-matrix-linux landlock-net-linux bench bench-embed bench-density fmt lint clean
 
 help:
@@ -15,6 +15,7 @@ help:
 	@echo "verify-mcp   drive the MCP server over a pipe, as an agent host does"
 	@echo "verify-api-linux  the HTTP API end to end, through the Python client"
 	@echo "verify-plugin-host  a plugin host on the API alone — the embedder exit criterion"
+	@echo "oci-image / verify-oci  the container image, built and run unprivileged"
 	@echo "vm-build     build the vm-capable binary (libkrun linked in)"
 	@echo "vm-kernel    build the guest kernel and check its config"
 	@echo "vm-probe     ask whether libkrun links against musl (the vm plan V1)"
@@ -140,6 +141,13 @@ conformance-node-seccomp: poc/zygo-linux-musl
 
 # The static binary the cross-image checks need. `make dist-linux` checks the
 # same build against N6; this one keeps it.
+#
+# `--offline` first, and the network only as a fallback. Every build otherwise
+# began with "Updating git repository https://github.com/containers/libkrun" —
+# the `[patch]` in the workspace root — which is a fetch of a repository this
+# build does not even compile (`vm` is off by default) and which stalled for
+# twenty minutes at a time on a slow link. The cargo registry volume already
+# has what the lockfile names.
 # Phony: the binary has to be rebuilt when the sources change, and make cannot
 # see that through a docker build. The target dir and registry are volumes so a
 # rebuild is incremental — this one is copied to a real Linux host to test on,
@@ -150,7 +158,25 @@ poc/zygo-linux-musl:
 		-v zygo-musl-target:/target -v zygo-musl-registry:/usr/local/cargo/registry \
 		-e CARGO_TARGET_DIR=/target \
 		rust:1-alpine sh -c 'apk add --no-cache musl-dev >/dev/null && \
-		cargo build --release -p zygo-cli && cp /target/release/zygo /w/poc/zygo-linux-musl'
+		cargo build --release --locked --offline -p zygo-cli \
+		|| cargo build --release --locked -p zygo-cli; \
+		cp /target/release/zygo /w/poc/zygo-linux-musl'
+
+# The container image: the static binary, `pasta`, `nft`, `tc` and
+# `newuidmap`, a non-root user and `zygo api` as the entrypoint.
+#
+# The binary is the one `poc/zygo-linux-musl` built rather than a second
+# compile inside Docker: an image whose contents differ from what the size and
+# static-linking checks were run against is an image nobody checked.
+oci-image: poc/zygo-linux-musl
+	cp poc/zygo-linux-musl packaging/oci/zygo
+	docker build -f packaging/oci/Dockerfile -t $(OCI_IMAGE) packaging/oci
+
+OCI_IMAGE ?= zygo:local
+
+# And the same image, run: a sandbox inside a container with no privileges.
+verify-oci: oci-image
+	OCI_IMAGE=$(OCI_IMAGE) sh poc/verify_oci.sh
 
 # The Go warm-exec example, built in a Go container and then run for real:
 # `zygo up` on alpine, `zygo exec` through the CLI.

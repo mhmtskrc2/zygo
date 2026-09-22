@@ -858,6 +858,25 @@ mod probe {
                     "cgroup v2",
                     "delegated through a scope of its own, which Zygo enters by itself",
                 ),
+                // A container has no user session and no `systemd-run`, so
+                // the remedy below is advice nobody there can take. What a
+                // container needs is a writable cgroup subtree of its own,
+                // owned by the uid this process runs as.
+                Err(_) if in_a_container() => Check::failed(
+                    "cgroup v2",
+                    reason,
+                    format!(
+                        "this container's own cgroup is not writable by uid {}: give it a \
+                         cgroup v2 subtree of its own, read-write and owned by that uid — \
+                         docker run --cgroupns=host --cgroup-parent=/zygo \
+                         -v /sys/fs/cgroup/zygo:/sys/fs/cgroup/zygo:rw. Binding the whole \
+                         of /sys/fs/cgroup read-write also works and hands the container \
+                         every cgroup on the host, which is worse than the privilege it \
+                         was avoiding",
+                        // SAFETY: no arguments, cannot fail.
+                        unsafe { libc::getuid() }
+                    ),
+                ),
                 Err(scope_reason) => Check::failed(
                     "cgroup v2",
                     format!("{reason}; and no transient scope either ({scope_reason})"),
@@ -950,12 +969,38 @@ mod probe {
         }
     }
 
+    /// This uid's login name, as the password database has it.
+    fn user_name(uid: libc::uid_t) -> Option<String> {
+        // SAFETY: `getpwuid` returns a pointer to storage it owns, valid
+        // until the next call to it from this thread. The name is copied out
+        // before anything else can call it.
+        unsafe {
+            let entry = libc::getpwuid(uid);
+            if entry.is_null() {
+                return None;
+            }
+            let name = (*entry).pw_name;
+            if name.is_null() {
+                return None;
+            }
+            std::ffi::CStr::from_ptr(name)
+                .to_str()
+                .ok()
+                .map(str::to_string)
+        }
+    }
+
     fn subuid() -> Check {
         let uid = unsafe { libc::getuid() };
         if uid == 0 {
             return Check::ok("subuid/subgid", "running as root");
         }
-        let user = std::env::var("USER").unwrap_or_default();
+        // From the password database, not from `$USER`. A container sets no
+        // `USER`, so this check answered "no range for this user" in an image
+        // whose `/etc/subuid` had one — and the remedy it printed was a
+        // `usermod` for a user it could not name. `su`, `cron` and every
+        // service manager have the same gap.
+        let user = user_name(uid).unwrap_or_else(|| std::env::var("USER").unwrap_or_default());
         let has_range = ["/etc/subuid", "/etc/subgid"].iter().all(|f| {
             std::fs::read_to_string(f)
                 .map(|s| {
