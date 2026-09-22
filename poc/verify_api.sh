@@ -115,6 +115,18 @@ API_CALL_ONLY_PID=
 ZYGO_API_TOKEN=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
 export ZYGO_API_TOKEN
 
+# And a key for the secret store. Set for this phase only: the two earlier
+# listeners run without one on purpose, which is what checks that a host with
+# no key is a working host rather than a refusal.
+ZYGO_SECRETS_KEY=$("$ZYGO" secrets keygen 2>/dev/null)
+export ZYGO_SECRETS_KEY
+
+# The supervisor reads the key once, at start-up. The one started by the
+# earlier phases has none, so it has to go before this phase's listener comes
+# up — otherwise the secret routes would refuse for a reason that is this
+# script's fault rather than the code's.
+"$ZYGO" stop --all >/dev/null 2>&1
+
 API_TOKENS_PID=$(start_api "$SOCK_TOKENS" "" --allow-deploy)
 if wait_for "$SOCK_TOKENS"; then
     python3 "$SRC/poc/api_driver.py" --tokens "$SOCK_TOKENS" "$IMAGE" || status=1

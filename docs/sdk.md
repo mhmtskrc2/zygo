@@ -84,6 +84,9 @@ as.
 | Version | `client.version()` | `client.version()` | either | no |
 | Register a script | `client.put_script(source)` | `client.putScript(source)` | either | no |
 | Stop a running request | `client.cancel(id)` | `client.cancel(id)` | own, or operator | no |
+| A tenant's secret names | `client.secrets(id)` | `client.secrets(id)` | own, or operator | no |
+| Set one | `client.put_secret(id, name, v)` | `client.putSecret(id, name, v)` | operator | **yes** |
+| Forget one | `client.delete_secret(id, name)` | `client.deleteSecret(id, name)` | operator | **yes** |
 | Store a blob | `client.put_blob(tar)` | `client.putBlob(tar)` | either | no |
 | Look one up | `client.blob(digest)` | `client.blob(digest)` | either | no |
 | Forget one | `client.delete_blob(digest)` | `client.deleteBlob(digest)` | operator | **yes** |
@@ -208,6 +211,51 @@ existing deployment already sets, with the same rights it already had, which
 is what keeps one working across this change. On the host, `zygo token mint`,
 `zygo token ls` and `zygo token revoke <id>` do the same three things without
 an HTTP round trip.
+
+## Secrets
+
+A function's `secrets` are delivered as files at `/run/secrets/<name>`, written
+from outside the sandbox and removed when the last request in flight finishes.
+An operator at a terminal supplies them from their own environment. An
+**embedder's customers** cannot: they have their own keys and nobody to restart
+a supervisor.
+
+```bash
+export ZYGO_SECRETS_KEY=$(zygo secrets keygen)   # before the supervisor starts
+zygo secrets set acme STRIPE_KEY                 # reads it with echo off
+```
+
+```python
+client.put_secret("acme", "STRIPE_KEY", value)   # PUT, operator-only
+client.secrets("acme")                           # ['STRIPE_KEY'] — names only
+```
+
+A stored secret fills in what the shell did not supply, per tenant, when a
+function is served. The client wins where both have a value: `zygo serve` at a
+terminal is somebody saying what they want *now*.
+
+**There is no way to read a value back.** Not a missing route — there is no
+response shape that could carry one, because a store that answered with values
+would make every route that reaches it a way to read every customer's keys.
+Values are sealed with ChaCha20-Poly1305 under a key Zygo never stores, bound
+to their own `tenant/name` so one cannot be moved to another by anything that
+can only rename files.
+
+What that is and is not: it protects the bytes **at rest** — a backup, a stray
+`tar`, anything that can read one uid's files. It does not protect them from a
+process that can read the supervisor's memory, and it is not a hardware root of
+trust. An operator who needs those has a KMS.
+
+A passphrase is refused rather than stretched: turning one into a key needs a
+password KDF, and a store that accepted `hunter2` and stretched it badly would
+be worse than one that said no.
+
+**Not yet: secrets for a runtime pool.** A pool's sandbox is shared by several
+tenants, and `/run/secrets` is one directory in it — so delivering two tenants'
+secrets there would put each in reach of the other. Per-request delivery needs
+the same per-request-directory shape workspaces use, and a second place for
+handlers to look is a contract change that deserves its own decision. Functions
+have one tenant and are unaffected.
 
 ## Files in and out
 

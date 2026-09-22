@@ -213,6 +213,10 @@ pub enum Command {
     /// Run the HTTP API in the foreground.
     Api(ApiArgs),
 
+    /// Per-tenant secrets, encrypted at rest.
+    #[command(subcommand)]
+    Secrets(SecretsCommand),
+
     /// Mint, list and revoke API tokens.
     ///
     /// A token is how `zygo api` answers "whose request is this?" with
@@ -263,6 +267,44 @@ pub enum Command {
         /// bash, zsh, fish, elvish or powershell.
         shell: clap_complete::Shell,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SecretsCommand {
+    /// Print a new encryption key.
+    ///
+    /// 32 bytes from the kernel, as hex. Put it in `ZYGO_SECRETS_KEY` (or a
+    /// file named by `ZYGO_SECRETS_KEY_FILE`) before starting the supervisor.
+    ///
+    /// **A passphrase is not a key.** Stretching one into a key needs a
+    /// password KDF, and a store that accepted `hunter2` and stretched it
+    /// badly would be worse than one that refused — so this refuses.
+    ///
+    /// Zygo never stores the key. Lose it and every stored secret is
+    /// unreadable; there is no recovery, which is the point of encrypting
+    /// them.
+    Keygen,
+
+    /// Store one of a tenant's secrets.
+    ///
+    /// The value is read from the terminal with echo off, or from standard
+    /// input with `--stdin`. There is deliberately no `--value` flag: an
+    /// argument is visible in `ps` to every process on the machine and lands
+    /// in the shell's history.
+    Set {
+        tenant: String,
+        name: String,
+        /// Read the value from standard input, for CI and secret managers.
+        #[arg(long)]
+        stdin: bool,
+    },
+
+    /// The names a tenant has. Never the values — they cannot be read back.
+    #[command(visible_alias = "list")]
+    Ls { tenant: String },
+
+    /// Forget one.
+    Rm { tenant: String, name: String },
 }
 
 #[derive(Debug, Subcommand)]

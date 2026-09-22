@@ -107,7 +107,7 @@ fn prompt_line(prompt: &str) -> anyhow::Result<String> {
 ///
 /// Only the trailing newline is stripped: a password may legitimately end in
 /// a space, and `echo` adds exactly one newline.
-fn read_all_stdin() -> anyhow::Result<String> {
+pub(super) fn read_all_stdin() -> anyhow::Result<String> {
     let mut buf = String::new();
     std::io::Read::read_to_string(&mut std::io::stdin().lock(), &mut buf)
         .context("could not read the password from standard input")?;
@@ -122,7 +122,7 @@ fn read_all_stdin() -> anyhow::Result<String> {
 /// `--password-stdin`, and saying so is better than silently doing the
 /// dangerous thing.
 #[cfg(unix)]
-fn prompt_password(registry: &str, prompt: &str) -> anyhow::Result<String> {
+pub(super) fn prompt_password(registry: &str, prompt: &str) -> anyhow::Result<String> {
     use std::os::fd::AsRawFd;
 
     let fd = std::io::stdin().as_raw_fd();
@@ -231,6 +231,6 @@ fn install_echo_handler(fd: std::os::fd::RawFd) {
 }
 
 #[cfg(not(unix))]
-fn prompt_password(_registry: &str, _prompt: &str) -> anyhow::Result<String> {
+pub(super) fn prompt_password(_registry: &str, _prompt: &str) -> anyhow::Result<String> {
     anyhow::bail!("reading a password without echo needs a Unix terminal; use --password-stdin")
 }

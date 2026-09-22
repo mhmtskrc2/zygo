@@ -292,6 +292,13 @@ export declare class Client {
   /** A view of this client that acts for one tenant. */
   forTenant(id: string): Client;
 
+  /** Store one of a tenant's secrets. Operator-only, needs deploy rights. */
+  putSecret(tenant: string, name: string, value: string): Promise<string[]>;
+  /** The **names** a tenant has. A value cannot be read back. */
+  secrets(tenant: string): Promise<string[]>;
+  /** Forget one. Operator-only, needs deploy rights. */
+  deleteSecret(tenant: string, name: string): Promise<string[]>;
+
   /**
    * Mint a token and get its secret, once. Operator-only, needs deploy rights.
    *

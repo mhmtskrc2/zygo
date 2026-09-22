@@ -401,6 +401,36 @@ class Client:
         """
         return self._request("DELETE", f"/requests/{_escape(request_id)}")
 
+    def put_secret(self, tenant: str, name: str, value: str) -> List[str]:
+        """Store one of a tenant's secrets, and get back their names.
+
+        The body is the value itself, and the host encrypts it the moment it
+        lands. Operator-only, and needs deploy rights: the operator holds the
+        relationship with whoever issued the key, and a customer that could
+        set one could set a value the operator's own functions then use.
+        """
+        body = self._request(
+            "PUT",
+            f"/tenants/{_escape(tenant)}/secrets/{_escape(name)}",
+            raw_body=value.encode(),
+        )
+        return list(body.get("secrets", []))
+
+    def secrets(self, tenant: str) -> List[str]:
+        """The **names** a tenant has. There is no way to read a value back.
+
+        A tenant may read its own; anything else is the operator's.
+        """
+        body = self._request("GET", f"/tenants/{_escape(tenant)}/secrets")
+        return list(body.get("secrets", []))
+
+    def delete_secret(self, tenant: str, name: str) -> List[str]:
+        """Forget one. Operator-only, and needs deploy rights."""
+        body = self._request(
+            "DELETE", f"/tenants/{_escape(tenant)}/secrets/{_escape(name)}"
+        )
+        return list(body.get("secrets", []))
+
     def mint_token(self, tenant: Optional[str] = None) -> Minted:
         """Mint an API token, and get its secret — once.
 

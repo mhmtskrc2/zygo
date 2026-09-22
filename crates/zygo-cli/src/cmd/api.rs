@@ -480,6 +480,29 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<ApiBod
             actor.may_deploy()?;
             delete_tenant(api, id).await
         }
+        // A tenant's own secrets: readable as *names* by that tenant, set and
+        // removed by the operator. A tenant cannot write its own, deliberately
+        // — the operator is who holds the relationship with the key's issuer,
+        // and a customer that could set one could set a value the operator's
+        // own functions then use.
+        (&Method::GET, ["tenants", id, "secrets"]) => {
+            let id = id.to_string();
+            if actor.tenant() != Some(id.as_str()) {
+                actor.operator_only("reading another tenant's secrets")?;
+            }
+            secret_names(api, id).await
+        }
+        (&Method::PUT, ["tenants", id, "secrets", name]) => {
+            let (id, name) = (id.to_string(), name.to_string());
+            let body = read_body(req).await?;
+            actor.may_deploy()?;
+            put_secret(api, id, name, &body).await
+        }
+        (&Method::DELETE, ["tenants", id, "secrets", name]) => {
+            let (id, name) = (id.to_string(), name.to_string());
+            actor.may_deploy()?;
+            delete_secret(api, id, name).await
+        }
         (&Method::POST, ["tenants", id, "tokens"]) => {
             let id = id.to_string();
             actor.may_deploy()?;
@@ -1598,6 +1621,60 @@ async fn delete_tenant(api: &Arc<Api>, id: String) -> Result<Response<ApiBody>, 
     }
 }
 
+/// `PUT /tenants/<id>/secrets/<name>`: the body **is** the value.
+///
+/// Not JSON around it, for the reason a script's body is the script: a secret
+/// is a string the caller has, and wrapping it to unwrap it again is a
+/// transformation with no reader — and one more place a value could be logged.
+async fn put_secret(
+    api: &Arc<Api>,
+    tenant: String,
+    name: String,
+    body: &[u8],
+) -> Result<Response<ApiBody>, HttpError> {
+    let value = std::str::from_utf8(body)
+        .map_err(|e| {
+            HttpError::new(
+                StatusCode::BAD_REQUEST,
+                format!("a secret value must be UTF-8 text: {e}"),
+            )
+        })?
+        .to_string();
+    if value.is_empty() {
+        return Err(HttpError::new(
+            StatusCode::BAD_REQUEST,
+            "the body is empty; it should be the secret's value",
+        ));
+    }
+    let reply = control(api, move |c| {
+        Ok(c.send(&Control::PutSecret {
+            tenant,
+            name,
+            value,
+        })?)
+    })
+    .await?;
+    Ok(reply_to_response(reply))
+}
+
+/// `GET /tenants/<id>/secrets`: the **names**, never the values.
+async fn secret_names(api: &Arc<Api>, tenant: String) -> Result<Response<ApiBody>, HttpError> {
+    let reply = control(api, move |c| Ok(c.send(&Control::Secrets { tenant })?)).await?;
+    Ok(reply_to_response(reply))
+}
+
+async fn delete_secret(
+    api: &Arc<Api>,
+    tenant: String,
+    name: String,
+) -> Result<Response<ApiBody>, HttpError> {
+    let reply = control(api, move |c| {
+        Ok(c.send(&Control::DeleteSecret { tenant, name })?)
+    })
+    .await?;
+    Ok(reply_to_response(reply))
+}
+
 /// `POST /tenants/<id>/tokens` and `POST /tokens`: mint one.
 ///
 /// `201`, and the only response in this API that carries a secret. It is not
@@ -2185,6 +2262,11 @@ fn reply_to_json(reply: Reply) -> (StatusCode, serde_json::Value) {
             }),
         ),
         Reply::Stopped { names } => (StatusCode::OK, serde_json::json!({ "stopped": names })),
+        Reply::Secrets { names } => (
+            StatusCode::OK,
+            // Names, and there is nowhere in this shape to put a value.
+            serde_json::json!({ "secrets": names }),
+        ),
         Reply::Cancelled { id, started } => (
             StatusCode::OK,
             serde_json::json!({

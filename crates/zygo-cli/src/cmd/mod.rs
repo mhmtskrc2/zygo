@@ -12,6 +12,7 @@ pub mod mcp;
 pub mod oneshot;
 pub mod otlp;
 pub mod run;
+pub mod secrets;
 pub mod shell;
 pub mod spec;
 pub mod stats;

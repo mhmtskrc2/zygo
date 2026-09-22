@@ -51,7 +51,9 @@ use crate::spec::{Layer, Spec};
 ///   allows.
 /// - v9: `PUT_BLOB`, `GET_BLOB`, `DELETE_BLOB` and a `workspace` on `EXEC` and
 ///   `EXEC_SCRIPT` — files in and out of one request.
-pub const CONTROL_VERSION: u32 = 9;
+/// - v10: `PUT_SECRET`, `SECRETS`, `DELETE_SECRET` and their answer —
+///   per-tenant secrets, encrypted at rest and never read back.
+pub const CONTROL_VERSION: u32 = 10;
 
 /// The files one request brings with it and takes away (v9).
 ///
@@ -393,6 +395,25 @@ pub enum Request {
     /// Revoke one by its public id. `not_found` if no token has that id.
     RevokeToken { id: String },
 
+    /// Store one of a tenant's secrets, encrypted at rest.
+    ///
+    /// The value crosses this socket in the clear, which is what a `0600`
+    /// unix socket between two processes of the same user is for; it is
+    /// encrypted the moment it lands. There is no `GET`: the store can list
+    /// names and cannot produce values, which is the whole point of sealing
+    /// them.
+    PutSecret {
+        tenant: String,
+        name: String,
+        value: String,
+    },
+
+    /// The names a tenant has. Never the values.
+    Secrets { tenant: String },
+
+    /// Forget one. `not_found` if the tenant has no secret by that name.
+    DeleteSecret { tenant: String, name: String },
+
     /// Stop a request that is running.
     ///
     /// `id` is what an `Outcome` carries and what `POST /fn/<name>` returns in
@@ -572,6 +593,15 @@ pub enum Response {
     Chunk {
         stream: crate::protocol::Stream,
         data: String,
+    },
+
+    /// Answer to `PutSecret`, `Secrets` and `DeleteSecret`.
+    ///
+    /// Names only, and there is no shape here that could carry a value. That
+    /// is deliberate: a response type with an optional value field is one
+    /// somebody eventually fills in.
+    Secrets {
+        names: Vec<String>,
     },
 
     /// Answer to `Cancel`: the kill was sent.
@@ -809,6 +839,18 @@ mod tests {
                 id: "r-0001".into(),
                 tenant: Some("acme".into()),
             },
+            Request::PutSecret {
+                tenant: "acme".into(),
+                name: "STRIPE_KEY".into(),
+                value: "sk_live_abc".into(),
+            },
+            Request::Secrets {
+                tenant: "acme".into(),
+            },
+            Request::DeleteSecret {
+                tenant: "acme".into(),
+                name: "STRIPE_KEY".into(),
+            },
             Request::Runtimes,
             Request::StopRuntime {
                 name: "py312".into(),
@@ -874,6 +916,9 @@ mod tests {
             Response::Cancelled {
                 id: "r-0001".into(),
                 started: true,
+            },
+            Response::Secrets {
+                names: vec!["STRIPE_KEY".into()],
             },
             Response::Chunk {
                 stream: crate::protocol::Stream::Stdout,

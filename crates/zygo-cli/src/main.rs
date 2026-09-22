@@ -124,6 +124,7 @@ fn run(cli: &Cli) -> anyhow::Result<u8> {
         Command::Stats { name } => cmd::stats::run(cli, name.as_deref()),
         Command::Api(args) => cmd::api::run(cli, args),
         Command::Token(command) => cmd::token::run(cli, command),
+        Command::Secrets(command) => cmd::secrets::run(cli, command),
         Command::Mcp(args) => cmd::mcp::run(cli, args),
         Command::Up { file, relock } => cmd::supervisor::up(cli, file.path(), *relock),
         Command::Down { file } => cmd::supervisor::down(cli, file.path()),

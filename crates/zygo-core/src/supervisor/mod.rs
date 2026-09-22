@@ -304,6 +304,13 @@ pub struct Supervisor {
     runtimes: Mutex<BTreeMap<String, Arc<runtime::RuntimePool>>>,
     /// Functions tiered down to cold: registered, but with no sandbox.
     cold: Mutex<BTreeMap<String, Cold>>,
+    /// The key per-tenant secrets are sealed with, if this host has one.
+    ///
+    /// Read once at start-up, not per request: a key that could change under a
+    /// running supervisor would mean half the store readable and half not, and
+    /// nothing would say which half. `None` is a host with no secrets, which
+    /// is a working host — see [`Supervisor::secret_store`].
+    secret_key: Option<crate::secrets::SecretKey>,
     /// Rewarm history per name. See [`Backoff`] for why it is not in `Entry`.
     rewarms: Mutex<BTreeMap<String, Backoff>>,
     /// One lock per function name, held for the length of a rewarm.
@@ -352,6 +359,11 @@ impl Supervisor {
             paths,
             functions: Mutex::new(BTreeMap::new()),
             runtimes: Mutex::new(BTreeMap::new()),
+            // A key that was configured and is unusable stops the supervisor
+            // here, rather than at the first request that needed it: an
+            // operator who typo'd the variable must not get a host that
+            // quietly behaves as though they had set nothing.
+            secret_key: crate::secrets::SecretKey::from_env(|k| std::env::var(k).ok())?,
             cold: Mutex::new(BTreeMap::new()),
             rewarms: Mutex::new(BTreeMap::new()),
             warming: Mutex::new(BTreeMap::new()),
@@ -413,8 +425,28 @@ impl Supervisor {
             .resolve_for_serve(name, layer, options)
             .map_err(|e| Response::error(ControlError::BadSpec, e))?;
 
-        // Every secret the spec names has to have a value, and the client is
-        // the only party that could have supplied one — so a missing value is
+        // Whatever the tenant has in the store fills in what the client did
+        // not send. The client wins where both have a value: `zygo serve` at a
+        // terminal is somebody saying what they want *now*, and a stored
+        // secret is the standing arrangement.
+        //
+        // Two sources rather than one because they answer different needs. An
+        // operator serving from a shell has the value in their environment; an
+        // embedder's customer has it in the store and nobody to restart.
+        let mut secrets = secrets;
+        if let Some(store) = self.secret_store() {
+            match store.values(&resolved.tenant) {
+                Ok(stored) => {
+                    for (name, value) in stored {
+                        secrets.entry(name).or_insert(value);
+                    }
+                }
+                Err(e) => return Err(Response::error(ControlError::BadSpec, e)),
+            }
+        }
+
+        // Every secret the spec names has to have a value, and only the client
+        // or the store could have supplied one — so a missing value is
         // reported here as the spec problem it is, before a sandbox exists.
         let missing: Vec<&str> = resolved
             .secrets
@@ -427,8 +459,11 @@ impl Supervisor {
                 ControlError::BadSpec,
                 format!(
                     "fn.{name}.secrets: no value for {}; \
-                     set {} in the environment of the shell running `zygo serve`",
+                     set {} in the environment of the shell running `zygo serve`, \
+                     or store {} for this tenant with \
+                     `PUT /tenants/<id>/secrets/<name>`",
                     missing.join(", "),
+                    if missing.len() == 1 { "it" } else { "them" },
                     if missing.len() == 1 { "it" } else { "them" }
                 ),
             ));
@@ -1128,6 +1163,13 @@ impl Supervisor {
         crate::tokens::Tokens::new(&self.paths)
             .revoke_tenants(id)
             .map_err(|e| Response::error(ControlError::CallFailed, e))?;
+        // And their secrets, for the same reason: a customer that is gone
+        // should leave nothing of theirs on this host.
+        if let Some(store) = self.secret_store() {
+            store
+                .remove_tenant(id)
+                .map_err(|e| Response::error(ControlError::CallFailed, e))?;
+        }
         let removed_scripts = store
             .remove(id)
             .map_err(|e| Response::error(ControlError::CallFailed, e))?
@@ -1263,6 +1305,77 @@ impl Supervisor {
             inbox,
             collect: request.collect,
         }))
+    }
+
+    /// The secret store, when this host has a key for one.
+    ///
+    /// `None` is a working supervisor whose secret routes refuse: a
+    /// deployment with no secrets needs no key, and demanding one would be a
+    /// ceremony for a risk that is not there.
+    pub fn secret_store(&self) -> Option<crate::secrets::SecretStore> {
+        self.secret_key
+            .clone()
+            .map(|key| crate::secrets::SecretStore::new(&self.paths, key))
+    }
+
+    /// The store, or the error a caller gets when there is no key.
+    fn secrets_or_refuse(&self) -> std::result::Result<crate::secrets::SecretStore, Response> {
+        self.secret_store().ok_or_else(|| {
+            Response::error(
+                ControlError::BadSpec,
+                format!(
+                    "this host has no secrets key, so it cannot store one. Set {} \
+                     (or {}) to 32 bytes from `zygo secrets keygen` and restart the \
+                     supervisor",
+                    crate::secrets::KEY_ENV,
+                    crate::secrets::KEY_FILE_ENV,
+                ),
+            )
+        })
+    }
+
+    /// Store one of a tenant's secrets.
+    pub fn put_secret(
+        &self,
+        tenant: &str,
+        name: &str,
+        value: &str,
+    ) -> std::result::Result<Response, Response> {
+        let store = self.secrets_or_refuse()?;
+        // A secret for a tenant that does not exist would be a secret nobody
+        // could ever use, and a typo nobody would notice.
+        crate::tenants::Tenants::new(&self.paths)
+            .create(tenant)
+            .map_err(|e| Response::error(ControlError::BadSpec, e))?;
+        store
+            .put(tenant, name, value)
+            .map_err(|e| Response::error(ControlError::BadSpec, e))?;
+        self.secret_names(tenant)
+    }
+
+    /// The names a tenant has. **Never the values.**
+    pub fn secret_names(&self, tenant: &str) -> std::result::Result<Response, Response> {
+        let store = self.secrets_or_refuse()?;
+        let names = store
+            .names(tenant)
+            .map_err(|e| Response::error(ControlError::BadSpec, e))?;
+        Ok(Response::Secrets { names })
+    }
+
+    pub fn delete_secret(
+        &self,
+        tenant: &str,
+        name: &str,
+    ) -> std::result::Result<Response, Response> {
+        let store = self.secrets_or_refuse()?;
+        match store.remove(tenant, name) {
+            Ok(true) => self.secret_names(tenant),
+            Ok(false) => Err(Response::error(
+                ControlError::NotFound,
+                format!("tenant `{tenant}` has no secret `{name}`"),
+            )),
+            Err(e) => Err(Response::error(ControlError::BadSpec, e)),
+        }
     }
 
     /// Store a blob a caller will name by digest later.
@@ -2128,6 +2241,13 @@ fn dispatch(supervisor: &Supervisor, request: Request, greeted: &mut bool) -> Re
         Request::Tokens => merge(supervisor.list_tokens()),
         Request::RevokeToken { id } => merge(supervisor.revoke_token(&id)),
         Request::Cancel { id, tenant } => merge(supervisor.cancel(&id, tenant.as_deref())),
+        Request::PutSecret {
+            tenant,
+            name,
+            value,
+        } => merge(supervisor.put_secret(&tenant, &name, &value)),
+        Request::Secrets { tenant } => merge(supervisor.secret_names(&tenant)),
+        Request::DeleteSecret { tenant, name } => merge(supervisor.delete_secret(&tenant, &name)),
         Request::PutBlob { tar } => merge(supervisor.put_blob(&tar)),
         Request::GetBlob { digest } => merge(supervisor.get_blob(&digest)),
         Request::DeleteBlob { digest } => merge(supervisor.delete_blob(&digest)),

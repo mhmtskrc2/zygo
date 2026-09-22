@@ -436,6 +436,35 @@ export class Client {
   }
 
   /**
+   * Store one of a tenant's secrets, and get back their names.
+   *
+   * The body is the value itself, and the host encrypts it the moment it
+   * lands. Operator-only, and needs deploy rights.
+   */
+  async putSecret(tenant, name, value) {
+    const body = await this.#request('PUT', `/tenants/${esc(tenant)}/secrets/${esc(name)}`, {
+      rawBody: Buffer.from(String(value)),
+    });
+    return body.secrets ?? [];
+  }
+
+  /**
+   * The **names** a tenant has. There is no way to read a value back.
+   *
+   * A tenant may read its own; anything else is the operator's.
+   */
+  async secrets(tenant) {
+    const body = await this.#request('GET', `/tenants/${esc(tenant)}/secrets`);
+    return body.secrets ?? [];
+  }
+
+  /** Forget one. Operator-only, and needs deploy rights. */
+  async deleteSecret(tenant, name) {
+    const body = await this.#request('DELETE', `/tenants/${esc(tenant)}/secrets/${esc(name)}`);
+    return body.secrets ?? [];
+  }
+
+  /**
    * Mint an API token, and get its secret — once.
    *
    * Without `tenant` this is an **operator** token: tenants, functions, pools,

@@ -1024,6 +1024,58 @@ def tokens(socket_path: str, image: str) -> int:
         # the same bytes.
         operator.delete_script(slow.sha256)
 
+        # --- per-tenant secrets --------------------------------------------------
+        #
+        # Encrypted at rest, never readable back, and delivered to a request as
+        # a file the zygote does not have.
+        print()
+        secret_value = "sk_live_" + "9" * 20
+        names = operator.put_secret("acme", "STRIPE_KEY", secret_value)
+        if names == ["STRIPE_KEY"]:
+            ok("a secret is stored for a tenant")
+        else:
+            bad("PUT /tenants/<id>/secrets/<name>", names)
+
+        if operator.secrets("acme") == ["STRIPE_KEY"]:
+            ok("and the API answers with names")
+        else:
+            bad("GET /tenants/<id>/secrets", operator.secrets("acme"))
+
+        # The one thing the whole design rests on: nothing gives the value
+        # back. There is no route that could, so this checks the store.
+        data = os.environ.get("ZYGO_DATA_HOME", "")
+        leaked = []
+        for root, _dirs, files in os.walk(os.path.join(data, "secrets")):
+            for f in files:
+                with open(os.path.join(root, f), "rb") as handle:
+                    if secret_value.encode() in handle.read():
+                        leaked.append(os.path.join(root, f))
+        if not leaked:
+            ok("and the value is not on disk in the clear")
+        else:
+            bad("a secret is readable on disk", leaked)
+
+        # A tenant may read its own names, and nobody else's.
+        if acme.secrets("acme") == ["STRIPE_KEY"]:
+            ok("a tenant can list its own secret names")
+        else:
+            bad("a tenant cannot read its own names")
+        try:
+            other.secrets("acme")
+            bad("a tenant read another tenant's secret names")
+        except zygo.AuthError:
+            ok("and not another tenant's")
+        try:
+            acme.put_secret("acme", "X", "mine")
+            bad("a tenant set its own secret")
+        except zygo.AuthError:
+            ok("nor may a tenant set one: that is the operator's")
+
+        if operator.delete_secret("acme", "STRIPE_KEY") == []:
+            ok("a secret can be forgotten")
+        else:
+            bad("DELETE /tenants/<id>/secrets/<name>")
+
         # --- revocation --------------------------------------------------------
 
         operator.revoke_token(minted.token.id)

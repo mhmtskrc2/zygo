@@ -58,6 +58,7 @@ pub mod pool;
 pub mod protocol;
 pub mod sandbox;
 pub mod scripts;
+pub mod secrets;
 pub mod spec;
 pub mod supervisor;
 pub mod tenants;

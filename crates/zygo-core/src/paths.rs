@@ -140,6 +140,14 @@ impl Paths {
     pub fn blob_store(&self) -> PathBuf {
         self.data.join("blobs")
     }
+    /// Per-tenant secrets, encrypted, one JSON file each.
+    ///
+    /// Beside the tenants because it is the same kind of state: the embedder's
+    /// own, and losing it on a restart would be an outage rather than an
+    /// inconvenience. Encrypted because losing the *file* must not be.
+    pub fn secrets(&self) -> PathBuf {
+        self.data.join("secrets")
+    }
     /// Tenants, one JSON file each.
     ///
     /// Under `data` rather than `run`, because a tenant outlives the
