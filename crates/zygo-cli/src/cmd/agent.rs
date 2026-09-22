@@ -208,6 +208,11 @@ struct Agent {
     /// Pid the agent announced in `READY`, for the "one process per request"
     /// check.
     announced_pid: u32,
+    /// The handler to send with every request, when the agent holds none.
+    ///
+    /// See `--pool-script`. `None` is the ordinary shape: the agent was warmed
+    /// with a handler and the suite sends events alone.
+    pool: Option<zygo_core::protocol::Script>,
 }
 
 impl Agent {
@@ -278,7 +283,26 @@ impl Agent {
             reader,
             child,
             announced_pid: 0,
+            pool: None,
         })
+    }
+
+    /// An `EXEC` for this agent, carrying the pool handler when there is one.
+    ///
+    /// Every check below asks its question through here rather than building
+    /// the message itself, so the same checks run against both shapes: an
+    /// agent warmed with a handler, and a runtime pool that holds no tenant
+    /// code and is sent one per request.
+    fn exec(&self, id: &str, event: serde_json::Value) -> Message {
+        Message::Exec {
+            script: self.pool.clone(),
+            id: id.to_string(),
+            event,
+            timeout_ms: 30_000,
+            env_overrides: Default::default(),
+            stream: false,
+            workspace: None,
+        }
     }
 
     fn send(&mut self, message: &Message) -> anyhow::Result<()> {
@@ -378,17 +402,25 @@ impl Drop for Agent {
     }
 }
 
-/// An `EXEC` whose event the handler is contracted to echo.
-fn exec(id: &str, event: serde_json::Value) -> Message {
-    Message::Exec {
-        script: None,
-        id: id.to_string(),
-        event,
-        timeout_ms: 30_000,
-        env_overrides: Default::default(),
-        stream: false,
-        workspace: None,
-    }
+/// The handler every request carries, for an agent that holds none.
+///
+/// A runtime pool is started with an interpreter and a dependency set and no
+/// tenant code, so the contract the suite relies on — echo the event, honour
+/// `stdout`/`stderr`, start a program for `spawn` — has to arrive with each
+/// request instead of being loaded once. It is the same file: the conformance
+/// handler, sent as a script.
+///
+/// `source` rather than `path`, because this suite runs the agent as a plain
+/// process on this host and has no sandbox to write into. The digest is over
+/// the bytes as read, so the check the child does is a real one.
+fn pool_handler(file: &Path) -> anyhow::Result<zygo_core::protocol::Script> {
+    let source = std::fs::read_to_string(file)
+        .with_context(|| format!("could not read the pool handler {}", file.display()))?;
+    let digest = zygo_core::scripts::ScriptDigest::of(&source).to_string();
+    Ok(zygo_core::protocol::Script {
+        digest: Some(digest),
+        ..zygo_core::protocol::Script::inline(source)
+    })
 }
 
 /// `zygo agent test <binary> [args…]`.
@@ -397,9 +429,11 @@ pub fn test(
     binary: &Path,
     script: Option<&Path>,
     spawning: Option<&Path>,
+    pool: Option<&Path>,
     args: &[String],
 ) -> anyhow::Result<u8> {
     let mut report = Report::new(cli.json);
+    let pool = pool.map(pool_handler).transpose()?;
     if !cli.json {
         println!(
             "protocol conformance: {} (proto {PROTOCOL_VERSION})",
@@ -412,10 +446,19 @@ pub fn test(
                  and start a program for `spawn`"
             )
         );
+        if pool.is_some() {
+            println!(
+                "  {}",
+                Report::new(false)
+                    .style
+                    .dim("runtime pool: the agent holds no handler, so every request carries one")
+            );
+        }
         println!();
     }
 
     let mut agent = Agent::start(binary, args)?;
+    agent.pool = pool;
 
     // 1. READY, before anything else and before any request.
     let ready = report.check(
@@ -640,7 +683,8 @@ fn ping_check(agent: &mut Agent) -> anyhow::Result<String> {
 /// `EXEC` → `FORKED`. Leaves the request unanswered on purpose: the next check
 /// is the one that must see silence.
 fn forked_check(agent: &mut Agent) -> anyhow::Result<String> {
-    agent.send(&exec("c1", serde_json::json!({ "n": 1 })))?;
+    let request = agent.exec("c1", serde_json::json!({ "n": 1 }));
+    agent.send(&request)?;
     let forked = agent.recv_matching("FORKED", |m| matches!(m, Message::Forked { .. }))?;
     match forked {
         Message::Forked { id, pid } => {
@@ -732,8 +776,10 @@ fn streams_check(agent: &mut Agent) -> anyhow::Result<String> {
 /// the protocol does not require concurrency — but it must answer both, and it
 /// must not cross their ids.
 fn concurrency_check(agent: &mut Agent) -> anyhow::Result<String> {
-    agent.send(&exec("a", serde_json::json!({ "which": "a" })))?;
-    agent.send(&exec("b", serde_json::json!({ "which": "b" })))?;
+    let first = agent.exec("a", serde_json::json!({ "which": "a" }));
+    let second = agent.exec("b", serde_json::json!({ "which": "b" }));
+    agent.send(&first)?;
+    agent.send(&second)?;
 
     // `None` records "answered by refusing", which a serial agent is entitled
     // to do: the protocol requires an answer, not concurrency.
@@ -1042,6 +1088,10 @@ fn child_seccomp_check(
         args,
         &[(zygo_core::protocol::CHILD_SECCOMP_ENV, filter)],
     )?;
+    // A pool agent holds no handler, so this copy needs the same one sent to
+    // it — otherwise the request below is refused for having no code to run
+    // and the refusal reads as the filter doing its job.
+    tightened.pool = warm.pool.clone();
     // A start-up `ERROR` is a conforming answer too: an agent that cannot
     // decode the program refuses to serve rather than serving unfiltered.
     match tightened.recv()? {
@@ -1270,7 +1320,8 @@ fn heartbeat_check(agent: &mut Agent) -> anyhow::Result<Outcome> {
     let id = "c11";
     // Long enough that a two-second heartbeat lands well inside it, and the
     // check never waits for the handler.
-    agent.send(&exec(id, serde_json::json!({ "sleep_ms": 30_000 })))?;
+    let request = agent.exec(id, serde_json::json!({ "sleep_ms": 30_000 }));
+    agent.send(&request)?;
 
     let forked = agent.recv_matching("FORKED", |m| matches!(m, Message::Forked { .. }))?;
     let Message::Forked { pid, .. } = forked else {
@@ -1330,7 +1381,7 @@ fn stream_check(agent: &mut Agent) -> anyhow::Result<Outcome> {
         event: serde_json::json!({ "stdout": early, "sleep_ms": 1_500 }),
         timeout_ms: 30_000,
         env_overrides: Default::default(),
-        script: None,
+        script: agent.pool.clone(),
         stream: true,
         workspace: None,
     })?;
@@ -1417,10 +1468,8 @@ const CANCEL_GRACE: Duration = Duration::from_secs(5);
 /// and the supervisor knows it sent the kill.
 fn cancel_check(agent: &mut Agent) -> anyhow::Result<Outcome> {
     let id = "c9";
-    agent.send(&exec(
-        id,
-        serde_json::json!({ "sleep_ms": CANCEL_SLEEP_MS }),
-    ))?;
+    let request = agent.exec(id, serde_json::json!({ "sleep_ms": CANCEL_SLEEP_MS }));
+    agent.send(&request)?;
 
     let forked = agent.recv_matching("FORKED", |m| matches!(m, Message::Forked { .. }))?;
     let Message::Forked { pid, .. } = forked else {
@@ -1482,7 +1531,8 @@ fn cancel_check(agent: &mut Agent) -> anyhow::Result<Outcome> {
 }
 
 fn one_request(agent: &mut Agent, id: &str, event: serde_json::Value) -> anyhow::Result<Message> {
-    agent.send(&exec(id, event))?;
+    let request = agent.exec(id, event);
+    agent.send(&request)?;
     await_done(agent, id)
 }
 

@@ -433,7 +433,46 @@ function withProgress(event, id, streaming) {
   return event;
 }
 
+/// Make this worker's stdout and stderr blocking, as they are everywhere else.
+///
+/// Node writes to a **pipe** asynchronously: `process.stdout.write` copies
+/// into an in-process queue and the bytes leave on a later turn of the event
+/// loop. A handler that is computing never gives that turn back, so measured
+/// with `poc/agent_stall.py --bytes 1048576` on `node:22` against a handler
+/// that wrote a megabyte and then spun for three seconds:
+///
+/// * 70 KB of it reached the supervisor while the handler spun; the rest sat
+///   in the worker;
+/// * and then **978 KB of it was lost** — `process.exit` discards a queued
+///   write to a pipe, so the `DONE` carried 70,672 bytes and said nothing
+///   about the rest. Not the 256 KiB ring truncating, which says so; silent.
+///
+/// The reference Python agent has neither problem because its writes are
+/// ordinary blocking ones: every byte was forwarded as it was written, and
+/// the `DONE` carried the ring's 256 KiB with its truncation note. Two agents
+/// on one protocol should not differ on whether a handler's output survives,
+/// and the honest one is the one that does not lose it.
+///
+/// So the descriptors are switched to blocking here, which costs the handler
+/// real backpressure when it outruns the agent — a write that waits, rather
+/// than a queue that grows without bound and is then thrown away.
+///
+/// `_handle.setBlocking` is how Node itself does this (it makes stdio
+/// blocking for files and TTYs already, and on Windows for pipes too); it is
+/// guarded because a worker whose stdout is something else entirely is not
+/// worth failing over.
+function writeStdioSynchronously() {
+  for (const stream of [process.stdout, process.stderr]) {
+    const handle = stream && stream._handle;
+    if (handle && typeof handle.setBlocking === 'function') {
+      handle.setBlocking(true);
+    }
+  }
+}
+
 function worker(argv) {
+  writeStdioSynchronously();
+
   const filterArg = argv.indexOf(CHILD_FILTER_ARG);
   if (filterArg >= 0) {
     // Before the handler is loaded, not merely before it is called: the

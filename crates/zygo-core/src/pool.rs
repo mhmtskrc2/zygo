@@ -527,7 +527,7 @@ impl Drop for WorkspaceLease {
 ///
 /// Generous against the agents' own interval, because a missed heartbeat kills
 /// a request that may have been running for hours. The reference agents beat
-/// once every five seconds.
+/// once every two seconds, so this is thirty beats' worth of slack.
 pub const HEARTBEAT_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The most output one streaming request may send, in bytes.

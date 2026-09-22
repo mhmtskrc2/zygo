@@ -99,12 +99,25 @@ conformance: build
 
 # The Node agent, against the protocol suite. The binary has to be the static
 # musl one: the node image's glibc is older than the build image's.
+#
+# Twice, in both shapes the agent supports. The second run starts it with *no
+# handler* — the runtime-pool shape, one warm Node per image and dependency set
+# serving whatever script arrives — and sends the same conformance handler as
+# every request's script. The two paths through the worker are different
+# enough that passing one says little about the other: the pool shape loads
+# tenant code in the child, after the fork, under the child filter.
 conformance-node: poc/zygo-linux-musl
 	docker run --rm -v "$(PWD):/src:ro" node:22-slim \
 		/src/poc/zygo-linux-musl agent test node \
 		--script /src/examples/agents/conformance/script.js \
 		--script-spawn /src/examples/agents/conformance/spawn.js -- \
 		/src/agents/node/zygo_agent.js /src/examples/agents/conformance/handler.js
+	docker run --rm -v "$(PWD):/src:ro" node:22-slim \
+		/src/poc/zygo-linux-musl agent test node \
+		--pool-script /src/examples/agents/conformance/handler.js \
+		--script /src/examples/agents/conformance/script.js \
+		--script-spawn /src/examples/agents/conformance/spawn.js -- \
+		/src/agents/node/zygo_agent.js
 
 # The same Node agent with the *kernel* filter rather than Node's permission
 # model: `node:22` has a compiler, so the helper object can be built and the

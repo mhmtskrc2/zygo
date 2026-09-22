@@ -81,6 +81,32 @@ This found a real bug in the reference agent the first time it was run: a frame
 that was not valid JSON raised out of the read loop and killed the agent,
 taking every request in flight with it. It is an `ERROR` now.
 
+### As a runtime pool
+
+An agent may also be started with **no handler at all** — one warm interpreter
+per image and dependency set, holding nothing of anybody's, with the code
+arriving in each `EXEC`. That is a different path through the agent: the child
+loads tenant code after the fork and under the child filter, rather than
+inheriting it from a zygote that imported it once. Passing the suite in one
+shape says little about the other, so check both:
+
+```bash
+zygo agent test python3 \
+    --pool-script examples/agents/conformance/handler.py \
+    --script examples/agents/conformance/script.py -- \
+    agents/python/zygo_agent.py --fd 3          # note: no handler
+
+zygo agent test node \
+    --pool-script examples/agents/conformance/handler.js \
+    --script examples/agents/conformance/script.js -- \
+    agents/node/zygo_agent.js
+```
+
+`--pool-script` is the same echo handler, sent as every request's script, so
+the checks above are asked unchanged. It carries a digest, which the child is
+required to verify before it loads anything — `--script` is what checks that a
+digest which does *not* match is refused.
+
 ## What is here
 
 | | |

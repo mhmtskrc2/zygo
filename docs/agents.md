@@ -103,6 +103,47 @@ tenants', so an agent must not look around it.
 - [`examples/warm-exec/go/`](../examples/warm-exec/go) — a Go program as a warm
   function, where the whole integration is a `cmd`.
 
+## A handler that computes without yielding
+
+A request that spends three seconds in a tight loop is the case where an
+agent's own housekeeping either survives or does not, and what survives is
+worth measuring rather than assuming.
+[`poc/agent_stall.py`](../poc/agent_stall.py) is that measurement: it drives an
+agent over a socket pair, sends one streaming request whose script writes,
+reports progress, then spins without yielding, and prints when each frame came
+back.
+
+Against both reference agents, with the handler spinning for three seconds:
+
+| | Python | Node |
+|---|---|---|
+| `PONG` to a `PING` sent a second into the spin | 0.5 ms | 0.3 ms |
+| the request's heartbeat (proto 1.4) | on time | on time |
+| output written before the spin | forwarded at once | forwarded at once |
+
+Neither agent goes quiet, and the reason is structural: the request runs in a
+*process* of its own — a fork in Python, a pooled worker in Node — so the loop
+that answers `PING` and `CANCEL` holds no tenant code and has nothing to be
+blocked by.
+
+What the measurement did find was output: a Node handler that wrote a megabyte
+and then spun had 70 KB of it forwarded and **978 KB silently lost**, because
+Node queues a write to a pipe in memory and `process.exit` discards what is
+still queued. The worker now makes stdout and stderr blocking, as Python's
+are; every byte is forwarded as it is written, and the `DONE` carries the
+ring's 256 KiB with its truncation note. If you write an agent in a runtime
+with asynchronous stdio, this is the part to get right.
+
+A **thread pool inside the worker** — running tenant code off the worker's own
+loop — buys nothing further and is not there. Measured on `node:22`, one
+`worker_threads` isolate costs 13 MB resident and 15–23 ms to start, against
+the 43 MB and ~2 ms the whole Node agent costs now; a tenant whose handler
+really must report progress while it computes can start one itself, since the
+`strict` filter refuses `clone` only without `CLONE_THREAD` and the permission
+fallback passes `--allow-worker` for exactly that reason. What would reopen it
+is a measurement showing an agent going quiet with a thread pool absent — the
+one above shows the opposite.
+
 ## Four rules an agent has to keep
 
 Each one is in the protocol document with the reason. They are here because

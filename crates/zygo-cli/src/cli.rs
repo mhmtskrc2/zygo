@@ -428,6 +428,21 @@ pub enum AgentCommand {
         #[arg(long, value_name = "FILE")]
         script_spawn: Option<PathBuf>,
 
+        /// The agent under test holds **no handler**: send this file as the
+        /// script of every request.
+        ///
+        /// The runtime-pool shape. A pool agent is warmed with an interpreter
+        /// and a dependency set and nothing of anybody's, so there is no
+        /// handler to echo the event — every check here has to carry one.
+        /// Pass the same conformance handler the agent would otherwise have
+        /// been started with, and leave the handler off the agent's own
+        /// arguments.
+        ///
+        /// Without it the suite assumes the ordinary shape, which is what
+        /// every check below asks of an agent warmed with a handler.
+        #[arg(long, value_name = "FILE")]
+        pool_script: Option<PathBuf>,
+
         /// Arguments for the agent, after `--`.
         #[arg(last = true)]
         args: Vec<String>,

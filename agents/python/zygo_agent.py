@@ -779,6 +779,7 @@ class Agent:
         """
         wire_fd = self._wire.fileno()
         accepting = True
+        beat_at = time.monotonic() + HEARTBEAT_SECONDS
 
         while accepting or self._inflight:
             watch = list(self._by_result_fd)
@@ -792,14 +793,30 @@ class Agent:
                 # wakes often enough to send heartbeats for the requests it is
                 # carrying (proto 1.4). With nothing in flight the timeout
                 # costs one wake-up every few seconds and nothing else.
-                ready, _, _ = select.select(watch, [], [], HEARTBEAT_SECONDS)
+                #
+                # The bound is the time left until the *next beat is due*, not
+                # a fresh two seconds. Waiting a fixed period and beating only
+                # when the wait expired is what this did, and it meant the
+                # heartbeat was starved by traffic: measured with
+                # `poc/agent_stall.py`, one `PING` from the supervisor a
+                # second into a three-second request pushed the beat past the
+                # end of the request, and an agent busy enough to be woken
+                # every couple of seconds would never beat at all. That is
+                # exactly the agent whose requests most need saying alive —
+                # and after `HEARTBEAT_GRACE` the supervisor kills a long one
+                # as stuck.
+                ready, _, _ = select.select(
+                    watch, [], [], max(0.0, beat_at - time.monotonic())
+                )
             except InterruptedError:
                 continue
             except OSError:
                 return
 
-            if not ready:
+            if time.monotonic() >= beat_at:
                 self._heartbeat()
+                beat_at = time.monotonic() + HEARTBEAT_SECONDS
+            if not ready:
                 continue
 
             for fd in ready:

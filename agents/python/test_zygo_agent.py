@@ -635,6 +635,15 @@ class FixtureTests(unittest.TestCase):
                     # wire; `RuntimePoolTests` covers the shape working.
                     self.assertEqual(done["exit_code"], 1, case["name"])
                     self.assertIn("cannot read", done["error"], case["name"])
+                elif message.get("workspace"):
+                    # Same: `/work/<random>` is a directory the supervisor
+                    # makes inside a sandbox, and there is none here. The
+                    # agent must say which directory it could not enter
+                    # rather than running the request somewhere else —
+                    # a handler that wrote its output into the last
+                    # request's directory would be worse than a failure.
+                    self.assertEqual(done["exit_code"], 1, case["name"])
+                    self.assertIn(message["workspace"], done["error"], case["name"])
                 else:
                     # Both the echo handler and the inline fixture script
                     # return the event unchanged, so one assertion covers a

@@ -421,6 +421,13 @@ is nothing the suite can assert about the answers:
 language, and [`examples/agents/sh/`](../examples/agents/sh) is a complete
 agent in POSIX sh, to check the suite against something that is not Python.
 
+An agent started with **no handler** — the runtime-pool shape, where the code
+arrives in each `EXEC`'s `script` (§2) — is checked the same way with
+`--pool-script <file>`, which sends that same handler as every request's
+script. Both shapes are worth running against an agent that supports both:
+the pool shape loads tenant code in the child, after the fork and under the
+child filter, and nothing about the warmed-handler path exercises that.
+
 1. **One process per request.** Every request runs in its own process, or at
    minimum a pid that can be moved into its own cgroup.
 2. **Announce, then wait.** The child pid is reported with `FORKED`, and the
