@@ -220,9 +220,15 @@ than an argument.
 
 | Raspberry Pi 5, 1 000 scripts | p50 | p99 |
 |---|---|---|
-| Pool, by digest, over the API | 6.28 ms | 26.10 ms |
-| **Control**: a warm function, same API, same host, same 1 000 calls | 4.29 ms | 21.29 ms |
-| The pool's own cost | +1.99 ms | +4.81 ms |
+| Pool, by digest, over the API | 6.36 ms | 25.24 ms |
+| **Control**: a warm function, same API, same host, same 1 000 calls | 4.28 ms | 20.99 ms |
+| The pool's own cost | +2.08 ms | +4.25 ms |
+
+Measured with the data directory on `tmpfs`, and repeated with it on the Pi's
+SD card: 6.28 / 26.10 against a 4.29 / 21.29 control. The two runs agree to
+within a millisecond, which is what rules the storage out — that card has
+stalled this machine on I/O before, and a tail measured on it is worth nothing
+until something says it was not the disk.
 
 The roadmap's exit criterion is p99 under 5 ms, and neither column is inside
 it — including the one with no pool in it at all. That is the finding: what
