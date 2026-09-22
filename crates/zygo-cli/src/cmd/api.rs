@@ -485,6 +485,14 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<ApiBod
         // — the operator is who holds the relationship with the key's issuer,
         // and a customer that could set one could set a value the operator's
         // own functions then use.
+        // A tenant's limits. The operator's, because they can only narrow and
+        // narrowing somebody is not something that somebody asks for.
+        (&Method::PATCH, ["tenants", id, "limits"]) => {
+            let id = id.to_string();
+            let body = read_body(req).await?;
+            actor.may_deploy()?;
+            set_limits(api, id, &body).await
+        }
         (&Method::GET, ["tenants", id, "secrets"]) => {
             let id = id.to_string();
             if actor.tenant() != Some(id.as_str()) {
@@ -1621,6 +1629,41 @@ async fn delete_tenant(api: &Arc<Api>, id: String) -> Result<Response<ApiBody>, 
     }
 }
 
+/// `PATCH /tenants/<id>/limits`: what this tenant may not exceed.
+///
+/// `PATCH` rather than `PUT` because it is a partial description: the keys
+/// that are present are set and the rest are left alone, which is what an
+/// operator tightening one number wants.
+async fn set_limits(
+    api: &Arc<Api>,
+    tenant: String,
+    body: &[u8],
+) -> Result<Response<ApiBody>, HttpError> {
+    let limits: zygo_core::tenants::TenantLimits = serde_json::from_slice(body).map_err(|e| {
+        HttpError::new(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "body must be a limits table — mem, cpu, pids, timeout, scratch, \
+                 network, allow: {e}"
+            ),
+        )
+    })?;
+    let reply = control(api, move |c| {
+        Ok(c.send(&Control::SetLimits {
+            tenant,
+            limits: Box::new(limits),
+        })?)
+    })
+    .await?;
+    match reply {
+        Reply::Tenants { tenants, .. } => Ok(json(
+            StatusCode::OK,
+            &serde_json::json!({ "tenant": tenants.first() }),
+        )),
+        other => Ok(reply_to_response(other)),
+    }
+}
+
 /// `PUT /tenants/<id>/secrets/<name>`: the body **is** the value.
 ///
 /// Not JSON around it, for the reason a script's body is the script: a secret
@@ -2320,6 +2363,8 @@ fn reply_to_json(reply: Reply) -> (StatusCode, serde_json::Value) {
                 ControlError::BadSpec => StatusCode::BAD_REQUEST,
                 ControlError::WarmFailed => StatusCode::SERVICE_UNAVAILABLE,
                 ControlError::Unauthorised => StatusCode::FORBIDDEN,
+                // Well formed, and the answer is "not that much".
+                ControlError::AboveCeiling => StatusCode::UNPROCESSABLE_ENTITY,
                 ControlError::VersionMismatch
                 | ControlError::CallFailed
                 | ControlError::BadMessage => StatusCode::INTERNAL_SERVER_ERROR,

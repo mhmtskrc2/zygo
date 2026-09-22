@@ -401,6 +401,28 @@ class Client:
         """
         return self._request("DELETE", f"/requests/{_escape(request_id)}")
 
+    def set_limits(self, tenant: str, **limits: Any) -> Tenant:
+        """What a tenant may not exceed: ``mem``, ``cpu``, ``pids``,
+        ``timeout``, ``scratch``, ``network``, ``allow``.
+
+        They only ever **narrow**. A tenant's limits are applied as the minimum
+        of themselves and whatever the function or pool was declared with, so
+        the worst a wrong value can do is give a customer less than they were
+        promised — never more.
+
+        A value above every ceiling the tenant currently has is refused with
+        `422`, naming the key: it could not take effect, and storing it would
+        leave you believing you had tightened something you had not.
+
+        Partial: the keys you pass are set and the rest are left alone.
+
+        Operator-only, and needs deploy rights.
+        """
+        body = self._request(
+            "PATCH", f"/tenants/{_escape(tenant)}/limits", body=dict(limits)
+        )
+        return Tenant.parse(body.get("tenant") or {})
+
     def put_secret(self, tenant: str, name: str, value: str) -> List[str]:
         """Store one of a tenant's secrets, and get back their names.
 

@@ -53,7 +53,9 @@ use crate::spec::{Layer, Spec};
 ///   `EXEC_SCRIPT` — files in and out of one request.
 /// - v10: `PUT_SECRET`, `SECRETS`, `DELETE_SECRET` and their answer —
 ///   per-tenant secrets, encrypted at rest and never read back.
-pub const CONTROL_VERSION: u32 = 10;
+/// - v11: `SET_LIMITS` — a tenant's own limits, which can only narrow what
+///   the function or pool was declared with.
+pub const CONTROL_VERSION: u32 = 11;
 
 /// The files one request brings with it and takes away (v9).
 ///
@@ -395,6 +397,18 @@ pub enum Request {
     /// Revoke one by its public id. `not_found` if no token has that id.
     RevokeToken { id: String },
 
+    /// Replace a tenant's limits.
+    ///
+    /// They can only **narrow**: applied as the minimum of themselves and the
+    /// function's or pool's own, on the request's cgroup. A value that could
+    /// never take effect — above every ceiling this tenant currently has — is
+    /// refused rather than stored, so an operator is told instead of left
+    /// believing it did something.
+    SetLimits {
+        tenant: String,
+        limits: Box<crate::tenants::TenantLimits>,
+    },
+
     /// Store one of a tenant's secrets, encrypted at rest.
     ///
     /// The value crosses this socket in the clear, which is what a `0600`
@@ -684,6 +698,12 @@ pub enum ControlError {
     BadMessage,
     /// The connection is not from the user who owns the supervisor.
     Unauthorised,
+    /// A value was asked for that is above a ceiling somebody else set.
+    ///
+    /// Its own code rather than `BadSpec`, because the request was *well
+    /// formed* and the answer is "not that much", which an API maps to `422`
+    /// rather than `400`.
+    AboveCeiling,
 }
 
 impl ControlError {
@@ -696,6 +716,7 @@ impl ControlError {
             ControlError::CallFailed => "call_failed",
             ControlError::BadMessage => "bad_message",
             ControlError::Unauthorised => "unauthorised",
+            ControlError::AboveCeiling => "above_ceiling",
         }
     }
 }
@@ -844,6 +865,13 @@ mod tests {
                 name: "STRIPE_KEY".into(),
                 value: "sk_live_abc".into(),
             },
+            Request::SetLimits {
+                tenant: "acme".into(),
+                limits: Box::new(crate::tenants::TenantLimits {
+                    mem: Some(crate::spec::Bytes::from_mib(64)),
+                    ..Default::default()
+                }),
+            },
             Request::Secrets {
                 tenant: "acme".into(),
             },
@@ -908,6 +936,10 @@ mod tests {
                     id: "acme".into(),
                     created_ms: 1_700_000_000_000,
                     scripts: ["sha256:abc".to_string()].into_iter().collect(),
+                    limits: crate::tenants::TenantLimits {
+                        pids: Some(64),
+                        ..Default::default()
+                    },
                 }],
                 existed: true,
                 removed_scripts: vec!["sha256:abc".into()],

@@ -287,6 +287,7 @@ impl Supervisor {
         workspace: Option<crate::supervisor::protocol::WorkspaceRequest>,
     ) -> std::result::Result<Response, Response> {
         let workspace = self.resolve_workspace(workspace)?;
+        let tenant_limits = self.limits_for(tenant)?;
         let script = self.script_for_request(script, tenant)?;
         let pool = self.runtime_named(name)?;
 
@@ -326,7 +327,19 @@ impl Supervisor {
         // owner is the only answer to "who may cancel this?".
         let outcome = zygote
             .function
-            .call_full(event, Some(script), timeout, tenant, key, sink, workspace)
+            .call_full(
+                event,
+                Some(script),
+                timeout,
+                tenant,
+                key,
+                sink,
+                workspace,
+                // Whose limits apply: the request's tenant, not the pool's.
+                // A pool is shared, so the pool's own tenant cannot answer
+                // this — the same argument cancellation made.
+                tenant_limits,
+            )
             .map(|(outcome, _)| outcome)
             .map_err(|e| Response::error(ControlError::CallFailed, e));
         drop(permit);

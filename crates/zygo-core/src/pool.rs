@@ -1024,6 +1024,7 @@ impl Pool {
                     generation_cgroup: generation,
                     per_request_cgroup: self.config.per_request_cgroup,
                     timeout: f.limits.timeout.get(),
+                    limits: f.limits.clone(),
                     agent_host_pid: sandbox.pid(),
                     secrets: Mutex::new(Secrets::default()),
                     scripts: Mutex::new(Scripts::default()),
@@ -1343,6 +1344,13 @@ pub struct WarmFn {
     /// Requirement N4 makes the spec's limits mandatory, so a client asking for
     /// longer cannot get it.
     timeout: std::time::Duration,
+    /// Everything this function was declared with, kept whole.
+    ///
+    /// The ceiling a tenant's own limits are narrowed against. A pool's
+    /// requests come from different tenants and the sandbox is shared, so the
+    /// narrowing cannot happen at warm time — it happens per request, on the
+    /// request's own cgroup.
+    limits: crate::sandbox::limits::Limits,
     /// The agent's pid as the *host* sees it.
     ///
     /// The agent lives in its own pid namespace, so the pid it reports in
@@ -1626,7 +1634,7 @@ impl WarmFn {
         caller: Option<&str>,
         key: Option<&str>,
     ) -> Result<(Outcome, CallTiming)> {
-        self.call_streaming(event, script, timeout, caller, key, None, None)
+        self.call_streaming(event, script, timeout, caller, key, None, None, None)
     }
 
     /// The same, with output delivered as it is produced (proto 1.3).
@@ -1646,6 +1654,7 @@ impl WarmFn {
         key: Option<&str>,
         sink: Option<ChunkSink<'_>>,
         workspace: Option<Workspace>,
+        tenant_limits: Option<crate::tenants::TenantLimits>,
     ) -> Result<(Outcome, CallTiming)> {
         if let Some(s) = &script
             && !s.is_loadable()
@@ -1771,11 +1780,19 @@ impl WarmFn {
                 });
             }
         };
+        // A tenant's limits, when they narrow this function's. Resolved here
+        // rather than at warm time because a pool's requests come from
+        // different tenants and the sandbox is shared.
+        let narrowed = tenant_limits
+            .as_ref()
+            .filter(|l| l.narrows(&self.limits))
+            .map(|l| l.narrow(&self.limits));
         let request_cgroup = admit(
             self.generation_cgroup.as_deref(),
             self.per_request_cgroup,
             &id,
             host_pid,
+            narrowed.as_ref(),
         );
         request.running_at(request_cgroup.as_deref(), host_pid);
         let _secrets = match self.place_secrets() {
@@ -1808,7 +1825,13 @@ impl WarmFn {
         //
         // The function's own limit wins over the caller's: asking for longer
         // than the spec allows is asking past a mandatory limit (N4).
-        let budget = timeout.min(self.timeout);
+        // A tenant's own timeout narrows this too: a cgroup cannot enforce a
+        // wall clock, so the supervisor's deadline is where that key lands.
+        let ceiling = narrowed
+            .as_ref()
+            .map(|l| l.timeout.get())
+            .unwrap_or(self.timeout);
+        let budget = timeout.min(ceiling);
         let deadline = budget.saturating_sub(admitted - started);
 
         // Chunks arrive on the same channel as the `DONE`, because the reply
@@ -2432,6 +2455,7 @@ fn admit(
     per_request: bool,
     id: &str,
     host_pid: u32,
+    narrower: Option<&crate::sandbox::limits::Limits>,
 ) -> Option<PathBuf> {
     if !per_request {
         return None;
@@ -2439,6 +2463,18 @@ fn admit(
     let dir = crate::cgroup::Hierarchy::request(generation?, id);
     if std::fs::create_dir(&dir).is_err() {
         return None;
+    }
+    // A tenant's own limits, written on *this request's* cgroup before the
+    // child is let go. Cgroups nest, so a narrower number here binds whatever
+    // the function above was declared with — and a wider one would not,
+    // which is why `TenantLimits::narrow` can only produce a smaller value.
+    //
+    // Best effort, like the attach below: a limit that could not be written
+    // leaves the request under the function's own, which is the promise the
+    // operator already made. Failing the request instead would turn a tenant's
+    // *tightening* into an outage.
+    if let Some(limits) = narrower {
+        let _ = crate::cgroup::apply(&dir, &limits.cgroup_writes());
     }
     let _ = crate::cgroup::attach(&dir, host_pid);
     Some(dir)
@@ -2977,6 +3013,9 @@ impl WarmExec {
             self.per_request_cgroup,
             &id,
             entered.pid,
+            // A warm-exec function is one tenant's and its limits were set at
+            // warm time; there is nothing per-request to narrow.
+            None,
         );
         // Through the descriptor the sandbox handed out at launch, never
         // through `/proc`: a held sandbox is not dumpable, and nothing an
@@ -3455,13 +3494,8 @@ impl Function {
         key: Option<&str>,
         sink: Option<ChunkSink<'_>>,
     ) -> Result<Outcome> {
-        match self {
-            Function::Agent(f) => f
-                .call_streaming(event, None, timeout, None, key, sink, None)
-                .map(|(o, _)| o),
-            #[cfg(target_os = "linux")]
-            Function::Exec(_) => self.call_with_timeout(event, timeout),
-        }
+        self.call_full(event, None, timeout, None, key, sink, None, None)
+            .map(|(o, _)| o)
     }
 
     pub fn call_timed(
@@ -3554,7 +3588,7 @@ impl Function {
         key: Option<&str>,
         sink: Option<ChunkSink<'_>>,
     ) -> Result<(Outcome, CallTiming)> {
-        self.call_full(event, script, timeout, caller, key, sink, None)
+        self.call_full(event, script, timeout, caller, key, sink, None, None)
     }
 
     /// The whole of what one request can carry. Everything above narrows it.
@@ -3568,11 +3602,19 @@ impl Function {
         key: Option<&str>,
         sink: Option<ChunkSink<'_>>,
         workspace: Option<Workspace>,
+        tenant_limits: Option<crate::tenants::TenantLimits>,
     ) -> Result<(Outcome, CallTiming)> {
         match self {
-            Function::Agent(f) => {
-                f.call_streaming(event, script, timeout, caller, key, sink, workspace)
-            }
+            Function::Agent(f) => f.call_streaming(
+                event,
+                script,
+                timeout,
+                caller,
+                key,
+                sink,
+                workspace,
+                tenant_limits,
+            ),
             #[cfg(target_os = "linux")]
             Function::Exec(f) => match script {
                 None => f.call_timed(event, timeout),

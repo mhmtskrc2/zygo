@@ -192,6 +192,11 @@ class Tenant:
     id: str
     created_ms: int = 0
     scripts: List[str] = field(default_factory=list)
+    #: What this tenant may not exceed. Empty when nothing was set.
+    #:
+    #: These only ever narrow: they are applied as the minimum of themselves
+    #: and whatever the function or pool was declared with.
+    limits: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def parse(cls, raw: Dict[str, Any]) -> "Tenant":
@@ -199,6 +204,7 @@ class Tenant:
             id=str(raw.get("id", "")),
             created_ms=int(raw.get("created_ms", 0)),
             scripts=list(raw.get("scripts", [])),
+            limits=dict(raw.get("limits") or {}),
         )
 
 

@@ -414,6 +414,7 @@ fn name_of(request: &Request) -> &'static str {
         Request::Tenants { .. } => "listing the tenants",
         Request::DeleteTenant { .. } => "deleting a tenant",
         Request::GetScript { .. } => "looking a script up",
+        Request::SetLimits { .. } => "setting a tenant's limits",
         Request::PutSecret { .. } => "storing a secret",
         Request::Secrets { .. } => "listing the secrets",
         Request::DeleteSecret { .. } => "removing a secret",

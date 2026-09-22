@@ -436,6 +436,28 @@ export class Client {
   }
 
   /**
+   * What a tenant may not exceed: `mem`, `cpu`, `pids`, `timeout`, `scratch`,
+   * `network`, `allow`.
+   *
+   * They only ever **narrow**: applied as the minimum of themselves and
+   * whatever the function or pool was declared with, so the worst a wrong
+   * value can do is give a customer less than they were promised.
+   *
+   * A value above every ceiling the tenant currently has is refused with 422,
+   * naming the key — it could not take effect, and storing it would leave you
+   * believing you had tightened something you had not.
+   *
+   * Partial: the keys you pass are set and the rest are left alone.
+   * Operator-only, and needs deploy rights.
+   */
+  async setLimits(tenant, limits) {
+    const body = await this.#request('PATCH', `/tenants/${esc(tenant)}/limits`, {
+      body: limits,
+    });
+    return body.tenant ?? {};
+  }
+
+  /**
    * Store one of a tenant's secrets, and get back their names.
    *
    * The body is the value itself, and the host encrypts it the moment it

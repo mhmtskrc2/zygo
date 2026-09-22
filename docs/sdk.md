@@ -84,6 +84,7 @@ as.
 | Version | `client.version()` | `client.version()` | either | no |
 | Register a script | `client.put_script(source)` | `client.putScript(source)` | either | no |
 | Stop a running request | `client.cancel(id)` | `client.cancel(id)` | own, or operator | no |
+| Limit a tenant | `client.set_limits(id, **keys)` | `client.setLimits(id, keys)` | operator | **yes** |
 | A tenant's secret names | `client.secrets(id)` | `client.secrets(id)` | own, or operator | no |
 | Set one | `client.put_secret(id, name, v)` | `client.putSecret(id, name, v)` | operator | **yes** |
 | Forget one | `client.delete_secret(id, name)` | `client.deleteSecret(id, name)` | operator | **yes** |
@@ -211,6 +212,34 @@ existing deployment already sets, with the same rights it already had, which
 is what keeps one working across this change. On the host, `zygo token mint`,
 `zygo token ls` and `zygo token revoke <id>` do the same three things without
 an HTTP round trip.
+
+## Limiting a tenant
+
+A pool is declared once by the operator and called by every customer. One
+customer should not be able to take the whole of it:
+
+```python
+client.set_limits("acme", mem="256M", cpu=0.5, pids=64, timeout="30s")
+```
+
+These only ever **narrow**. They are applied as the minimum of themselves and
+whatever the function or pool was declared with, written on the request's own
+cgroup before the handler is let go — so the worst a wrong value can do is give
+a customer less than they were promised, never more. There is no value and no
+key that can widen anything, which is what makes the route safe for an operator
+to expose without re-reading the code.
+
+`PATCH`, so the keys you pass are set and the rest are left alone.
+
+A value above **every** ceiling the tenant can reach — their own functions, and
+every pool on the host — is refused with `422` naming the key. It could not
+take effect, and storing it would leave you believing you had tightened
+something you had not. Above *one* ceiling and below another is fine: it
+narrows the larger and does nothing to the smaller, which is what narrowing
+means.
+
+`timeout` lands on the supervisor's deadline rather than the cgroup, because a
+cgroup cannot enforce a wall clock. The rest are cgroup files.
 
 ## Secrets
 

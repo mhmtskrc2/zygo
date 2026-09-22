@@ -29,8 +29,89 @@ use crate::error::{IoContext, Result};
 use crate::paths::Paths;
 use crate::spec::SpecError;
 
+/// What one tenant may not exceed.
+///
+/// Every field is an **override that can only narrow**. A tenant's limits are
+/// applied as the minimum of themselves and whatever the function or pool was
+/// declared with, on the request's own cgroup — so a tenant can be held below
+/// what the operator declared and can never be raised above it, whatever is
+/// written here.
+///
+/// That is the whole rule, and it is what makes the store safe to expose: the
+/// worst a wrong value can do is give a tenant less than they were promised.
+/// A value above the ceiling is refused when it can never take effect, so an
+/// operator setting one is told rather than left believing it did something.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TenantLimits {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem: Option<crate::spec::Bytes>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<crate::spec::Cpu>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pids: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<crate::spec::Duration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scratch: Option<crate::spec::Bytes>,
+    /// Narrower only: `none` < `egress` < `full` < `host`. A tenant cannot be
+    /// given a wider network than the function was declared with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<crate::spec::Network>,
+    /// Destinations this tenant may reach, **intersected** with the
+    /// function's. An empty list is "nothing beyond what the function allows",
+    /// not "everything" — `None` is the way to say nothing was set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow: Option<Vec<String>>,
+}
+
+impl TenantLimits {
+    pub fn is_empty(&self) -> bool {
+        *self == TenantLimits::default()
+    }
+
+    /// Narrow `limits` by whatever this tenant sets, and never widen them.
+    ///
+    /// The one function the whole feature rests on, so it is `min` at every
+    /// key and there is no branch that can produce a larger number.
+    pub fn narrow(
+        &self,
+        limits: &crate::sandbox::limits::Limits,
+    ) -> crate::sandbox::limits::Limits {
+        let mut out = limits.clone();
+        if let Some(mem) = self.mem {
+            out.mem = crate::spec::Bytes(out.mem.get().min(mem.get()));
+            // `memory.high` must stay under `memory.max`, or the kernel
+            // rejects the pair on some versions.
+            out.mem_high = crate::spec::Bytes(out.mem_high.get().min(out.mem.get()));
+        }
+        if let Some(cpu) = self.cpu {
+            out.cpu = crate::spec::Cpu(out.cpu.0.min(cpu.0));
+        }
+        if let Some(pids) = self.pids {
+            out.pids = out.pids.min(pids);
+        }
+        if let Some(timeout) = self.timeout {
+            out.timeout = crate::spec::Duration(out.timeout.get().min(timeout.get()));
+        }
+        if let Some(scratch) = self.scratch {
+            out.scratch = crate::spec::Bytes(out.scratch.get().min(scratch.get()));
+        }
+        out
+    }
+
+    /// Whether this narrows `limits` at all — if not, nothing needs writing.
+    pub fn narrows(&self, limits: &crate::sandbox::limits::Limits) -> bool {
+        let narrowed = self.narrow(limits);
+        narrowed.mem != limits.mem
+            || narrowed.cpu != limits.cpu
+            || narrowed.pids != limits.pids
+            || narrowed.timeout != limits.timeout
+            || narrowed.scratch != limits.scratch
+    }
+}
+
 /// One customer of whoever embedded Zygo.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Tenant {
     pub id: String,
     /// When this tenant was registered, as milliseconds since the epoch.
@@ -46,6 +127,9 @@ pub struct Tenant {
     /// referenced.
     #[serde(default)]
     pub scripts: BTreeSet<String>,
+    /// What this tenant may not exceed. See [`TenantLimits`].
+    #[serde(default, skip_serializing_if = "TenantLimits::is_empty")]
+    pub limits: TenantLimits,
 }
 
 impl Tenant {
@@ -54,6 +138,7 @@ impl Tenant {
             id,
             created_ms: now_ms(),
             scripts: BTreeSet::new(),
+            limits: TenantLimits::default(),
         }
     }
 }
@@ -175,6 +260,17 @@ impl Tenants {
         Ok(())
     }
 
+    /// Replace a tenant's limits, creating the tenant if it is new.
+    pub fn set_limits(&self, id: &str, limits: TenantLimits) -> Result<Tenant> {
+        let mut tenant = match self.get(id)? {
+            Some(t) => t,
+            None => self.create(id)?.0,
+        };
+        tenant.limits = limits;
+        self.write(&tenant)?;
+        Ok(tenant)
+    }
+
     /// Forget one, and say which of its scripts nothing else refers to.
     ///
     /// The caller removes those from the store; this only decides which they
@@ -288,6 +384,100 @@ mod tests {
             tenants.get("b").expect("get").expect("b").scripts.len() == 1,
             "b kept the script it registered"
         );
+    }
+
+    /// The rule the whole feature rests on, at every key.
+    ///
+    /// A tenant's limits are applied as the minimum of themselves and the
+    /// function's. There is no key and no value that can produce a larger
+    /// number than the function was declared with — which is what makes the
+    /// route safe for an operator to expose without re-reading the code.
+    #[test]
+    fn a_tenant_limit_narrows_and_can_never_widen() {
+        use crate::spec::{Bytes, Cpu, Duration};
+
+        let ceiling = crate::sandbox::limits::Limits {
+            mem: Bytes::from_mib(512),
+            mem_high: Bytes::from_mib(512),
+            swap: Bytes(0),
+            oom_group: true,
+            connections: 256,
+            bandwidth: None,
+            cpu: Cpu(2.0),
+            pids: 256,
+            timeout: Duration::from_secs(60),
+            scratch: Bytes::from_mib(128),
+            scratch_inodes: 10_000,
+            io_read: None,
+            io_write: None,
+            nofile: 1024,
+            fsize: Bytes::from_mib(64),
+        };
+
+        // Below the ceiling: every key narrows.
+        let tighter = TenantLimits {
+            mem: Some(Bytes::from_mib(64)),
+            cpu: Some(Cpu(0.5)),
+            pids: Some(32),
+            timeout: Some(Duration::from_secs(5)),
+            scratch: Some(Bytes::from_mib(16)),
+            ..Default::default()
+        };
+        let out = tighter.narrow(&ceiling);
+        assert_eq!(out.mem, Bytes::from_mib(64), "mem");
+        assert_eq!(out.cpu, Cpu(0.5), "cpu");
+        assert_eq!(out.pids, 32, "pids");
+        assert_eq!(out.timeout, Duration::from_secs(5), "timeout");
+        assert_eq!(out.scratch, Bytes::from_mib(16), "scratch");
+        // `memory.high` follows `memory.max` down: the kernel rejects a
+        // `high` above the `max` on some versions.
+        assert!(out.mem_high.get() <= out.mem.get(), "mem_high");
+        assert!(tighter.narrows(&ceiling));
+
+        // Above it: every key is left alone. This is the assertion that
+        // matters — a wrong value can only ever give a tenant less.
+        let looser = TenantLimits {
+            mem: Some(Bytes::from_mib(4096)),
+            cpu: Some(Cpu(64.0)),
+            pids: Some(100_000),
+            timeout: Some(Duration::from_secs(86_400)),
+            scratch: Some(Bytes::from_mib(4096)),
+            ..Default::default()
+        };
+        let out = looser.narrow(&ceiling);
+        assert_eq!(out.mem, ceiling.mem, "mem was widened");
+        assert_eq!(out.cpu, ceiling.cpu, "cpu was widened");
+        assert_eq!(out.pids, ceiling.pids, "pids was widened");
+        assert_eq!(out.timeout, ceiling.timeout, "timeout was widened");
+        assert_eq!(out.scratch, ceiling.scratch, "scratch was widened");
+        assert!(!looser.narrows(&ceiling), "nothing was narrowed");
+
+        // And nothing set is nothing changed, which is the common case.
+        assert_eq!(TenantLimits::default().narrow(&ceiling), ceiling);
+        assert!(!TenantLimits::default().narrows(&ceiling));
+    }
+
+    #[test]
+    fn limits_survive_the_process_that_set_them() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::rooted(root.path());
+        {
+            let tenants = Tenants::new(&paths);
+            tenants
+                .set_limits(
+                    "acme",
+                    TenantLimits {
+                        pids: Some(16),
+                        ..Default::default()
+                    },
+                )
+                .expect("set");
+        }
+        let back = Tenants::new(&paths)
+            .get("acme")
+            .expect("get")
+            .expect("still there");
+        assert_eq!(back.limits.pids, Some(16));
     }
 
     #[test]

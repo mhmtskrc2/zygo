@@ -854,6 +854,9 @@ impl Supervisor {
         workspace: Option<crate::supervisor::protocol::WorkspaceRequest>,
     ) -> std::result::Result<Response, Response> {
         let workspace = self.resolve_workspace(workspace)?;
+        // A warm function belongs to one tenant, so its limits are that
+        // tenant's — resolved once here rather than per attempt.
+        let limits = self.limits_for(self.tenant_of(name).as_deref())?;
         let mut entry = self.lookup(name)?;
 
         // At most one redirect. A gate closes for two reasons — the function was
@@ -871,7 +874,16 @@ impl Supervisor {
                 entry = self.rewarm(name, &entry)?;
             }
 
-            event = match self.attempt(&entry, name, event, timeout, key, sink, workspace.clone()) {
+            event = match self.attempt(
+                &entry,
+                name,
+                event,
+                timeout,
+                key,
+                sink,
+                workspace.clone(),
+                limits.clone(),
+            ) {
                 Attempt::Done(response) => return response,
                 Attempt::Closed(event) => event,
             };
@@ -909,6 +921,7 @@ impl Supervisor {
         key: Option<&str>,
         sink: Option<crate::pool::ChunkSink<'_>>,
         workspace: Option<crate::pool::Workspace>,
+        tenant_limits: Option<crate::tenants::TenantLimits>,
     ) -> Attempt {
         let permit = match entry.gate.enter(QUEUE_WAIT) {
             Ok(permit) => permit,
@@ -942,7 +955,16 @@ impl Supervisor {
 
         let outcome = entry
             .function
-            .call_full(event, None, timeout, None, key, sink, workspace)
+            .call_full(
+                event,
+                None,
+                timeout,
+                None,
+                key,
+                sink,
+                workspace,
+                tenant_limits,
+            )
             .map(|(outcome, _)| outcome)
             .map_err(|e| Response::error(ControlError::CallFailed, e));
         drop(permit);
@@ -1305,6 +1327,144 @@ impl Supervisor {
             inbox,
             collect: request.collect,
         }))
+    }
+
+    /// Replace a tenant's limits, refusing one that could never take effect.
+    ///
+    /// The refusal is the useful part. A tenant's limits only ever narrow, so
+    /// a value *above* every ceiling this tenant currently has is not
+    /// dangerous — it simply does nothing. Storing it silently would leave an
+    /// operator believing they had tightened something they had not, which is
+    /// the worse outcome, so it is a `422` naming the ceiling.
+    ///
+    /// A tenant with nothing running has no ceiling to compare against and the
+    /// value is accepted: it will narrow whatever is served later.
+    pub fn set_limits(
+        &self,
+        tenant: &str,
+        limits: crate::tenants::TenantLimits,
+    ) -> std::result::Result<Response, Response> {
+        crate::tenants::valid_id(tenant).map_err(|e| Response::error(ControlError::BadSpec, e))?;
+
+        let over = self.over_every_ceiling(tenant, &limits);
+        if !over.is_empty() {
+            let named: Vec<String> = over
+                .iter()
+                .map(|(key, value)| format!("`{key}` is {value}"))
+                .collect();
+            return Err(Response::error(
+                ControlError::AboveCeiling,
+                format!(
+                    "{}, which is above every ceiling tenant `{tenant}` currently                      has — a tenant's limits only narrow, so this would do nothing.                      Lower it, or raise the function's own first",
+                    named.join(", ")
+                ),
+            ));
+        }
+
+        let updated = crate::tenants::Tenants::new(&self.paths)
+            .set_limits(tenant, limits)
+            .map_err(|e| Response::error(ControlError::BadSpec, e))?;
+        Ok(Response::Tenants {
+            tenants: vec![updated],
+            existed: true,
+            removed_scripts: Vec::new(),
+            stopped: Vec::new(),
+        })
+    }
+
+    /// Keys whose value is above *every* ceiling this tenant can reach.
+    ///
+    /// Every, not any: a tenant who can reach a small function and a large one
+    /// may legitimately set a limit between them — it narrows the large one
+    /// and does nothing to the small one, which is what narrowing means.
+    ///
+    /// **Reach**, not own. A tenant's own functions, plus every pool on the
+    /// host: a pool is shared by design and `EXEC_SCRIPT` does not check whose
+    /// it is — only whose *script* is. Looking at the tenant's own sandboxes
+    /// alone would have found no ceiling at all in the usual shape, where the
+    /// operator declares one pool and every customer calls it, and the check
+    /// would have been an ornament.
+    fn over_every_ceiling(
+        &self,
+        tenant: &str,
+        limits: &crate::tenants::TenantLimits,
+    ) -> Vec<(&'static str, String)> {
+        let ceilings: Vec<crate::sandbox::limits::Limits> = self
+            .functions
+            .lock()
+            .expect("registry")
+            .values()
+            .filter(|e| e.resolved.tenant == tenant)
+            .map(|e| e.resolved.limits.clone())
+            .chain(
+                self.runtimes
+                    .lock()
+                    .expect("runtimes")
+                    .values()
+                    .map(|p| p.resolved.limits.clone()),
+            )
+            .collect();
+        if ceilings.is_empty() {
+            return Vec::new();
+        }
+
+        let mut over = Vec::new();
+        if let Some(mem) = limits.mem
+            && ceilings.iter().all(|c| mem.get() > c.mem.get())
+        {
+            over.push(("mem", mem.to_string()));
+        }
+        if let Some(cpu) = limits.cpu
+            && ceilings.iter().all(|c| cpu.0 > c.cpu.0)
+        {
+            over.push(("cpu", cpu.to_string()));
+        }
+        if let Some(pids) = limits.pids
+            && ceilings.iter().all(|c| pids > c.pids)
+        {
+            over.push(("pids", pids.to_string()));
+        }
+        if let Some(timeout) = limits.timeout
+            && ceilings.iter().all(|c| timeout.get() > c.timeout.get())
+        {
+            over.push(("timeout", timeout.to_string()));
+        }
+        if let Some(scratch) = limits.scratch
+            && ceilings.iter().all(|c| scratch.get() > c.scratch.get())
+        {
+            over.push(("scratch", scratch.to_string()));
+        }
+        over
+    }
+
+    /// A tenant's own limits, if they have any that narrow anything.
+    ///
+    /// `None` for the operator's own requests and for a tenant with nothing
+    /// set, which is the common case and costs one file read that finds
+    /// nothing.
+    pub(crate) fn limits_for(
+        &self,
+        tenant: Option<&str>,
+    ) -> std::result::Result<Option<crate::tenants::TenantLimits>, Response> {
+        let Some(tenant) = tenant else {
+            return Ok(None);
+        };
+        let found = crate::tenants::Tenants::new(&self.paths)
+            .get(tenant)
+            .map_err(|e| Response::error(ControlError::CallFailed, e))?;
+        Ok(found.map(|t| t.limits).filter(|l| !l.is_empty()))
+    }
+
+    /// Whose function this is, for the limits above.
+    fn tenant_of(&self, name: &str) -> Option<String> {
+        if let Some(entry) = self.functions.lock().expect("registry").get(name) {
+            return Some(entry.resolved.tenant.clone());
+        }
+        self.cold
+            .lock()
+            .expect("cold")
+            .get(name)
+            .map(|c| c.resolved.tenant.clone())
     }
 
     /// The secret store, when this host has a key for one.
@@ -2241,6 +2401,7 @@ fn dispatch(supervisor: &Supervisor, request: Request, greeted: &mut bool) -> Re
         Request::Tokens => merge(supervisor.list_tokens()),
         Request::RevokeToken { id } => merge(supervisor.revoke_token(&id)),
         Request::Cancel { id, tenant } => merge(supervisor.cancel(&id, tenant.as_deref())),
+        Request::SetLimits { tenant, limits } => merge(supervisor.set_limits(&tenant, *limits)),
         Request::PutSecret {
             tenant,
             name,

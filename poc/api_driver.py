@@ -1024,6 +1024,60 @@ def tokens(socket_path: str, image: str) -> int:
         # the same bytes.
         operator.delete_script(slow.sha256)
 
+        # --- per-tenant limits ---------------------------------------------------
+        #
+        # A tenant's limits narrow the pool's and never widen them. What is
+        # checked here is that they *bind*: a memory limit the operator's own
+        # request survives kills the tenant's.
+        print()
+        tight = operator.set_limits("acme", mem="24M", pids=24)
+        if tight.limits.get("mem") and tight.limits.get("pids") == 24:
+            ok("a tenant's limits are stored")
+        else:
+            bad("PATCH /tenants/<id>/limits", tight.limits)
+
+        # The pool was declared without a `mem`, so it has the default — far
+        # above 24 MiB. A request that allocates 64 MiB survives for the
+        # operator and is killed for acme, which is the whole claim.
+        # Registered by acme, because a digest is not a capability: a script
+        # the operator registered is not acme's to run.
+        hungry = acme.put_script(
+            "def handler(event):\n    b = bytearray(64 * 1024 * 1024)\n"
+            "    b[::4096] = b'x' * len(b[::4096])\n    return len(b)\n"
+        )
+        # The control: the same script, the same pool, with the limit lifted.
+        operator.set_limits("acme", mem=None, pids=None)
+        try:
+            got = acme.run_script("shared", hungry.sha256, {})
+            unlimited = got.result == 64 * 1024 * 1024
+        except zygo.ZygoError:
+            unlimited = False
+        if unlimited:
+            ok("with no tenant limit the request allocates 64 MiB")
+        else:
+            bad("the control allocation failed, so the limit below proves nothing")
+
+        operator.set_limits("acme", mem="24M", pids=24)
+        try:
+            acme.run_script("shared", hungry.sha256, {})
+            bad("a tenant's memory limit did not bind")
+        except zygo.ZygoError as e:
+            ok(f"and the same request is killed at 24M ({type(e).__name__})")
+
+        # A value above every ceiling the tenant has could never take effect,
+        # so it is refused rather than stored silently.
+        try:
+            operator.set_limits("acme", mem="999G")
+            bad("a limit above every ceiling was accepted")
+        except zygo.ZygoError as e:
+            if "above every ceiling" in str(e):
+                ok("and one that could never take effect is refused, naming the key")
+            else:
+                bad("the refusal does not say why", e)
+
+        operator.set_limits("acme", mem=None, pids=None)
+        operator.delete_script(hungry.sha256)
+
         # --- per-tenant secrets --------------------------------------------------
         #
         # Encrypted at rest, never readable back, and delivered to a request as

@@ -145,12 +145,30 @@ export interface RuntimePool {
   uptime_s: number;
 }
 
+/**
+ * What a tenant may not exceed.
+ *
+ * Every key only ever narrows: applied as the minimum of itself and whatever
+ * the function or pool was declared with.
+ */
+export interface TenantLimits {
+  mem?: string;
+  cpu?: number;
+  pids?: number;
+  timeout?: string;
+  scratch?: string;
+  network?: 'none' | 'egress' | 'full' | 'host';
+  allow?: string[];
+}
+
 /** One customer of whoever embedded Zygo. */
 export interface Tenant {
   id: string;
   created_ms: number;
   /** Digests of the scripts registered for this tenant. */
   scripts: string[];
+  /** What this tenant may not exceed. Absent when nothing was set. */
+  limits?: TenantLimits;
 }
 
 /**
@@ -291,6 +309,12 @@ export declare class Client {
   deleteTenant(id: string): Promise<{ deleted: boolean; removed_scripts: string[]; stopped: string[] }>;
   /** A view of this client that acts for one tenant. */
   forTenant(id: string): Client;
+
+  /**
+   * What a tenant may not exceed. These only ever narrow; a value above every
+   * ceiling the tenant has is a 422. Operator-only, needs deploy rights.
+   */
+  setLimits(tenant: string, limits: TenantLimits): Promise<Tenant>;
 
   /** Store one of a tenant's secrets. Operator-only, needs deploy rights. */
   putSecret(tenant: string, name: string, value: string): Promise<string[]>;
