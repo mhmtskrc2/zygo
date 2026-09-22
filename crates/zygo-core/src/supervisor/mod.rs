@@ -1797,8 +1797,78 @@ impl Supervisor {
     }
 
     /// Ask the accept loop to stop taking connections.
+    #[allow(clippy::missing_const_for_fn)]
     pub fn shutdown(&self) {
         self.stopping.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether this supervisor is on its way out.
+    ///
+    /// What `GET /healthz` reports as a `503`: a load balancer that keeps
+    /// sending to a draining host is the reason draining does not work.
+    pub fn stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
+    }
+
+    /// Stop admitting, let what is running finish, and say what was waited for.
+    ///
+    /// Three steps, in this order, and the order is the whole of it:
+    ///
+    /// 1. **Stop admitting.** Every gate closes, so a request that has not
+    ///    started is refused now rather than accepted into a process that is
+    ///    leaving. A caller sees the refusal immediately and can go elsewhere.
+    /// 2. **Wait.** In-flight requests run to their own ends. A drain that
+    ///    killed them would be a restart with extra steps.
+    /// 3. **Give up on the stragglers.** Past `grace` the wait stops and the
+    ///    answer says how many were still running, because a deploy script
+    ///    needs to know whether it drained or timed out — and a `grace` that
+    ///    silently became "for ever" is how a rolling restart hangs.
+    ///
+    /// The supervisor exits after answering, which is why the answer is sent
+    /// before the accept loop is asked to stop.
+    pub fn drain(&self, grace: Duration) -> Response {
+        // The entries themselves, not their gates: a `Gate` is not `Clone`
+        // and cloning one would be the wrong thing anyway — the gate a
+        // request is waiting on has to be *the* gate, not a copy of its
+        // numbers.
+        let functions: Vec<Arc<Entry>> = self
+            .functions
+            .lock()
+            .expect("registry")
+            .values()
+            .map(Arc::clone)
+            .collect();
+        let pools: Vec<Arc<runtime::RuntimePool>> = self
+            .runtimes
+            .lock()
+            .expect("runtimes")
+            .values()
+            .map(Arc::clone)
+            .collect();
+
+        for entry in &functions {
+            entry.gate.close();
+        }
+        for pool in &pools {
+            pool.gate.close();
+        }
+
+        let running = || {
+            functions.iter().map(|e| e.gate.load().0).sum::<u32>()
+                + pools.iter().map(|p| p.gate.load().0).sum::<u32>()
+        };
+        let until = Instant::now() + grace;
+        let mut in_flight = running();
+        while in_flight > 0 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+            in_flight = running();
+        }
+
+        tracing::info!(in_flight, "drained");
+        Response::Drained {
+            in_flight,
+            grace_ms: grace.as_millis() as u64,
+        }
     }
 
     /// Find a function, bringing it back from cold if that is where it is.
@@ -2032,8 +2102,33 @@ impl Listener {
                 .map_err(|e| Error::primitive("spawn", "idle thread", e))?
         };
 
+        // `SIGTERM` drains, like `DRAIN` does, rather than stopping where it
+        // stands. A supervisor killed mid-request loses that request's answer,
+        // and a `systemctl restart` or a container stop is exactly the moment
+        // somebody is waiting for one.
+        //
+        // The handler cannot do the draining — it runs on a signal stack and
+        // may not allocate or lock — so it sets the same flag `SHUTDOWN` sets
+        // and wakes the accept loop by connecting to the socket, which is what
+        // `handle` already does. The draining itself happens below, once the
+        // loop is out.
+        #[cfg(unix)]
+        let _term = {
+            let path = supervisor.paths().supervisor_sock();
+            crate::supervisor::on_terminate(move || {
+                TERMINATING.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = UnixStream::connect(&path);
+            })
+        };
+
         let mut threads = Vec::new();
         for stream in self.listener.incoming() {
+            if TERMINATING.load(std::sync::atomic::Ordering::SeqCst) {
+                tracing::info!("SIGTERM: draining");
+                supervisor.drain(DEFAULT_TERM_GRACE);
+                supervisor.shutdown();
+                break;
+            }
             if supervisor.is_stopping() {
                 break;
             }
@@ -2227,6 +2322,60 @@ fn handle(supervisor: &Supervisor, stream: UnixStream) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Set by the `SIGTERM` handler, read by the accept loop.
+///
+/// A plain flag because a signal handler may not allocate, lock, or log: the
+/// most it can honestly do is set this and nudge the loop awake.
+static TERMINATING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// How long `SIGTERM` waits for in-flight requests before giving up.
+///
+/// Twenty-five seconds, chosen against the thirty systemd and Docker give a
+/// process by default: a drain that outlived its own `SIGKILL` would be a
+/// drain that never finished.
+const DEFAULT_TERM_GRACE: Duration = Duration::from_secs(25);
+
+/// Run `on_signal` when this process is asked to terminate.
+///
+/// Returns a guard that restores the previous disposition; dropping it is how
+/// a test puts the process back as it found it.
+#[cfg(unix)]
+pub fn on_terminate(on_signal: impl Fn() + Send + Sync + 'static) -> TermGuard {
+    static HANDLER: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> = std::sync::OnceLock::new();
+    let _ = HANDLER.set(Box::new(on_signal));
+
+    extern "C" fn trampoline(_signal: libc::c_int) {
+        // Nothing here allocates or locks. The closure this reaches sets an
+        // atomic and connects to a unix socket, both of which are safe from a
+        // handler; anything more would be a deadlock waiting for the right
+        // moment.
+        if let Some(handler) = HANDLER.get() {
+            handler();
+        }
+    }
+
+    // SAFETY: installing a handler for SIGTERM with a function that does no
+    // allocation. `SIG_DFL` is restored by the guard.
+    unsafe {
+        libc::signal(libc::SIGTERM, trampoline as *const () as libc::sighandler_t);
+    }
+    TermGuard
+}
+
+/// Restores `SIGTERM` to its default when dropped.
+#[cfg(unix)]
+pub struct TermGuard;
+
+#[cfg(unix)]
+impl Drop for TermGuard {
+    fn drop(&mut self) {
+        // SAFETY: restoring the default disposition.
+        unsafe {
+            libc::signal(libc::SIGTERM, libc::SIG_DFL);
+        }
+    }
 }
 
 /// Record what one finished request cost.
@@ -2445,6 +2594,7 @@ fn dispatch(supervisor: &Supervisor, request: Request, greeted: &mut bool) -> Re
         Request::GetScript { digest } => merge(supervisor.get_script(&digest)),
         Request::DeleteScript { digest } => merge(supervisor.delete_script(&digest)),
         Request::Shutdown => Response::Ok,
+        Request::Drain { grace_ms } => supervisor.drain(Duration::from_millis(grace_ms)),
         // Intercepted in `handle`, which has the socket the descriptors
         // arrive on; a `RUN` that reaches this table was sent to a code path
         // that cannot receive them.

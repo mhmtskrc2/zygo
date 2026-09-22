@@ -112,9 +112,27 @@ export class Client {
     return this.#request('GET', '/version');
   }
 
-  /** `GET /healthz`, which needs no token. */
+  /**
+   * `GET /healthz`, which needs no token.
+   *
+   * `status` is `ok`, `degraded` — a pool below its `min_warm`, so requests
+   * work but the first of them pay a cold start — or `stopping`, which is the
+   * only one that is not a 200.
+   */
   health() {
     return this.#request('GET', '/healthz', { authenticated: false });
+  }
+
+  /**
+   * Stop admitting, let what is running finish, then exit.
+   *
+   * Answers before the process leaves: `inFlight` is what was still running
+   * when the grace ran out, so `0` is a clean drain. `SIGTERM` does the same.
+   * Operator-only, and needs deploy rights.
+   */
+  async drain(grace = 30) {
+    const body = await this.#request('POST', `/drain?grace_ms=${Math.round(grace * 1000)}`);
+    return { drained: Boolean(body.drained), inFlight: Number(body.in_flight ?? 0) };
   }
 
   /** Every warm function the supervisor holds. */

@@ -844,6 +844,74 @@ def call_only(socket_path: str) -> int:
     return 0
 
 
+def drain(socket_path: str, image: str) -> int:
+    """Draining, which ends the API it is run against.
+
+    Its own phase for that reason, and the last one. What is checked is the
+    promise a rolling restart rests on: a call already in flight when the
+    drain starts still gets its answer, and only then does the process go.
+    """
+    import threading
+
+    import zygo
+
+    url = f"unix://{socket_path}"
+    print("\ndrain")
+    print(f"  {url}")
+
+    with zygo.connect(url, token=None, timeout=600) as client:
+        health = client.health()
+        if health.get("status") == "ok":
+            ok("a host with nothing below its floor is `ok`")
+        else:
+            bad("GET /healthz", health)
+
+        client.serve_runtime(
+            "slow-drain", {"image": image, "agent": "python", "timeout": "60s"}
+        )
+        slow = client.put_script(
+            "import time\n\n\ndef handler(event):\n"
+            "    time.sleep(6)\n    return 'finished'\n"
+        )
+
+        answer: list = []
+
+        def call() -> None:
+            try:
+                answer.append(("result", client.run_script("slow-drain", slow.sha256, {})))
+            except BaseException as e:  # noqa: BLE001
+                answer.append(("error", e))
+
+        caller = threading.Thread(target=call, daemon=True)
+        caller.start()
+        time.sleep(2.0)
+
+        # The drain waits for that request. It answers before the process
+        # goes, so this call returns rather than seeing a closed connection.
+        began = time.time()
+        drained = client.drain(grace=30)
+        took = time.time() - began
+        if drained.get("drained") and drained.get("in_flight") == 0:
+            ok(f"a drain waits for what is running and says so ({took:.1f}s)")
+        else:
+            bad("POST /drain", drained)
+
+        caller.join(timeout=20)
+        if answer and answer[0][0] == "result" and answer[0][1].result == "finished":
+            ok("and the call that was in flight still got its answer")
+        else:
+            bad("a request in flight lost its answer to the drain", answer)
+
+        # And the API is gone a moment later.
+        time.sleep(1.5)
+        try:
+            client.health()
+            bad("the API is still serving after a drain")
+        except zygo.ZygoError:
+            ok("then the API exits")
+    return 0
+
+
 def tokens(socket_path: str, image: str) -> int:
     """Scoped tokens, against a listener that actually checks one.
 
@@ -1271,6 +1339,8 @@ if __name__ == "__main__":
         status = call_only(sys.argv[2])
     elif sys.argv[1] == "--tokens":
         status = tokens(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else "python:3.12-slim")
+    elif sys.argv[1] == "--drain":
+        status = drain(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else "python:3.12-slim")
     else:
         status = main()
     print(f"\n  {PASS} passed, {FAIL} failed")

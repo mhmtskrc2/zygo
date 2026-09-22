@@ -213,6 +213,36 @@ is what keeps one working across this change. On the host, `zygo token mint`,
 `zygo token ls` and `zygo token revoke <id>` do the same three things without
 an HTTP round trip.
 
+## Health and draining
+
+`GET /healthz` needs no token and answers one of three things:
+
+| Status | Code | Means |
+|---|---|---|
+| `ok` | 200 | every pool is at its floor |
+| `degraded` | 200 | a pool is below `min_warm`; requests work, the first pay a cold start |
+| `stopping` | **503** | the supervisor is draining |
+
+`degraded` is a `200` on purpose. A host that can serve should be served to,
+and a probe that took one out of rotation for being slow would take every host
+out at once after a restart. `stopping` is the one answer that is not, because
+a balancer that keeps sending to a draining host is the reason draining does
+not work.
+
+```python
+client.drain(grace=30)    # {"drained": true, "in_flight": 0}
+```
+
+Draining stops admitting, lets what is running finish, answers, and *then*
+exits. `in_flight: 0` is a clean drain; anything else is the grace running out,
+which is the difference between "drained" and "gave up" — a deploy script needs
+to know which.
+
+**`SIGTERM` does the same**, so a container stop or a `systemctl restart`
+needs no call at all. The grace there is 25 seconds, chosen against the 30 that
+systemd and Docker give a process before `SIGKILL`: a drain that outlived its
+own kill would be one that never finished.
+
 ## Usage, for billing
 
 Every finished request produces one event, from the **supervisor** — which is

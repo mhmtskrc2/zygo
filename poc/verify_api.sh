@@ -46,6 +46,7 @@ cleanup() {
     [ -n "${API_CALL_ONLY_PID:-}" ] && kill "$API_CALL_ONLY_PID" 2>/dev/null
     [ -n "${API_TOKENS_PID:-}" ] && kill "$API_TOKENS_PID" 2>/dev/null
     [ -n "${USAGE_PID:-}" ] && kill "$USAGE_PID" 2>/dev/null
+    [ -n "${API_DRAIN_PID:-}" ] && kill "$API_DRAIN_PID" 2>/dev/null
     "$ZYGO" stop --all >/dev/null 2>&1
     rm -rf "$WORK"
 }
@@ -147,6 +148,23 @@ if wait_for "$SOCK_TOKENS"; then
     python3 "$SRC/poc/api_driver.py" --tokens "$SOCK_TOKENS" "$IMAGE" || status=1
 else
     echo "  FAIL  the token API did not come up" >&2
+    tail -10 "$WORK/api.log" >&2
+    status=1
+fi
+
+# Draining, last, because it ends the API it runs against — and a fourth
+# listener with no auth, so the phase is about the drain rather than tokens.
+SOCK_DRAIN=$WORK/api-drain.sock
+unset ZYGO_API_TOKEN
+kill "$API_TOKENS_PID" 2>/dev/null
+API_TOKENS_PID=
+"$ZYGO" stop --all >/dev/null 2>&1
+
+API_DRAIN_PID=$(start_api "$SOCK_DRAIN" --no-auth --allow-deploy)
+if wait_for "$SOCK_DRAIN"; then
+    python3 "$SRC/poc/api_driver.py" --drain "$SOCK_DRAIN" "$IMAGE" || status=1
+else
+    echo "  FAIL  the drain API did not come up" >&2
     tail -10 "$WORK/api.log" >&2
     status=1
 fi

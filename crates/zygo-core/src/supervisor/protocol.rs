@@ -55,7 +55,9 @@ use crate::spec::{Layer, Spec};
 ///   per-tenant secrets, encrypted at rest and never read back.
 /// - v11: `SET_LIMITS` — a tenant's own limits, which can only narrow what
 ///   the function or pool was declared with.
-pub const CONTROL_VERSION: u32 = 11;
+/// - v12: `DRAIN` and `DRAINED` — stop admitting, finish what is running, and
+///   say whether anything was still going when the grace ran out.
+pub const CONTROL_VERSION: u32 = 12;
 
 /// The files one request brings with it and takes away (v9).
 ///
@@ -226,6 +228,18 @@ pub enum Request {
 
     /// Ask the supervisor itself to exit once in-flight requests finish.
     Shutdown,
+
+    /// Stop admitting, let what is running finish, then exit.
+    ///
+    /// Answered when everything has finished or `grace_ms` has passed,
+    /// whichever comes first, with a count of what was still running. A deploy
+    /// script needs that number: it is the difference between "drained" and
+    /// "gave up", and a grace that silently became "for ever" is how a rolling
+    /// restart hangs.
+    Drain {
+        #[serde(default = "default_grace")]
+        grace_ms: u64,
+    },
 
     /// Liveness probe, used by the client to decide whether an existing socket
     /// belongs to a supervisor that is actually running.
@@ -454,6 +468,14 @@ fn default_log_limit() -> u32 {
     50
 }
 
+/// How long a drain waits for in-flight requests by default.
+///
+/// Thirty seconds: longer than an ordinary request and shorter than a
+/// deployment tool's own patience. A caller with slow requests passes its own.
+fn default_grace() -> u64 {
+    30_000
+}
+
 /// What a `SERVE` did to the name it served.
 ///
 /// A deploy tool reads this to say "3 replaced, 7 unchanged" rather than
@@ -616,6 +638,16 @@ pub enum Response {
     /// somebody eventually fills in.
     Secrets {
         names: Vec<String>,
+    },
+
+    /// Answer to `Drain`: admitting has stopped, and this is what was left.
+    ///
+    /// `in_flight` is zero when everything finished inside the grace, and the
+    /// number still running when it did not — which is the caller's cue that
+    /// it timed out rather than drained.
+    Drained {
+        in_flight: u32,
+        grace_ms: u64,
     },
 
     /// Answer to `Cancel`: the kill was sent.
@@ -796,6 +828,7 @@ mod tests {
             },
             Request::Stop { name: None },
             Request::Shutdown,
+            Request::Drain { grace_ms: 5_000 },
             Request::Ping,
             Request::Warm {
                 name: "resize".into(),
@@ -948,6 +981,10 @@ mod tests {
             Response::Cancelled {
                 id: "r-0001".into(),
                 started: true,
+            },
+            Response::Drained {
+                in_flight: 0,
+                grace_ms: 30_000,
             },
             Response::Secrets {
                 names: vec!["STRIPE_KEY".into()],

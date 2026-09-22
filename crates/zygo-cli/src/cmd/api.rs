@@ -243,6 +243,11 @@ struct Api {
     /// Per-tenant totals since this process started, and the queue waiting to
     /// be delivered to `--usage-webhook`. See [`Usage`].
     usage: std::sync::Mutex<Usage>,
+    /// The last `/healthz` answer, and when it was computed.
+    ///
+    /// The route is unauthenticated, so a control round trip per probe would
+    /// be a way to make a host busy without holding a token.
+    health: std::sync::Mutex<Option<(Instant, serde_json::Value)>>,
     started: Instant,
     requests: AtomicU64,
     errors: AtomicU64,
@@ -296,6 +301,7 @@ pub fn run(cli: &Cli, args: &ApiArgs) -> anyhow::Result<u8> {
         deploy: args.allow_deploy,
         clients: std::sync::Mutex::new(vec![first]),
         usage: std::sync::Mutex::new(Usage::default()),
+        health: std::sync::Mutex::new(None),
         started: Instant::now(),
         requests: AtomicU64::new(0),
         errors: AtomicU64::new(0),
@@ -598,12 +604,10 @@ use hyper::header::HeaderValue;
 
 async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<ApiBody>, HttpError> {
     // `/healthz` is deliberately unauthenticated: a load balancer probing it
-    // has no business holding the token, and it reveals nothing but "up".
+    // has no business holding the token, and it reveals nothing but how ready
+    // this host is to take work.
     if req.method() == Method::GET && req.uri().path() == "/healthz" {
-        return Ok(json(
-            StatusCode::OK,
-            &serde_json::json!({ "ok": true, "uptime_s": api.started.elapsed().as_secs() }),
-        ));
+        return healthz(api).await;
     }
 
     let actor = authorise(&req, api)?;
@@ -696,6 +700,13 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<ApiBod
         (&Method::DELETE, ["requests", id]) => {
             let id = id.to_string();
             cancel(api, id, tenant).await
+        }
+        // Draining is the operator's: it stops this host serving anybody.
+        (&Method::POST, ["drain"]) => {
+            let query = Query::parse(req.uri().query().unwrap_or(""));
+            let grace_ms = query.number("grace_ms")?.unwrap_or(30_000);
+            actor.may_deploy()?;
+            drain(api, grace_ms).await
         }
         (&Method::GET, ["metrics"]) => metrics(api).await,
         (&Method::GET, ["version"]) => Ok(json(
@@ -834,6 +845,7 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<ApiBod
         }
         (_, ["fn", ..])
         | (_, ["requests", ..])
+        | (_, ["drain"])
         | (_, ["metrics"])
         | (_, ["version"])
         | (_, ["run"])
@@ -1420,6 +1432,103 @@ fn mine(
         None => functions,
         Some(id) => functions.into_iter().filter(|f| f.tenant == id).collect(),
     }
+}
+
+/// `GET /healthz`: whether this host should be sent work.
+///
+/// Three answers, because a load balancer needs three:
+///
+/// * **`200 ok`** — every pool is at its floor.
+/// * **`200 degraded`** — a pool is below `min_warm`, so requests will work
+///   but the first of them pay a cold start. Still `200`: a host that can
+///   serve should be served to, and a probe that took it out of rotation for
+///   being slow would take every host out at once after a restart.
+/// * **`503 stopping`** — the supervisor is draining. A balancer that keeps
+///   sending here is the reason draining does not work, so this is the one
+///   answer that is not `200`.
+///
+/// Cached for a second. The route is unauthenticated and a control round trip
+/// per probe would be a way to make a host busy without a token.
+async fn healthz(api: &Arc<Api>) -> Result<Response<ApiBody>, HttpError> {
+    const FRESH: std::time::Duration = std::time::Duration::from_secs(1);
+
+    if let Some((at, body)) = api.health.lock().expect("health").clone()
+        && at.elapsed() < FRESH
+    {
+        let stopping = body["status"] == "stopping";
+        return Ok(json(
+            if stopping {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::OK
+            },
+            &body,
+        ));
+    }
+
+    let reply = control(api, |c| Ok(c.send(&Control::Runtimes)?)).await;
+    let (status, body) = match reply {
+        Ok(Reply::Runtimes { runtimes }) => {
+            let below: Vec<&str> = runtimes
+                .iter()
+                .filter(|r| r.warm + r.paused < r.min_warm)
+                .map(|r| r.name.as_str())
+                .collect();
+            if below.is_empty() {
+                (
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "ok": true,
+                        "status": "ok",
+                        "uptime_s": api.started.elapsed().as_secs(),
+                    }),
+                )
+            } else {
+                (
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "ok": true,
+                        "status": "degraded",
+                        "below_min_warm": below,
+                        "uptime_s": api.started.elapsed().as_secs(),
+                    }),
+                )
+            }
+        }
+        // The supervisor is gone or going. Either way this host cannot take
+        // work, which is the one thing this route exists to say.
+        _ => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({
+                "ok": false,
+                "status": "stopping",
+                "uptime_s": api.started.elapsed().as_secs(),
+            }),
+        ),
+    };
+
+    *api.health.lock().expect("health") = Some((Instant::now(), body.clone()));
+    Ok(json(status, &body))
+}
+
+/// `POST /drain`: stop admitting, finish what is running, then exit.
+///
+/// Answers *before* the process leaves, so a deploy script gets the count of
+/// what was still in flight rather than a closed connection. `in_flight: 0` is
+/// a clean drain; anything else is the grace running out, which is the
+/// difference between "drained" and "gave up".
+async fn drain(api: &Arc<Api>, grace_ms: u64) -> Result<Response<ApiBody>, HttpError> {
+    let reply = control(api, move |c| Ok(c.send(&Control::Drain { grace_ms })?)).await?;
+    let response = reply_to_response(reply);
+
+    // The API goes too, once this answer is on the wire. A moment, not
+    // immediately: `hyper` has to write the body first, and a process that
+    // exited inside its own handler would answer nothing.
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        std::process::exit(0);
+    });
+    Ok(response)
 }
 
 async fn list(api: &Arc<Api>, tenant: Option<String>) -> Result<Response<ApiBody>, HttpError> {
@@ -2487,6 +2596,17 @@ fn reply_to_json(reply: Reply) -> (StatusCode, serde_json::Value) {
             }),
         ),
         Reply::Stopped { names } => (StatusCode::OK, serde_json::json!({ "stopped": names })),
+        Reply::Drained {
+            in_flight,
+            grace_ms,
+        } => (
+            StatusCode::OK,
+            serde_json::json!({
+                "drained": in_flight == 0,
+                "in_flight": in_flight,
+                "grace_ms": grace_ms,
+            }),
+        ),
         Reply::Secrets { names } => (
             StatusCode::OK,
             // Names, and there is nowhere in this shape to put a value.

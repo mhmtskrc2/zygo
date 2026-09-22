@@ -125,8 +125,26 @@ class Client:
         return self._request("GET", "/version")
 
     def health(self) -> Dict[str, Any]:
-        """``GET /healthz``, which needs no token."""
+        """``GET /healthz``, which needs no token.
+
+        ``status`` is ``ok``, ``degraded`` — a pool below its ``min_warm``, so
+        requests work but the first of them pay a cold start — or ``stopping``,
+        which is the only one that is not a `200`. A load balancer that kept
+        sending to a draining host is the reason draining does not work.
+        """
         return self._request("GET", "/healthz", authenticated=False)
+
+    def drain(self, grace: float = 30.0) -> Dict[str, Any]:
+        """Stop admitting, let what is running finish, then exit.
+
+        Answers before the process leaves, so ``in_flight`` is the count of
+        requests still going when the grace ran out — `0` is a clean drain and
+        anything else is the difference between "drained" and "gave up".
+
+        `SIGTERM` does the same, so a container stop or a `systemctl restart`
+        needs no call at all. Operator-only, and needs deploy rights.
+        """
+        return self._request("POST", f"/drain?grace_ms={int(grace * 1000)}")
 
     def functions(self) -> List[Function]:
         """Every warm function the supervisor holds."""

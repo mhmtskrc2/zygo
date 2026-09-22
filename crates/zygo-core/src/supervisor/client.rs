@@ -157,6 +157,11 @@ impl Client {
             // carries descriptors, so it has methods of its own below. The
             // arm exists so the match stays exhaustive.
             Request::Run { .. } => CONTROL_TIMEOUT,
+            // A drain waits for in-flight requests, so the client has to wait
+            // for the grace it asked for and then for the answer.
+            Request::Drain { grace_ms } => {
+                Duration::from_millis(*grace_ms).saturating_add(REPLY_GRACE)
+            }
             // A follow is the caller's own loop of short requests; each one is
             // ordinary. Everything else reads state the supervisor has.
             _ => CONTROL_TIMEOUT,
@@ -400,6 +405,7 @@ fn name_of(request: &Request) -> &'static str {
         Request::List => "ps",
         Request::Stop { .. } => "stop",
         Request::Shutdown => "shutdown",
+        Request::Drain { .. } => "drain",
         Request::Ping => "ping",
         Request::Shell { .. } => "shell",
         Request::Logs { .. } => "logs",
