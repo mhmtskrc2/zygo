@@ -185,7 +185,9 @@ def load_handler(path: str, mode: str):
     handler = getattr(module, "handler", None)
     if handler is None:
         raise AttributeError(
-            f"{path} defines no `handler`; expected `def handler(event: dict)`"
+            f"{path} defines no `handler`; expected `def handler(event: dict)` "
+            "— or, for a script whose module body is the program, "
+            "serve it with `--mode stdin`"
         )
     return handler
 

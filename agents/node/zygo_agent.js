@@ -520,7 +520,8 @@ function loadHandler(handlerPath, mode) {
   const handler = typeof loaded === 'function' ? loaded : loaded && loaded.handler;
   if (typeof handler !== 'function') {
     throw new Error(
-      `${handlerPath} exports no handler; expected \`module.exports = function handler(event)\``
+      `${handlerPath} exports no handler; expected \`module.exports = function handler(event)\` ` +
+        '— or, for a script whose module body is the program, serve it with `--mode stdin`'
     );
   }
   return handler;

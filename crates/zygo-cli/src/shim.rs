@@ -43,6 +43,83 @@ use crate::cli::{AgentCommand, Cli, Command};
 /// command must never be the reason one of them restarts.
 pub const INSTANCE: &str = "zygo";
 
+/// Exit status for "the Linux VM could not be reached".
+///
+/// Distinct from every status a forwarded program can produce and from the
+/// ones Zygo already means something by: 125 is "this host cannot run
+/// sandboxes", 137 a deadline, 255 what SSH exits with *and* what a program
+/// may exit with — which is why the first adoption report (Z-2) could not tell
+/// "the transport failed before anything started" from "the program exited
+/// 255" except by matching on text. 111 is `ECONNREFUSED`'s number on Linux,
+/// which is the sentence this status stands for.
+pub const EXIT_VM_UNREACHABLE: u8 = 111;
+
+/// How many times a forwarded command is retried when the transport failed
+/// before the guest ran anything.
+///
+/// Two, because that is the number an adopter measured to zero at width 24
+/// (0 → ~7 failures in 144, 1 → 1, 2 → 0), and a third would only lengthen
+/// a failure that is going to be reported anyway.
+pub const TRANSPORT_RETRIES: u32 = 2;
+
+/// The pause before retry `attempt` (1-based): long enough for a session on
+/// the multiplexed connection to close, short enough that a run does not
+/// notice.
+pub fn transport_backoff(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(100 * u64::from(attempt) * u64::from(attempt) + 100)
+}
+
+/// Whether a line of `limactl`'s stderr says the SSH session never opened.
+///
+/// Every forwarded command is a session on one multiplexed SSH connection
+/// (`ControlMaster auto`, one `ControlPath`), and OpenSSH's `MaxSessions`
+/// caps how many one connection may carry — ten by default. Past it, the
+/// peer refuses the session and `ssh` exits 255 with one of these lines. The
+/// guest ran nothing: there is no session for it to have run anything in,
+/// which is what makes a retry safe and why this is checked here rather than
+/// by a caller, who cannot tell 255-from-SSH from 255-from-the-program.
+pub fn is_transport_failure(line: &str) -> bool {
+    line.contains("mux_client_request_session")
+        || line.contains("Session open refused by peer")
+        || line.contains("mux_client_request_session: session request failed")
+}
+
+/// The generation of the VM template this build ships.
+///
+/// Lima copies the template into the instance when it is created and never
+/// reads the source again, so a change to `shim/lima.yaml` reaches a new VM
+/// and not an existing one. The number is written into the template as a
+/// comment ([`TEMPLATE_GENERATION_MARKER`]) and read back from the
+/// instance's copy by `zygo doctor`, which says when the two differ and what
+/// to do about it. Bump it whenever the template changes in a way an
+/// existing VM should pick up.
+///
+/// 2: `MaxSessions` raised in the guest's `sshd_config` (Z-2).
+pub const TEMPLATE_GENERATION: u32 = 2;
+
+/// The comment the generation is written after, in `shim/lima.yaml`.
+pub const TEMPLATE_GENERATION_MARKER: &str = "# zygo-template-generation:";
+
+/// The generation a template (or an instance's copy of one) declares.
+///
+/// `None` for a template from before the marker existed, which `doctor`
+/// reads as older than any generation — because it is.
+pub fn template_generation_of(text: &str) -> Option<u32> {
+    text.lines()
+        .find_map(|l| l.trim().strip_prefix(TEMPLATE_GENERATION_MARKER))
+        .and_then(|rest| rest.trim().parse().ok())
+}
+
+/// Where a forwarded command runs when its caller's directory is not
+/// shared and nothing in the command depends on it.
+///
+/// The root, not the guest's home: a relative path that slipped past
+/// [`cwd_dependency`] would then resolve to a file that does not exist
+/// rather than to one of the user's own under `$HOME` that they did not
+/// name — and a spec discovered upwards from `/` finds nothing, which is
+/// what the same command finds on Linux from `/tmp`.
+pub const GUEST_NEUTRAL_DIR: &str = "/";
+
 /// Whether this command can be answered without a Linux kernel.
 ///
 /// The list is short and everything else forwards, which is the safe way
@@ -80,6 +157,8 @@ pub fn runs_on_the_host(command: &Command) -> bool {
 pub struct Unmapped {
     pub cwd: PathBuf,
     pub home: PathBuf,
+    /// The argument that made the directory matter — see [`cwd_dependency`].
+    pub needed_by: String,
 }
 
 impl std::fmt::Display for Unmapped {
@@ -87,73 +166,195 @@ impl std::fmt::Display for Unmapped {
         write!(
             f,
             "on macOS Zygo runs in a Linux VM, and only {} is shared with it — \
-             but this command was run from {}",
+             but this command was run from {}, and {}",
             self.home.display(),
-            self.cwd.display()
+            self.cwd.display(),
+            self.needed_by
         )
     }
 }
 
 /// The directory the forwarded command should run in.
 ///
-/// Identity or refusal, never a guess. The VM mounts `$HOME` at its own path,
-/// so anything underneath needs no translation at all; anything outside it
-/// has no counterpart, and inventing one — running in the VM's `/tmp`, say —
-/// would mean the command silently read different files from the ones in
-/// front of the user.
-pub fn workdir(cwd: &Path, home: &Path) -> Result<PathBuf, Unmapped> {
+/// Identity where it can be: the VM mounts `$HOME` at its own path, so a
+/// directory underneath needs no translation at all. Outside `$HOME` the
+/// directory has no counterpart, and what happens next depends on whether
+/// the command *uses* it. `dependency` is [`cwd_dependency`]'s answer:
+///
+/// * `None` — nothing in the command resolves against the directory, so it
+///   runs in [`GUEST_NEUTRAL_DIR`] and every path it names still means the
+///   same file. A server started from `/`, or a systemd unit with its
+///   default working directory, can run a sandbox whose mounts are all under
+///   `$HOME` — which the first adoption report (Z-5) found it could not.
+/// * `Some(reason)` — a relative path, or a spec file found by searching
+///   upwards, would mean a different file in the VM. Refused, naming the
+///   argument, rather than run against a directory that is not the one the
+///   user is looking at.
+pub fn workdir(cwd: &Path, home: &Path, dependency: Option<String>) -> Result<PathBuf, Unmapped> {
     if cwd.starts_with(home) {
-        Ok(cwd.to_path_buf())
-    } else {
-        Err(Unmapped {
+        return Ok(cwd.to_path_buf());
+    }
+    match dependency {
+        None => Ok(PathBuf::from(GUEST_NEUTRAL_DIR)),
+        Some(needed_by) => Err(Unmapped {
             cwd: cwd.to_path_buf(),
             home: home.to_path_buf(),
-        })
+            needed_by,
+        }),
     }
+}
+
+/// Every path in the command that names something on *this* side, with what
+/// it is, for [`cwd_dependency`].
+///
+/// A path the guest resolves against its own root — the command after the
+/// image in `zygo run`, a `--workdir` inside the sandbox — is not here: it
+/// means the same thing wherever the caller was standing. What is here is
+/// everything Zygo itself opens on the host before the sandbox exists.
+pub fn host_paths(command: &Command) -> Vec<(&'static str, PathBuf)> {
+    let mut out: Vec<(&'static str, PathBuf)> = Vec::new();
+    let mounts = |out: &mut Vec<(&'static str, PathBuf)>, mounts: &[Mount]| {
+        out.extend(mounts.iter().map(|m| ("the mount", m.source.clone())));
+    };
+    match command {
+        Command::Run(args) => {
+            mounts(&mut out, &args.sandbox.mounts);
+            out.extend(args.spec_file.file.clone().map(|p| ("the spec file", p)));
+            out.extend(
+                args.requirements
+                    .clone()
+                    .map(|p| ("the requirements file", p)),
+            );
+            out.extend(args.outcome.clone().map(|p| ("the outcome file", p)));
+        }
+        Command::Serve(args) => {
+            out.extend(args.handler.clone().map(|p| ("the handler", p)));
+            mounts(&mut out, &args.sandbox.mounts);
+            out.extend(args.spec_file.file.clone().map(|p| ("the spec file", p)));
+            out.extend(
+                args.requirements
+                    .clone()
+                    .map(|p| ("the requirements file", p)),
+            );
+        }
+        Command::Exec(args) => {
+            // A digest names something the host already holds, not a file.
+            if let Some(script) = &args.script
+                && !script.starts_with("sha256:")
+            {
+                out.push(("the script", PathBuf::from(script)));
+            }
+        }
+        Command::Up { file, .. } | Command::Down { file } | Command::Spec { file, .. } => {
+            out.extend(file.file.clone().map(|p| ("the spec file", p)));
+        }
+        Command::Api(args) => {
+            out.extend(args.spec_file.file.clone().map(|p| ("the spec file", p)));
+        }
+        Command::Mcp(args) => {
+            out.extend(args.workspace.clone().map(|p| ("the workspace", p)));
+            out.extend(args.spec_file.file.clone().map(|p| ("the spec file", p)));
+            mounts(&mut out, &args.sandbox.mounts);
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Whether the command looks for `sandbox.toml` upwards from the working
+/// directory when no `-f` names one.
+pub fn discovers_a_spec(command: &Command) -> bool {
+    match command {
+        Command::Run(args) => args.spec_file.file.is_none(),
+        Command::Serve(args) => args.spec_file.file.is_none(),
+        Command::Api(args) => args.spec_file.file.is_none(),
+        Command::Mcp(args) => args.spec_file.file.is_none(),
+        Command::Up { file, .. } | Command::Down { file } | Command::Spec { file, .. } => {
+            file.file.is_none()
+        }
+        _ => false,
+    }
+}
+
+/// Why this command needs its working directory to exist in the VM, if it
+/// does.
+///
+/// Two ways it can: an argument is a relative path, which means "from
+/// here"; or no `-f` was given and a `sandbox.toml` is found by searching
+/// upwards from here, which the guest — searching upwards from
+/// [`GUEST_NEUTRAL_DIR`] — would not find. `spec_here` is that search,
+/// passed in so the rule can be tested without a filesystem.
+///
+/// `None` means every path the command names is absolute (and so is checked
+/// by [`unmapped_paths`] on its own merits) and nothing is discovered, so
+/// where the caller stood is of no consequence.
+pub fn cwd_dependency(command: &Command, spec_here: Option<&Path>) -> Option<String> {
+    for (what, path) in host_paths(command) {
+        if path.is_relative() {
+            return Some(format!(
+                "{what} `{}` is relative to that directory",
+                path.display()
+            ));
+        }
+    }
+    if discovers_a_spec(command)
+        && let Some(found) = spec_here
+    {
+        return Some(format!(
+            "`{}` was found by searching upwards from it (pass -f to name it instead)",
+            found.display()
+        ));
+    }
+    None
+}
+
+/// The `sandbox.toml` a search upwards from the process's directory finds.
+///
+/// Only the *path*: parsing it is the command's job, and a spec that does
+/// not parse is still a spec the guest would not have found.
+#[cfg(target_os = "macos")]
+fn spec_discoverable_here() -> Option<PathBuf> {
+    let mut dir = std::env::current_dir().ok();
+    while let Some(d) = dir {
+        let candidate = d.join("sandbox.toml");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        dir = d.parent().map(Path::to_path_buf);
+    }
+    None
 }
 
 /// Mount sources this VM has no counterpart for.
 ///
+/// Every path the command names that the VM cannot see, with what it is for.
+///
 /// The same rule as [`workdir`], applied to the other half of what a command
-/// brings with it. `workdir` has always refused a command run from outside
+/// brings with it: `workdir` has always refused a command run from outside
 /// `$HOME`, on the stated grounds that forwarding it would silently run
-/// against a directory that is not the one the user is looking at — and a
-/// `--mount` is exactly that, with the silence replaced by a worse noise:
-/// the guest reports `applying a bind mount from the spec failed: No such
-/// file or directory` about a path that plainly exists on the host, and
-/// points at `zygo doctor`, which has nothing to say about it.
-///
-/// Found by running an embedder's script driver against Zygo: it puts its
-/// scratch directory in the system temporary directory, which on macOS is
-/// `/var/folders/…`, and every one of its tests failed on this line.
-///
-/// Relative paths are resolved against `cwd` first, because they mean a
-/// place on this side and the VM never sees them as written.
-pub fn unmapped_mounts<'a>(
-    mounts: impl IntoIterator<Item = &'a Mount>,
-    cwd: &Path,
-    home: &Path,
-) -> Vec<PathBuf> {
-    mounts
+/// against a directory that is not the one the user is looking at. A mount
+/// the guest lacks fails with `applying a bind mount from the spec failed:
+/// No such file or directory` about a path that plainly exists on the host
+/// (found by an embedder's script driver, whose scratch directory lives under
+/// macOS's `/var/folders`, and every one of whose tests failed on it). The
+/// other paths fail worse. An `--outcome` file outside
+/// `$HOME` is written without complaint — into the *VM's* `/tmp`, where the
+/// caller on this side will never find it and concludes the sandbox wrote
+/// nothing. Found by running `zygo run --pull never --outcome /tmp/o.json`
+/// from a Mac: exit 1 as promised, and no file.
+pub fn unmapped_paths(command: &Command, cwd: &Path, home: &Path) -> Vec<(&'static str, PathBuf)> {
+    host_paths(command)
         .into_iter()
-        .map(|m| {
-            if m.source.is_absolute() {
-                m.source.clone()
+        .map(|(what, path)| {
+            let resolved = if path.is_absolute() {
+                path
             } else {
-                cwd.join(&m.source)
-            }
+                cwd.join(path)
+            };
+            (what, resolved)
         })
-        .filter(|source| !source.starts_with(home))
+        .filter(|(_, path)| !path.starts_with(home))
         .collect()
-}
-
-/// Every mount the command carries, whichever command it is.
-pub fn mounts_of(command: &Command) -> &[Mount] {
-    match command {
-        Command::Run(args) => &args.sandbox.mounts,
-        Command::Serve(args) => &args.sandbox.mounts,
-        _ => &[],
-    }
 }
 
 /// What `limactl list` said about the instance.
@@ -340,11 +541,219 @@ where
     out
 }
 
+/// The `ssh -F` config Lima writes beside the instance, when there is one.
+///
+/// `~/.lima/<instance>/ssh.config` — or under `LIMA_HOME` — and only once the
+/// instance has been created, which is why a missing file means "take the
+/// `limactl` path", not an error. Lima rewrites it on every start (the port
+/// moves), so it is read per command rather than remembered.
+pub fn ssh_config(home: &Path) -> Option<PathBuf> {
+    let lima = std::env::var_os("LIMA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".lima"));
+    let config = lima.join(INSTANCE).join("ssh.config");
+    config.is_file().then_some(config)
+}
+
+/// Whether the multiplexed connection's master is alive: `ssh -O check`.
+///
+/// Sub-millisecond, and the only question it answers is whether a session
+/// can be opened without `limactl`. A dead master is not a failure — the VM
+/// may be up with nobody connected yet — it just means the slower path.
+#[cfg(target_os = "macos")]
+fn mux_alive(config: &Path) -> bool {
+    std::process::Command::new("ssh")
+        .args(["-F"])
+        .arg(config)
+        .args(["-O", "check", &format!("lima-{INSTANCE}")])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// The `ssh` invocation that does what `limactl shell --workdir W zygo env …
+/// zygo …` does, over the connection Lima already holds.
+///
+/// One remote command string, because that is what ssh carries: every word
+/// is quoted for the guest's shell, the working directory is entered first
+/// (the same rule as [`forward_args`] — a relative path means the same file on
+/// both sides), and the binary is named by its absolute path so the answer
+/// does not depend on what the guest's login shell puts on `PATH`. `-t` only
+/// when the caller's stdin is a terminal, which is also when `limactl shell`
+/// allocates one; a pipeline must reach the sandbox unbuffered and untouched.
+pub fn ssh_args<I, S>(
+    config: &Path,
+    workdir: &Path,
+    args: I,
+    env: &[(OsString, OsString)],
+    tty: bool,
+) -> Vec<OsString>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<OsString>,
+{
+    let mut remote = OsString::from("cd ");
+    remote.push(sh_quote(workdir.as_os_str()));
+    remote.push(" && ");
+    if !env.is_empty() {
+        remote.push("env ");
+        for (k, v) in env {
+            let mut pair = k.clone();
+            pair.push("=");
+            pair.push(v);
+            remote.push(sh_quote(&pair));
+            remote.push(" ");
+        }
+    }
+    remote.push(GUEST_BIN);
+    for arg in args {
+        remote.push(" ");
+        remote.push(sh_quote(&arg.into()));
+    }
+
+    let mut out: Vec<OsString> = vec!["-F".into(), config.into()];
+    if tty {
+        out.push("-t".into());
+    }
+    out.push(format!("lima-{INSTANCE}").into());
+    out.push("--".into());
+    out.push(remote);
+    out
+}
+
+/// One word, safe for a POSIX shell: single quotes, with a quote inside
+/// written as `'\''`. Every byte goes through, including the ones that are
+/// not UTF-8, because a path is bytes.
+pub fn sh_quote(word: &std::ffi::OsStr) -> OsString {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let bytes = word.as_bytes();
+    if !bytes.is_empty()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_./=:@%+,".contains(b))
+    {
+        return word.to_os_string();
+    }
+    let mut out = Vec::with_capacity(bytes.len() + 2);
+    out.push(b'\'');
+    for &b in bytes {
+        if b == b'\'' {
+            out.extend_from_slice(b"'\\''");
+        } else {
+            out.push(b);
+        }
+    }
+    out.push(b'\'');
+    OsString::from_vec(out)
+}
+
 /// Whether a name is safe to hand to `env` on the other side of a shell.
 pub fn is_forwardable_env_name(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with(|c: char| c.is_ascii_digit())
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// What `zygo doctor` says about the Mac side, as checks a deploy script
+/// can read.
+///
+/// Pure, so the rule is tested on every host: the probing is
+/// [`describe_vm`]'s. The first adoption report (Z-4) read `platform: FAIL`
+/// with "macos has no kernel to build a sandbox in" — true, and useless on
+/// the one platform Zygo ships a VM for. These are the checks that matter
+/// here: whether the VM can be started, whether it *is*, whether it was
+/// made from this release's template, and whether the binary inside it is
+/// this one.
+pub fn host_checks(
+    limactl: Option<&Path>,
+    template: Option<&Path>,
+    linux_binary: Option<&Path>,
+    vm: Vm,
+    generation: Option<u32>,
+    home: Option<&Path>,
+) -> Vec<zygo_core::doctor::Check> {
+    use zygo_core::doctor::Check;
+    let mut checks = Vec::new();
+
+    checks.push(match limactl {
+        Some(path) => Check::ok("limactl", format!("at {}", path.display())),
+        None => Check::failed(
+            "limactl",
+            "not installed, so there is no Linux VM to run sandboxes in",
+            "brew install lima",
+        ),
+    });
+    checks.push(match template {
+        Some(path) => Check::ok("vm template", path.display().to_string()),
+        None => Check::failed(
+            "vm template",
+            "missing; Zygo cannot create the Linux VM without it",
+            "set ZYGO_LIMA_TEMPLATE to a Lima template, or reinstall Zygo",
+        ),
+    });
+    checks.push(match linux_binary {
+        Some(path) => Check::ok("linux build", path.display().to_string()),
+        None => Check::degraded(
+            "linux build",
+            "none on this Mac; the VM keeps whatever it already has",
+            "in a checkout: make guest-build (no Docker) or make poc/zygo-linux-musl; otherwise set ZYGO_LINUX_BIN",
+        ),
+    });
+    checks.push(match vm {
+        Vm::Running => Check::ok("vm", format!("instance `{INSTANCE}` is running")),
+        Vm::Stopped => Check::degraded(
+            "vm",
+            format!("instance `{INSTANCE}` is stopped"),
+            "it starts by itself on the next command",
+        ),
+        Vm::Absent => Check::degraded(
+            "vm",
+            format!("instance `{INSTANCE}` does not exist yet"),
+            "it is created by the first command that needs it",
+        ),
+    });
+    if vm != Vm::Absent {
+        checks.push(match generation {
+            Some(have) if have >= TEMPLATE_GENERATION => {
+                Check::ok("vm template generation", format!("{have}"))
+            }
+            have => Check::degraded(
+                "vm template generation",
+                format!(
+                    "the VM was created from generation {} of the template; this release ships {TEMPLATE_GENERATION}",
+                    have.map(|g| g.to_string()).unwrap_or_else(|| "0".into())
+                ),
+                format!(
+                    "`limactl delete {INSTANCE}` — the next command recreates it (about a minute; \
+                     nothing under $HOME is lost) — or apply the change by hand: \
+                     docs/troubleshooting.md, \"Session open refused by peer\""
+                ),
+            ),
+        });
+    }
+    if let Some(home) = home {
+        checks.push(Check::ok(
+            "shared directory",
+            format!("{} is mounted in the VM at the same path", home.display()),
+        ));
+    }
+    if vm != Vm::Running {
+        // The checks that matter — kernel, namespaces, cgroups, seccomp — are
+        // the guest's to make, and there is no guest to ask. Said as a
+        // failure rather than left out, so `ok` stays the *and* of every
+        // line and a health check does not read a stopped VM as a healthy
+        // one.
+        checks.push(Check::failed(
+            "sandboxes",
+            "nothing can be said about them while the VM is not running",
+            "run any zygo command to start it, then `zygo doctor` again",
+        ));
+    }
+    checks
 }
 
 /// What `zygo doctor` can say about the VM without starting it.
@@ -355,46 +764,76 @@ pub fn is_forwardable_env_name(name: &str) -> bool {
 /// reported as stopped.
 #[cfg(target_os = "macos")]
 pub struct VmReport {
-    pub limactl: Option<PathBuf>,
-    pub vm: Vm,
-    /// The guest's own `zygo doctor`, when there is a guest to ask.
-    pub guest: Option<(String, u8)>,
+    /// The Mac side: [`host_checks`].
+    pub host: Vec<zygo_core::doctor::Check>,
+    /// The guest's own `zygo doctor --json`, when there is a running guest
+    /// to ask. `Err` carries what it said instead, for the line that
+    /// reports it.
+    pub guest: Option<Result<crate::cmd::doctor::JsonReport, String>>,
 }
 
 #[cfg(target_os = "macos")]
 pub fn describe_vm() -> VmReport {
-    let Some(limactl) = which("limactl") else {
-        return VmReport {
-            limactl: None,
-            vm: Vm::Absent,
-            guest: None,
-        };
-    };
-    let vm = std::process::Command::new(&limactl)
-        .args(status_args())
-        .output()
-        .map(|out| Vm::parse(&String::from_utf8_lossy(&out.stdout)))
-        .unwrap_or(Vm::Absent);
-
-    let guest = (vm == Vm::Running)
-        .then(|| {
-            std::process::Command::new(&limactl)
-                .args(["shell", INSTANCE, "zygo", "doctor"])
+    let limactl = which("limactl");
+    let vm = limactl
+        .as_ref()
+        .and_then(|l| {
+            std::process::Command::new(l)
+                .args(status_args())
                 .output()
                 .ok()
-                .map(|out| {
-                    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-                    text.push_str(&String::from_utf8_lossy(&out.stderr));
-                    (text, out.status.code().unwrap_or(1) as u8)
-                })
         })
-        .flatten();
+        .map(|out| Vm::parse(&String::from_utf8_lossy(&out.stdout)))
+        .unwrap_or(Vm::Absent);
+    let generation = instance_template()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|text| template_generation_of(&text));
+    let home = std::env::var_os("HOME").map(PathBuf::from);
 
-    VmReport {
-        limactl: Some(limactl),
+    // Canonical for display: the checkout's template is found through
+    // `crates/zygo-cli/../../shim/lima.yaml`, which is true and unreadable.
+    let tidy = |p: PathBuf| p.canonicalize().unwrap_or(p);
+    let host = host_checks(
+        limactl.as_deref(),
+        template_path().ok().map(tidy).as_deref(),
+        linux_binary().map(tidy).as_deref(),
         vm,
-        guest,
-    }
+        generation,
+        home.as_deref(),
+    );
+
+    let guest = match (&limactl, vm) {
+        (Some(limactl), Vm::Running) => Some(
+            std::process::Command::new(limactl)
+                .args(["shell", INSTANCE, "zygo", "doctor", "--json"])
+                .output()
+                .map_err(|e| e.to_string())
+                .and_then(|out| {
+                    serde_json::from_slice::<crate::cmd::doctor::JsonReport>(&out.stdout).map_err(
+                        |_| {
+                            let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+                            text.push_str(&String::from_utf8_lossy(&out.stderr));
+                            text.trim().to_string()
+                        },
+                    )
+                }),
+        ),
+        _ => None,
+    };
+
+    VmReport { host, guest }
+}
+
+/// The instance's own copy of the template, which Lima writes at creation.
+#[cfg(target_os = "macos")]
+fn instance_template() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(
+        PathBuf::from(home)
+            .join(".lima")
+            .join(INSTANCE)
+            .join("lima.yaml"),
+    )
 }
 
 /// Run the command in the VM and return its exit status.
@@ -421,17 +860,23 @@ pub fn forward(cli: &Cli) -> anyhow::Result<Option<u8>> {
         .map(PathBuf::from)
         .context("HOME is not set, so there is no shared directory to run in")?;
     let cwd = std::env::current_dir().context("this process has no working directory")?;
-    let workdir = workdir(&cwd, &home)
-        .map_err(|e| anyhow::anyhow!("{e}\n  → run it from somewhere under {}", home.display()))?;
+    let dependency = cwd_dependency(&cli.command, spec_discoverable_here().as_deref());
+    let workdir = workdir(&cwd, &home, dependency).map_err(|e| {
+        anyhow::anyhow!(
+            "{e}\n  → run it from somewhere under {}, or name every path absolutely",
+            home.display()
+        )
+    })?;
 
     // The same rule, for what the command brings with it. Refused here so the
     // reader is told about a path on the host they are looking at, rather than
-    // by the guest about a path it has never had.
-    let unmapped = unmapped_mounts(mounts_of(&cli.command), &cwd, &home);
-    if let Some(first) = unmapped.first() {
+    // by the guest about a path it has never had — or, for an output file,
+    // not told at all.
+    let unmapped = unmapped_paths(&cli.command, &cwd, &home);
+    if let Some((what, first)) = unmapped.first() {
         anyhow::bail!(
             "on macOS Zygo runs in a Linux VM, and only {} is shared with it — \
-             but this command mounts {}{}\n  \
+             but {what} {} is outside it{}\n  \
              → move it under {}, or set TMPDIR there if it is a temporary directory",
             home.display(),
             first.display(),
@@ -455,33 +900,77 @@ pub fn forward(cli: &Cli) -> anyhow::Result<Option<u8>> {
         return Ok(Some(0));
     }
 
-    ensure_running(&limactl, &paths)?;
+    // Said before it is done, because it is more than was asked (Z-6). On
+    // Linux `stop --all` stops the functions; here it also stops the machine
+    // they ran in, and the next command pays the boot.
+    if stops_everything(&cli.command) {
+        eprintln!(
+            "this stops every sandbox and every warm function on this Mac, and then \
+             the Linux VM they run in; the next command boots it again (about 16 s)"
+        );
+    }
+
+    // The fast path: Lima keeps one multiplexed SSH connection to the VM and
+    // writes an `ssh -F`-able config beside the instance for exactly this. When
+    // that connection's master is alive the VM is running by definition, so the
+    // `limactl list` that `ensure_running` would make is skipped, and the
+    // command goes over the existing connection rather than through `limactl
+    // shell`, which reads the instance, checks it and *then* runs ssh. Measured
+    // on the Mac this was written on: `limactl shell zygo true` 40–50 ms, the
+    // same over `ssh -F` under 10 ms, `-O check` under a millisecond — against
+    // 10 ms for the sandbox itself. A consumer that runs a sandbox per event
+    // was paying eight times the sandbox in ceremony.
+    //
+    // `limactl` stays for what it is for: booting the VM, copying the binary
+    // in, and the first command after a boot, before there is a master to
+    // check. The retry below reads the same SSH signatures either way.
+    let fast = ssh_config(&home).filter(|config| mux_alive(config));
+    if fast.is_none() {
+        ensure_running(&limactl, &paths)?;
+    }
     ensure_guest_binary(&limactl, &paths)?;
 
     let env = environment_to_forward(cli);
-    let mut child = std::process::Command::new(&limactl)
-        .args(forward_args_with_env(
-            &workdir,
-            std::env::args_os().skip(1),
-            &env,
-        ))
-        .spawn()
-        .with_context(|| format!("could not run {}", limactl.display()))?;
+    let (program, args): (PathBuf, Vec<OsString>) = match &fast {
+        Some(config) => (
+            PathBuf::from("ssh"),
+            ssh_args(
+                config,
+                &workdir,
+                std::env::args_os().skip(1),
+                &env,
+                std::io::IsTerminal::is_terminal(&std::io::stdin()),
+            ),
+        ),
+        None => (
+            limactl.clone(),
+            forward_args_with_env(&workdir, std::env::args_os().skip(1), &env),
+        ),
+    };
 
-    // Relay the signals the user can send to *this* process.
-    //
-    // Ctrl-C reaches `limactl` anyway, because it goes to the whole foreground
-    // process group. A `kill` by pid does not: it arrives here, this process
-    // ends, and `limactl` — and the sandbox behind it — carries on with
-    // nobody left to wait for it (B-28). So the pid is published and the two
-    // signals a person actually sends are forwarded.
-    FORWARDED_CHILD.store(child.id() as i32, std::sync::atomic::Ordering::SeqCst);
-    install_signal_relay();
-
-    let status = child
-        .wait()
-        .with_context(|| format!("could not wait for {}", limactl.display()))?;
-    FORWARDED_CHILD.store(0, std::sync::atomic::Ordering::SeqCst);
+    // Retried only when the guest demonstrably ran nothing: the SSH session
+    // never opened. This is the one layer that can know that, which is why
+    // the retry is here and not in every caller.
+    let mut attempt = 0;
+    let status = loop {
+        let (status, transport_failed) = run_forwarded(&program, &args, cli.verbose > 0)?;
+        if !transport_failed {
+            break status;
+        }
+        if attempt < TRANSPORT_RETRIES {
+            attempt += 1;
+            tracing::debug!(attempt, "the VM refused a session; retrying");
+            std::thread::sleep(transport_backoff(attempt));
+            continue;
+        }
+        crate::output::error(&anyhow::anyhow!(
+            "could not open a session to the Linux VM (too many at once)\n  \
+             → tried {} times; the VM's sshd caps the sessions one connection may carry\n  \
+             → `zygo doctor` says whether the VM was made from a template that raises the cap",
+            TRANSPORT_RETRIES + 1
+        ));
+        return Ok(Some(EXIT_VM_UNREACHABLE));
+    };
 
     // "Stop everything" includes the machine Zygo started to do it in. A VM
     // holding no warm functions is four gigabytes of a laptop doing nothing,
@@ -499,6 +988,79 @@ pub fn forward(cli: &Cli) -> anyhow::Result<Option<u8>> {
     // it can; where the child died on a signal there is none to relay, and
     // 128 + n is what every shell reports.
     Ok(Some(exit_status(&status)))
+}
+
+/// One attempt at the forwarded command.
+///
+/// Standard input and output are the child's own — a pipeline on the Mac has
+/// to reach the sandbox unbuffered and untouched. Standard error passes
+/// through this process, chunk by chunk as it arrives, so the one thing
+/// SSH says that Zygo has an answer for ([`is_transport_failure`]) can be
+/// recognised, kept back unless `-v` asked for it, and replaced by a
+/// sentence a user can act on. The second value is whether that happened
+/// *and* `limactl` exited 255, which together mean the guest ran nothing.
+#[cfg(target_os = "macos")]
+fn run_forwarded(
+    program: &Path,
+    args: &[OsString],
+    verbose: bool,
+) -> anyhow::Result<(std::process::ExitStatus, bool)> {
+    use anyhow::Context;
+    use std::io::{Read, Write};
+
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("could not run {}", program.display()))?;
+
+    // Relay the signals the user can send to *this* process.
+    //
+    // Ctrl-C reaches `limactl` anyway, because it goes to the whole foreground
+    // process group. A `kill` by pid does not: it arrives here, this process
+    // ends, and `limactl` — and the sandbox behind it — carries on with
+    // nobody left to wait for it (B-28). So the pid is published and the two
+    // signals a person actually sends are forwarded.
+    FORWARDED_CHILD.store(child.id() as i32, std::sync::atomic::Ordering::SeqCst);
+    install_signal_relay();
+
+    let mut stderr = child.stderr.take().expect("stderr was piped");
+    let relay = std::thread::spawn(move || {
+        // The transport fails before the guest has said anything, so the
+        // signature is in the first few kilobytes if it is anywhere.
+        const LOOK_IN: usize = 8 * 1024;
+        let mut seen = String::new();
+        let mut matched = false;
+        let mut out = std::io::stderr();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = match stderr.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            let chunk = &buf[..n];
+            if seen.len() < LOOK_IN {
+                seen.push_str(&String::from_utf8_lossy(chunk));
+            }
+            let is_ssh = is_transport_failure(&String::from_utf8_lossy(chunk));
+            matched |= is_ssh;
+            if is_ssh && !verbose {
+                // Zygo's own sentence replaces it, once the retries are spent.
+                continue;
+            }
+            let _ = out.write_all(chunk);
+            let _ = out.flush();
+        }
+        matched || is_transport_failure(&seen)
+    });
+
+    let status = child
+        .wait()
+        .with_context(|| format!("could not wait for {}", program.display()))?;
+    FORWARDED_CHILD.store(0, std::sync::atomic::Ordering::SeqCst);
+    let matched = relay.join().unwrap_or(false);
+
+    Ok((status, matched && status.code() == Some(255)))
 }
 
 /// The `limactl` child's pid while one is running, for the signal relay.
@@ -676,7 +1238,8 @@ fn ensure_guest_binary(limactl: &Path, paths: &zygo_core::paths::Paths) -> anyho
         anyhow::bail!(
             "the VM has no Linux build of Zygo to run, and there is none on \
              this Mac to put there\n  \
-             → in a checkout: make poc/zygo-linux-musl\n  \
+             → in a checkout: make guest-build (compiled in the VM, no Docker) \
+             or make poc/zygo-linux-musl\n  \
              → otherwise: set ZYGO_LINUX_BIN to a Linux `zygo` for this \
              machine's architecture"
         );
@@ -706,6 +1269,10 @@ fn ensure_guest_binary(limactl: &Path, paths: &zygo_core::paths::Paths) -> anyho
         return Ok(());
     }
 
+    // Whether this is a *replacement*: the stamp says an earlier install
+    // happened, so a supervisor started from the old binary may be running.
+    let replacing = stamp.is_file();
+
     tracing::info!(binary = %source.display(), "installing this release's Linux binary in the VM");
     for args in [copy_args(&source), install_args()] {
         let status = std::process::Command::new(limactl)
@@ -723,6 +1290,27 @@ fn ensure_guest_binary(limactl: &Path, paths: &zygo_core::paths::Paths) -> anyho
         let _ = std::fs::create_dir_all(dir);
     }
     let _ = std::fs::write(&stamp, &want);
+
+    // A skew the shim caused is a skew the shim fixes (Z-6). The supervisor
+    // in the guest, if there is one, was started from the binary that was
+    // just replaced, and the next command would be refused with "client
+    // speaks control v13, this supervisor speaks v12". `supervisor stop`
+    // drains it and exits; the next `serve` starts one of this release.
+    // Best effort and quiet on the common case, which is no supervisor.
+    if replacing {
+        let stopped = std::process::Command::new(limactl)
+            .args(["shell", INSTANCE, GUEST_BIN, "supervisor", "stop"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if stopped {
+            eprintln!(
+                "the supervisor in the Linux VM was running the previous release and has \
+                 been stopped; the next `serve` or `up` starts one of this release"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -979,26 +1567,309 @@ mod tests {
     fn a_directory_under_home_keeps_its_path() {
         let home = Path::new("/Users/m");
         assert_eq!(
-            workdir(Path::new("/Users/m/work/fn"), home).unwrap(),
+            workdir(Path::new("/Users/m/work/fn"), home, None).unwrap(),
             PathBuf::from("/Users/m/work/fn")
         );
-        assert_eq!(workdir(home, home).unwrap(), PathBuf::from("/Users/m"));
+        assert_eq!(
+            workdir(home, home, None).unwrap(),
+            PathBuf::from("/Users/m")
+        );
+        // Under home, a relative argument is fine: the directory is shared.
+        assert_eq!(
+            workdir(
+                Path::new("/Users/m/work"),
+                home,
+                Some("the mount `./x`".into())
+            )
+            .unwrap(),
+            PathBuf::from("/Users/m/work")
+        );
     }
 
+    /// Z-5 from the first adoption report: `cd /tmp && zygo run --mount
+    /// $HOME/x:/data:rw alpine:3 true` was refused although every path in
+    /// it is shared. Only a command that *uses* its directory is refused
+    /// now, and the message says which argument used it.
     #[test]
-    fn a_directory_outside_home_is_refused_and_says_both_paths() {
+    fn a_directory_outside_home_is_refused_only_when_something_depends_on_it() {
         let home = Path::new("/Users/m");
-        let err = workdir(Path::new("/tmp/scratch"), home).unwrap_err();
+        assert_eq!(
+            workdir(Path::new("/tmp/scratch"), home, None).unwrap(),
+            PathBuf::from(GUEST_NEUTRAL_DIR),
+            "nothing relative, nothing discovered: forwarded, in a neutral directory"
+        );
+
+        let err = workdir(
+            Path::new("/tmp/scratch"),
+            home,
+            Some("the mount `./x` is relative to that directory".into()),
+        )
+        .unwrap_err();
         let text = err.to_string();
         assert!(text.contains("/tmp/scratch"), "{text}");
         assert!(text.contains("/Users/m"), "{text}");
+        assert!(
+            text.contains("the mount `./x`"),
+            "the argument is named: {text}"
+        );
     }
 
     // A prefix match on strings would accept this; on paths it does not.
     #[test]
     fn a_sibling_directory_that_merely_starts_with_home_is_not_home() {
         let home = Path::new("/Users/m");
-        assert!(workdir(Path::new("/Users/martin/work"), home).is_err());
+        assert!(workdir(Path::new("/Users/martin/work"), home, Some("x".into())).is_err());
+    }
+
+    /// The rule, argument by argument.
+    #[test]
+    fn only_a_relative_path_or_a_discovered_spec_needs_the_working_directory() {
+        let none: Option<&Path> = None;
+
+        // The report's exact command: every path absolute, nothing found.
+        let absolute = command_of(&[
+            "zygo",
+            "run",
+            "--mount",
+            "/Users/m/x:/data:rw",
+            "alpine:3",
+            "true",
+        ]);
+        assert_eq!(cwd_dependency(&absolute, none), None);
+
+        // A relative mount means "from here".
+        let relative = command_of(&["zygo", "run", "--mount", "./x:/x:rw", "alpine:3", "true"]);
+        let why = cwd_dependency(&relative, none).expect("refused");
+        assert!(why.contains("the mount `./x`"), "{why}");
+
+        // A handler file is the same kind of thing.
+        let served = command_of(&["zygo", "serve", "handler.py", "--name", "f"]);
+        let why = cwd_dependency(&served, none).expect("refused");
+        assert!(why.contains("the handler `handler.py`"), "{why}");
+        let served = command_of(&["zygo", "serve", "/Users/m/handler.py", "--name", "f"]);
+        assert_eq!(cwd_dependency(&served, none), None);
+
+        // A spec found by searching upwards would not be found in the VM.
+        let found = Path::new("/tmp/project/sandbox.toml");
+        let why = cwd_dependency(&absolute, Some(found)).expect("refused");
+        assert!(why.contains("/tmp/project/sandbox.toml"), "{why}");
+        // Unless `-f` names one, absolutely.
+        let named = command_of(&["zygo", "run", "-f", "/Users/m/s.toml", "alpine:3", "true"]);
+        assert_eq!(cwd_dependency(&named, Some(found)), None);
+        let named = command_of(&["zygo", "run", "-f", "s.toml", "alpine:3", "true"]);
+        assert!(
+            cwd_dependency(&named, none)
+                .unwrap()
+                .contains("the spec file `s.toml`")
+        );
+
+        // Commands with no host paths at all: the interactive shell, `ps`,
+        // `stop`. Where the user stood is of no consequence.
+        for args in [
+            &["zygo", "shell", "f"][..],
+            &["zygo", "ps"][..],
+            &["zygo", "stop", "--all"][..],
+            &["zygo", "exec", "f", "{}"][..],
+            &[
+                "zygo",
+                "exec",
+                "--runtime",
+                "py",
+                "--script",
+                "sha256:abc",
+                "{}",
+            ][..],
+        ] {
+            assert_eq!(cwd_dependency(&command_of(args), none), None, "{args:?}");
+        }
+        let script = command_of(&["zygo", "exec", "--runtime", "py", "--script", "s.py", "{}"]);
+        assert!(
+            cwd_dependency(&script, none)
+                .unwrap()
+                .contains("the script `s.py`")
+        );
+
+        // `up` discovers, `up -f /abs` does not.
+        assert!(cwd_dependency(&command_of(&["zygo", "up"]), Some(found)).is_some());
+        assert_eq!(
+            cwd_dependency(
+                &command_of(&["zygo", "up", "-f", "/Users/m/s.toml"]),
+                Some(found)
+            ),
+            None
+        );
+    }
+
+    /// SSH's transport failures, and the lines that are not one.
+    #[test]
+    fn the_transport_signature_is_recognised_and_nothing_else_is() {
+        for line in [
+            "mux_client_request_session: session request failed: Session open refused by peer\n",
+            "Session open refused by peer",
+        ] {
+            assert!(is_transport_failure(line), "{line:?}");
+        }
+        for line in [
+            "Traceback (most recent call last):\n",
+            "error: the sandbox exceeded its 30s deadline and was killed\n",
+            "ssh: connect to host 127.0.0.1 port 60022: Connection refused\n",
+            "",
+        ] {
+            assert!(!is_transport_failure(line), "{line:?}");
+        }
+    }
+
+    /// The backoff grows, and the whole retry budget stays well under a
+    /// second: a run that needed it should not notice.
+    #[test]
+    fn the_retry_budget_is_short() {
+        let total: std::time::Duration = (1..=TRANSPORT_RETRIES).map(transport_backoff).sum();
+        assert!(transport_backoff(1) < transport_backoff(2));
+        assert!(total < std::time::Duration::from_secs(1), "{total:?}");
+        assert_ne!(
+            EXIT_VM_UNREACHABLE, 125,
+            "125 is `this host cannot run sandboxes`"
+        );
+        assert_ne!(
+            EXIT_VM_UNREACHABLE, 255,
+            "255 is what SSH and a program both exit with"
+        );
+    }
+
+    /// The retry decision, against a stand-in for `limactl`: SSH's line
+    /// and exit 255 together mean the guest ran nothing; either alone does
+    /// not. A real refusal needs a VM and a burst wide enough to hit its
+    /// session cap, which `poc/verify_shim_concurrency.sh` attempts; this
+    /// is the decision itself, on the bytes SSH actually prints.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_refused_session_is_recognised_only_with_exit_255() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = |name: &str, script: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let refused = fake(
+            "refused",
+            "printf 'mux_client_request_session: session request failed: Session open refused by peer\\n' >&2; exit 255",
+        );
+        let program_255 = fake("program", "printf 'Traceback\\n' >&2; exit 255");
+        let refused_but_ran = fake(
+            "odd",
+            "printf 'Session open refused by peer\\n' >&2; exit 3",
+        );
+        let fine = fake("fine", "exit 0");
+
+        let (status, transport) = run_forwarded(&refused, &[], false).unwrap();
+        assert_eq!(status.code(), Some(255));
+        assert!(transport, "SSH's line and 255: the guest ran nothing");
+
+        let (status, transport) = run_forwarded(&program_255, &[], false).unwrap();
+        assert_eq!(status.code(), Some(255));
+        assert!(!transport, "255 from a program is the program's");
+
+        let (_, transport) = run_forwarded(&refused_but_ran, &[], false).unwrap();
+        assert!(
+            !transport,
+            "the line without 255 is not a transport failure"
+        );
+
+        let (status, transport) = run_forwarded(&fine, &[], false).unwrap();
+        assert!(status.success());
+        assert!(!transport);
+    }
+
+    /// The generation marker, as the template writes it and an old
+    /// instance's copy lacks it.
+    #[test]
+    fn the_template_declares_this_generation() {
+        let shipped = include_str!("../../../shim/lima.yaml");
+        assert_eq!(template_generation_of(shipped), Some(TEMPLATE_GENERATION));
+        assert_eq!(template_generation_of("images:\n  - location: x\n"), None);
+        assert_eq!(
+            template_generation_of("# zygo-template-generation: 1\n"),
+            Some(1)
+        );
+    }
+
+    /// Z-4: the Mac side is its own checks, and `ok` is the *and* of them.
+    #[test]
+    fn host_checks_name_what_a_deploy_script_needs_to_know() {
+        use zygo_core::doctor::Status;
+        let names =
+            |checks: &[zygo_core::doctor::Check]| checks.iter().map(|c| c.name).collect::<Vec<_>>();
+        let worst =
+            |checks: &[zygo_core::doctor::Check]| checks.iter().map(|c| c.status).max().unwrap();
+
+        let healthy = host_checks(
+            Some(Path::new("/opt/homebrew/bin/limactl")),
+            Some(Path::new("/opt/zygo/lima.yaml")),
+            Some(Path::new("/opt/zygo/zygo-linux-aarch64")),
+            Vm::Running,
+            Some(TEMPLATE_GENERATION),
+            Some(Path::new("/Users/m")),
+        );
+        assert_eq!(worst(&healthy), Status::Ok, "{healthy:?}");
+        assert!(names(&healthy).contains(&"vm template generation"));
+
+        // No limactl: a failure with the brew line, not "no kernel".
+        let bare = host_checks(None, None, None, Vm::Absent, None, None);
+        assert_eq!(worst(&bare), Status::Failed);
+        assert!(
+            bare.iter()
+                .any(|c| c.name == "limactl" && c.remedy.as_deref() == Some("brew install lima"))
+        );
+        assert!(
+            !names(&bare).contains(&"vm template generation"),
+            "no instance, no generation to compare"
+        );
+
+        // A stopped VM is not a broken one, but nothing can vouch for the
+        // sandboxes until it is up — so `ok` is false, with the remedy.
+        let stopped = host_checks(
+            Some(Path::new("/l")),
+            Some(Path::new("/t")),
+            Some(Path::new("/b")),
+            Vm::Stopped,
+            Some(TEMPLATE_GENERATION),
+            None,
+        );
+        assert_eq!(worst(&stopped), Status::Failed);
+        assert!(
+            stopped
+                .iter()
+                .any(|c| c.name == "vm" && c.status == Status::Degraded)
+        );
+        assert!(
+            stopped
+                .iter()
+                .any(|c| c.name == "sandboxes" && c.status == Status::Failed)
+        );
+
+        // An instance made from an older template says so and names the fix.
+        let stale = host_checks(
+            Some(Path::new("/l")),
+            Some(Path::new("/t")),
+            Some(Path::new("/b")),
+            Vm::Running,
+            None,
+            None,
+        );
+        let generation = stale
+            .iter()
+            .find(|c| c.name == "vm template generation")
+            .unwrap();
+        assert_eq!(generation.status, Status::Degraded);
+        assert!(
+            generation
+                .remedy
+                .as_deref()
+                .unwrap()
+                .contains("limactl delete zygo")
+        );
     }
 
     #[test]
@@ -1101,41 +1972,148 @@ mod tests {
         }
     }
 
-    /// The other half of the path rule. Found by a real consumer: an embedder
-    /// mounts a scratch directory from the system temporary directory, which
-    /// on macOS is outside `$HOME`, and every one of its tests failed with
-    /// the guest complaining about a path the host has.
+    /// What goes over the wire is one shell command for the guest, so every
+    /// word is quoted and the binary is absolute.
+    #[test]
+    fn the_ssh_form_quotes_every_word_and_names_the_binary_absolutely() {
+        let config = Path::new("/Users/m/.lima/zygo/ssh.config");
+        let workdir = Path::new("/Users/m/my project");
+        let env = [(OsString::from("ZYGO_LOG"), OsString::from("debug"))];
+
+        let args = ssh_args(
+            config,
+            workdir,
+            [
+                "run",
+                "--env",
+                "GREETING=it's here",
+                "alpine:3",
+                "echo",
+                "hi",
+            ],
+            &env,
+            false,
+        );
+
+        assert_eq!(args[0], "-F");
+        assert_eq!(args[1], config.as_os_str());
+        assert_eq!(args[2], "lima-zygo");
+        assert_eq!(args[3], "--");
+        assert_eq!(
+            args[4],
+            "cd '/Users/m/my project' && env ZYGO_LOG=debug /usr/local/bin/zygo run --env \
+             'GREETING=it'\\''s here' alpine:3 echo hi"
+        );
+        assert_eq!(args.len(), 5, "no -t without a terminal");
+
+        let with_tty = ssh_args(config, workdir, ["ps"], &[], true);
+        assert_eq!(with_tty[2], "-t");
+        assert_eq!(
+            with_tty[5],
+            "cd '/Users/m/my project' && /usr/local/bin/zygo ps"
+        );
+    }
+
+    #[test]
+    fn a_word_is_left_bare_only_when_a_shell_would_read_it_as_one() {
+        let q = |s: &str| sh_quote(std::ffi::OsStr::new(s)).into_string().unwrap();
+        assert_eq!(q("alpine:3"), "alpine:3");
+        assert_eq!(q("--mem=512M"), "--mem=512M");
+        assert_eq!(q("/Users/m/x.py"), "/Users/m/x.py");
+        assert_eq!(q(""), "''");
+        assert_eq!(q("a b"), "'a b'");
+        assert_eq!(q("it's"), "'it'\\''s'");
+        assert_eq!(q("$HOME"), "'$HOME'");
+        assert_eq!(q("a;b"), "'a;b'");
+    }
+
+    /// The config is where Lima puts it, and only counts once the instance
+    /// exists — before that there is nothing to connect to.
+    #[test]
+    fn the_ssh_config_is_lima_s_and_only_when_present() {
+        let home = tempfile::tempdir().expect("tempdir");
+        assert_eq!(ssh_config(home.path()), None);
+
+        let dir = home.path().join(".lima").join(INSTANCE);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ssh.config"), "Host lima-zygo\n").unwrap();
+        assert_eq!(ssh_config(home.path()), Some(dir.join("ssh.config")));
+    }
+
+    /// The same rule for the paths that are not mounts. An outcome file
+    /// outside `$HOME` used to be forwarded and written inside the VM, where
+    /// the caller never saw it.
+    #[test]
+    fn every_path_the_command_names_is_held_to_the_shared_directory() {
+        let home = Path::new("/Users/m");
+        let cwd = Path::new("/Users/m/projects/app");
+        let parse = |args: &[&str]| Cli::try_parse_from(args).expect("parses").command;
+
+        let run = parse(&[
+            "zygo",
+            "run",
+            "--outcome",
+            "/tmp/o.json",
+            "--requirements",
+            "./requirements.txt",
+            "--mount",
+            "/Users/m/data:/data",
+            "alpine",
+        ]);
+        assert_eq!(
+            unmapped_paths(&run, cwd, home),
+            [("the outcome file", PathBuf::from("/tmp/o.json"))],
+            "the outcome file is outside; the relative requirements file and the mount are not"
+        );
+
+        let ok = parse(&["zygo", "run", "--outcome", "/Users/m/o.json", "alpine"]);
+        assert!(unmapped_paths(&ok, cwd, home).is_empty());
+
+        let serve = parse(&["zygo", "serve", "/var/lib/h.py", "--name", "h"]);
+        assert_eq!(
+            unmapped_paths(&serve, cwd, home),
+            [("the handler", PathBuf::from("/var/lib/h.py"))]
+        );
+    }
+
+    /// The case that started the rule: an embedder's script driver mounts a
+    /// scratch directory from the system temporary directory, which on macOS
+    /// is outside `$HOME`, and every one of its tests failed with the guest
+    /// complaining about a path the host has.
     #[test]
     fn a_mount_the_vm_cannot_see_is_refused_here() {
         let home = Path::new("/Users/m");
         let cwd = Path::new("/Users/m/projects/app");
-        let mount = |s: &str| s.parse::<Mount>().expect("mount");
+        let run = |mounts: &[&str]| {
+            let mut args = vec!["zygo", "run"];
+            for m in mounts {
+                args.extend(["--mount", m]);
+            }
+            args.push("alpine");
+            Cli::try_parse_from(args).expect("parses").command
+        };
 
         // Under `$HOME`: the VM has it at the same path.
         assert!(
-            unmapped_mounts(&[mount("/Users/m/data:/data")], cwd, home).is_empty(),
+            unmapped_paths(&run(&["/Users/m/data:/data"]), cwd, home).is_empty(),
             "an absolute path under home is shared"
         );
         // Relative: resolved against the caller's directory, which is itself
         // already known to be under home.
         assert!(
-            unmapped_mounts(&[mount("./cache:/cache:rw")], cwd, home).is_empty(),
+            unmapped_paths(&run(&["./cache:/cache:rw"]), cwd, home).is_empty(),
             "a relative path means a place on this side"
         );
 
         // The case that failed: macOS puts temporary directories here.
         assert_eq!(
-            unmapped_mounts(&[mount("/var/folders/ab/T/run:/data:rw")], cwd, home),
-            [PathBuf::from("/var/folders/ab/T/run")]
+            unmapped_paths(&run(&["/var/folders/ab/T/run:/data:rw"]), cwd, home),
+            [("the mount", PathBuf::from("/var/folders/ab/T/run"))]
         );
         // And every one of them is collected, so the message can count them.
         assert_eq!(
-            unmapped_mounts(
-                &[
-                    mount("/Users/m/ok:/ok"),
-                    mount("/tmp/one:/one"),
-                    mount("/etc/two:/two"),
-                ],
+            unmapped_paths(
+                &run(&["/Users/m/ok:/ok", "/tmp/one:/one", "/etc/two:/two"]),
                 cwd,
                 home
             )
@@ -1147,8 +2125,14 @@ mod tests {
     /// Only the commands that can carry one are asked.
     #[test]
     fn mounts_are_read_from_whichever_command_has_them() {
+        let mounts = |command: &Command| {
+            host_paths(command)
+                .into_iter()
+                .filter(|(what, _)| *what == "the mount")
+                .count()
+        };
         let with_mount = command_of(&["zygo", "run", "--mount", "/tmp/x:/x", "alpine:3", "true"]);
-        assert_eq!(mounts_of(&with_mount).len(), 1);
+        assert_eq!(mounts(&with_mount), 1);
 
         let served = command_of(&[
             "zygo",
@@ -1159,9 +2143,9 @@ mod tests {
             "--mount",
             "/tmp/x:/x:rw",
         ]);
-        assert_eq!(mounts_of(&served).len(), 1);
+        assert_eq!(mounts(&served), 1);
 
-        assert!(mounts_of(&command_of(&["zygo", "ps"])).is_empty());
+        assert_eq!(mounts(&command_of(&["zygo", "ps"])), 0);
     }
 
     #[test]

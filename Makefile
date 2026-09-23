@@ -16,6 +16,7 @@ help:
 	@echo "verify-api-linux  the HTTP API end to end, through the Python client"
 	@echo "verify-plugin-host  a plugin host on the API alone — the embedder exit criterion"
 	@echo "oci-image / verify-oci  the container image, built and run unprivileged"
+	@echo "guest-build  the Linux build for the macOS VM, compiled in the VM (no Docker)"
 	@echo "vm-build     build the vm-capable binary (libkrun linked in)"
 	@echo "vm-kernel    build the guest kernel and check its config"
 	@echo "vm-probe     ask whether libkrun links against musl (the vm plan V1)"
@@ -44,6 +45,8 @@ help:
 	@echo "conformance / conformance-node  the agent protocol suite"
 	@echo "conformance-node-seccomp  the Node agent with the real kernel filter"
 	@echo "verify-shim  the macOS shim, against the Linux VM it manages"
+	@echo "verify-shim-concurrency  24 runs at once from a Mac, six rounds, wants 144/144"
+	@echo "verify-seccomp-profiles-linux  copy2 and pip --target under every profile; the profiles differ from inside"
 	@echo "syscall-tables  regenerate the seccomp syscall number tables"
 	@echo "fmt / lint   rustfmt / clippy"
 
@@ -152,6 +155,14 @@ conformance-node-seccomp: poc/zygo-linux-musl
 # see that through a docker build. The target dir and registry are volumes so a
 # rebuild is incremental — this one is copied to a real Linux host to test on,
 # so it is rebuilt often.
+# The same binary, compiled inside the Lima VM that will run it, for a Mac
+# with no Docker. First use installs rustup, the musl target and musl-gcc into
+# the VM; the target directory is the VM's own, not this checkout's.
+.PHONY: guest-build
+guest-build:
+	limactl shell zygo -- sh poc/build_guest.sh
+	@ls -lh poc/zygo-linux-musl
+
 .PHONY: poc/zygo-linux-musl
 poc/zygo-linux-musl:
 	docker run --rm -v "$(PWD):/w" -w /w \
@@ -214,6 +225,11 @@ verify-login-linux: poc/zygo-linux-musl
 verify-shim: build
 	sh poc/verify_shim.sh
 
+# Z-2 of the first adoption report: 24 `zygo run`s at once, six rounds, from
+# a Mac. Wants 144/144; the baseline before the fix was about 7 failures.
+verify-shim-concurrency: build
+	sh poc/verify_shim_concurrency.sh
+
 # Type-checking against a Linux target does, without needing a Linux host.
 # `--no-default-features` drops the registry client, whose TLS stack needs a
 # cross C toolchain that is not worth installing for a type check.
@@ -238,6 +254,17 @@ verify-linux: poc/zygo-linux-musl
 	docker run --rm -t --privileged -v "$(PWD):/src:ro" \
 		-e ZYGO_DATA_HOME=/tmp/zdata python:3.12-slim \
 		sh /src/poc/verify_launcher.sh
+
+# What the first adoption report found about seccomp, attempted on a kernel:
+# `shutil.copy2` and `pip install --target` across a mount under every
+# profile (Z-1), the profiles observably different from inside a sandbox,
+# and `--seccomp` visible in `--dry-run` (Z-3). Needs the network for the
+# `pip` half, which skips without it.
+verify-seccomp-profiles-linux: poc/zygo-linux-musl
+	docker run --rm --privileged -v "$(PWD):/src:ro" \
+		-e ZYGO_DATA_HOME=/tmp/zdata-seccomp -e ZYGO_VERIFY_OUT=/tmp/zverify-out \
+		python:3.12-slim \
+		sh /src/poc/verify_seccomp_profiles.sh
 
 # End-to-end supervisor lifecycle: serve, exec, ps, backpressure, stop.
 #

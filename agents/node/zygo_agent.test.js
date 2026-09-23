@@ -183,6 +183,8 @@ test('a handler that exports nothing callable is named, not silently absent', ()
   fs.writeFileSync(handler, 'module.exports = { notAHandler: 1 };\n');
   try {
     assert.throws(() => agent.loadHandler(handler, 'function'), /exports no handler/);
+    // And names the alternative where the failure is.
+    assert.throws(() => agent.loadHandler(handler, 'function'), /--mode stdin/);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

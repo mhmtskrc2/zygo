@@ -181,14 +181,15 @@ formula installs both; from a checkout they are:
 
 ```bash
 brew install lima            # what starts the VM
-make poc/zygo-linux-musl     # the Linux build that runs inside it
+make guest-build             # the Linux build that runs inside it, compiled in the VM
 ```
 
-Crossing into the VM costs about 100 ms per command, which hides the warm path
-from anything typed at a Mac shell; it is still there through the API and the
-SDKs, and through `zygo api` running *inside* the VM. That hop is not being
-optimised on purpose: a Mac is where Zygo is developed and tested, and Linux
-is where it runs. [The guide](docs/guide.md#macos) has the details.
+Crossing into the VM costs about 20 ms per command once it is up — the shim
+uses the SSH connection Lima already holds — so a one-shot `run` from a Mac
+shell is about 30 ms, of which ~10 ms is the sandbox. The millisecond warm path
+is there through the API and the SDKs, and through `zygo api` running *inside*
+the VM. [The guide](docs/guide.md#macos) has the details, and
+[what Zygo costs](docs/performance.md#on-a-mac) has the numbers.
 
 ## How
 
@@ -289,7 +290,9 @@ things. Those are set once, by whoever installed the server:
 **Measured, not asserted.** The warm path is a median of **1.70 ms** and a 99th
 percentile of **2.81 ms** through the shipping code at 250 requests a second,
 sustaining **981 requests a second** at a concurrency of four; a cold `zygo run`
-with the image cached is a median of **18.4 ms**. The suites run in three
+with the image cached is a median of **18.4 ms**. The warm path is the
+production shape, and the gap is the argument: [the guide](docs/guide.md#a-multi-tenant-consumer-on-the-warm-path)
+shows a multi-tenant consumer — one warm zygote per script version — on it. The suites run in three
 places, which turned out to matter: a privileged container, a Raspberry Pi as
 an ordinary user under a systemd session, and a Mac. The launcher is checked
 against a real kernel, including actual escape attempts; every syscall number

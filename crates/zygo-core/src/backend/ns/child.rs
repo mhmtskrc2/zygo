@@ -187,7 +187,7 @@ pub(super) unsafe fn harden(plan: &PreparedLaunch, err_fd: c_int) {
     // unprivileged caller) and after every other setup step, because the
     // filter denies most of what those steps needed.
     if !plan.seccomp.is_empty()
-        && let Err(e) = unsafe { super::seccomp::install(&plan.seccomp) }
+        && let Err(e) = unsafe { super::seccomp::install(&plan.seccomp, plan.seccomp_log) }
     {
         fail_with(err_fd, Step::InstallSeccomp, e.raw_os_error().unwrap_or(0));
     }

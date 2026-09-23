@@ -845,6 +845,8 @@ mod tests {
             oom_killed: false,
             peak_rss_kb: 0,
             wall_ms: 1.0,
+            started: true,
+            phase: "run".into(),
         };
         assert!(render(&quiet).contains("no output"));
 
@@ -857,6 +859,8 @@ mod tests {
             oom_killed: false,
             peak_rss_kb: 0,
             wall_ms: 1.0,
+            started: true,
+            phase: "run".into(),
         };
         let text = render(&failed);
         assert!(text.starts_with("partial\n"), "{text}");
@@ -872,6 +876,8 @@ mod tests {
             oom_killed: false,
             peak_rss_kb: 0,
             wall_ms: 1.0,
+            started: true,
+            phase: "run".into(),
         };
         assert!(render(&killed).contains("time limit"));
 
@@ -886,6 +892,8 @@ mod tests {
             oom_killed: true,
             peak_rss_kb: 65_536,
             wall_ms: 1.0,
+            started: true,
+            phase: "run".into(),
         };
         let text = render(&starved);
         assert!(text.contains("out of memory"), "{text}");

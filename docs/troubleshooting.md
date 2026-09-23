@@ -31,7 +31,10 @@ so, in those words, above the confirmation.
 **On a Mac**, and the path is outside your home directory: the Linux VM mounts
 `$HOME` and nothing else, so a path elsewhere has no counterpart inside it.
 System temporary directories are the usual culprit, because macOS puts them
-under `/var/folders`. Move the directory under `$HOME`.
+under `/var/folders`. Move the directory under `$HOME`. The shim refuses every
+such path before forwarding — a mount, a spec or requirements file, a handler,
+an `--outcome` file — and names which; an output file it let through would be
+written inside the VM, where you would never find it.
 
 ### "no cgroup controllers" or "there is no `memory.max` here"
 
@@ -130,6 +133,40 @@ On purpose. Private and link-local ranges — your host, its neighbours, and
 
 ## A request fails
 
+### "[Errno 1] Operation not permitted", naming a file that exists and is readable
+
+The file is fine. A **syscall** was refused: every sandbox runs under a
+seccomp allowlist, and a syscall the profile does not name answers `EPERM`,
+which libc and Python report as "Operation not permitted" against whatever
+path the call was about. The traceback names the file, never the syscall —
+`pip install --target` failed this way in nine tracebacks about `RECORD` and
+`WHEEL`, and the refused call was `listxattr` inside `shutil.copy2`.
+
+Find out which syscall, in this order:
+
+1. **`--seccomp permissive`**, once. If it works there, the profile is the
+   cause. (`permissive` is `default` plus namespaces, mounts, `ptrace` and
+   friends — it is not "no filter", so a call refused under both is not a
+   seccomp refusal at all.)
+2. **`ZYGO_LOG=debug zygo run …`**: the launcher then asks the kernel to
+   log every refusal, and each one appears in the host's kernel log as
+   `audit: type=1326 … comm="python3" … syscall=<n>`:
+
+   ```bash
+   ZYGO_LOG=debug zygo run --mount ./out:/out:rw python:3.12-slim python3 -c 'import shutil; shutil.copy2("/etc/hostname", "/out/x")'
+   sudo journalctl -k -n 20 | grep type=1326     # or: sudo dmesg | grep seccomp
+   ```
+
+   `<n>` is the syscall number for the sandbox's architecture; the tables
+   in `crates/zygo-core/src/backend/ns/syscalls.rs` map it to a name.
+3. **`strace -f -e trace=%file`** on the program *outside* Zygo, when the
+   kernel log is out of reach: it shows every file-related syscall the
+   program makes, and the one missing from the profile is usually obvious.
+
+Then report it. A syscall a real package needs that the profile refuses is a
+bug in the profile, and the extended-attribute family was one until the first
+adoption report found it.
+
 ### Exit 137, and you cannot tell why
 
 Both a deadline kill and an out-of-memory kill are a `SIGKILL`, so both are
@@ -144,6 +181,16 @@ cat /tmp/why.json
 counter. Over the HTTP API the same three fields are in the answer to
 `POST /run`, and the SDKs expose them as `timed_out` / `timedOut` and
 `oom_killed` / `oomKilled`.
+
+### The sandbox never started, and it looks like the program failed
+
+`--outcome` says which. A run that could not build its sandbox — the image
+is not there, the host cannot, a mount does not exist — writes the file too,
+with `started: false` and the `phase` that failed (`plan` or `start`); a
+program that ran and failed has `started: true` and `phase: "run"`. Over the
+API the same two fields are in the answer to `POST /run`, and the SDKs expose
+`started` / `phase`. Classify on those rather than on the error's text: a
+sandbox that never started is *unavailable*, not the code's fault.
 
 ### "`<name>` is at its concurrency limit — retry" (HTTP 429)
 
@@ -275,11 +322,12 @@ Guests boot either way.
 
 ### Everything is slow
 
-Crossing into the Linux VM costs about 100 ms per command, and that is the
-floor for anything typed at a Mac shell. The millisecond warm path is real and
-is reached through the HTTP API or the SDKs, where the hop is paid once by the
-connection rather than once per request. See
-[what Zygo costs](performance.md#on-a-mac).
+Crossing into the Linux VM costs about 20 ms per command once the VM is up,
+over the SSH connection Lima keeps open. If every command costs 100 ms or more,
+that connection is not being used: `ssh -F ~/.lima/zygo/ssh.config -O check
+lima-zygo` should say `Master running`. The millisecond warm path is reached
+through the HTTP API or the SDKs, where the hop is paid once by the connection
+rather than once per request. See [what Zygo costs](performance.md#on-a-mac).
 
 ### "limactl is not installed"
 
@@ -290,17 +338,106 @@ brew install lima
 ### "the Linux build is missing"
 
 ```bash
-make poc/zygo-linux-musl
+make guest-build             # compiled inside the VM; needs no Docker
+make poc/zygo-linux-musl     # the same binary, built in a Docker container
 ```
 
 That is the binary that runs inside the VM. A release ships it beside the Mac
-one; from a checkout it is one `make`.
+one; from a checkout it is one `make`, and the next `zygo` command copies it
+in.
+
+### "Session open refused by peer", or exit 111
+
+Every command forwarded into the VM is one session on one multiplexed SSH
+connection, and the guest's `sshd` caps the sessions a connection may carry
+(`MaxSessions`, ten by default). Past that, running many `zygo` commands at
+once — an adopter measured it at 24 — some fraction were refused before the
+guest ran anything, with SSH's own line and exit 255.
+
+Three things stand against it now:
+
+- **The shim retries** a session the peer refused, twice, because it is
+  the one layer that knows the guest ran nothing. What still fails after
+  that exits **111** with a sentence of Zygo's, and SSH's line is kept for
+  `-v`. 111 is distinct from every status a program can produce and from
+  125, so a caller can branch on it.
+- **The template raises the cap** to 64 in the guest's
+  `/etc/ssh/sshd_config.d/zygo.conf`. That reaches a VM created from this
+  release's template and **not** one created before it: Lima copies the
+  template once. `zygo doctor` reads the generation back from the VM's
+  copy and says when it is behind.
+- **For an existing VM**, either recreate it — nothing under `$HOME` is in
+  it, so nothing is lost but warm functions and about a minute:
+
+  ```bash
+  limactl delete zygo      # the next zygo command builds a fresh one
+  ```
+
+  or apply the change by hand and keep the VM:
+
+  ```bash
+  limactl shell zygo -- sudo sh -c 'printf "MaxSessions 64\nMaxStartups 64:30:128\n" > /etc/ssh/sshd_config.d/zygo.conf && systemctl reload ssh'
+  ```
+
+`make verify-shim-concurrency` fires 24 at once for six rounds and wants
+144 of 144.
 
 ### A command is refused because of where it was run
 
-The VM mounts your home directory at the same path and nothing else. A command
-from outside `$HOME` is refused, with both directories named, rather than
-quietly running against a directory you are not looking at.
+The VM mounts your home directory at the same path and nothing else. A
+command from outside `$HOME` is refused **only when something in it depends
+on where it was run**: a relative path — a mount, a handler file, `-f`, a
+script — or a `sandbox.toml` found by searching upwards from there, which
+the VM could not find. The message names the argument.
+
+A command whose every path is absolute and under `$HOME`, or that names no
+path at all, runs from anywhere — a server started from `/`, a systemd unit
+with its default working directory. It runs in the VM's `/`, so a relative
+path that slipped through would name a file that does not exist rather than
+one of yours that you did not name.
+
+### "client speaks control v13, this supervisor speaks v12"
+
+The supervisor in the VM is from the previous release: the shim replaced the
+binary but a supervisor started from the old one was still running. The shim
+now stops it itself when it replaces the binary and says so. If you see the
+message anyway:
+
+```bash
+zygo supervisor stop     # only the supervisor: it drains, exits, and the next serve starts a new one
+```
+
+`zygo stop --all` also works, but on a Mac it stops the whole Linux VM and
+the next command pays the boot; it says so before it does it.
+
+### What `doctor --json` says
+
+The document a health check parses:
+
+```json
+{
+  "checks": [
+    {"name": "limactl", "status": "ok", "detail": "at /opt/homebrew/bin/limactl", "side": "host"},
+    {"name": "vm", "status": "ok", "detail": "instance `zygo` is running", "side": "host"},
+    {"name": "kernel", "status": "ok", "detail": "6.8.0-31-generic", "side": "vm"},
+    {"name": "pasta", "status": "FAIL", "detail": "not on PATH", "remedy": "apt install passt", "side": "vm"}
+  ],
+  "backends": ["ns"],
+  "ok": false
+}
+```
+
+- `checks[]`: one per probe. `status` is `ok`, `degraded` (usable, with a
+  fallback), `absent` (an optional backend that is not installed) or
+  `FAIL`. `remedy` is present when there is one. On a Mac, `side` says
+  whether the check is the Mac's (`host`) or the VM's (`vm`); on Linux
+  there is one side and no field.
+- `backends[]`: the isolation backends usable right now — the host has what
+  each needs and this binary implements it. On a Mac these are the VM's.
+- `ok`: no check failed. **The exit status is 0 exactly when `ok` is
+  true**, and both are derived from the same list, so either can be
+  trusted alone. A stopped VM is `ok: false`: nothing can vouch for the
+  sandboxes until it is up, and the remedy says so.
 
 ## Still stuck
 

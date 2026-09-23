@@ -122,7 +122,8 @@ cannot carry what a caller needs:
 
 ```json
 {"exit_code": 137, "timed_out": false, "oom_killed": true,
- "peak_rss_kb": 65536, "wall_ms": 412.7, "stdout": "", "stderr": ""}
+ "peak_rss_kb": 65536, "wall_ms": 412.7, "stdout": "", "stderr": "",
+ "started": true, "phase": "run"}
 ```
 
 A deadline kill and an out-of-memory kill are both `SIGKILL`, so both are 137.
@@ -130,6 +131,12 @@ A deadline kill and an out-of-memory kill are both `SIGKILL`, so both are 137.
 comes from the kernel's own counter in the sandbox's cgroup. Neither is a
 guess, and a caller deciding between "too slow" and "too much memory" — an
 online judge, a CI step — has nothing else to go on.
+
+`started` is whether the program ran at all: `false` (with `phase` naming
+what failed, `plan` or `start`) is Zygo failing to build the sandbox, which
+a caller reports as *unavailable* rather than as the code's failure — and
+`ok` is false for it. An API one release behind does not send the field, and
+only answered once the program had run, so the SDKs default it to `true`.
 
 ## Tenants
 

@@ -220,6 +220,48 @@ impl Spec {
         resolve_layer(name.unwrap_or("run"), merged, &base_dir, opts)
     }
 
+    /// Where a function's resolved `seccomp` came from.
+    ///
+    /// Resolution merges four layers and keeps the answer, not the reason —
+    /// which is right for a launcher and wrong for a person asking "why is
+    /// this function on `permissive`?". The first adoption report (Z-3) put
+    /// it as: the flag is accepted and nothing shows it took effect. This
+    /// asks the layers the same question the merge did, in the same order,
+    /// so `spec explain` and `run --dry-run` can say which one answered.
+    ///
+    /// `name` is a `[fn.<name>]` (or `None` for `zygo run`'s defaults);
+    /// pools have [`Spec::seccomp_source_runtime`], whose built-in differs.
+    pub fn seccomp_source(&self, name: Option<&str>, overrides: &Layer) -> SeccompSource {
+        if overrides.seccomp.is_some() {
+            return SeccompSource::Override;
+        }
+        if name
+            .and_then(|n| self.functions.get(n))
+            .is_some_and(|f| f.seccomp.is_some())
+        {
+            return SeccompSource::Function;
+        }
+        if self.defaults.seccomp.is_some() {
+            return SeccompSource::Defaults;
+        }
+        SeccompSource::BuiltIn
+    }
+
+    /// [`Spec::seccomp_source`] for a `[runtime.<name>]` pool, whose
+    /// built-in is `strict` rather than `default`.
+    pub fn seccomp_source_runtime(&self, name: &str, overrides: &Layer) -> SeccompSource {
+        if overrides.seccomp.is_some() {
+            return SeccompSource::Override;
+        }
+        if self.runtimes.get(name).is_some_and(|r| r.seccomp.is_some()) {
+            return SeccompSource::Runtime;
+        }
+        if self.defaults.seccomp.is_some() {
+            return SeccompSource::Defaults;
+        }
+        SeccompSource::PoolDefault
+    }
+
     /// Resolve a `[runtime.<name>]` pool.
     ///
     /// `[defaults]` applies, as it does to a function: an operator who set
@@ -294,6 +336,47 @@ impl Spec {
             .merge(overrides);
         let base_dir = opts.base_dir.clone().unwrap_or_else(|| self.base_dir());
         resolve_layer(name, merged, &base_dir, opts)
+    }
+}
+
+/// Which layer answered for a resolved `seccomp` profile.
+///
+/// Printed by `zygo spec explain` and `zygo run --dry-run` beside the
+/// profile, so "the flag did nothing" and "the spec overrode the flag" are
+/// told apart without reading four tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeccompSource {
+    /// `--seccomp` on the command line, or the layer an API request carried.
+    Override,
+    /// The `[fn.<name>]` table's own `seccomp`.
+    Function,
+    /// The `[runtime.<name>]` table's own `seccomp`.
+    Runtime,
+    /// `[defaults]`.
+    Defaults,
+    /// Nobody chose: a pool gets `strict`.
+    PoolDefault,
+    /// Nobody chose: a function gets `default`.
+    BuiltIn,
+}
+
+impl SeccompSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            SeccompSource::Override => "the --seccomp flag",
+            SeccompSource::Function => "the function's own table",
+            SeccompSource::Runtime => "the pool's own table",
+            SeccompSource::Defaults => "[defaults]",
+            SeccompSource::PoolDefault => "the pool default",
+            SeccompSource::BuiltIn => "the built-in default",
+        }
+    }
+}
+
+impl std::fmt::Display for SeccompSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -622,7 +705,9 @@ fn resolve_layer(
         return Err(SpecError::invalid_with(
             field("network"),
             "`host` removes the network namespace entirely",
-            "pass --allow-host-net if that is really what you want",
+            "pass --allow-host-net if that is really what you want; coming from \
+             Docker's `--network host`, the nearest namespaced mode is `full`, \
+             which still refuses private ranges and the metadata endpoint",
         ));
     }
 
@@ -987,6 +1072,73 @@ mod tests {
         assert!(text.contains("needs an agent or a command"), "{text}");
         assert!(text.contains("python"), "{text}");
         assert!(text.contains("cmd"), "{text}");
+    }
+
+    /// Z-3 of the first adoption report: the flag was accepted and nothing
+    /// showed it had taken effect. This is what `spec explain` and
+    /// `run --dry-run` print beside the profile — which of the four layers
+    /// answered, in the order the merge asks them.
+    #[test]
+    fn the_seccomp_source_is_the_layer_that_answered() {
+        let s = spec(
+            "[defaults]\nseccomp = \"permissive\"\n\
+             [fn.chosen]\nimage = \"alpine:3\"\ncmd = [\"true\"]\nseccomp = \"strict\"\n\
+             [fn.plain]\nimage = \"alpine:3\"\ncmd = [\"true\"]\n\
+             [runtime.p]\nimage = \"python:3.12-slim\"\nagent = \"python\"\n",
+        );
+        let none = Layer::default();
+        let flag = Layer {
+            seccomp: Some(SeccompProfile::Default),
+            ..Layer::default()
+        };
+
+        assert_eq!(
+            s.seccomp_source(Some("chosen"), &none),
+            SeccompSource::Function
+        );
+        assert_eq!(
+            s.seccomp_source(Some("plain"), &none),
+            SeccompSource::Defaults
+        );
+        assert_eq!(s.seccomp_source(None, &none), SeccompSource::Defaults);
+        assert_eq!(
+            s.seccomp_source(Some("chosen"), &flag),
+            SeccompSource::Override
+        );
+        assert_eq!(
+            s.seccomp_source_runtime("p", &none),
+            SeccompSource::Defaults
+        );
+        assert_eq!(
+            s.seccomp_source_runtime("p", &flag),
+            SeccompSource::Override
+        );
+
+        // With nothing chosen anywhere, a function and a pool differ in
+        // their built-in, and the source says which built-in.
+        let bare = spec(
+            "[fn.f]\nimage = \"alpine:3\"\ncmd = [\"true\"]\n\
+             [runtime.p]\nimage = \"python:3.12-slim\"\nagent = \"python\"\n",
+        );
+        assert_eq!(
+            bare.seccomp_source(Some("f"), &none),
+            SeccompSource::BuiltIn
+        );
+        assert_eq!(
+            bare.seccomp_source_runtime("p", &none),
+            SeccompSource::PoolDefault
+        );
+        assert_eq!(SeccompSource::Override.to_string(), "the --seccomp flag");
+        assert_eq!(
+            serde_json::to_value(SeccompSource::PoolDefault).unwrap(),
+            "pool_default"
+        );
+
+        // And the source agrees with what resolution actually produced.
+        let chosen = bare.resolve(Some("f"), &none, &opts()).unwrap();
+        assert_eq!(chosen.seccomp, SeccompProfile::Default);
+        let pool = bare.resolve_runtime("p", &none, &opts()).unwrap();
+        assert_eq!(pool.seccomp, SeccompProfile::Strict);
     }
 
     /// The one built-in a pool does not share with a function.

@@ -117,6 +117,13 @@ export interface RunResult {
   /** Peak resident memory of the sandbox, from its cgroup. */
   peakRssKb: number;
   wallMs: number;
+  /**
+   * Whether the program ran at all. `false` is Zygo failing to build the
+   * sandbox — unavailable, not the program's failure; `phase` says how far
+   * it got (`plan`, `start`, or `run` when it ran).
+   */
+  started: boolean;
+  phase: 'plan' | 'start' | 'run' | string;
   readonly ok: boolean;
 }
 

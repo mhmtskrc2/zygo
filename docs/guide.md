@@ -89,8 +89,12 @@ streams; the exit status comes back out.
 
 ```bash
 brew install lima            # what starts the VM
-make poc/zygo-linux-musl     # the Linux build that runs inside it
+make guest-build             # the Linux build that runs inside it, compiled in the VM
 ```
+
+`make poc/zygo-linux-musl` builds the same binary in a Docker container
+instead, for a Mac that has one; `guest-build` needs nothing but the VM, and
+installs a Rust toolchain into it on first use.
 
 The VM is built on the first command that needs it and takes about a minute.
 After that a command is milliseconds, and `zygo stop --all` puts it away again.
@@ -100,7 +104,7 @@ Your home directory is mounted at *the same path* inside the VM, writable, so
 enforced: a command run from outside `$HOME` is refused, and the message names
 both directories rather than quietly running somewhere else.
 
-Crossing into the VM costs about 100 ms per command. See
+Crossing into the VM costs about 20 ms per command once it is up. See
 [what Zygo costs](performance.md#on-a-mac) for what that does and does not mean.
 
 ---
@@ -112,10 +116,14 @@ zygo run python:3.12-slim python3 -c 'print("hello")'
 ```
 
 The first run pulls the image, exactly as `docker run` does. The second is
-about 18 ms.
+about 18 ms. A program that keeps a clock of its own passes `--pull never`, so
+a missing image is a refusal in a millisecond rather than a download it will
+mistake for a slow run.
 
 What that sandbox has: a read-only root filesystem built from the image's
-layers, a writable `/tmp` sized by `scratch`, no network at all, no
+layers, a writable `/tmp` sized by `scratch` — which is also `HOME` unless the
+image or you set one, so `pip`'s cache and `npm`'s land somewhere writable — no
+network at all, no
 capabilities, a seccomp allowlist, and memory, CPU and process limits it cannot
 exceed. What it does not have: your filesystem, your network, your processes,
 or any way to reach the image store it was built from.
@@ -162,9 +170,23 @@ puts the two side by side, flag by flag.
 zygo run --dry-run --json python:3.12-slim
 ```
 
-That prints the resolved configuration, the mount plan and the cgroup values
-the launcher will apply, and runs nothing. It is how a sandbox's boundaries get
-reviewed.
+That prints the resolved configuration, the mount plan, the seccomp profile
+(with where it came from — the flag, the spec, or the default — and how many
+syscalls it names), whether Landlock applies on this host, and the cgroup
+values the launcher will apply, and runs nothing. It is how a sandbox's
+boundaries get reviewed, and two plans can be diffed.
+
+**Exit statuses** that are Zygo's rather than the program's:
+
+| status | meaning |
+|---|---|
+| the program's own | it ran, and this is what it said |
+| **137** | Zygo or the kernel killed it: the deadline or the memory limit; `--outcome` says which |
+| **2** | the spec or the flags are wrong |
+| **125** | this host cannot run sandboxes; `zygo doctor` says why |
+| **111** | macOS only: the Linux VM could not be reached (the SSH session cap; see [troubleshooting](troubleshooting.md#session-open-refused-by-peer-or-exit-111)) |
+| **75** | `zygo exec`: the function is at its concurrency limit — retry |
+| **4** | `zygo exec`: no such function |
 
 ### Knowing why a sandbox ended
 
@@ -185,12 +207,49 @@ cat /tmp/why.json
 comes from the kernel's own counter in the sandbox's cgroup. Neither is a
 guess. It goes to a file because standard output belongs to the program.
 
+The file is also written when the sandbox **never started** — the image is
+not there, the host cannot, a mount does not exist — with `started: false`
+and the `phase` that failed (`plan` or `start`). A program that ran has
+`started: true` and `phase: "run"`. That is the difference between
+*unavailable* and *the code failed*, which the exit status cannot carry and
+a caller should not have to read `stderr` for.
+
+### Installing packages into a mounted directory
+
+The shape every "install this tenant's packages" feature has: a networked
+one-shot that installs into a mount, and then any number of networkless
+sandboxes that import from it.
+
+```bash
+mkdir -p ./pkgs
+zygo run --net full --mount ./pkgs:/pkgs:rw python:3.12-slim \
+    python3 -m pip install --target /pkgs python-dateutil
+zygo run --mount ./pkgs:/pkgs:ro --env PYTHONPATH=/pkgs python:3.12-slim \
+    python3 -c 'import dateutil, six; print(dateutil.__version__)'
+```
+
+Measured by the first adoption report on its 2-core VM: `python-dateutil` and
+`six` install in **2.8 s** through Zygo against 3.9 s through Docker. (Before
+the extended-attribute family was added to every seccomp profile this failed
+with `[Errno 1] Operation not permitted` on a `RECORD` file, and the
+workaround was `TMPDIR` on the same mount; neither is needed now, and
+`make verify-seccomp-profiles-linux` keeps it that way.)
+
 ---
 
 ## Warm functions
 
 A one-shot sandbox costs about 18 ms, most of it setup. A warm function pays
 that once and then costs about **1.7 ms** a request.
+
+**This is the production shape.** `zygo run` is the obvious mapping for
+"run this code once", and a consumer that adopts it that way gets a
+sandbox per event: `zygo bench cold` says 22.6 ms on a 2-core VM where
+`zygo bench warm` says **0.91 ms** and 845 requests a second — a
+twenty-five-fold difference the one-shot API gives no hint of. The first
+adoption report chose `run` because the mapping was obvious, and its
+recommendation 4 is this section. [The worked example below](#a-multi-tenant-consumer-on-the-warm-path)
+is what "one warm zygote per script version" looks like.
 
 ```bash
 zygo serve ./handler.py --name resize
@@ -228,6 +287,63 @@ one.
 That is the trade Zygo exists to make. A long-running worker is fast and leaks
 state between requests. A container per request is clean and costs hundreds of
 milliseconds. A fork is both.
+
+### A multi-tenant consumer on the warm path
+
+A low-code platform, a workflow engine, a plugin host: hundreds of tenant scripts that
+change whenever somebody presses Save, each project with its own mounts and
+egress allowlist, each run with its own secrets. The one-shot mapping is one
+sandbox per event. The warm mapping is **one warm zygote per script
+version**, forked per run, and it looks like this:
+
+```python
+import hashlib, zygo
+
+client = zygo.connect()                      # zygo api --allow-deploy, in the VM on a Mac
+
+def run(project, script_source, event, secrets):
+    # A version is a function. The name carries the digest, so an edit is a
+    # new function and the old one is reaped by --idle-timeout, not by you.
+    digest = hashlib.sha256(script_source.encode()).hexdigest()[:16]
+    name = f"{project.id}-{digest}"
+    client.serve(
+        name,
+        {
+            "entry": project.script_path(digest),          # the version, on disk
+            "mounts": [f"{project.data_dir}:/data:rw"],    # per project
+            "network": "egress",
+            "allow": project.allowlist,                    # per project
+            "secrets": list(secrets),                      # names; values per run
+            "idle_timeout": "10m",                         # reaped when idle
+            "cold_after": "1h",
+            "mem": "256M", "timeout": "30s",
+        },
+        if_changed=True,                                   # a no-op when it is warm
+    )
+    return client.fn(name)(event)                          # one fork
+```
+
+What each line buys:
+
+- **`if_changed=True`** makes the `serve` free when the version is already
+  warm, so the caller does not track state: it always asks, and the
+  supervisor does nothing when nothing changed.
+- **Mounts and the allowlist are per function**, so two projects' versions
+  are two zygotes that share an interpreter's pages and nothing else.
+- **Secrets are per run**: the names are declared once, the values arrive
+  with the request and exist as files only while the request runs.
+- **`idle_timeout` and `cold_after`** are the eviction policy. A version
+  nobody has called for ten minutes is frozen (resident, one write to wake);
+  after an hour it is dropped and the next call pays a warm-up — about 270
+  ms for a Python handler plus its imports.
+
+Four hundred projects do not mean four hundred warm zygotes: they mean as
+many as were called in the last ten minutes, which is the number that
+matters, and `zygo ps` shows it. [ADR 0005](adr/0005-one-warm-zygote-per-script-version.md)
+has the memory per warm script measured on a 4 GB VM and the eviction
+policy written down. [`examples/workflow-engine/`](../examples/workflow-engine)
+is this shape end to end — a worker draining a job queue, one warm function
+per script version, an LRU over warm scripts — in Python and Node.
 
 ### Other languages
 
@@ -354,7 +470,7 @@ network = "none"     # the default
 |---|---|
 | `none` | nothing at all — an empty network namespace with loopback |
 | `egress` | exactly what `allow` names, plus DNS |
-| `full` | the public internet |
+| `full` | the public internet (`bridge`, Docker's word, is accepted as a spelling of it and printed back as `full`) |
 | `host` | everything, no namespace — needs `--allow-host-net` |
 
 `egress` and `full` hand the sandbox's network namespace to
@@ -456,11 +572,14 @@ bound read-only into every sandbox that uses them.
 zygo pull python:3.12-slim              # into the local store
 zygo pull --platform linux/amd64 alpine:3
 zygo images                             # reference, digest, layers, size, when pulled
+zygo images --json                      # the same, for a program: match `reference` exactly
 ```
 
-`zygo run` pulls on first use, as `docker run` does. `zygo serve` and `zygo up`
-do **not**: a deploy should not silently depend on a registry being reachable,
-so they ask you to pull first.
+`zygo run` pulls on first use, as `docker run` does; `zygo run --pull never`
+refuses a missing image instead (exit 1, `phase: plan` in `--outcome`), and
+`--pull always` pulls again for a tag that may have moved. `zygo serve` and
+`zygo up` never pull: a deploy should not silently depend on a registry being
+reachable, so they ask you to pull first.
 
 For a private registry:
 

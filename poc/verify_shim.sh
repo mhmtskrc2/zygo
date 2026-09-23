@@ -64,13 +64,34 @@ say "what stays on this side"
 # Checked by its content rather than its speed: a fast wrong answer passes a
 # timing test.
 out=$("$ZYGO" doctor 2>&1)
+rc=$?
 case $out in
-    *"has no kernel to build a sandbox in"*) ok "\`doctor\` reports the host honestly: macOS has no kernel to sandbox in" ;;
+    *"sandboxes run in the Linux VM"*) ok "\`doctor\` reports the platform as what it is: a Mac whose sandboxes run in a VM" ;;
     *) bad "doctor did not report the platform: $(printf '%s' "$out" | head -1)" ;;
 esac
 case $out in
     *"what that VM says about itself"*) ok "and appends what the Linux VM says about itself" ;;
     *) bad "doctor said nothing about the VM: $(printf '%s' "$out" | tail -3 | tr '\n' ' ')" ;;
+esac
+case $out in
+    *"backends available: "*ns*) ok "and the backends line is the VM's: ns" ;;
+    *) bad "no usable backend reported (exit $rc): $(printf '%s' "$out" | tail -1)" ;;
+esac
+
+# Z-4: the JSON has to say the same as the text — the VM's checks in it,
+# `backends` from the VM, and an exit status that follows `ok`. A health
+# check parses this, and it used to read `ok: false, backends: []` on a Mac
+# where `zygo run` worked.
+json=$("$ZYGO" doctor --json 2>/dev/null)
+jrc=$?
+verdict=$(printf '%s' "$json" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+sides = sorted({c.get("side") for c in d["checks"]})
+print(d["ok"], ",".join(d["backends"]), ",".join(str(s) for s in sides))' 2>&1)
+case "$verdict|$jrc" in
+    "True ns host,vm|0") ok "\`doctor --json\` merges both sides: ok, backends ns, exit 0" ;;
+    *) bad "doctor --json said '$verdict' with exit $jrc" ;;
 esac
 
 # The protocol suite tests an agent on *this* machine's interpreter. Forwarding
@@ -89,18 +110,39 @@ say ""
 # ---------------------------------------------------------------------------
 say "the path contract"
 
-# Only `$HOME` is shared, and a command from outside it must be refused rather
-# than run somewhere that merely exists on both sides. Attempted, not read: the
-# check runs `zygo` from `/tmp` and reads what it says.
+# Only `$HOME` is shared. A command from outside it is refused when — and
+# only when — something in it depends on where it was run (Z-5): a relative
+# path, or a spec found by searching upwards. Attempted, not read: the checks
+# run `zygo` from `/tmp` and read what it says.
 outside=$(mktemp -d /tmp/zygo-shim-XXXXXX)
-out=$(cd "$outside" && "$ZYGO" ps 2>&1)
+out=$(cd "$outside" && "$ZYGO" run --mount ./x:/x:rw alpine:3 true 2>&1)
 rc=$?
-rmdir "$outside" 2>/dev/null
-if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "$HOME"; then
-    ok "a command from outside \$HOME is refused, and the message names both directories"
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "$HOME" && printf '%s' "$out" | grep -q "the mount"; then
+    ok "a relative mount from outside \$HOME is refused, naming both directories and the mount"
 else
-    bad "running from $outside was not refused (exit $rc): $(printf '%s' "$out" | head -1)"
+    bad "a relative mount from $outside was not refused as expected (exit $rc): $(printf '%s' "$out" | head -1)"
 fi
+# The report's own command: every path absolute, so where it ran is of no
+# consequence. Its exit status and output are the sandbox's.
+mkdir -p "$HOME/.zygo-shim-check-mount"
+out=$(cd "$outside" && "$ZYGO" run --mount "$HOME/.zygo-shim-check-mount:/data:rw" alpine:3 sh -c 'echo hi > /data/hi && cat /data/hi' 2>&1)
+rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = hi ] && [ -f "$HOME/.zygo-shim-check-mount/hi" ]; then
+    ok "the same command with an absolute mount runs from outside \$HOME (exit 0, wrote through the mount)"
+else
+    bad "an absolute-path command from $outside was refused or failed (exit $rc): $(printf '%s' "$out" | head -1)"
+fi
+rm -rf "$HOME/.zygo-shim-check-mount"
+# A spec that would be found here would not be found in the VM.
+printf '[fn.f]\nimage="alpine:3"\ncmd=["true"]\n' > "$outside/sandbox.toml"
+out=$(cd "$outside" && "$ZYGO" run alpine:3 true 2>&1)
+rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "sandbox.toml"; then
+    ok "a sandbox.toml discovered outside \$HOME is refused, and named"
+else
+    bad "a discovered spec outside \$HOME was not refused (exit $rc): $(printf '%s' "$out" | head -1)"
+fi
+rm -rf "$outside"
 
 say ""
 # ---------------------------------------------------------------------------
@@ -195,7 +237,12 @@ say ""
 # ---------------------------------------------------------------------------
 say "cleaning up"
 
-"$ZYGO" stop --all >/dev/null 2>&1
+# Z-6: `stop --all` says what it is about to do on a Mac before it does it.
+stopsaid=$("$ZYGO" stop --all 2>&1 >/dev/null)
+case $stopsaid in
+    *"stops every sandbox"*"Linux VM"*) ok "\`stop --all\` warns that it stops the VM, before it does" ;;
+    *) bad "stop --all did not warn about the VM: $(printf '%s' "$stopsaid" | head -1)" ;;
+esac
 
 # "Stop everything" includes the machine it was all running in. Read from
 # `limactl` rather than from Zygo, because Zygo saying it stopped the VM is

@@ -246,6 +246,10 @@ pub struct PreparedLaunch {
     /// The seccomp program, compiled here because generating BPF allocates and
     /// the child may not.
     pub seccomp: Vec<super::seccomp::SockFilter>,
+    /// Ask the kernel to log every syscall the filter refuses
+    /// ([`super::seccomp::SECCOMP_FILTER_FLAG_LOG`]). Decided here, from the
+    /// log level, because the child may not consult a subscriber.
+    pub seccomp_log: bool,
     /// The Landlock ruleset, empty when the kernel has no Landlock.
     pub landlock: super::landlock::Ruleset,
     /// Terminal for the sandbox's stdio, when one was allocated for it.
@@ -500,6 +504,10 @@ pub fn prepare(config: &SandboxConfig) -> Result<PreparedLaunch, PrepareError> {
         bring_up_loopback: config.network != crate::spec::Network::Host,
         drop_capabilities: true,
         seccomp: super::seccomp::program(config.seccomp)?,
+        // `ZYGO_LOG=debug` is the documented first step for "`[Errno 1]
+        // Operation not permitted` on a file that exists": from then on
+        // every refused syscall is a line in the host's kernel log.
+        seccomp_log: tracing::enabled!(tracing::Level::DEBUG),
         stdio: config.stdio,
         stdio_streams: config.stdio_streams,
         ignored_signals: config.ignored_signals,

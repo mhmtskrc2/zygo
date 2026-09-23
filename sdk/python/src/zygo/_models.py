@@ -389,6 +389,14 @@ class Run:
     ``SIGKILL``, so both are 137. The first comes from the launcher, which
     enforced the deadline; the second from the kernel's own counter in the
     sandbox's cgroup. Neither is a guess.
+
+    ``started`` is whether the program ran at all. ``False`` means Zygo could
+    not build the sandbox — an image that is not there, a host that cannot —
+    and ``phase`` says how far it got (``plan``, ``start``). That is
+    *unavailable*, not the program's failure, and a caller classifying
+    results should treat it so rather than read ``stderr`` for the reason.
+    An API one release behind does not send it; ``started`` then defaults
+    to ``True``, which is what those releases meant.
     """
 
     exit_code: int
@@ -398,10 +406,17 @@ class Run:
     oom_killed: bool = False
     peak_rss_kb: int = 0
     wall_ms: float = 0.0
+    started: bool = True
+    phase: str = "run"
 
     @property
     def ok(self) -> bool:
-        return self.exit_code == 0 and not self.timed_out and not self.oom_killed
+        return (
+            self.started
+            and self.exit_code == 0
+            and not self.timed_out
+            and not self.oom_killed
+        )
 
     @classmethod
     def parse(cls, raw: Dict[str, Any]) -> "Run":
@@ -413,6 +428,8 @@ class Run:
             oom_killed=bool(raw.get("oom_killed", False)),
             peak_rss_kb=int(raw.get("peak_rss_kb", 0)),
             wall_ms=float(raw.get("wall_ms", 0.0)),
+            started=bool(raw.get("started", True)),
+            phase=str(raw.get("phase", "run")),
         )
 
 

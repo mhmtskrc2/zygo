@@ -13,11 +13,36 @@ use zygo_core::image::{PullProgress, Reference, RegistryClient, Store};
 use zygo_core::sandbox::{RootfsView, SandboxConfig};
 use zygo_core::spec::Spec;
 
-use crate::cli::{Cli, RunArgs};
+use crate::cli::{Cli, PullPolicy, RunArgs};
 use crate::output::{self, Style};
 use crate::tty;
 
 pub fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<u8> {
+    let phase = std::cell::Cell::new(Phase::Plan);
+    let result = run_in_phases(cli, args, &phase);
+
+    // A sandbox that never started is not a program that failed, and the
+    // exit status cannot say which (the first adoption report, §8: it had to
+    // classify a start failure by matching on the error's text, and
+    // reported it as the tenant's fault meanwhile). The outcome file can:
+    // written here too, with `started: false` and the phase that failed,
+    // so a caller reports "unavailable" rather than "harness" without
+    // reading stderr. Best effort — the error is the answer, and a file
+    // that could not be written must not replace it.
+    if let (Err(e), Some(path)) = (&result, &args.outcome)
+        && phase.get() != Phase::Run
+    {
+        let code = e
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<zygo_core::Error>())
+            .map(|e| e.exit_code())
+            .unwrap_or(1);
+        let _ = Outcome::never_started(phase.get(), code).write(path);
+    }
+    result
+}
+
+fn run_in_phases(cli: &Cli, args: &RunArgs, phase: &std::cell::Cell<Phase>) -> anyhow::Result<u8> {
     // Where a one-shot run spends its time, in three phases, because "the
     // p99 is twenty times the p50 on this host" cannot be acted on without
     // knowing *which* twenty milliseconds became twenty seconds. `zygo bench
@@ -77,10 +102,22 @@ pub fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<u8> {
         },
     };
 
-    let entry = match store.get(&reference) {
-        Some(e) => e,
-        None => {
-            // Same behaviour as `docker run`: pull on first use.
+    let entry = match (store.get(&reference), args.pull) {
+        (Some(e), PullPolicy::Missing | PullPolicy::Never) => e,
+        (None, PullPolicy::Never) => {
+            // The caller said it would rather fail than wait. Refused here, in
+            // the plan phase, so `--outcome` says `started: false` and the
+            // caller can report "not set up" rather than "too slow".
+            anyhow::bail!(
+                "`{}` is not in the store, and --pull never was given\n  \
+                 → pull it first: zygo pull {}",
+                resolved.image,
+                resolved.image
+            );
+        }
+        (_, _) => {
+            // Same behaviour as `docker run`: pull on first use — or again,
+            // under `--pull always`, for a tag that may have moved.
             let client = RegistryClient::new(store.clone())?;
             let style = Style::stdout();
             let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -120,7 +157,7 @@ pub fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<u8> {
         && let Ok(client) = zygo_core::supervisor::client::Client::connect(store.paths())
     {
         return run_through_supervisor(
-            cli, args, client, &spec, &overrides, &options, &resolved, planning,
+            cli, args, client, &spec, &overrides, &options, &resolved, planning, phase,
         );
     }
 
@@ -190,10 +227,11 @@ pub fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<u8> {
     // of lowerdirs to go. gVisor's Sentry keeps an overlay of its own above it,
     // and a guest kernel can build one inside itself if M3 needs the layers
     // back.
+    let host = zygo_core::doctor::cached(store.paths());
     let overlay_supported = !matches!(
         resolved.isolation,
         zygo_core::spec::Isolation::Gvisor | zygo_core::spec::Isolation::Vm
-    ) && zygo_core::doctor::cached(store.paths())
+    ) && host
         .checks
         .iter()
         .any(|c| c.name == "overlayfs (userns)" && c.status == zygo_core::doctor::Status::Ok);
@@ -259,7 +297,8 @@ pub fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<u8> {
     config.pasta_pid_file = net.pid_file;
 
     if args.dry_run {
-        return print_plan(cli, &resolved, &view, &config);
+        let seccomp_source = spec.seccomp_source(None, &overrides);
+        return print_plan(cli, &resolved, seccomp_source, &host, &view, &config);
     }
 
     // A terminal of the sandbox's own, when asked for. The master stays here;
@@ -284,7 +323,9 @@ pub fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<u8> {
     // `pivot_root`, the cgroup, seccomp, Landlock, and `execve`. The program
     // has not run one instruction of its own when this phase ends.
     let starting = std::time::Instant::now();
+    phase.set(Phase::Start);
     let mut sandbox = backend.start(&config)?;
+    phase.set(Phase::Run);
     let start_ms = starting.elapsed().as_secs_f64() * 1000.0;
 
     // The slave belongs to the sandbox now; holding it open here would keep the
@@ -335,6 +376,8 @@ pub fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<u8> {
         wall_ms: started.elapsed().as_secs_f64() * 1000.0,
         plan_ms,
         start_ms,
+        started: true,
+        phase: Phase::Run,
     };
     if let Some(path) = &args.outcome {
         outcome.write(path)?;
@@ -371,6 +414,7 @@ fn run_through_supervisor(
     options: &zygo_core::spec::ResolveOptions,
     resolved: &zygo_core::spec::ResolvedFn,
     planning: std::time::Instant,
+    phase: &std::cell::Cell<Phase>,
 ) -> anyhow::Result<u8> {
     use zygo_core::supervisor::protocol::{Request, Response};
 
@@ -389,7 +433,9 @@ fn run_through_supervisor(
     let plan_ms = planning.elapsed().as_secs_f64() * 1000.0;
 
     let starting = std::time::Instant::now();
+    phase.set(Phase::Start);
     let pid = client.run_start(&request, [0, 1, 2])?;
+    phase.set(Phase::Run);
     let start_ms = starting.elapsed().as_secs_f64() * 1000.0;
 
     // The sandbox is the supervisor's child, not this process's, but it is
@@ -419,6 +465,8 @@ fn run_through_supervisor(
         wall_ms,
         plan_ms,
         start_ms,
+        started: true,
+        phase: Phase::Run,
     };
     if let Some(path) = &args.outcome {
         outcome.write(path)?;
@@ -458,6 +506,20 @@ fn ignored_signals() -> u64 {
     mask
 }
 
+/// How far a one-shot run got.
+///
+/// `plan` is everything before a sandbox exists — the spec, the image, the
+/// venv, the network; `start` is building it, up to `execve`; `run` is the
+/// program. An outcome that stopped short of `run` is Zygo's failure (or
+/// the host's), not the program's, and a caller can say so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Phase {
+    Plan,
+    Start,
+    Run,
+}
+
 /// Why a one-shot sandbox ended, beyond its exit status.
 #[derive(serde::Serialize)]
 struct Outcome {
@@ -475,9 +537,30 @@ struct Outcome {
     plan_ms: f64,
     /// Building the sandbox, up to and including `execve`.
     start_ms: f64,
+    /// Whether the program ran at all. `false` is Zygo failing, not the
+    /// program: a caller reports it as *unavailable*, not as the code's.
+    started: bool,
+    /// The phase the run reached: `run` when the program ran, otherwise
+    /// the one that failed.
+    phase: Phase,
 }
 
 impl Outcome {
+    /// The outcome of a run that never reached the program.
+    fn never_started(phase: Phase, exit_code: i32) -> Outcome {
+        Outcome {
+            exit_code,
+            timed_out: false,
+            oom_killed: false,
+            peak_rss_kb: 0,
+            wall_ms: 0.0,
+            plan_ms: 0.0,
+            start_ms: 0.0,
+            started: false,
+            phase,
+        }
+    }
+
     /// Written whole, then renamed: a reader that finds the file finds all of
     /// it, never half a JSON document.
     fn write(&self, path: &std::path::Path) -> anyhow::Result<()> {
@@ -576,14 +659,56 @@ fn mount_pair(s: &str) -> Option<(&str, &str)> {
     (guest.starts_with('/') && host_is_a_path).then_some((host, guest))
 }
 
+/// How many syscalls a profile names on this architecture.
+///
+/// `None` where there is no `ns` backend to ask — which is macOS, where
+/// `--dry-run` is forwarded into the VM and never printed here.
+fn allowed_syscalls(profile: zygo_core::spec::SeccompProfile) -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        Some(zygo_core::backend::ns::seccomp::allowed_names(profile).len())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = profile;
+        None
+    }
+}
+
+/// The host's Landlock line from `doctor`, for the plan.
+///
+/// Landlock is applied by the launcher from what the kernel offers, not
+/// from anything in the spec, so the plan says what *this* host will do.
+fn landlock_line(host: &zygo_core::doctor::Report) -> (bool, String) {
+    match host.checks.iter().find(|c| c.name == "landlock") {
+        Some(c) if c.status == zygo_core::doctor::Status::Ok => (true, c.detail.clone()),
+        Some(c) => (false, format!("{}; seccomp still applies", c.detail)),
+        None => (false, "not probed on this host".to_string()),
+    }
+}
+
 fn print_plan(
     cli: &Cli,
     resolved: &zygo_core::spec::ResolvedFn,
+    seccomp_source: zygo_core::spec::SeccompSource,
+    host: &zygo_core::doctor::Report,
     view: &RootfsView,
     config: &SandboxConfig,
 ) -> anyhow::Result<u8> {
+    let (landlock_on, landlock) = landlock_line(host);
     if cli.json {
         let mut value = super::spec::to_json(resolved);
+        // The profile, where it came from, and its size — so two plans can
+        // be diffed and a reviewer can see that `--seccomp` took. The first
+        // adoption report (Z-3) read the flag as dead because nothing here
+        // said otherwise.
+        value["seccomp"]["source"] = serde_json::json!(seccomp_source);
+        value["seccomp"]["allowed_syscalls"] =
+            serde_json::json!(allowed_syscalls(resolved.seccomp));
+        value["landlock"] = serde_json::json!({
+            "enabled": landlock_on,
+            "detail": landlock,
+        });
         value["argv"] = serde_json::json!(config.argv);
         value["rootfs"] = match view {
             RootfsView::Overlay { lower } => serde_json::json!({
@@ -634,6 +759,20 @@ fn print_plan(
         println!("  {} {rule}", style.dim("allow"));
     }
 
+    println!("{}", style.bold("seccomp"));
+    println!(
+        "  {} {}{}",
+        resolved.seccomp,
+        style.dim(&format!("(from {seccomp_source})")),
+        match allowed_syscalls(resolved.seccomp) {
+            Some(n) => format!(", {n} syscalls allowed"),
+            None => String::new(),
+        }
+    );
+
+    println!("{}", style.bold("landlock"));
+    println!("  {landlock}");
+
     println!("{}", style.bold("cgroup"));
     for w in resolved.limits.cgroup_writes() {
         println!("  {} = {}", w.file, w.value);
@@ -655,7 +794,20 @@ fn print_plan(
 
 #[cfg(test)]
 mod tests {
-    use super::mount_pair;
+    use super::{Outcome, Phase, mount_pair};
+
+    /// A caller reading the file can tell "never started" from "ran and
+    /// failed" by one boolean, and which phase failed by one word.
+    #[test]
+    fn an_outcome_that_never_started_says_so_and_where() {
+        let never = serde_json::to_value(Outcome::never_started(Phase::Start, 125)).unwrap();
+        assert_eq!(never["started"], false);
+        assert_eq!(never["phase"], "start");
+        assert_eq!(never["exit_code"], 125);
+        assert_eq!(never["timed_out"], false);
+        assert_eq!(serde_json::to_value(Phase::Plan).unwrap(), "plan");
+        assert_eq!(serde_json::to_value(Phase::Run).unwrap(), "run");
+    }
 
     /// The shapes a Docker user actually types, and the references they must
     /// not be confused with.

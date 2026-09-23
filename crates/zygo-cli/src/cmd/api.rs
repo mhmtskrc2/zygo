@@ -2594,6 +2594,10 @@ async fn one_shot(api: &Arc<Api>, body: &[u8]) -> Result<Response<ApiBody>, Http
             "oom_killed": captured.oom_killed,
             "peak_rss_kb": captured.peak_rss_kb,
             "wall_ms": captured.wall_ms,
+            // Whether the program ran at all, and how far the run got when
+            // it did not: a start failure is *unavailable*, not the code's.
+            "started": captured.started,
+            "phase": captured.phase,
         }),
     ))
 }

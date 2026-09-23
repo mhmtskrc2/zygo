@@ -598,6 +598,53 @@ fn parse_platform(s: &str) -> anyhow::Result<Platform> {
 mod tests {
     use super::*;
 
+    /// `zygo images --json` is the interface a program reads; the table is
+    /// for a person. An embedder moved from parsing the table to `--json` after
+    /// `node:22` text-matched `node:22-alpine`, and this is the shape it
+    /// relies on: `reference` exactly as pulled, the digests, the layers,
+    /// the size, and when. A key removed or renamed here fails this before
+    /// it fails a consumer.
+    #[test]
+    fn the_json_listing_is_the_stable_interface() {
+        let entry = zygo_core::image::store::ImageEntry {
+            reference: "node:22-alpine".into(),
+            manifest: format!("sha256:{}", "b".repeat(64)),
+            config: format!("sha256:{}", "c".repeat(64)),
+            layers: vec![format!("sha256:{}", "d".repeat(64))],
+            size: 51_200,
+            pulled_at: 1_700_000_000,
+            index: Some(format!("sha256:{}", "e".repeat(64))),
+            platform: Some("linux/arm64".into()),
+        };
+        let v = serde_json::to_value(vec![entry]).unwrap();
+        let first = &v[0];
+        for key in [
+            "reference",
+            "manifest",
+            "config",
+            "layers",
+            "size",
+            "pulled_at",
+        ] {
+            assert!(first.get(key).is_some(), "`{key}` is part of the contract");
+        }
+        assert_eq!(
+            first["reference"], "node:22-alpine",
+            "verbatim, so `==` works and `contains` is not needed"
+        );
+        assert_eq!(first["layers"].as_array().unwrap().len(), 1);
+        assert_eq!(first["size"], 51_200);
+        // Optional, present when known, absent otherwise — never `null`.
+        assert_eq!(first["index"].as_str().unwrap().len(), 71);
+        let without = zygo_core::image::store::ImageEntry {
+            index: None,
+            platform: None,
+            ..serde_json::from_value(first.clone()).unwrap()
+        };
+        let v = serde_json::to_value(without).unwrap();
+        assert!(v.get("index").is_none());
+    }
+
     #[test]
     fn digests_are_shortened_the_way_registries_print_them() {
         assert_eq!(short(&format!("sha256:{}", "a".repeat(64))), "aaaaaaaaaaaa");

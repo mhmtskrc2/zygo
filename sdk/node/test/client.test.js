@@ -282,6 +282,33 @@ test('running out of memory and out of time are different answers', async () => 
     assert.equal(starved.timedOut, false);
     assert.equal(starved.peakRssKb, 65536);
     assert.equal(starved.ok, false);
+    assert.equal(starved.started, true, 'an API that omits it only answered once the program ran');
+    assert.equal(starved.phase, 'run');
+  } finally {
+    client.close();
+    await api.close();
+  }
+});
+
+test('a sandbox that never started is unavailable, not the program\'s fault', async () => {
+  // The first adoption report had to match on the error's text to tell a
+  // start failure from a failing program. `started` says it outright.
+  const api = await FakeApi.start();
+  api.answer('POST', '/run', 200, {
+    exit_code: 125,
+    stdout: '',
+    stderr: 'error: this host cannot run sandboxes\n',
+    timed_out: false,
+    oom_killed: false,
+    started: false,
+    phase: 'start',
+  });
+  const client = connect(api.url, { token: null });
+  try {
+    const never = await client.run('alpine:3', ['true']);
+    assert.equal(never.started, false);
+    assert.equal(never.phase, 'start');
+    assert.equal(never.ok, false);
   } finally {
     client.close();
     await api.close();

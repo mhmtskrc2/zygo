@@ -61,7 +61,7 @@ pub struct Check {
 // `probe::all` returns a single `failed` check.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 impl Check {
-    fn ok(name: &'static str, detail: impl Into<String>) -> Self {
+    pub fn ok(name: &'static str, detail: impl Into<String>) -> Self {
         Self {
             name,
             status: Status::Ok,
@@ -70,7 +70,11 @@ impl Check {
         }
     }
 
-    fn failed(name: &'static str, detail: impl Into<String>, remedy: impl Into<String>) -> Self {
+    pub fn failed(
+        name: &'static str,
+        detail: impl Into<String>,
+        remedy: impl Into<String>,
+    ) -> Self {
         Self {
             name,
             status: Status::Failed,
@@ -79,7 +83,11 @@ impl Check {
         }
     }
 
-    fn degraded(name: &'static str, detail: impl Into<String>, remedy: impl Into<String>) -> Self {
+    pub fn degraded(
+        name: &'static str,
+        detail: impl Into<String>,
+        remedy: impl Into<String>,
+    ) -> Self {
         Self {
             name,
             status: Status::Degraded,
@@ -1177,14 +1185,25 @@ mod probe {
     /// wants is *its* — which the CLI appends, because knowing how to reach
     /// the VM is the shim's business and not this library's.
     pub fn all(_paths: &crate::Paths) -> Vec<Check> {
+        if cfg!(target_os = "macos") {
+            // Not a failure: this is the platform Zygo ships a VM for, and a
+            // deploy script reading `platform: FAIL` here concluded Zygo was
+            // unusable on a machine where `zygo run` worked (the first
+            // adoption report, Z-4). The VM's own checks, and whether it is
+            // up at all, are the CLI's to add — it knows how to reach it.
+            return vec![Check::ok(
+                "platform",
+                "macOS; sandboxes run in the Linux VM below",
+            )];
+        }
         vec![Check::failed(
             "platform",
             format!(
                 "{} has no kernel to build a sandbox in",
                 std::env::consts::OS
             ),
-            "this host runs sandboxes in a Linux VM; what that VM says about \
-             itself is below",
+            "Zygo's sandboxes are Linux processes; run it on Linux, or on macOS, \
+             where it manages a Linux VM",
         )]
     }
 }

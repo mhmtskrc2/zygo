@@ -81,9 +81,15 @@ fn explain(cli: &Cli, spec: &Spec, name: Option<&str>) -> anyhow::Result<u8> {
         ..Default::default()
     };
     let resolved = spec.resolve(name, &Layer::default(), &opts)?;
+    // Where the profile came from, beside what it is: the first adoption
+    // report (Z-3) could not tell whether `--seccomp` had taken effect,
+    // and "which table answered" is the question that settles it.
+    let seccomp_source = spec.seccomp_source(name, &Layer::default());
 
     if cli.json {
-        output::json(&to_json(&resolved))?;
+        let mut value = to_json(&resolved);
+        value["seccomp"]["source"] = serde_json::json!(seccomp_source);
+        output::json(&value)?;
         return Ok(0);
     }
 
@@ -97,7 +103,10 @@ fn explain(cli: &Cli, spec: &Spec, name: Option<&str>) -> anyhow::Result<u8> {
     let mut rows: Vec<Vec<String>> = vec![
         row("image", &resolved.image),
         row("isolation", &resolved.isolation.to_string()),
-        row("seccomp", &resolved.seccomp.to_string()),
+        row(
+            "seccomp",
+            &format!("{} (from {seccomp_source})", resolved.seccomp),
+        ),
         row(
             "runtime",
             &resolved
@@ -227,7 +236,10 @@ pub fn to_json(r: &ResolvedFn) -> serde_json::Value {
         "mode": r.mode.to_string(),
         "runtime": r.runtime.as_ref().map(|x| x.to_string()),
         "isolation": r.isolation.to_string(),
-        "seccomp": r.seccomp.to_string(),
+        // An object rather than the bare name, so `source` (which only the
+        // caller knows) and `allowed_syscalls` (which only `--dry-run`
+        // computes) have somewhere to go without a second key.
+        "seccomp": { "profile": r.seccomp.to_string() },
         "workdir": r.workdir.display().to_string(),
         "user": r.user,
         "limits": {

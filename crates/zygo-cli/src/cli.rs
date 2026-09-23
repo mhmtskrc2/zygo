@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use zygo_core::spec::{
     AllowRule, Bytes, Cpu, Duration, HandlerMode, Isolation, Layer, Mount, Network, SeccompProfile,
 };
@@ -584,6 +584,17 @@ pub struct RunArgs {
     #[arg(long)]
     pub requirements: Option<PathBuf>,
 
+    /// When to pull the image: `missing` (the default, as `docker run`),
+    /// `never`, or `always`.
+    ///
+    /// `never` is for a caller that keeps a clock of its own. A pull is
+    /// minutes and a run is seconds, so a run that quietly became a pull is
+    /// reported to that caller's user as a program that took too long — which
+    /// is not what happened. With `never`, a missing image is refused before
+    /// anything starts: exit 1, and the outcome file says `phase: plan`.
+    #[arg(long, value_enum, default_value_t = PullPolicy::Missing)]
+    pub pull: PullPolicy,
+
     /// Write why the sandbox ended to this file, as JSON.
     ///
     /// `{"exit_code":137,"timed_out":true,"oom_killed":false,"peak_rss_kb":…,
@@ -737,6 +748,17 @@ pub enum SupervisorCommand {
     Run,
     /// Print what the supervisor is and where its socket lives.
     Status,
+    /// Stop the supervisor and nothing else: it drains, exits, and the next
+    /// `serve` or `up` starts one of this release.
+    ///
+    /// The remedy for "client speaks control v13, this supervisor speaks
+    /// v12", which `zygo stop --all` was — except that a client the
+    /// supervisor refuses to talk to cannot ask it to stop, so `stop --all`
+    /// reported nothing to stop and left it running (on a Mac it worked only
+    /// because the shim stops the whole VM afterwards). This goes through
+    /// the protocol when it can and through the pid file and `SIGTERM` when
+    /// it cannot.
+    Stop,
 }
 
 #[derive(Debug, Args)]
@@ -969,6 +991,18 @@ impl SandboxArgs {
     }
 }
 
+/// When `zygo run` pulls the image it was given.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum PullPolicy {
+    /// Pull when the image is not in the store — what `docker run` does.
+    #[default]
+    Missing,
+    /// Never pull; a missing image is a refusal, not a download.
+    Never,
+    /// Pull even when the image is in the store, to pick up a moved tag.
+    Always,
+}
+
 impl RunArgs {
     /// The override layer these flags describe.
     pub fn to_layer(&self) -> anyhow::Result<Layer> {
@@ -1159,6 +1193,27 @@ mod tests {
             "./repo:/src:ro"
         );
         assert_eq!(layer.allow.as_ref().unwrap()[0].to_string(), "pypi.org:443");
+    }
+
+    #[test]
+    fn run_pulls_on_first_use_unless_told_otherwise() {
+        let Command::Run(args) = Cli::try_parse_from(["zygo", "run", "alpine"])
+            .unwrap()
+            .command
+        else {
+            panic!("expected run");
+        };
+        assert_eq!(args.pull, PullPolicy::Missing);
+
+        let Command::Run(args) = Cli::try_parse_from(["zygo", "run", "--pull", "never", "alpine"])
+            .unwrap()
+            .command
+        else {
+            panic!("expected run");
+        };
+        assert_eq!(args.pull, PullPolicy::Never);
+
+        assert!(Cli::try_parse_from(["zygo", "run", "--pull", "sometimes", "alpine"]).is_err());
     }
 
     #[test]

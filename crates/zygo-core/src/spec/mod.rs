@@ -13,7 +13,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-pub use resolve::{DEFAULT_TENANT, ResolveOptions, ResolvedFn, defaults, resolve_standalone};
+pub use resolve::{
+    DEFAULT_TENANT, ResolveOptions, ResolvedFn, SeccompSource, defaults, resolve_standalone,
+};
 pub use types::{
     AllowRule, BuiltinRuntime, Bytes, Cidr, Cpu, Duration, HandlerMode, HostPattern, Isolation,
     Mount, MountMode, Network, ParseError, Runtime, SeccompProfile,

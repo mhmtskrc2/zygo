@@ -1,26 +1,68 @@
 //! `zygo doctor` — can this host run sandboxes, and if not, what fixes it.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use zygo_core::doctor::{self, Status};
 use zygo_core::spec::Isolation;
 
 use crate::cli::Cli;
 use crate::output::Style;
 
-#[derive(Serialize)]
-struct JsonCheck {
-    name: &'static str,
-    status: &'static str,
-    detail: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    remedy: Option<String>,
+/// One line of `zygo doctor --json`.
+///
+/// The shape a health check parses, so it is documented
+/// (`docs/troubleshooting.md`, "What `doctor --json` says") and read back
+/// here: on macOS the guest's report arrives as this document and is merged
+/// with the Mac's own checks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JsonCheck {
+    pub name: String,
+    /// `ok`, `degraded`, `absent` or `FAIL`, as the text output prints it.
+    pub status: String,
+    pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remedy: Option<String>,
+    /// On macOS, which side made the check: `host` (the Mac) or `vm`.
+    /// Absent on Linux, where there is one side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side: Option<String>,
 }
 
-#[derive(Serialize)]
-struct JsonReport {
-    checks: Vec<JsonCheck>,
-    backends: Vec<&'static str>,
-    ok: bool,
+impl JsonCheck {
+    fn from_check(c: &doctor::Check, side: Option<&str>) -> JsonCheck {
+        JsonCheck {
+            name: c.name.to_string(),
+            status: c.status.as_str().to_string(),
+            detail: c.detail.clone(),
+            remedy: c.remedy.clone(),
+            side: side.map(str::to_string),
+        }
+    }
+
+    fn failed(&self) -> bool {
+        self.status == Status::Failed.as_str()
+    }
+}
+
+/// The whole of `zygo doctor --json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JsonReport {
+    pub checks: Vec<JsonCheck>,
+    /// The isolation backends this host can use *right now*: the host has
+    /// what each needs and this binary implements it.
+    pub backends: Vec<String>,
+    /// Whether sandboxes can run here. The exit status is 0 exactly when
+    /// this is true — [`verdict`] derives both from the same checks.
+    pub ok: bool,
+}
+
+/// `ok` and the exit status, from one place, so they cannot disagree.
+///
+/// The first adoption report (Z-4) saw `ok: false` beside exit 0 and
+/// concluded neither could be trusted alone. Both come from here now: `ok`
+/// is "no check failed", and the exit status is `!ok`.
+pub fn verdict(checks: &[JsonCheck]) -> (bool, u8) {
+    let ok = !checks.iter().any(JsonCheck::failed);
+    (ok, u8::from(!ok))
 }
 
 pub fn run(cli: &Cli, fix: bool, yes: bool) -> anyhow::Result<u8> {
@@ -43,44 +85,50 @@ pub fn run(cli: &Cli, fix: bool, yes: bool) -> anyhow::Result<u8> {
         .map(|i| i.as_str())
         .collect();
 
-    if cli.json {
-        crate::output::json(&JsonReport {
-            checks: report
-                .checks
-                .iter()
-                .map(|c| JsonCheck {
-                    name: c.name,
-                    status: c.status.as_str(),
-                    detail: c.detail.clone(),
-                    remedy: c.remedy.clone(),
-                })
-                .collect(),
-            backends: usable.clone(),
-            ok: report.exit_code() == 0,
-        })?;
-        return Ok(report.exit_code() as u8);
+    // On macOS the host's checks are about reaching the VM, and the kernel's
+    // are the VM's own. One report, from both sides, with one verdict.
+    #[cfg(target_os = "macos")]
+    {
+        return on_a_mac(cli, &report, &usable);
     }
 
-    let style = Style::stdout();
-    let name_width = report
-        .checks
-        .iter()
-        .map(|c| c.name.len())
-        .max()
-        .unwrap_or(0);
-    let detail_width = report
-        .checks
-        .iter()
-        .map(|c| c.detail.len())
-        .max()
-        .unwrap_or(0);
+    #[allow(unreachable_code)]
+    {
+        let checks: Vec<JsonCheck> = report
+            .checks
+            .iter()
+            .map(|c| JsonCheck::from_check(c, None))
+            .collect();
+        let (ok, code) = verdict(&checks);
+        if cli.json {
+            crate::output::json(&JsonReport {
+                checks,
+                backends: usable.iter().map(|s| s.to_string()).collect(),
+                ok,
+            })?;
+            return Ok(code);
+        }
 
-    for check in &report.checks {
-        let status = match check.status {
-            Status::Ok => style.green("ok"),
-            Status::Degraded => style.yellow("degraded"),
-            Status::Absent => style.dim("-"),
-            Status::Failed => style.red("FAIL"),
+        let style = Style::stdout();
+        print_checks(&style, &checks);
+        println!();
+        print_backends(&style, &usable);
+        Ok(code)
+    }
+}
+
+/// The checks as a table, one line each, with the remedy under any that
+/// is not `ok`.
+fn print_checks(style: &Style, checks: &[JsonCheck]) {
+    let name_width = checks.iter().map(|c| c.name.len()).max().unwrap_or(0);
+    let detail_width = checks.iter().map(|c| c.detail.len()).max().unwrap_or(0);
+
+    for check in checks {
+        let status = match check.status.as_str() {
+            "ok" => style.green("ok"),
+            "degraded" => style.yellow("degraded"),
+            "absent" => style.dim("-"),
+            _ => style.red("FAIL"),
         };
         println!(
             "{:name_width$}  {:detail_width$}  {status}",
@@ -89,27 +137,96 @@ pub fn run(cli: &Cli, fix: bool, yes: bool) -> anyhow::Result<u8> {
         // Only show a remedy where it changes what the user should do: an
         // absent optional backend is not a problem to be fixed.
         if let Some(remedy) = &check.remedy
-            && check.status != Status::Ok
+            && check.status != Status::Ok.as_str()
         {
             println!("{:name_width$}  {}", "", style.dim(&format!("→ {remedy}")));
         }
     }
+}
 
-    println!();
+fn print_backends(style: &Style, usable: &[impl AsRef<str>]) {
     if usable.is_empty() {
         println!("{} no isolation backend is usable here", style.red("✗"));
     } else {
-        println!("backends available: {}", style.bold(&usable.join(", ")));
+        let names: Vec<&str> = usable.iter().map(AsRef::as_ref).collect();
+        println!("backends available: {}", style.bold(&names.join(", ")));
     }
+}
 
-    // On macOS the host's own answer is always the same and always no. The
-    // one worth printing is the VM's, so it goes below and its exit code is
-    // the one that leaves.
-    if let Some(code) = vm_section(&style) {
+/// `zygo doctor` on macOS: the Mac's checks, then the VM's, one verdict.
+///
+/// The text and the JSON are built from the same merged list, so the two
+/// cannot say different things — which they did (Z-4): the text went on to
+/// ask the VM and the JSON stopped at the platform line.
+#[cfg(target_os = "macos")]
+fn on_a_mac(cli: &Cli, report: &doctor::Report, _usable: &[&'static str]) -> anyhow::Result<u8> {
+    let vm = crate::shim::describe_vm();
+
+    let mut checks: Vec<JsonCheck> = report
+        .checks
+        .iter()
+        .chain(vm.host.iter())
+        .map(|c| JsonCheck::from_check(c, Some("host")))
+        .collect();
+    let mut backends: Vec<String> = Vec::new();
+    let mut guest_checks: Vec<JsonCheck> = Vec::new();
+    match &vm.guest {
+        Some(Ok(guest)) => {
+            guest_checks = guest
+                .checks
+                .iter()
+                .cloned()
+                .map(|mut c| {
+                    c.side = Some("vm".into());
+                    c
+                })
+                .collect();
+            backends = guest.backends.clone();
+        }
+        Some(Err(said)) => guest_checks.push(JsonCheck {
+            name: "vm doctor".into(),
+            status: Status::Failed.as_str().into(),
+            detail: "the VM is running but did not answer `zygo doctor --json`".into(),
+            remedy: Some(format!(
+                "limactl shell {} -- zygo doctor{}",
+                crate::shim::INSTANCE,
+                if said.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (it said: {said})")
+                }
+            )),
+            side: Some("vm".into()),
+        }),
+        None => {}
+    }
+    checks.extend(guest_checks.iter().cloned());
+    let (ok, code) = verdict(&checks);
+
+    if cli.json {
+        crate::output::json(&JsonReport {
+            checks,
+            backends,
+            ok,
+        })?;
         return Ok(code);
     }
 
-    Ok(report.exit_code() as u8)
+    let style = Style::stdout();
+    let host: Vec<JsonCheck> = checks
+        .iter()
+        .filter(|c| c.side.as_deref() == Some("host"))
+        .cloned()
+        .collect();
+    print_checks(&style, &host);
+    if !guest_checks.is_empty() {
+        println!();
+        println!("what that VM says about itself:");
+        print_checks(&style, &guest_checks);
+    }
+    println!();
+    print_backends(&style, &backends);
+    Ok(code)
 }
 
 /// `zygo doctor --fix`: print the plan, ask, then run it.
@@ -346,72 +463,49 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// Print what the Linux VM says about itself, and return its exit code.
-///
-/// `None` anywhere but macOS, where there is no VM to ask.
-#[cfg(target_os = "macos")]
-fn vm_section(style: &Style) -> Option<u8> {
-    use crate::shim::{self, Vm};
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let report = shim::describe_vm();
-    println!();
-    match &report.limactl {
-        Some(path) => println!("the Linux VM   limactl at {}", path.display()),
-        None => {
-            println!(
-                "{} `limactl` is not installed, so there is no Linux VM to run sandboxes in",
-                style.red("✗")
-            );
-            println!("{}", style.dim("  → brew install lima"));
-            return Some(1);
+    fn check(status: Status) -> JsonCheck {
+        JsonCheck {
+            name: "x".into(),
+            status: status.as_str().into(),
+            detail: String::new(),
+            remedy: None,
+            side: None,
         }
     }
 
-    match report.vm {
-        Vm::Running => println!(
-            "               instance `zygo` is {}",
-            style.green("running")
-        ),
-        Vm::Stopped => {
-            println!(
-                "               instance `zygo` is {}",
-                style.yellow("stopped")
-            );
-            println!(
-                "{}",
-                style.dim("  → it starts by itself on the next command")
-            );
-            return Some(1);
-        }
-        Vm::Absent => {
-            println!(
-                "               instance `zygo` {}",
-                style.yellow("does not exist yet")
-            );
-            println!(
-                "{}",
-                style.dim("  → it is created by the first command that needs it")
-            );
-            return Some(1);
-        }
-    }
-
-    let Some((text, code)) = report.guest else {
-        println!(
-            "{}",
-            style.dim("  → the VM is running but did not answer `zygo doctor`")
+    /// Z-4: `ok: false` beside exit 0 meant neither could be trusted alone.
+    /// Both come from one function now, and this is the pair.
+    #[test]
+    fn ok_and_the_exit_status_cannot_disagree() {
+        assert_eq!(verdict(&[]), (true, 0));
+        assert_eq!(verdict(&[check(Status::Ok)]), (true, 0));
+        assert_eq!(
+            verdict(&[check(Status::Degraded)]),
+            (true, 0),
+            "degraded is usable"
         );
-        return Some(1);
-    };
-    println!();
-    println!("what that VM says about itself:");
-    for line in text.lines() {
-        println!("  {line}");
+        assert_eq!(verdict(&[check(Status::Absent)]), (true, 0));
+        assert_eq!(
+            verdict(&[check(Status::Ok), check(Status::Failed)]),
+            (false, 1)
+        );
     }
-    Some(code)
-}
 
-#[cfg(not(target_os = "macos"))]
-fn vm_section(_style: &Style) -> Option<u8> {
-    None
+    /// The document round-trips, because on macOS the guest's is read back.
+    #[test]
+    fn the_json_shape_reads_back() {
+        let text = r#"{"checks":[{"name":"kernel","status":"ok","detail":"6.8.0"},
+            {"name":"pasta","status":"FAIL","detail":"missing","remedy":"apt install passt"}],
+            "backends":["ns"],"ok":false}"#;
+        let report: JsonReport = serde_json::from_str(text).unwrap();
+        assert_eq!(report.checks.len(), 2);
+        assert_eq!(report.backends, ["ns"]);
+        assert!(!report.ok);
+        assert_eq!(verdict(&report.checks), (false, 1));
+        assert!(report.checks[0].side.is_none());
+    }
 }

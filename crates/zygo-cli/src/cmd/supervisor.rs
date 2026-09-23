@@ -22,7 +22,68 @@ pub fn supervisor(cli: &Cli, command: &SupervisorCommand) -> anyhow::Result<u8> 
     match command {
         SupervisorCommand::Run => run_supervisor(cli),
         SupervisorCommand::Status => status(cli),
+        SupervisorCommand::Stop => stop_supervisor(cli),
     }
+}
+
+/// `zygo supervisor stop`: end the supervisor process, and only it.
+///
+/// Exit 0 when one was told to stop, 1 when there was none — so the shim,
+/// which runs this after replacing the guest's binary, can say whether a
+/// restart happened without parsing the line.
+fn stop_supervisor(cli: &Cli) -> anyhow::Result<u8> {
+    let paths = super::paths(cli);
+    let style = Style::stdout();
+
+    // Through the protocol where the supervisor will talk to us: `SHUTDOWN`
+    // is what `stop --all` sends once the functions are stopped.
+    let (pid, how) = match Client::connect(&paths) {
+        Ok(mut client) => {
+            let _ = client.send(&Request::Shutdown);
+            (client.supervisor_pid, "asked over the control socket")
+        }
+        // It will not — a version skew, or a supervisor that has stopped
+        // answering — so the pid file is the way. `SIGTERM` drains, as
+        // `DRAIN` does, and then exits.
+        Err(connect) => match std::fs::read_to_string(paths.supervisor_pid())
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+        {
+            Some(pid) => {
+                // SAFETY: `kill` with a pid read from a file this user
+                // wrote; a stale pid is `ESRCH`, checked below.
+                let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+                if rc != 0 {
+                    tracing::debug!(pid, "no such supervisor: {connect}");
+                    if cli.json {
+                        output::json(&serde_json::json!({ "stopped": false }))?;
+                    } else {
+                        println!("{}", style.dim("no supervisor running"));
+                    }
+                    return Ok(1);
+                }
+                (pid, "sent SIGTERM; it drains, then exits")
+            }
+            None => {
+                tracing::debug!("nothing to stop: {connect}");
+                if cli.json {
+                    output::json(&serde_json::json!({ "stopped": false }))?;
+                } else {
+                    println!("{}", style.dim("no supervisor running"));
+                }
+                return Ok(1);
+            }
+        },
+    };
+
+    if cli.json {
+        output::json(&serde_json::json!({ "stopped": true, "pid": pid, "how": how }))?;
+    } else {
+        println!(
+            "stopping supervisor pid {pid} ({how}); the next `serve` or `up` starts a new one"
+        );
+    }
+    Ok(0)
 }
 
 /// Run the supervisor in the foreground until something tells it to stop.

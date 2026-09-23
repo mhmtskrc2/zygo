@@ -1,5 +1,13 @@
 # The Linux VM macOS runs Zygo's sandboxes in.
 #
+# zygo-template-generation: 2
+# ^ Read back by `zygo doctor` from the instance's copy of this file. Lima
+#   copies the template when the instance is created and never reads the
+#   source again, so a change here reaches a new VM and not an existing one;
+#   the number is how `doctor` tells the two apart. Bump it, and the constant
+#   `TEMPLATE_GENERATION` in `crates/zygo-cli/src/shim.rs`, whenever the
+#   change is one an existing VM should pick up.
+#
 # Nothing here is about Zygo's isolation — that is built inside the sandboxes
 # this VM hosts, by the same `ns` backend that runs on any Linux box. This
 # file is about making the VM invisible, which comes down to three things:
@@ -99,6 +107,23 @@ provision:
       Delegate=cpu cpuset io memory pids
       EOF
       systemctl daemon-reload
+
+      # Every forwarded command is one session on one multiplexed SSH
+      # connection (Lima's `ControlMaster auto`), and OpenSSH caps the
+      # sessions a connection may carry at `MaxSessions`, ten by default.
+      # Past it the peer refuses the session and `zygo` exits 255 before the
+      # guest has run anything — which is how twenty-four concurrent
+      # `zygo run`s from a Mac lost one in twenty (the first adoption report,
+      # Z-2). Sixty-four covers that width with headroom; the shim retries
+      # twice on top, for a burst wider than this.
+      # `MaxStartups` is the other cap, on connections not yet
+      # authenticated, for the rare path where Lima opens a fresh one.
+      mkdir -p /etc/ssh/sshd_config.d
+      cat > /etc/ssh/sshd_config.d/zygo.conf <<'EOF'
+      MaxSessions 64
+      MaxStartups 64:30:128
+      EOF
+      systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
 
   - mode: user
     script: |

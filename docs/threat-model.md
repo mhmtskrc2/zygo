@@ -79,13 +79,34 @@ the table below is refused.
 | Reaching the host's filesystem | `pivot_root` with the old root detached | **attempted** |
 | Tampering with shared image layers | the store is not reachable from inside; layers are bound read-only | **attempted** |
 | Resource exhaustion | mandatory cgroup limits; `pids.max` always set; `memory.oom.group` | **attempted** separately by `make verify-linux` (the fork bomb is cut off at `pids.max`; the memory hog is OOM-killed inside its own cgroup and the host loses 0 MB) |
-| Reaching the host over the network | default `network = "none"`; under `egress`/`full`, RFC1918, CGNAT, link-local and loopback are rejected *above* every allow rule, so a hostname that resolves into one is refused too | **attempted** by the supervisor suite |
+| Reaching the host over the network | default `network = "none"`; under `egress`/`full`, RFC1918, CGNAT, link-local and loopback are rejected *above* every allow rule, so a hostname that resolves into one is refused too | **attempted** by the supervisor suite, and measured from outside by the first consumer: under `--net full` the cloud metadata address, the host's own Postgres and the LAN router are all *no route*, where Docker's default bridge reaches two of the three (see below) |
 | Using a resolver of one's own to dodge the allowlist | DNS is forced to one address; port 53 to anything else is rejected | **attempted** |
 | Secrets | never in `EXEC`, never in the zygote: written by the supervisor from *outside* the sandbox to `/run/secrets/<name>` (0400) between `FORKED` and `GO`, removed when the last request in flight finishes. A warm-exec sandbox is reached through a directory descriptor its own init hands out before it hardens, not through `/proc` — which a non-dumpable process does not offer an unprivileged supervisor at all | **attempted** — the file is absent between requests, the value is absent from the agent's `environ`, and both paths are exercised as an ordinary user |
 | The supervisor's socket | unix socket 0600 inside a 0700 directory, plus an `SO_PEERCRED` uid check | **attempted** |
 | The HTTP API | bearer token from the environment only, compared in constant time; refuses to start unauthenticated on a reachable address | **attempted** |
 | Zygote contamination | the zygote never handles a request itself; every request is a fresh process that ends in `_exit` | by construction |
 | Timing / microarchitectural side channels | **out of scope** | — |
+
+### The stated guarantee for egress
+
+Under `network = "egress"` or `"full"`, a sandbox **cannot reach** the cloud
+metadata endpoint (`169.254.169.254`), any RFC1918 address (the host, its
+neighbours, the LAN's router), any CGNAT or link-local address, or the
+host's loopback — whatever name they resolve from — unless the operator
+passes `--allow-private-net`. This is enforced inside the sandbox's own
+network namespace by nftables rules that sit *above* every allow rule, and
+by a resolver that admits only what the allowlist names.
+
+Measured, not read, by the first adoption report through its own driver on
+one host: the same probe through Zygo's `--net full` found *no route* to
+the metadata address, the host's Postgres, the LAN router and `10.0.0.1`,
+and reached `1.1.1.1:53`; Docker's `--network bridge` on the same host
+reached the host's Postgres and the LAN router, and routed the metadata
+address (refused by the host, not blocked). Docker needs four
+`iptables -I DOCKER-USER … -j DROP` rules — `169.254.0.0/16`, `10.0.0.0/8`,
+`172.16.0.0/12`, `192.168.0.0/16` — for parity; [the comparison](comparison.md#networking)
+lists them. What Zygo does *not* guarantee is anything about the public
+internet under `full`: that mode is "the internet and nothing of yours".
 
 ## Where the boundary is weaker than it looks
 

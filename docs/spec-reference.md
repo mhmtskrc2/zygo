@@ -52,7 +52,7 @@ then only `timeout`.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `network` | `none` \| `egress` \| `full` \| `host` | `none` | `none`: loopback only. `egress`: the `allow` list, enforced by nftables inside the namespace, with DNS through a resolver of Zygo's own. `full`: the public internet. `host`: no namespace; needs `--allow-host-net`. |
+| `network` | `none` \| `egress` \| `full` \| `host` | `none` | `none`: loopback only. `egress`: the `allow` list, enforced by nftables inside the namespace, with DNS through a resolver of Zygo's own. `full`: the public internet (`bridge`, Docker's word, is accepted as a spelling of it and printed back as `full`). `host`: no namespace; needs `--allow-host-net`. |
 | `allow` | list | `[]` | `host:port`, `*.domain:port`, `CIDR:port`; a host with no port means every port. Only with `egress`. Private and link-local ranges are refused unless `--allow-private-net`, even when listed. |
 
 ## Files, environment, secrets

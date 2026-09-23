@@ -10,7 +10,34 @@ Three profiles, chosen per function with `seccomp = "…"` or `--seccomp`:
 |---|---|---|
 | `default` | ~190 syscalls: the set five reference packages exercise their real code paths under — numpy's BLAS threads, Pillow's codecs, pandas' file I/O, pydantic's Rust core, requests' TLS setup. `clone` is allowed only with every `CLONE_NEW*` flag clear, so a sandbox cannot make a namespace; `ioctl` is allowed except for `TIOCSTI` and its relatives. `bpf`, `io_uring_*`, `userfaultfd`, `keyctl`, `perf_event_open`, `ptrace`, `mount` and `unshare` are absent. | Everyone (T1, T2) |
 | `strict` | `default` minus the calls that reach the network — `socket`, `connect`, `bind`, `listen`, `accept4` — and minus `ptrace`, `mount`, `umount2`. In the agent's forked child, additionally minus `execve`, `execveat`, `fork`, `vfork` and any `clone` without `CLONE_THREAD` (see [the child filter](#the-child-filter)). | A `network = "none"` function whose author wants the kernel to refuse a socket, not merely the namespace to have nothing behind it — and **every runtime pool by default**, because a pool's child runs a script that arrived over an API |
-| `permissive` | `default` plus `clone3`, `ptrace`, `unshare`, `setns`, `mount`, `pivot_root`, `chroot`, `mknod`, `process_vm_readv`/`writev`, `personality` and the rest of Docker's default profile. Those eight are the *only* appendix-B exclusions it grants, and a test asserts the list. | Debugging a package the tighter profiles break, and Zygo's own derived-layer builds, where `dpkg` uses the legacy `chown`/`chmod`/`mknod` calls. **Not a tenant profile.** |
+| `permissive` | `default` plus `clone3`, `ptrace`, `unshare`, `setns`, `mount`, `pivot_root`, `chroot`, `mknod`, `process_vm_readv`/`writev`, `personality` and the rest of Docker's default profile. Those eight are the *only* appendix-B exclusions it grants, and a test asserts the list. **It is not "no filter"**: a syscall outside all three lists is refused under `permissive` too. | Debugging a package the tighter profiles break, and Zygo's own derived-layer builds, where `dpkg` uses the legacy `chown`/`chmod`/`mknod` calls. **Not a tenant profile.** |
+
+A word on the last row, because a reader used it wrongly and drew the wrong
+conclusion. `permissive` is "the default plus namespaces, mounts, ptrace and
+friends" — the set Docker's default profile allows. It is not the "turn
+seccomp off" diagnostic step. The first adoption report tried `--seccomp
+permissive` against a failure whose cause (`listxattr`, below) was in *no*
+list, saw no change, and inferred the flag was dead. It was not; the
+syscall was missing from all three profiles. If something fails under
+`permissive` too, the answer is the [troubleshooting entry for
+`EPERM`](troubleshooting.md#errno-1-operation-not-permitted-naming-a-file-that-exists-and-is-readable),
+which says how to find the syscall. `zygo run --dry-run` prints the resolved
+profile, where it came from and how many syscalls it names, so the flag can
+be seen to take effect without running anything.
+
+Every profile allows the whole **extended-attribute family** — `getxattr`,
+`listxattr`, `setxattr`, `removexattr` and their `l`/`f` spellings — since
+the first adoption report found `listxattr` missing. `shutil.copy2` calls it,
+and `pip install --target` is a `copy2` per file, so a profile without it
+broke every Python package install into a mounted directory with a
+traceback about `RECORD`. `strict` keeps them on purpose: reading and
+listing attributes on a filesystem the sandbox owns leaks nothing, a
+`user.*` write is bounded by the mount, the kernel refuses `trusted.*` and
+`security.*` to an unprivileged uid before any filter is consulted, and a
+`network = "none"` function copies files like any other. A unit test holds
+all twelve under all three profiles, and `make
+verify-seccomp-profiles-linux` does the `copy2` and the `pip install` on a
+kernel.
 
 ## The compatibility matrix
 
@@ -41,6 +68,13 @@ asked for.
 | `worker_threads` | works | works — a thread is a `clone` **with** `CLONE_THREAD`, which the child filter permits | works |
 | `crypto` + `zlib` + `fs` | works | works | works |
 | `child_process` | works | refused, which is the point of the profile | refused |
+
+`make verify-seccomp-profiles-linux` is the short form of the same idea for
+the *profiles* rather than the packages: from inside a sandbox, `unshare`
+succeeds under `permissive` and returns `EPERM` under `default`, and
+`socket` succeeds under `default` and returns `EPERM` under `strict`. The
+unit tests prove the lists differ; that proves the sandbox does. `make
+fuzz-linux` is the long form, every syscall number under every profile.
 
 Measured on Linux 5.10 (aarch64, Docker Desktop). "Works" means the handler
 returned `{"ok": true}` from a real operation — a validation error caught, a

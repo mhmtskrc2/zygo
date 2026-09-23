@@ -669,6 +669,30 @@ class OutcomeTests(unittest.TestCase):
                 with self.assertRaises(zygo.Timeout):
                     client.run("alpine:3", ["sleep", "60"])
 
+    def test_a_sandbox_that_never_started_is_unavailable_not_the_programs_fault(self) -> None:
+        # The first adoption report had to match on the error's text to tell a
+        # start failure from a failing program. `started` says it outright.
+        with FakeApi() as api:
+            api.answer(
+                "POST",
+                "/run",
+                200,
+                {
+                    "exit_code": 125,
+                    "stdout": "",
+                    "stderr": "error: this host cannot run sandboxes\n",
+                    "timed_out": False,
+                    "oom_killed": False,
+                    "started": False,
+                    "phase": "start",
+                },
+            )
+            with zygo.connect(api.url) as client:
+                never = client.run("alpine:3", ["true"])
+        self.assertFalse(never.started)
+        self.assertEqual(never.phase, "start")
+        self.assertFalse(never.ok)
+
     def test_an_older_api_that_does_not_report_a_reason_still_parses(self) -> None:
         # The fields were added after the route; a client that required them
         # would fail against a Zygo one release behind.
@@ -679,6 +703,8 @@ class OutcomeTests(unittest.TestCase):
         self.assertTrue(run.ok)
         self.assertFalse(run.oom_killed)
         self.assertEqual(run.peak_rss_kb, 0)
+        self.assertTrue(run.started, "an older API only answered once the program ran")
+        self.assertEqual(run.phase, "run")
 
 
 class AsyncTests(unittest.TestCase):

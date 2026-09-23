@@ -126,8 +126,10 @@ impl Client {
             } => Err(Error::BackendUnavailable {
                 backend: "supervisor",
                 reason: message,
-                remedy: "stop the running supervisor with `zygo stop --all`, \
-                         then run the command again"
+                remedy: "`zygo supervisor stop` restarts only the supervisor — it \
+                         drains, exits, and the next `serve` or `up` starts one of \
+                         this release; `zygo stop --all` is the heavier fallback, and \
+                         on a Mac it stops the whole Linux VM"
                     .into(),
             }),
             other => Err(unexpected(&other)),
@@ -203,7 +205,7 @@ impl Client {
                     budget.as_secs()
                 ),
                 remedy: "it is running but not replying — check `zygo logs`, and \
-                         `zygo stop --all` to restart it; report it if it repeats"
+                         `zygo supervisor stop` to restart it; report it if it repeats"
                     .into(),
             }),
             Err(e) => Err(Error::primitive(
@@ -352,7 +354,7 @@ impl Client {
                          deadline plus grace"
                     .into(),
                 remedy: "it is running but not replying — check `zygo logs`, and \
-                         `zygo stop --all` to restart it; report it if it repeats"
+                         `zygo supervisor stop` to restart it; report it if it repeats"
                     .into(),
             }),
             Err(e) => Err(Error::primitive(

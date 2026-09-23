@@ -540,6 +540,9 @@ class ProtocolTests(unittest.TestCase):
         first = h.wire.recv()
         self.assertEqual(first["type"], "ERROR")
         self.assertIn("defines no `handler`", first["message"])
+        # The alternative is named where the failure is (the first adoption
+        # report, Z-6): `--mode` was undocumented at the point of use.
+        self.assertIn("--mode stdin", first["message"])
 
     def test_a_frame_that_is_not_json_is_reported_and_survived(self):
         """Found by `zygo agent test`: this used to kill the agent.

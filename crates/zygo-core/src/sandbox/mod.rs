@@ -236,6 +236,16 @@ impl SandboxConfig {
         // that may break a handler.
         merged.insert("ZYGO_TENANT".to_string(), f.name.clone());
         merged.insert("ZYGO_FUNCTION".to_string(), f.name.clone());
+        // A home that can be written to, unless the image or the spec named
+        // one. Docker fills `HOME` in from the image's passwd entry for the
+        // user; the sandbox's uid rarely has one, and then everything that
+        // expands `~` — pip's cache, npm's, git's config — lands on the
+        // read-only root and fails with a sentence about a directory nobody
+        // asked for. `/tmp` is the scratch mount: the one place every sandbox
+        // can write, sized by `scratch`, gone with the run.
+        merged
+            .entry("HOME".to_string())
+            .or_insert_with(|| "/tmp".to_string());
         let env: Vec<(String, String)> = merged.into_iter().collect();
 
         Self {
@@ -349,6 +359,62 @@ mod tests {
         assert_eq!(get("PATH").as_deref(), Some("/usr/bin:/bin"), "inherited");
         assert_eq!(get("LANG").as_deref(), Some("tr_TR"), "the spec wins");
         assert_eq!(get("ZYGO_TENANT").as_deref(), Some("demo"));
+        assert_eq!(
+            get("HOME").as_deref(),
+            Some("/tmp"),
+            "a writable home by default"
+        );
+    }
+
+    /// `HOME` is a default, not an override: an image that sets one, or a
+    /// spec that does, keeps it.
+    #[test]
+    fn a_home_the_image_or_the_spec_names_is_kept() {
+        let view = RootfsView::Flat {
+            dir: PathBuf::from("/x"),
+        };
+        let cfg = |spec_env: Option<(&str, &str)>, image_env: &[(String, String)]| {
+            let f = resolve_standalone(
+                "demo",
+                &Layer {
+                    image: Some("alpine".into()),
+                    cmd: Some(vec!["/bin/true".into()]),
+                    env: spec_env
+                        .map(|(k, v)| [(k.to_string(), v.to_string())].into_iter().collect()),
+                    ..Default::default()
+                },
+                &ResolveOptions::default(),
+            )
+            .unwrap();
+            let cfg = SandboxConfig::from_resolved(
+                &f,
+                &view,
+                "/newroot",
+                vec!["/bin/true".into()],
+                image_env,
+            );
+            cfg.env
+                .iter()
+                .find(|(k, _)| k == "HOME")
+                .map(|(_, v)| v.clone())
+        };
+
+        let image_home = [("HOME".to_string(), "/home/app".to_string())];
+        assert_eq!(
+            cfg(None, &image_home).as_deref(),
+            Some("/home/app"),
+            "the image's"
+        );
+        assert_eq!(
+            cfg(Some(("HOME", "/work")), &[]).as_deref(),
+            Some("/work"),
+            "the spec's"
+        );
+        assert_eq!(
+            cfg(Some(("HOME", "/work")), &image_home).as_deref(),
+            Some("/work"),
+            "the spec over the image"
+        );
     }
 
     #[test]

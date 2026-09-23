@@ -70,6 +70,17 @@ pub struct Captured {
     /// kernel did not report one.
     pub peak_rss_kb: u64,
     pub wall_ms: f64,
+    /// Whether the program ran at all, as the child reported it.
+    ///
+    /// `false` is Zygo failing to build the sandbox — a missing image, a
+    /// host that cannot, a mount that does not exist — and a caller should
+    /// report it as *unavailable* rather than as the program's failure.
+    /// Also `false` when the child wrote no outcome at all, which is a child
+    /// that died before it could say anything.
+    pub started: bool,
+    /// How far the child got: `plan`, `start` or `run`. See the outcome
+    /// file's own `phase`.
+    pub phase: String,
 }
 
 /// What `zygo run --outcome` writes. The fields it does not carry — the two
@@ -84,6 +95,10 @@ struct Outcome {
     oom_killed: bool,
     #[serde(default)]
     peak_rss_kb: u64,
+    #[serde(default)]
+    started: bool,
+    #[serde(default)]
+    phase: String,
 }
 
 /// Run one sandbox to completion and collect its output.
@@ -210,11 +225,18 @@ pub fn run(
     // The child's own account, when it got far enough to write one. A child
     // this module killed never did, and the outer deadline is then the only
     // thing there is to report.
-    let outcome: Outcome = std::fs::read(&outcome_path)
+    let outcome: Option<Outcome> = std::fs::read(&outcome_path)
         .ok()
-        .and_then(|raw| serde_json::from_slice(&raw).ok())
-        .unwrap_or_default();
+        .and_then(|raw| serde_json::from_slice(&raw).ok());
     let _ = std::fs::remove_file(&outcome_path);
+    // A child killed by the outer bound wrote nothing; whether its program
+    // ran is unknown, and "unknown" is reported as not started, which is
+    // the answer a caller acts on correctly either way.
+    let (ran, phase) = match &outcome {
+        Some(o) => (o.started, o.phase.clone()),
+        None => (false, String::new()),
+    };
+    let outcome = outcome.unwrap_or_default();
 
     Ok(Captured {
         exit_code: status.code().unwrap_or(-1),
@@ -225,6 +247,8 @@ pub fn run(
         oom_killed: outcome.oom_killed,
         peak_rss_kb: outcome.peak_rss_kb,
         wall_ms: started.elapsed().as_secs_f64() * 1000.0,
+        started: ran,
+        phase,
     })
 }
 

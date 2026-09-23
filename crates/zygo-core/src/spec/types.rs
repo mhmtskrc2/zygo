@@ -271,6 +271,8 @@ impl fmt::Display for Cpu {
 // ---------------------------------------------------------------------------
 
 macro_rules! str_enum {
+    // The common shape: one spelling per variant, and serde derives the
+    // (de)serialisation from the same names.
     ($(#[$meta:meta])* $name:ident { $($variant:ident => $text:literal),+ $(,)? }, default = $default:ident, kind = $kind:literal) => {
         $(#[$meta])*
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -279,11 +281,38 @@ macro_rules! str_enum {
             $($variant),+
         }
 
+        str_enum!(@common $name { $($variant => $text),+ }, default = $default, kind = $kind, aliases = {});
+    };
+    // With aliases: other spellings accepted on the way *in* — the flag, the
+    // spec file, the API — and never produced on the way out, so a name
+    // borrowed from another tool never appears in Zygo's own output.
+    // Deserialisation goes through `FromStr` so a spec file and the API take
+    // the alias too, which a derived `Deserialize` would refuse.
+    ($(#[$meta:meta])* $name:ident { $($variant:ident => $text:literal),+ $(,)? }, default = $default:ident, kind = $kind:literal, aliases = { $($alias:literal => $target:ident),+ $(,)? }) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+        #[serde(rename_all = "lowercase")]
+        pub enum $name {
+            $($variant),+
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                let s = String::deserialize(d)?;
+                s.parse().map_err(de::Error::custom)
+            }
+        }
+
+        str_enum!(@common $name { $($variant => $text),+ }, default = $default, kind = $kind, aliases = { $($alias => $target),+ });
+    };
+    (@common $name:ident { $($variant:ident => $text:literal),+ }, default = $default:ident, kind = $kind:literal, aliases = { $($alias:literal => $target:ident),* }) => {
         impl $name {
             pub const fn as_str(self) -> &'static str {
                 match self { $(Self::$variant => $text),+ }
             }
             pub const ALL: &'static [$name] = &[$($name::$variant),+];
+            /// Spellings accepted besides [`Self::as_str`]'s, and what they mean.
+            pub const ALIASES: &'static [(&'static str, $name)] = &[$(($alias, $name::$target)),*];
         }
 
         impl Default for $name {
@@ -295,6 +324,7 @@ macro_rules! str_enum {
             fn from_str(s: &str) -> Result<Self, Self::Err> {
                 match s.trim().to_ascii_lowercase().as_str() {
                     $($text => Ok(Self::$variant),)+
+                    $($alias => Ok(Self::$target),)*
                     _ => Err(ParseError::new(
                         $kind,
                         s,
@@ -326,6 +356,12 @@ str_enum! {
 str_enum! {
     /// Network policy (design doc §3.8). `Host` additionally requires
     /// `--allow-host-net`, since it removes the network boundary entirely.
+    ///
+    /// `bridge` is accepted as a spelling of `full`: it is the word every
+    /// migrating Docker configuration already contains, and the first
+    /// adoption report's runner failed every networked run on it before
+    /// anybody read the usage error. It is read and never written — a
+    /// resolved `full` prints as `full`.
     Network {
         None => "none",
         Egress => "egress",
@@ -333,7 +369,8 @@ str_enum! {
         Host => "host",
     },
     default = None,
-    kind = "network mode"
+    kind = "network mode",
+    aliases = { "bridge" => Full }
 }
 
 str_enum! {
@@ -1076,5 +1113,39 @@ mod tests {
         assert_eq!("VM".parse::<Isolation>().unwrap(), Isolation::Vm);
         assert_eq!("Egress".parse::<Network>().unwrap(), Network::Egress);
         assert!("kvm".parse::<Isolation>().is_err());
+    }
+
+    /// `bridge` is Docker's word for "a network, NAT'd", and every migrating
+    /// configuration contains it. Read as `full` on every way in — the
+    /// flag, a spec file, the API's JSON — and never written back out.
+    #[test]
+    fn bridge_is_read_as_full_and_never_printed() {
+        assert_eq!("bridge".parse::<Network>().unwrap(), Network::Full);
+        assert_eq!("Bridge".parse::<Network>().unwrap(), Network::Full);
+        assert_eq!(Network::Full.to_string(), "full");
+        assert_eq!(Network::ALIASES, [("bridge", Network::Full)]);
+
+        // Through serde, which is what a spec file and an API request use.
+        let from_toml: Network = toml::from_str::<toml::Value>("n = \"bridge\"")
+            .unwrap()
+            .get("n")
+            .cloned()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(from_toml, Network::Full);
+        let from_json: Network = serde_json::from_str("\"bridge\"").unwrap();
+        assert_eq!(from_json, Network::Full);
+        assert_eq!(serde_json::to_string(&Network::Full).unwrap(), "\"full\"");
+
+        // The others still parse, and nonsense is still refused with the
+        // canonical names — the alias is not advertised.
+        assert_eq!(
+            serde_json::from_str::<Network>("\"egress\"").unwrap(),
+            Network::Egress
+        );
+        let err = "sideways".parse::<Network>().unwrap_err().to_string();
+        assert!(err.contains("none, egress, full, host"), "{err}");
+        assert!(!err.contains("bridge"), "{err}");
     }
 }

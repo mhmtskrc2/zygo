@@ -150,14 +150,37 @@ same cache serves `zygo run --requirements` and `zygo serve`.
 ## On a Mac
 
 Sandboxes are Linux. On macOS every command runs inside a Linux virtual machine
-Zygo manages, and crossing into it costs about **100 ms per command**. That is
-the floor for anything typed at a Mac shell, and `zygo exec` and `docker exec`
-feel the same there.
+Zygo manages, and crossing into it costs about **20 ms per command** once the
+VM is up. The shim goes over the multiplexed SSH connection Lima already holds
+(`ssh -F ~/.lima/zygo/ssh.config`), and asks `limactl` for nothing unless that
+connection is down — which is when the VM needs booting anyway.
 
 The millisecond warm path is still reachable on a Mac — through the HTTP API or
-the SDKs, where the round trip happens inside the VM and the 100 ms is paid once
-by the connection rather than once per request. A warm `exec` from a Mac shell
-round-trips in 96 ms, nearly all of it the hop.
+the SDKs, where the round trip happens inside the VM and the hop is paid once by
+the connection rather than once per request.
+
+Where a one-shot `run` from a Mac spends its time (median of nine, after a
+warm-up, on the Mac this was measured on):
+
+| | |
+|---|---|
+| one event end to end, from a Mac shell | **30 ms** |
+| of which the sandbox (`zygo run … true` typed *inside* the VM) | ~10 ms |
+| `zygo ps` from the Mac — the pure-hop baseline, no sandbox | 20 ms |
+| `ssh -F … lima-zygo true` — the connection alone | under 10 ms |
+| `zygo --version` — no VM at all | 0 ms |
+
+Before the shim used the connection directly the same run was **171 ms**, of
+which ~148 ms was `limactl shell` (40–50 ms) plus a `limactl list` to ask
+whether the VM was running, per command. Both are gone from the hot path.
+
+So "why is `run` 170 ms when `bench cold` says 22" has one answer: the hop.
+A Linux host sees the 23. The same run through Docker Desktop on the same
+Mac was 433 ms. The hop is not being optimised, by decision (`mhmt/todo.md`,
+"Warm path on macOS"); the warm path through the API is the answer for
+anything that has to be fast on a Mac — [the guide](guide.md#a-multi-tenant-consumer-on-the-warm-path)
+has the worked example, and `bench warm` in the same VM says **0.91 ms** p50
+and 845 requests a second against `bench cold`'s 22.6 ms.
 
 ## What is not measured
 

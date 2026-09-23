@@ -106,6 +106,40 @@ namespaced mode. If `pasta` or `nft` is missing a networked sandbox does not
 start, rather than starting unconfined. There is no port publishing; Zygo does
 not run services.
 
+What that means from inside, measured by the first product to make Zygo its
+default sandbox (the first adoption report): the same probe, the same host,
+through Zygo's `--net full` and Docker's `--network bridge`.
+
+| target | Zygo `--net full` | Docker `--network bridge` |
+|---|---|---|
+| cloud metadata `169.254.169.254:80` | no route | **routed** (refused by the host, not blocked) |
+| the host's own Postgres | no route | **reached** |
+| private `192.168.1.1:80` (the LAN router) | no route | **reached** |
+| private `10.0.0.1:80` | no route | no route |
+| the sandbox's default gateway | no route | no route |
+| public internet `1.1.1.1:53` | reached | reached |
+
+Docker needs four rules to close what Zygo closes by default:
+
+```bash
+iptables -I DOCKER-USER -d 169.254.0.0/16 -j DROP
+iptables -I DOCKER-USER -d 10.0.0.0/8     -j DROP
+iptables -I DOCKER-USER -d 172.16.0.0/12  -j DROP
+iptables -I DOCKER-USER -d 192.168.0.0/16 -j DROP
+```
+
+In a product where the code inside the sandbox is written by a *tenant*,
+that is not a preference. The allowlist, end to end, on the same host:
+
+| configuration | `https://example.com` | raw socket to `1.1.1.1:53` |
+|---|---|---|
+| `--net none` | DNS fails | `PermissionError` |
+| `--net egress`, no `--allow` | DNS fails | `PermissionError` |
+| `--net egress --allow example.com:443` | **200** | `OSError` |
+| `--net full` | 200 | reached |
+
+One named host opens and nothing else does, with no proxy process anywhere.
+
 ### Images and dependencies
 
 Both pull the same images from the same registries, and `zygo run` pulls on
@@ -134,6 +168,8 @@ and shared by everything that names the same thing.
 | `--memory 256m --cpus 0.5 --pids-limit 64` | `--mem 256M --cpu 0.5 --pids 64` | present in Zygo whether you pass them or not |
 | `timeout 30 docker run …` | `--timeout 30s` | the whole process tree is killed, through the cgroup |
 | `--network none` | (the default) | `--net egress --allow host:port` for an allowlist |
+| `--network bridge` | `--net full` | `bridge` is accepted as a spelling of `full`; see the egress table below for what the two reach |
+| `--network host` | `--net host --allow-host-net` | the same removal of the boundary, and it says so in its name |
 | `--security-opt seccomp=…` | `--seccomp default\|strict\|permissive` | three shipped profiles; see [seccomp profiles](seccomp-profiles.md) |
 | `--runtime runsc` | `--isolation gvisor` | same spec, same command; `vm` is another value of the same flag |
 | `--rm` | (always) | |

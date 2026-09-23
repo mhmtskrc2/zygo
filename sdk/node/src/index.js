@@ -412,8 +412,14 @@ export class Client {
       oomKilled: Boolean(body.oom_killed),
       peakRssKb: Number(body.peak_rss_kb ?? 0),
       wallMs: Number(body.wall_ms ?? 0),
+      // Whether the program ran at all. `false` is Zygo failing to build the
+      // sandbox — *unavailable*, not the program's failure — and `phase`
+      // says how far it got. An API one release behind does not send it,
+      // and only answered once the program had run.
+      started: body.started === undefined ? true : Boolean(body.started),
+      phase: String(body.phase ?? 'run'),
       get ok() {
-        return this.exitCode === 0 && !this.timedOut && !this.oomKilled;
+        return this.started && this.exitCode === 0 && !this.timedOut && !this.oomKilled;
       },
     };
   }

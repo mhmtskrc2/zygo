@@ -223,6 +223,19 @@ impl Assembler {
 /// This is PoC 5's validated set: the five reference packages exercise their
 /// real code paths — numpy's BLAS threads, Pillow's codecs, pandas' file I/O,
 /// pydantic's Rust core, requests' TLS setup — under exactly these.
+///
+/// Plus the whole extended-attribute family, which PoC 5 did not reach and
+/// the first real consumer did (the first adoption report, Z-1). Only
+/// `getxattr` and `lgetxattr` were here; `listxattr` was not, so it answered
+/// `EPERM` — which `shutil.copy2` reports as `[Errno 1] Operation not
+/// permitted` naming a file that plainly exists, and `pip install --target`
+/// is a `copy2` per file. Nine tracebacks about `RECORD` and `WHEEL` do not
+/// point at `listxattr`. Listing and reading attributes on a tmpfs or an
+/// overlay the sandbox owns leaks nothing; a `user.*` write is bounded by the
+/// mount; `trusted.*` and `security.*` writes are refused by the kernel to an
+/// unprivileged uid before any filter is consulted. So all twelve are allowed
+/// on every profile — `strict` too, because a `network = "none"` function
+/// copies files like any other.
 pub const BASE_ALLOWLIST: &[&str] = &[
     "accept4",
     "access",
@@ -266,6 +279,8 @@ pub const BASE_ALLOWLIST: &[&str] = &[
     "fchownat",
     "fcntl",
     "fdatasync",
+    "fgetxattr",
+    "flistxattr",
     "flock",
     // x86 only, and that is the whole reason they were missing. musl's
     // `fork()` uses `SYS_fork` where the architecture has one and falls back
@@ -278,6 +293,8 @@ pub const BASE_ALLOWLIST: &[&str] = &[
     // thing the `clone` flags check exists to refuse. `vfork` for the same
     // reason — it is what `posix_spawn` reaches for.
     "fork",
+    "fremovexattr",
+    "fsetxattr",
     "fstat",
     "fstatfs",
     "fsync",
@@ -314,7 +331,11 @@ pub const BASE_ALLOWLIST: &[&str] = &[
     "link",
     "linkat",
     "listen",
+    "listxattr",
+    "llistxattr",
+    "lremovexattr",
     "lseek",
+    "lsetxattr",
     "lstat",
     "madvise",
     "membarrier",
@@ -351,6 +372,7 @@ pub const BASE_ALLOWLIST: &[&str] = &[
     "readv",
     "recvfrom",
     "recvmsg",
+    "removexattr",
     "rename",
     "renameat",
     "renameat2",
@@ -396,6 +418,7 @@ pub const BASE_ALLOWLIST: &[&str] = &[
     "setsid",
     "setsockopt",
     "setuid",
+    "setxattr",
     "shutdown",
     "sigaltstack",
     "signalfd4",
@@ -835,8 +858,25 @@ const SYS_SECCOMP: libc::c_long = if cfg!(target_arch = "aarch64") {
 const SECCOMP_SET_MODE_FILTER: libc::c_uint = 1;
 /// Apply to every thread, not just the calling one.
 const SECCOMP_FILTER_FLAG_TSYNC: libc::c_uint = 1;
+/// Write every non-`ALLOW` verdict to the kernel's audit log (4.14+).
+///
+/// With `SECCOMP_RET_ERRNO` the kernel is otherwise silent: the program sees
+/// `EPERM` from a syscall its traceback never names, and nothing anywhere
+/// says which syscall it was. The first adoption report spent a session on
+/// exactly that — `listxattr`, seen as nine tracebacks about `RECORD` and
+/// `WHEEL`. Under `ZYGO_LOG=debug` the launcher sets this flag, and each
+/// refusal then appears in `dmesg` / `journalctl -k` as
+/// `audit: type=1326 … comm="python3" … syscall=<n> …`, where `<n>` is the
+/// number in [`syscalls::TABLE`]. The kernel's own `actions_logged` sysctl
+/// includes `errno` by default, which is what makes the line appear.
+const SECCOMP_FILTER_FLAG_LOG: libc::c_uint = 2;
 
 /// Install a filter on the calling process.
+///
+/// `log_denials` asks the kernel to write every refusal to its audit log —
+/// see [`SECCOMP_FILTER_FLAG_LOG`]. A kernel too old to know the flag answers
+/// `EINVAL`, and the filter is then installed without it: the policy matters
+/// more than the log line, and an unfiltered sandbox is not an option.
 ///
 /// # Safety
 ///
@@ -845,19 +885,27 @@ const SECCOMP_FILTER_FLAG_TSYNC: libc::c_uint = 1;
 ///
 /// `PR_SET_NO_NEW_PRIVS` must already be set, or the kernel refuses the filter
 /// for an unprivileged caller.
-pub unsafe fn install(prog: &[SockFilter]) -> Result<(), std::io::Error> {
+pub unsafe fn install(prog: &[SockFilter], log_denials: bool) -> Result<(), std::io::Error> {
     let fprog = SockFprog {
         len: prog.len() as u16,
         filter: prog.as_ptr(),
     };
-    let rc = unsafe {
+    let apply = |flags: libc::c_uint| unsafe {
         libc::syscall(
             SYS_SECCOMP,
             SECCOMP_SET_MODE_FILTER,
-            SECCOMP_FILTER_FLAG_TSYNC,
+            flags,
             &fprog as *const SockFprog,
         )
     };
+    let mut rc = apply(if log_denials {
+        SECCOMP_FILTER_FLAG_TSYNC | SECCOMP_FILTER_FLAG_LOG
+    } else {
+        SECCOMP_FILTER_FLAG_TSYNC
+    });
+    if rc != 0 && log_denials {
+        rc = apply(SECCOMP_FILTER_FLAG_TSYNC);
+    }
     if rc != 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -1222,6 +1270,44 @@ mod tests {
                 Verdict::Deny(libc::EPERM as u32),
                 "`ptrace` exists here and is refused"
             );
+        }
+
+        /// Z-1 from the first adoption report: `listxattr` answered `EPERM`,
+        /// which `shutil.copy2` reports as `[Errno 1] Operation not permitted`
+        /// on a file that plainly exists — and `pip install --target` is a
+        /// `copy2` per file. Every spelling of every operation on an extended
+        /// attribute is allowed, under every profile; the reasoning is on
+        /// [`BASE_ALLOWLIST`]. `strict` keeps them on purpose: a `network =
+        /// "none"` function copies files like any other, and a profile that
+        /// broke `copy2` in a way nothing documents would be the bug again.
+        #[test]
+        fn the_xattr_family_is_allowed_by_every_profile() {
+            for name in [
+                "getxattr",
+                "lgetxattr",
+                "fgetxattr",
+                "listxattr",
+                "llistxattr",
+                "flistxattr",
+                "setxattr",
+                "lsetxattr",
+                "fsetxattr",
+                "removexattr",
+                "lremovexattr",
+                "fremovexattr",
+            ] {
+                for profile in [
+                    SeccompProfile::Permissive,
+                    SeccompProfile::Default,
+                    SeccompProfile::Strict,
+                ] {
+                    assert_eq!(
+                        verdict(profile, name, 0),
+                        Verdict::Allow,
+                        "{profile}: `{name}` must be allowed, or `shutil.copy2` dies with EPERM"
+                    );
+                }
+            }
         }
 
         /// A legacy spelling and its `*at` form get the same answer.
