@@ -728,8 +728,10 @@ fn exec_batch(cli: &Cli, args: &ExecArgs) -> anyhow::Result<u8> {
 
     let paths = super::paths(cli);
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let answers: Vec<std::sync::Mutex<Option<serde_json::Value>>> =
-        requests.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    let answers: Vec<std::sync::Mutex<Option<serde_json::Value>>> = requests
+        .iter()
+        .map(|_| std::sync::Mutex::new(None))
+        .collect();
     std::thread::scope(|scope| {
         for _ in 0..BATCH_IN_FLIGHT.min(requests.len()) {
             scope.spawn(|| {

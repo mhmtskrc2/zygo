@@ -1006,9 +1006,7 @@ pub fn forward(cli: &Cli) -> anyhow::Result<Option<u8>> {
                 // Then boot it if it is stopped, and give a sshd that is a
                 // moment behind a moment.
                 ensure_running(&limactl, &paths)?;
-                std::thread::sleep(std::time::Duration::from_millis(
-                    500 << (unreachable - 1),
-                ));
+                std::thread::sleep(std::time::Duration::from_millis(500 << (unreachable - 1)));
                 continue;
             }
             crate::output::error(&anyhow::anyhow!(
@@ -1879,7 +1877,11 @@ mod tests {
 
         let (status, transport) = run_forwarded(&program_255, &[], false).unwrap();
         assert_eq!(status.code(), Some(255));
-        assert_eq!(transport, Transport::Ran, "255 from a program is the program's");
+        assert_eq!(
+            transport,
+            Transport::Ran,
+            "255 from a program is the program's"
+        );
 
         let (_, transport) = run_forwarded(&refused_but_ran, &[], false).unwrap();
         assert_eq!(
