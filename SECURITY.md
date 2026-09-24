@@ -71,7 +71,7 @@ Anything that crosses one of the boundaries the project claims to hold:
 
 ## What the project already does about this
 
-Every escape vector in the [threat model](docs/threat-model.md) is **actually
+Every escape vector in the [threat model](docs/book/23-security.md) is **actually
 attempted** by `make escape-linux` — 16 of them, currently 16 blocked, 0
 escaped, 1 skipped for a missing kernel feature. The rule the whole suite is
 built on is that a test must attempt the thing rather than read a setting: a

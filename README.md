@@ -2,6 +2,9 @@
 
 **Warm sandboxes for function-shaped code — daemonless, rootless, OCI-compatible.**
 
+*This page is the first page of [the Zygo book](docs/book/README.md). Read it
+for the idea in five minutes; the book takes it from there.*
+
 Zygo runs webhook handlers, agent tools, cron jobs and data transforms with
 Docker's ergonomics, but without the container create/destroy cycle. The sandbox
 waits warm; a request costs a `fork()`.
@@ -90,7 +93,7 @@ shim → runc, and a container object left behind to remove.
 | Boundary | kernel | kernel | kernel, or gVisor | kernel |
 
 Zygo's two numbers are medians with the image cached, on the machines named in
-[what Zygo costs](docs/performance.md#the-machines) — a Raspberry Pi 5 and two
+[what Zygo costs](docs/book/25-performance.md#the-machines) — a Raspberry Pi 5 and two
 VMs on an Apple-silicon Mac, all aarch64; Docker's are its commonly measured
 range. The program's own start-up is on top of every column. `zygo bench all`
 reproduces every one of them on your host, prints the machine it ran on, and
@@ -171,7 +174,7 @@ is where Landlock's network rules, `cgroup.kill` and `memory.peak` are all
 present. `zygo doctor` attempts each requirement rather than reading a setting,
 and prints the fix for anything missing. On Ubuntu and Debian two AppArmor
 policies get in the way of sandboxes and of networked sandboxes respectively;
-[troubleshooting](docs/troubleshooting.md) has both, and `doctor` names them.
+[troubleshooting](docs/book/22-troubleshooting.md) has both, and `doctor` names them.
 
 **macOS** gets a Linux VM. Every sandbox command is forwarded into one that
 Zygo starts and manages, with the same arguments, working directory and
@@ -188,8 +191,8 @@ Crossing into the VM costs about 20 ms per command once it is up — the shim
 uses the SSH connection Lima already holds — so a one-shot `run` from a Mac
 shell is about 30 ms, of which ~10 ms is the sandbox. The millisecond warm path
 is there through the API and the SDKs, and through `zygo api` running *inside*
-the VM. [The guide](docs/guide.md#macos) has the details, and
-[what Zygo costs](docs/performance.md#on-a-mac) has the numbers.
+the VM. [Getting started](docs/book/11-getting-started.md) has the details, and
+[what Zygo costs](docs/book/25-performance.md#on-a-mac) has the numbers.
 
 ## How
 
@@ -291,14 +294,14 @@ things. Those are set once, by whoever installed the server:
 percentile of **2.81 ms** through the shipping code at 250 requests a second,
 sustaining **981 requests a second** at a concurrency of four; a cold `zygo run`
 with the image cached is a median of **18.4 ms**. The warm path is the
-production shape, and the gap is the argument: [the guide](docs/guide.md#a-multi-tenant-consumer-on-the-warm-path)
+production shape, and the gap is the argument: [the book](docs/book/13-warm-functions.md)
 shows a multi-tenant consumer — one warm zygote per script version — on it. The suites run in three
 places, which turned out to matter: a privileged container, a Raspberry Pi as
 an ordinary user under a systemd session, and a Mac. The launcher is checked
 against a real kernel, including actual escape attempts; every syscall number
 the architecture has is swept against all three seccomp profiles; and fifty
 scenarios shaped by use case rather than by mechanism run on two of the three.
-[What Zygo costs](docs/performance.md) has the numbers, the hosts, and what is
+[What Zygo costs](docs/book/25-performance.md) has the numbers, the hosts, and what is
 *not* measured — and `zygo bench all` reproduces every one of them on your own
 host, printing the machine it ran on and refusing to give a verdict when that
 machine was throttled or busy.
@@ -309,7 +312,7 @@ of the guest's own. The guest can write, to a private layer bounded by
 `scratch` and never to the shared image. It has no network and no warm
 functions, and `gvisor` has neither either; both refuse them with a reason
 rather than weakening something. That is a decision rather than a gap —
-[ADR 0002](docs/adr/0002-warm-paths-stay-on-ns.md) says why, and what would
+[ADR 0002](docs/book/adr/0002-warm-paths-stay-on-ns.md) says why, and what would
 reopen it. Warm functions are an `ns` feature.
 
 Zygo scales to one machine, and answers `429` past its capacity. No external
@@ -317,22 +320,18 @@ audit has been done.
 
 ## Documentation
 
+Everything is in **[the Zygo book](docs/book/README.md)** — one book, in plain
+English, with diagrams throughout. It starts from zero and ends with the full
+reference.
+
 | | |
 |---|---|
-| [The Zygo book](docs/book/README.md) | A short book from the ground up: the kernel, namespaces, cgroups, seccomp and Landlock; Docker; how Zygo works and where it saves; FreeBSD jails; and every similar project, compared. Diagrams throughout, plain English. |
-| [Quickstart](docs/quickstart.md) | From a checkout to three warm functions behind HTTP. |
-| [The guide](docs/guide.md) | Everything, in the order you meet it: installing, sandboxes, warm functions, limits, networking, secrets, dependencies, images, deploying, production, backends. |
-| [Concepts](docs/concepts.md) | The eight principles, and what each one costs. |
-| [`sandbox.toml` reference](docs/spec-reference.md) | Every field, its default, and what it maps to. |
-| [What Zygo costs](docs/performance.md) | The measured numbers and the hosts they came from. |
-| [The embedder's benchmark](docs/bench-embed.md) | The warm fork against a container and a one-shot sandbox, on one host: 6.4 ms against 384.7 and 761.9. And what a host costs per warm script, which is the number the roadmap's next phase exists to change. |
-| [Troubleshooting](docs/troubleshooting.md) | The errors people actually hit, and the fix for each. |
-| [Threat model](docs/threat-model.md) | Every vector, the control against it, and whether the suite attempts it. |
-| [Seccomp profiles](docs/seccomp-profiles.md) | The three syscall profiles and the compatibility matrix. |
-| [The SDKs](docs/sdk.md) | The Python and Node clients, the HTTP API, and the deploy gate. |
-| [The MCP server](docs/mcp.md) | Giving an agent host a code interpreter with a reviewed boundary. |
-| [Writing an agent](docs/agents.md) | Warm functions in a language of your own. |
-| [Comparison](docs/comparison.md) | Against Docker, gVisor, Firecracker and the function platforms — including `docker run` and `zygo run` side by side, flag by flag. |
+| [Part I — Container 101](docs/book/README.md#part-i--container-101) | The kernel, namespaces, cgroups, seccomp and Landlock, and Docker: what a sandbox is made of. |
+| [Part II — Zygo, explained](docs/book/README.md#part-ii--zygo-explained) | How Zygo works, where it saves, its principles, FreeBSD jails, and every similar project — `docker run` against `zygo run`, flag by flag. |
+| [Part III — Using Zygo](docs/book/README.md#part-iii--using-zygo) | [Getting started](docs/book/11-getting-started.md), one-shot sandboxes, warm functions, limits and networking, images, production, [the API and SDKs](docs/book/17-api-sdk-mcp.md), writing an agent. |
+| [Part IV — Reference](docs/book/README.md#part-iv--reference) | [Every command](docs/book/19-commands.md), [every `sandbox.toml` field](docs/book/20-sandbox-toml.md), environment, files and exit codes, [troubleshooting](docs/book/22-troubleshooting.md). |
+| [Part V — Security and speed](docs/book/README.md#part-v--security-and-speed) | [The threat model](docs/book/23-security.md), seccomp profiles, and [what Zygo costs](docs/book/25-performance.md). |
+| [Part VI — Decisions](docs/book/README.md#part-vi--decisions) | Why it is built this way, and the design records. |
 | [`examples/`](examples/) | A webhook, a CI job, an LLM tool, a Go program, and agents in Node and POSIX sh. |
 | [`spec/protocol.md`](spec/protocol.md) | The wire protocol between the supervisor and an agent. |
 
@@ -405,7 +404,7 @@ were applied.
 Zygo runs other people's code on purpose, so an escape is the most serious kind
 of bug it can have. [SECURITY.md](SECURITY.md) is how to report one — privately,
 through GitHub, not as an issue — and what is in scope.
-[docs/threat-model.md](docs/threat-model.md) lists every vector, the control
+[docs/book/23-security.md](docs/book/23-security.md) lists every vector, the control
 against it, and whether the escape suite actually attempts it. It also has a
 section on where the boundary is weaker than it looks, which is the part worth
 reading before you trust this with anything.
@@ -415,3 +414,9 @@ No external audit has been done.
 ## Licence
 
 Apache-2.0.
+
+<!-- nav: generated by docs/nav.py, do not edit by hand -->
+
+---
+
+**Next: [About this book](docs/book/README.md) →**
