@@ -224,12 +224,16 @@ fn build(store: &Store, image: &ImageEntry, requirements: &Path, dir: &Path) -> 
         .checks
         .iter()
         .any(|c| c.name == "overlayfs (userns)" && c.status == crate::doctor::Status::Ok);
-    let view = store.rootfs_view(&image.layers, overlay, &mount_points)?;
+    // The build runs on the image with its bytecode, so `pip` itself starts
+    // from compiled code rather than recompiling a few hundred of its own
+    // modules. The venv stays keyed on `image`, the one it is served with.
+    let with_bytecode = crate::bytecode::ensure(store, image)?.image;
+    let view = store.rootfs_view(&with_bytecode.layers, overlay, &mount_points)?;
 
     let newroot = store
         .paths()
         .tmp()
-        .join(format!("venv-build-{}", std::process::id()));
+        .join(format!("venv-build-{}", crate::process_token()));
     std::fs::create_dir_all(&newroot).at(&newroot)?;
 
     let mut config =
@@ -324,11 +328,21 @@ fn build_argv() -> Vec<String> {
         // which is what a CI runner said, and it names nothing anyone can act
         // on. Splitting it puts `ensurepip`'s own stderr in the sandbox's
         // output, where the error message already carries it.
+        //
+        // The image's own `pip` installs into the venv when it can (`--python`,
+        // pip 22.3+). `ensurepip` put a second pip into every venv first, and
+        // that alone was 2.0 s of every build — measured, before a single
+        // package — for a tool the venv never uses once it is built.
         format!(
             "python3 -m venv --without-pip {VENV_IN_SANDBOX} && \
-             {VENV_IN_SANDBOX}/bin/python3 -m ensurepip --upgrade --default-pip && \
-             {VENV_IN_SANDBOX}/bin/pip install --no-cache-dir --disable-pip-version-check \
-             --timeout 60 --retries 5 -r {REQUIREMENTS_IN_SANDBOX}"
+             if python3 -m pip --python {VENV_IN_SANDBOX}/bin/python3 --version >/dev/null 2>&1; then \
+               python3 -m pip --python {VENV_IN_SANDBOX}/bin/python3 install --no-cache-dir \
+               --disable-pip-version-check --timeout 60 --retries 5 -r {REQUIREMENTS_IN_SANDBOX}; \
+             else \
+               {VENV_IN_SANDBOX}/bin/python3 -m ensurepip --upgrade --default-pip && \
+               {VENV_IN_SANDBOX}/bin/pip install --no-cache-dir --disable-pip-version-check \
+               --timeout 60 --retries 5 -r {REQUIREMENTS_IN_SANDBOX}; \
+             fi"
         ),
     ]
 }

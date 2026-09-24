@@ -97,7 +97,30 @@ impl Hierarchy {
             return Ok(Self::new(existing));
         }
 
-        Ok(Self::new(current.join("zygo.slice")))
+        Ok(Self::new(placement_parent(&current).join("zygo.slice")))
+    }
+
+    /// Whether a sandbox can be built under this hierarchy from here, without
+    /// re-executing into a transient scope first.
+    ///
+    /// Asked of the place [`Hierarchy::discover`] chose, not of the cgroup this
+    /// process happens to be in. The two used to be the same question, and
+    /// then they were not: from a cgroup that also holds its embedder, the
+    /// answer about the current cgroup was "no" while the delegated tree above
+    /// it was ready — and every run paid for a scope it did not need.
+    #[cfg(target_os = "linux")]
+    pub fn usable_from_here(&self) -> bool {
+        // A slice that is already there was built by a Zygo that could, and
+        // what the probe's `mkdir` would still find out — that systemd or
+        // root owns the directory, or that cgroupfs is mounted read-only — is
+        // what `access` answers without creating anything. The probe cost two
+        // cgroup creations and removals on every one-shot run.
+        if self.root.is_dir() {
+            return missing_controllers(&self.root).is_empty() && may_write(&self.root);
+        }
+        self.root.parent().is_some_and(|parent| {
+            !holds_foreign_processes(parent) && probe_delegation(parent).is_ok()
+        })
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -137,6 +160,25 @@ impl Hierarchy {
         self.tenant(tenant).join(sanitise(name))
     }
 
+    /// The function-level name a sandbox's limits go under.
+    ///
+    /// A warm function's own name: its limits cover every generation of it,
+    /// so a blue/green replacement shares one budget with the sandbox it
+    /// replaces. A sandbox with `own_limits` — a one-shot — gets a name
+    /// nothing else will use, `run.<pid>-<n>`, because every one-shot resolves
+    /// to the same name and they must not share a budget: under one
+    /// `tenants/default/run`, `--mem 256M` bounded the sum of all of them, and
+    /// twenty-four concurrent runs of a ten-megabyte script were OOM-killed
+    /// together. Removed with the sandbox, like the generation below it.
+    pub fn function_name(name: &str, own_limits: bool) -> String {
+        if !own_limits {
+            return name.to_string();
+        }
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        format!("{name}.{}-{n}", crate::process_token())
+    }
+
     /// A fresh generation of a function's sandbox:
     /// `tenants/<tenant>/<name>/g<pid>-<n>`.
     ///
@@ -153,7 +195,7 @@ impl Hierarchy {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
         self.function(tenant, name)
-            .join(format!("g{}-{n}", std::process::id()))
+            .join(format!("g{}-{n}", crate::process_token()))
     }
 
     /// Where a generation's long-lived process actually sits.
@@ -192,8 +234,22 @@ impl Hierarchy {
         create(&self.root)?;
         create(&self.system())?;
 
-        // Step out of the way, then vacate anything else still in the slice.
-        join_system(&self.system())?;
+        // Step out of the way — when this process is in the way. It is when
+        // it sits in the slice's parent, which then could not pass controllers
+        // down, or inside the slice outside `system`. It is not when the slice
+        // was placed at the top of a delegated tree above it
+        // (`placement_parent`), which is the ordinary case for an embedded
+        // one-shot, and then the move was pure cost: migrating this process
+        // into a cgroup measured 1.9–6.0 ms of every run's 6–11 ms start on
+        // an adopter's benchmark, the largest single step of the launch.
+        let here = own_cgroup();
+        let in_the_way = here.as_ref().is_some_and(|h| {
+            self.root.parent() == Some(h.as_path())
+                || (h.starts_with(&self.root) && !h.starts_with(self.system()))
+        });
+        if in_the_way {
+            join_system(&self.system())?;
+        }
         vacate(&self.root, &self.system())?;
 
         // Delegation has to be enabled from the parent downwards: a controller
@@ -531,6 +587,98 @@ pub fn available_controllers(dir: &Path) -> Vec<String> {
 /// Controllers Zygo cannot enforce limits without.
 pub const REQUIRED_CONTROLLERS: &[&str] = &["memory", "pids", "cpu"];
 
+/// This process's own cgroup directory.
+#[cfg(target_os = "linux")]
+fn own_cgroup() -> Option<PathBuf> {
+    let text = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let rel = text.lines().find_map(|l| l.strip_prefix("0::"))?.trim();
+    Some(Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/')))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn own_cgroup() -> Option<PathBuf> {
+    None
+}
+
+/// Where `zygo.slice` goes, for a process in `current`.
+///
+/// `current` itself when it can hold the slice — the case this was written
+/// for: a transient scope Zygo re-executed itself into, or a supervisor's own
+/// cgroup, where every process is Zygo's and [`Hierarchy::ensure`] can move
+/// them out of the way.
+///
+/// Otherwise the top of what was delegated to this user. A cgroup that holds
+/// somebody else's process — the embedder's own, for a service that runs
+/// Zygo as a child — can never pass controllers down (cgroup v2 forbids a
+/// cgroup from holding processes and delegating at once), and `ensure` will
+/// not move a process that is not Zygo's. An adopter's benchmark found this: from
+/// a delegated scope that also held its caller, `zygo run` refused with "its
+/// controllers were not delegated", on a host where everything was. kern
+/// solves the same problem the same way, with a persistent `kern.slice` under
+/// `user@<uid>.service`.
+///
+/// Moving this process there is allowed exactly when the delegation root is
+/// writable: cgroup v2 lets a process migrate between two cgroups when the
+/// mover can write the common ancestor's `cgroup.procs`, and that ancestor is
+/// the delegation root. On an ssh login the root is `session-N.scope`, owned
+/// by root, so nothing changes there: `current` it is, and the scope
+/// re-execution in the CLI takes over as before.
+#[cfg(target_os = "linux")]
+fn placement_parent(current: &Path) -> PathBuf {
+    if !holds_foreign_processes(current) {
+        return current.to_path_buf();
+    }
+    match delegation_root(current) {
+        Some(root) if root != current && !holds_foreign_processes(&root) => root,
+        _ => current.to_path_buf(),
+    }
+}
+
+/// Whether `dir` holds a process that is not this binary.
+#[cfg(target_os = "linux")]
+fn holds_foreign_processes(dir: &Path) -> bool {
+    let Ok(procs) = std::fs::read_to_string(dir.join("cgroup.procs")) else {
+        return false;
+    };
+    let ours = std::fs::read_link("/proc/self/exe").ok();
+    procs.split_whitespace().any(|pid| {
+        let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
+        exe.is_none() || exe != ours
+    })
+}
+
+/// The highest ancestor of `dir`, itself included, that this process may
+/// write — the top of the subtree that was delegated to it. `None` when not
+/// even `dir` is.
+#[cfg(target_os = "linux")]
+fn delegation_root(dir: &Path) -> Option<PathBuf> {
+    let mount = Path::new("/sys/fs/cgroup");
+    let mut top = None;
+    for a in dir.ancestors() {
+        if !a.starts_with(mount) || !may_write(a) {
+            break;
+        }
+        top = Some(a.to_path_buf());
+        if a == mount {
+            break;
+        }
+    }
+    top
+}
+
+/// Whether this process may create a child of the cgroup `dir` and move a
+/// process into it: the directory and its `cgroup.procs` are both writable to
+/// it. `EROFS` from a read-only cgroupfs counts as no.
+#[cfg(target_os = "linux")]
+fn may_write(dir: &Path) -> bool {
+    let w = |q: &Path| {
+        std::ffi::CString::new(q.as_os_str().as_encoded_bytes())
+            // SAFETY: a NUL-terminated path; `access` only reads it.
+            .is_ok_and(|c| unsafe { libc::access(c.as_ptr(), libc::W_OK) } == 0)
+    };
+    w(dir) && w(&dir.join("cgroup.procs"))
+}
+
 /// Which of [`REQUIRED_CONTROLLERS`] are missing at `dir`.
 pub fn missing_controllers(dir: &Path) -> Vec<&'static str> {
     let have = available_controllers(dir);
@@ -563,7 +711,7 @@ pub fn probe_delegation(dir: &Path) -> std::result::Result<Vec<String>, String> 
     if !missing.is_empty() {
         return Err(format!("not delegated (missing: {})", missing.join(" ")));
     }
-    let probe = dir.join(format!("zygo-doctor-{}", std::process::id()));
+    let probe = dir.join(format!("zygo-doctor-{}", crate::process_token()));
     // A leftover from a crashed probe would make this look like a success it
     // did not earn.
     let _ = std::fs::remove_dir(&probe);
@@ -712,9 +860,19 @@ fn vacate_ours(from: &Path, into: &Path) -> Result<()> {
 /// delegated, produces an error the caller cannot act on here. Enforcement of
 /// "no limits, no sandbox" happens in [`Hierarchy::create_tenant`], which
 /// checks that the limit files actually appeared.
+///
+/// Only what is not enabled yet is written. Every write to
+/// `cgroup.subtree_control` takes the kernel's global `cgroup_mutex` and walks
+/// the subtree, even when it changes nothing, and a one-shot run asked for
+/// every controller at every level each time: 32 writes per run, about
+/// 0.25 ms, and a lock every concurrent run queued on.
 fn enable_controllers(dir: &Path, controllers: &[&str]) -> Result<()> {
     let have = available_controllers(dir);
+    let enabled = std::fs::read_to_string(dir.join("cgroup.subtree_control")).unwrap_or_default();
     for c in controllers {
+        if enabled.split_whitespace().any(|e| e == *c) {
+            continue;
+        }
         if have.iter().any(|h| h == *c) {
             // One controller per write: a single rejected entry would
             // otherwise discard the whole line.
@@ -934,6 +1092,19 @@ mod tests {
         assert_eq!(Hierarchy::request(&g, "01f3"), g.join("req-01f3"));
     }
 
+    /// A one-shot's limits are its own; a warm function's are shared by its
+    /// generations.
+    #[test]
+    fn a_one_shot_gets_a_function_of_its_own_and_a_warm_function_does_not() {
+        assert_eq!(Hierarchy::function_name("resize", false), "resize");
+        let a = Hierarchy::function_name("run", true);
+        let b = Hierarchy::function_name("run", true);
+        assert_ne!(a, b, "two one-shots must not share a budget");
+        assert!(a.starts_with("run."), "{a}");
+        // It survives the sanitiser unchanged, so the directory is the name.
+        assert_eq!(sanitise(&a), a);
+    }
+
     /// Two generations of one function never collide, even in one process.
     #[test]
     fn generations_are_unique() {
@@ -1132,6 +1303,40 @@ mod tests {
             std::fs::read_to_string(tmp.path().join("cgroup.freeze")).unwrap(),
             "0"
         );
+    }
+
+    /// On a plain directory a write replaces the file, so what is left in
+    /// `cgroup.subtree_control` is exactly the last thing written — and
+    /// nothing is written when every controller is on already.
+    #[test]
+    fn only_controllers_not_yet_enabled_are_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let control = tmp.path().join("cgroup.subtree_control");
+        std::fs::write(
+            tmp.path().join("cgroup.controllers"),
+            "cpu io memory pids\n",
+        )
+        .unwrap();
+
+        std::fs::write(&control, "cpu memory pids\n").unwrap();
+        enable_controllers(tmp.path(), &["cpu", "memory", "pids"]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&control).unwrap(),
+            "cpu memory pids\n"
+        );
+
+        std::fs::write(&control, "cpu memory\n").unwrap();
+        enable_controllers(tmp.path(), &["cpu", "memory", "pids"]).unwrap();
+        assert_eq!(std::fs::read_to_string(&control).unwrap(), "+pids");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_cgroup_is_writable_only_with_its_procs_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!may_write(tmp.path()), "no cgroup.procs, no cgroup");
+        std::fs::write(tmp.path().join("cgroup.procs"), "").unwrap();
+        assert!(may_write(tmp.path()));
     }
 
     #[test]

@@ -148,6 +148,18 @@ pub struct ResolvedFn {
     /// /run/script/<digest>`. The resolver knows which it was asked for; this
     /// is it remembering.
     pub pool: bool,
+
+    /// Resolved for a one-shot run (`zygo run`, `POST /run`, a venv or
+    /// package build) rather than for a function that stays warm.
+    ///
+    /// Recorded because it decides who a limit belongs to. A warm function's
+    /// limits cover all of its generations at once — blue and green share one
+    /// budget — so they are written on the function's cgroup. A one-shot has
+    /// no generations to share with, and every one of them resolves to the
+    /// same name, `run`: written on the function, `--mem 256M` capped the
+    /// *sum* of every one-shot running at that moment, and twenty-four
+    /// concurrent ten-megabyte scripts were OOM-killed together.
+    pub one_shot: bool,
 }
 
 impl ResolvedFn {
@@ -743,10 +755,23 @@ fn resolve_layer(
     let mut seen_targets: BTreeMap<PathBuf, ()> = BTreeMap::new();
     for m in l.mounts.unwrap_or_default() {
         if is_reserved_mount_target(&m.target) {
+            // Named from the same list the check reads. The sentence used to be
+            // written out and said "/, /proc, /sys and /dev" — so a mount on
+            // `/tmp`, refused since `/tmp` joined the list, was refused with a
+            // remedy that did not mention it (found wiring Zygo into Windmill's
+            // worker, whose jobs expect their files in `/tmp`).
+            let managed = std::iter::once("/")
+                .chain(crate::sandbox::mount::MANAGED_TARGETS.iter().copied())
+                .collect::<Vec<_>>()
+                .join(", ");
             return Err(SpecError::invalid_with(
                 field("mounts"),
                 format!("`{}` is managed by the sandbox", m.target.display()),
-                "/, /proc, /sys and /dev are set up by the launcher and cannot be overridden",
+                format!(
+                    "{managed} are set up by the launcher and cannot be overridden; mount \
+                     somewhere else and point the program there (`--workdir`), and size \
+                     `/tmp` with `--scratch`"
+                ),
             ));
         }
         // Duplicates are duplicates of a *place*: `/app/cfg` and `/app//cfg`
@@ -812,6 +837,7 @@ fn resolve_layer(
 
     Ok(ResolvedFn {
         pool: opts.pool,
+        one_shot: opts.one_shot,
         name: name.to_string(),
         tenant: opts
             .tenant
@@ -927,6 +953,29 @@ mod tests {
     /// `/proc/` and `/proc/../proc` passed it, and the list left out `/tmp`
     /// and `/run`, which the launcher mounts over. A spec naming either was
     /// accepted and then quietly overridden.
+    #[test]
+    fn the_refusal_names_the_path_it_refused_among_the_managed_ones() {
+        let flags = Layer {
+            image: Some("python:3.12-slim".into()),
+            cmd: Some(vec!["true".into()]),
+            mounts: Some(vec![Mount {
+                source: PathBuf::from("/srv/job"),
+                target: PathBuf::from("/tmp"),
+                mode: MountMode::Rw,
+            }]),
+            ..Default::default()
+        };
+        let err = resolve_standalone("run", &flags, &opts())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`/tmp` is managed"), "{err}");
+        assert!(
+            err.contains("/tmp,") || err.contains(", /tmp"),
+            "the remedy must list /tmp: {err}"
+        );
+        assert!(err.contains("--scratch"), "{err}");
+    }
+
     #[test]
     fn a_mount_cannot_take_a_path_the_launcher_manages() {
         for spelling in [

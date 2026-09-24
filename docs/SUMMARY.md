@@ -7,6 +7,20 @@ without mdBook.
 - [The guide](guide.md)
 - [Concepts](concepts.md)
 
+# The Zygo book
+
+- [About this book](book/README.md)
+  - [1. The kernel and the process](book/01-kernel-and-process.md)
+  - [2. Namespaces](book/02-namespaces.md)
+  - [3. Control groups](book/03-cgroups.md)
+  - [4. The other locks](book/04-other-locks.md)
+  - [5. Docker](book/05-docker.md)
+  - [6. How Zygo works](book/06-how-zygo-works.md)
+  - [7. Where the time and memory are saved](book/07-where-zygo-saves.md)
+  - [8. FreeBSD jails, and Zygo](book/08-jails.md)
+  - [9. Similar projects](book/09-similar-projects.md)
+  - [Glossary](book/glossary.md)
+
 # Reference
 
 - [`sandbox.toml`](spec-reference.md)

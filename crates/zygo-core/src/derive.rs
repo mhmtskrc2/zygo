@@ -56,7 +56,7 @@ use crate::spec::{Bytes, Cpu, Duration, Network, ResolvedFn, SeccompProfile, Spe
 /// Top-level directories every sandbox mounts over, and so never part of a
 /// layer: whatever is under them at build time is the kernel's or the host's,
 /// not the image's.
-const RUNTIME_DIRS: &[&str] = &["proc", "sys", "dev", "tmp", "run"];
+pub(crate) const RUNTIME_DIRS: &[&str] = &["proc", "sys", "dev", "tmp", "run"];
 
 /// The record of a build under `cache/system/<key>/`: the packages at the
 /// versions `apt` chose, one per line.
@@ -203,7 +203,7 @@ pub fn recorded_versions(store: &Store, base: &ImageEntry, packages: &[String]) 
 }
 
 /// A derived image that is fully present: indexed, and every layer unpacked.
-fn find(store: &Store, reference: &str) -> Option<ImageEntry> {
+pub(crate) fn find(store: &Store, reference: &str) -> Option<ImageEntry> {
     store
         .list()
         .into_iter()
@@ -220,10 +220,11 @@ fn build(
     reference: String,
 ) -> Result<Derived> {
     let flat = store.flatten(&base.layers)?;
-    let work = store
-        .paths()
-        .tmp()
-        .join(format!("system-{}-{}", &key[..12], std::process::id()));
+    let work =
+        store
+            .paths()
+            .tmp()
+            .join(format!("system-{}-{}", &key[..12], crate::process_token()));
     let _ = std::fs::remove_dir_all(&work);
     let root = work.join("root");
     copy_preserving(&flat, &root)?;
@@ -513,7 +514,7 @@ fn read_record(store: &Store, key: &str) -> Vec<String> {
 /// mtime are unchanged as unchanged, and that is only sound if the copy did
 /// not touch them. `dpkg` writes files with their package's timestamps, so a
 /// file it replaced with an identical one is identical.
-fn copy_preserving(src: &Path, dst: &Path) -> Result<()> {
+pub(crate) fn copy_preserving(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst).at(dst)?;
     for entry in std::fs::read_dir(src).at(src)? {
         let entry = entry.at(src)?;
@@ -758,7 +759,7 @@ impl<W: Write> Write for Hashing<W> {
 /// Ownership is root throughout: on disk everything belongs to the user who
 /// ran the build, and a layer that recorded that uid would be wrong on every
 /// other machine.
-fn write_layer(base: &Path, result: &Path, out: &Path) -> Result<(String, u64)> {
+pub(crate) fn write_layer(base: &Path, result: &Path, out: &Path) -> Result<(String, u64)> {
     let changes = diff(base, result)?;
     let file = File::create(out).at(out)?;
     let mut builder = tar::Builder::new(Hashing {

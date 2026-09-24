@@ -59,11 +59,43 @@ pub enum CloneResult {
 /// [`super::prepare::PreparedLaunch`]).
 #[cfg(target_os = "linux")]
 pub unsafe fn clone3(flags: u64) -> io::Result<CloneResult> {
+    // SAFETY: the caller's contract is this function's.
+    unsafe { clone3_into(flags, None) }
+}
+
+/// `CLONE_INTO_CGROUP` (Linux 5.7): the child is born in the cgroup `cgroup`
+/// names, rather than moved there afterwards.
+pub const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
+
+/// [`clone3`], with the child created directly inside the cgroup whose
+/// directory `cgroup` is open on.
+///
+/// Why it matters: moving a process into a cgroup (`cgroup.procs`) takes the
+/// kernel's thread-group lock for writing, and the first writer after a quiet
+/// spell waits out an RCU grace period. On an adopter's benchmark VM that was
+/// 3.4–6.6 ms of a 6–10 ms sandbox start, every run. A child created in its
+/// cgroup never migrates, so it never waits — which is how kern starts a box
+/// in a few milliseconds. It is also the stricter order: the limits apply
+/// from the child's first instruction rather than from the moment the
+/// parent got round to moving it.
+///
+/// # Safety
+///
+/// As for [`clone3`].
+#[cfg(target_os = "linux")]
+pub unsafe fn clone3_into(
+    flags: u64,
+    cgroup: Option<std::os::fd::RawFd>,
+) -> io::Result<CloneResult> {
     let mut args = CloneArgs {
         flags,
         exit_signal: libc::SIGCHLD as u64,
         ..Default::default()
     };
+    if let Some(fd) = cgroup {
+        args.flags |= CLONE_INTO_CGROUP;
+        args.cgroup = fd as u64;
+    }
 
     // SAFETY: `args` is a correctly sized, correctly aligned clone_args, and
     // the caller has accepted the fork-like contract documented above.
@@ -80,6 +112,17 @@ pub unsafe fn clone3(flags: u64) -> io::Result<CloneResult> {
         0 => Ok(CloneResult::Child),
         pid => Ok(CloneResult::Parent { child: pid as u32 }),
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub unsafe fn clone3_into(
+    _flags: u64,
+    _cgroup: Option<std::os::fd::RawFd>,
+) -> io::Result<CloneResult> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "clone3 is a Linux syscall",
+    ))
 }
 
 #[cfg(not(target_os = "linux"))]

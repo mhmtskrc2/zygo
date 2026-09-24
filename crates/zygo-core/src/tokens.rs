@@ -214,7 +214,7 @@ impl Tokens {
         let body = serde_json::to_vec_pretty(tokens).map_err(|e| {
             crate::error::Error::primitive("serialise", "the token list", std::io::Error::other(e))
         })?;
-        let temporary = dir.join(format!(".tokens.{}.incoming", std::process::id()));
+        let temporary = dir.join(format!(".tokens.{}.incoming", crate::process_token()));
         std::fs::write(&temporary, &body).at(&temporary)?;
         // `0600` before it is in place, not after: a token file that is
         // world-readable for a moment is a token file that was readable.

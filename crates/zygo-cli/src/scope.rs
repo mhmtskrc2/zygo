@@ -122,6 +122,10 @@ pub fn needs_a_cgroup(command: &Command) -> bool {
     matches!(
         command,
         Command::Run(_)
+            // It compiles a Python image's bytecode in a sandbox of its own
+            // (`zygo_core::bytecode`), and from an ssh session that failed
+            // for want of a cgroup and left the job to the first run.
+            | Command::Pull { .. }
             | Command::Serve(_)
             | Command::Up { .. }
             | Command::Bench(_)
@@ -156,6 +160,13 @@ pub fn ensure_delegated(cli: &Cli) {
     let Some(current) = current_cgroup() else {
         return;
     };
+    // Asked of where the sandbox will actually go, which is not always here:
+    // from a cgroup that also holds its embedder, `zygo.slice` goes to the top
+    // of the delegated tree instead (`Hierarchy::discover`), and a scope would
+    // only be paid for — every run, measured at about 10 ms of CPU each.
+    if zygo_core::cgroup::Hierarchy::discover().is_ok_and(|h| h.usable_from_here()) {
+        return;
+    }
     // Attempted, not read: the whole point is that `cgroup.controllers` says
     // yes here and `mkdir` says no.
     if zygo_core::cgroup::probe_delegation(&current).is_ok() {
@@ -252,6 +263,7 @@ mod tests {
             vec!["zygo", "serve", "h.py", "--name", "x"],
             vec!["zygo", "up"],
             vec!["zygo", "supervisor", "run"],
+            vec!["zygo", "pull", "python:3.12-slim"],
             // Every bench mode warms a sandbox, so every one of them needs a
             // cgroup it can build under.
             vec!["zygo", "bench", "warm"],

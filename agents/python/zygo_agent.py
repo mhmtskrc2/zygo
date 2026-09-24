@@ -79,14 +79,31 @@ class InFlight:
     the loop knows whether a request that is finishing was ever released.
     """
 
-    __slots__ = ("request_id", "pid", "result_fd", "go_fd", "chunks", "cancelled")
+    __slots__ = (
+        "request_id", "pid", "result_fd", "go_fd", "chunks", "cancelled", "go_payload", "proc",
+    )
 
-    def __init__(self, request_id: str, pid: int, result_fd: int, go_fd: int) -> None:
+    def __init__(
+        self,
+        request_id: str,
+        pid: int,
+        result_fd: int,
+        go_fd: int,
+        *,
+        go_payload: bytes = b"\0",
+        proc=None,
+    ) -> None:
         self.request_id = request_id
         self.pid = pid
         self.result_fd = result_fd
         self.go_fd: int | None = go_fd
         self.chunks: list[bytes] = []
+        #: What `GO` writes to `go_fd`: one byte for a fork, which is blocked
+        #: on it, and the whole request for a spawned worker, which is blocked
+        #: reading its stdin.
+        self.go_payload = go_payload
+        #: The `Popen` of a spawned worker, which reaps it; `None` for a fork.
+        self.proc = proc
         #: A `CANCEL` arrived for this request (proto 1.2).
         #:
         #: Only ever read on the way out, to set `cancelled` on the `DONE`.
@@ -308,15 +325,45 @@ def _check_digest(raw: bytes, digest: "str | None", path: "str | None") -> None:
 
 
 def has_extra_threads() -> bool:
-    """Whether the handler started threads at import time.
+    """Whether the handler started threads at import time that a fork cannot
+    survive.
 
     ``fork()`` in a threaded process only carries the calling thread across, so
     a lock another thread held stays locked forever in the child. That is risk
     R1; the caller falls back to spawning instead of forking.
+
+    Python threads are not the only kind. ``import duckdb`` starts four native
+    ones, which ``threading`` cannot see: forked anyway, a child died in glibc
+    with "The futex facility returned an unexpected error code" on about half
+    of all requests and took the zygote with it. So the kernel's count is read
+    too. Native threads are not all a hazard, though: OpenBLAS starts its pool
+    at import and stops it in a ``pthread_atfork`` handler, so it is gone by
+    the time the fork happens. The test is therefore the one CPython applies
+    itself: fork once, and count what is still running in the parent. A pool
+    that stops for a fork is fine; one that does not is what deadlocks.
     """
     import threading
 
-    return threading.active_count() > 1
+    if threading.active_count() > 1:
+        return True
+    try:
+        if len(os.listdir("/proc/self/task")) <= 1:
+            return False
+    except OSError:
+        return False
+    import warnings
+
+    with warnings.catch_warnings():
+        # The warning this would print is the verdict being taken here.
+        warnings.simplefilter("ignore", DeprecationWarning)
+        pid = os.fork()
+    if pid == 0:
+        os._exit(0)
+    try:
+        survivors = len(os.listdir("/proc/self/task"))
+    finally:
+        os.waitpid(pid, 0)
+    return survivors > 1
 
 
 # --------------------------------------------------------------------------
@@ -621,6 +668,46 @@ class ChildFilter:
 
 def _reseed_random() -> None:
     random.seed(os.urandom(16))
+    # The process-wide generators of the libraries that have one, when the
+    # handler imported them — never imported here. numpy's legacy global and
+    # torch's default generator are seeded once, in the zygote, and every
+    # child would otherwise draw the same sequence from them.
+    np_random = sys.modules.get("numpy.random")
+    if np_random is not None:
+        try:
+            np_random.seed()
+        except Exception:  # noqa: BLE001
+            pass
+    torch = sys.modules.get("torch")
+    if torch is not None:
+        try:
+            torch.seed()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def shared_generators(handler) -> list[str]:
+    """Module-level generators in the handler's module, by name.
+
+    A generator the handler built at import time lives in the zygote, and every
+    child starts from a copy of its state: ``RNG = random.Random()`` or
+    ``np.random.default_rng()`` hands every request the same "random" numbers.
+    The agent cannot reseed an object it does not know about, so it says so
+    at warm-up instead.
+    """
+    names = []
+    for name, value in getattr(handler, "__globals__", {}).items():
+        cls = type(value)
+        if isinstance(value, random.Random) and value is not getattr(random, "_inst", None):
+            names.append(name)
+        elif cls.__module__.startswith("numpy.random") and cls.__name__ in (
+            "Generator",
+            "RandomState",
+        ):
+            names.append(name)
+        elif cls.__module__.startswith("torch") and cls.__name__ == "Generator":
+            names.append(name)
+    return names
 
 
 def _is_awaitable(value) -> bool:
@@ -896,8 +983,12 @@ class Agent:
         request = self._inflight.get(request_id)
         if request is None or request.go_fd is None:
             return
+        # A loop, because a spawned worker's payload is a whole request and
+        # can be larger than a pipe holds; the worker reads all of it.
+        payload = memoryview(request.go_payload)
         try:
-            os.write(request.go_fd, b"\0")
+            while payload:
+                payload = payload[os.write(request.go_fd, payload):]
         except OSError:
             pass
         os.close(request.go_fd)
@@ -980,14 +1071,23 @@ class Agent:
             # No result means the child died on the way — an OOM kill, a
             # deadline kill, or a segfault in a C extension. Here the exit
             # status *is* the answer, so it is worth waiting for.
-            _, status = os.waitpid(request.pid, 0)
+            if request.proc is not None:
+                code = request.proc.wait()
+                exit_code = 128 - code if code < 0 else code
+                error = (
+                    _death_reason(-code) if code < 0
+                    else f"spawned worker exited with {code} without returning a result"
+                )
+            else:
+                _, status = os.waitpid(request.pid, 0)
+                exit_code, error = _exit_code(status), _death_reason(status)
             result = {
                 "id": request.request_id,
-                "exit_code": _exit_code(status),
+                "exit_code": exit_code,
                 "result": None,
                 "stdout": "",
                 "stderr": "",
-                "error": _death_reason(status),
+                "error": error,
                 "peak_rss_kb": 0,
                 "wall_ms": 0.0,
                 "cpu_ms": 0.0,
@@ -995,8 +1095,12 @@ class Agent:
         else:
             # The child has already reported and called `_exit`; what remains
             # is the kernel tearing its address space down. Answering now and
-            # reaping later keeps that off the request's clock.
-            self._unreaped.append(request.pid)
+            # reaping later keeps that off the request's clock. A spawned
+            # worker closed its stdout by exiting, so it is reaped at once.
+            if request.proc is not None:
+                request.proc.wait()
+            else:
+                self._unreaped.append(request.pid)
 
         # An `ERROR` from the child goes up as an `ERROR`: it is the answer to
         # this `EXEC` either way (§3.5), and a request that was refused is not
@@ -1129,22 +1233,35 @@ class Agent:
     def _exec_spawned(self, request: dict) -> None:
         """Fallback for handlers that cannot be forked (risk R1).
 
-        A fresh interpreter per request: 20-40 ms instead of 1-2 ms, but it
-        cannot deadlock on a lock some import-time thread was holding. The
+        A fresh interpreter per request, imports and all, instead of a 1-2 ms
+        fork — but it cannot deadlock on a lock some import-time thread was
+        holding. The
         handshake is unchanged, so the supervisor still gets its cgroup window
-        — the child blocks reading stdin until `GO` has been acknowledged.
+        — the worker blocks reading stdin until `GO` writes the request to it.
+
+        It joins the same in-flight table a fork does, with its stdin as the
+        `go` pipe and its stdout as the result pipe, so the serve loop carries
+        several at once and keeps sending heartbeats. It used to run each one
+        to completion inside this method and answer every `EXEC` that arrived
+        meanwhile with `overloaded`: a function served with `concurrency = 8`
+        whose import started a thread failed 40 of 49 requests in the fork
+        sweep (`poc/fork_sweep.py`).
         """
         import subprocess
 
         request_id = request.get("id", "")
+        go_r, go_w = os.pipe()
+        result_r, result_w = os.pipe()
         try:
             proc = subprocess.Popen(
                 [sys.executable, os.path.abspath(__file__), "--oneshot",
                  self._handler_path, self._mode],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
+                stdin=go_r,
+                stdout=result_w,
             )
         except OSError as exc:
+            for fd in (go_r, go_w, result_r, result_w):
+                os.close(fd)
             self._wire.send(
                 {
                     "type": "ERROR",
@@ -1154,117 +1271,17 @@ class Agent:
                 }
             )
             return
-
-        self._wire.send({"type": "FORKED", "id": request_id, "pid": proc.pid})
-        if not self._await_go(request_id, proc):
-            return
+        os.close(go_r)
+        os.close(result_w)
 
         body = json.dumps(request, separators=(",", ":")).encode()
-        try:
-            stdout, _ = proc.communicate(HEADER.pack(len(body)) + body)
-        except BrokenPipeError:
-            stdout = b""
-        # `communicate` already waited; a spawned worker is a fresh interpreter
-        # whose teardown cannot be deferred the way a fork's can.
-        proc.wait()
-
-        result = _decode_result_frame(stdout, request_id)
-        if result is None:
-            result = {
-                "id": request_id,
-                "exit_code": proc.returncode or 1,
-                "result": None,
-                "stdout": "",
-                "stderr": "",
-                "error": f"spawned worker exited with {proc.returncode} "
-                         "without returning a result",
-                "peak_rss_kb": 0,
-                "wall_ms": 0.0,
-                "cpu_ms": 0.0,
-            }
-        # As on the fork path: a worker that refused the request answers
-        # `ERROR`, and that is what goes up.
-        if result.get("type") != "ERROR":
-            result["type"] = "DONE"
-        self._wire.send(result)
-
-    def _await_go(self, request_id: str, proc) -> bool:
-        """Wait for *this* request's `GO`, answering anything else on the way.
-
-        The spawn fallback used to take the next frame and require it to be
-        `GO`: a second `EXEC`, a `PING`, or a `GO` for another request killed
-        the worker and answered **nothing** — the supervisor then waited out
-        the whole deadline for a reply that was never coming. `zygo agent test`
-        sends two `EXEC`s before any `GO`, so every handler that made this
-        agent fall back to spawning failed conformance for this reason
-        (B-09, 2026-09-21 review).
-
-        Returns `True` when this request may run.
-        """
-        while True:
-            try:
-                reply = self._wire.recv()
-            except BadFrame as e:
-                # Reportable, not fatal: the stream is still aligned.
-                self._wire.send(
-                    {"type": "ERROR", "id": None, "code": "bad_message", "message": str(e)}
-                )
-                continue
-            except (ConnectionError, OSError):
-                reply = None
-
-            if reply is None:
-                self._kill(proc)
-                return False
-
-            kind = reply.get("type")
-            if kind == "GO" and reply.get("id") == request_id:
-                return True
-            if kind == "PING":
-                self._wire.send({"type": "PONG", "seq": reply.get("seq", 0)})
-                continue
-            if kind == "EXEC":
-                # One at a time on this path: the fallback exists because
-                # forking is unavailable, and a second interpreter would not
-                # share the warmed one's memory anyway.
-                self._wire.send(
-                    {
-                        "type": "ERROR",
-                        "id": reply.get("id"),
-                        "code": "overloaded",
-                        "message": "this agent runs one spawned request at a time",
-                    }
-                )
-                continue
-            if kind == "SHUTDOWN":
-                self._kill(proc)
-                return False
-            if kind == "GO":
-                # A `GO` for a request this agent is not running. Reported
-                # rather than ignored: it means the two sides disagree about
-                # what is in flight.
-                self._wire.send(
-                    {
-                        "type": "ERROR",
-                        "id": reply.get("id"),
-                        "code": "bad_message",
-                        "message": "no such request is waiting to be released",
-                    }
-                )
-                continue
-            self._wire.send(
-                {
-                    "type": "ERROR",
-                    "id": reply.get("id"),
-                    "code": "bad_message",
-                    "message": f"unexpected message `{kind}` while waiting for GO",
-                }
-            )
-
-    @staticmethod
-    def _kill(proc) -> None:
-        proc.kill()
-        proc.wait()
+        request_state = InFlight(
+            request_id, proc.pid, result_r, go_w,
+            go_payload=HEADER.pack(len(body)) + body, proc=proc,
+        )
+        self._inflight[request_id] = request_state
+        self._by_result_fd[result_r] = request_state
+        self._wire.send({"type": "FORKED", "id": request_id, "pid": proc.pid})
 
     def _reap_finished(self) -> None:
         """Collect children that have finished exiting, without waiting.
@@ -1486,10 +1503,20 @@ def main(argv: list[str]) -> int:
     gc.freeze()
 
     can_fork = not has_extra_threads()
+    generators = shared_generators(handler) if handler is not None else []
+    if generators:
+        sys.stderr.write(
+            "zygo: %s %s a random generator created at import time; every "
+            "request starts from the same copy of its state and draws the same "
+            "numbers. Create it inside the handler, or seed it from "
+            "os.urandom there.\n"
+            % (", ".join(generators), "is" if len(generators) == 1 else "are")
+        )
     if not can_fork:
         sys.stderr.write(
             "zygo: the handler started threads at import time; falling back to "
-            "spawn per request (20-40 ms instead of 1-2 ms)\n"
+            "spawn per request — a fresh interpreter, and every import again, "
+            "instead of a 1-2 ms fork\n"
         )
 
     wire.send(

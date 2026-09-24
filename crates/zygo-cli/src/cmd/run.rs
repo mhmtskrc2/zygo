@@ -206,6 +206,23 @@ fn run_in_phases(cli: &Cli, args: &RunArgs, phase: &std::cell::Cell<Phase>) -> a
         None => None,
     };
 
+    // Python's standard library compiled, once, as a layer: the slim images
+    // ship none, and a read-only root cannot cache it. After the venv, whose
+    // cache is keyed on the image it was built for. `--dry-run` builds nothing.
+    let entry = if args.dry_run {
+        entry
+    } else {
+        let compiled = zygo_core::bytecode::ensure(&store, &entry)?;
+        if compiled.built {
+            say(&format!(
+                "{} {}",
+                Style::stdout().dim("compiled bytecode for"),
+                entry.reference
+            ));
+        }
+        compiled.image
+    };
+
     // The network, when this run has one: the allowlist is resolved here on
     // the host, and `/etc/resolv.conf` is bound in rather than written.
     // `--dry-run` wants the mount in the plan it prints, so this comes first.
@@ -243,7 +260,7 @@ fn run_in_phases(cli: &Cli, args: &RunArgs, phase: &std::cell::Cell<Phase>) -> a
     let newroot = store
         .paths()
         .tmp()
-        .join(format!("root-{}", std::process::id()));
+        .join(format!("root-{}", zygo_core::process_token()));
     std::fs::create_dir_all(&newroot)?;
     // Removed however this function leaves, not only when it succeeds. The
     // cleanup used to be one line before the `Ok`, so a run that failed after
@@ -257,13 +274,14 @@ fn run_in_phases(cli: &Cli, args: &RunArgs, phase: &std::cell::Cell<Phase>) -> a
 
     // The image's own config supplies the default command and, just as
     // importantly, `PATH` — without which a bare `python3` cannot be resolved.
-    let image_config = {
-        let client = RegistryClient::new(store.clone())?;
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()?;
-        runtime.block_on(client.image_config(&entry))?
-    };
+    //
+    // Read from the store directly, as the pool does. It used to go through a
+    // registry client — an HTTP client with its TLS roots, and a
+    // multi-threaded async runtime with a worker per core — built on every
+    // run to read one small file that is always already local.
+    let image_config: zygo_core::image::ImageConfig =
+        serde_json::from_slice(&store.read_blob(&entry.config)?)
+            .context("the image's config in the store is not valid JSON")?;
 
     let argv = if resolved.cmd.is_empty() {
         let argv = image_config.default_argv();

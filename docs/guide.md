@@ -254,6 +254,7 @@ is what "one warm zygote per script version" looks like.
 ```bash
 zygo serve ./handler.py --name resize
 zygo exec resize '{"url": "https://example.com/a.png"}'
+zygo exec resize --batch < events.ndjson   # one event a line in, one answer a line out, in order
 zygo ps
 zygo stop resize
 ```
@@ -287,6 +288,26 @@ one.
 That is the trade Zygo exists to make. A long-running worker is fast and leaks
 state between requests. A container per request is clean and costs hundreds of
 milliseconds. A fork is both.
+
+Three things a fork carries that a fresh process would not, and what Zygo does
+about each (measured across 44 popular PyPI packages by `make fork-sweep-linux`):
+
+* **Threads started at import.** A fork copies only the calling thread, so a
+  lock another thread held stays locked in every child. The agent checks at
+  warm-up — Python threads *and* native ones, such as the four `import duckdb`
+  starts — and, if any would survive a fork, falls back to a fresh interpreter
+  per request. That is correct and much slower: `zygo logs` says when it
+  happened. Pools that stop themselves for a fork, as OpenBLAS's does, do not
+  trigger it.
+* **Random generators.** `random`, numpy's global generator and torch's are
+  reseeded in every child. A generator *you* create at import time —
+  `RNG = random.Random()`, `np.random.default_rng()` — is not, and every
+  request draws the same numbers from it; the agent names it in `zygo logs` at
+  warm-up. Create it inside the handler.
+* **Work done lazily on first use.** Every request is the first call in its
+  process, so a library that initialises on first use pays that each time.
+  Do it at import: build the `boto3` client, compile the template, create the
+  pydantic model at module level, where the zygote pays once.
 
 ### A multi-tenant consumer on the warm path
 
@@ -457,6 +478,15 @@ deciding.
 A request that overruns `timeout` is killed with everything it started, not
 just the process Zygo can see. The kill goes through the cgroup, so a handler
 that forked helpers takes them with it.
+
+Thread pools follow `cpu`, not the host. OpenBLAS, OpenMP, MKL, numexpr,
+polars and Rayon size themselves from the machine's CPU count and then fight
+over the sandbox's quota: on a 5-CPU host, eight concurrent numpy requests
+under `cpu = 2` ran at 24–38 a second with the host's count and 155–173 with
+one thread each. So a sandbox gets `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`,
+`MKL_NUM_THREADS`, `NUMEXPR_NUM_THREADS`, `VECLIB_MAXIMUM_THREADS`,
+`RAYON_NUM_THREADS`, `POLARS_MAX_THREADS`, `PYTHON_CPU_COUNT` and `GOMAXPROCS`
+set to `cpu` rounded up. The image or the spec setting any of them wins.
 
 ---
 
@@ -672,17 +702,23 @@ make that true.
 
 Zygo builds sandboxes, so a container it runs in has to let it. It needs no
 privileges and no capabilities, and **`--privileged` is not the answer** — it
-needs exactly three things, and `zygo doctor` names each one when it is
-missing:
+needs three things, a fourth on hosts that run AppArmor, and a fifth for
+sandboxes with a network. `zygo doctor` names each one when it is missing:
 
 ```bash
 docker run \
   --security-opt seccomp=unconfined \
   --security-opt systempaths=unconfined \
+  --security-opt apparmor=unconfined \
   --cgroupns=host --cgroup-parent=/zygo \
   -v /sys/fs/cgroup/zygo:/sys/fs/cgroup/zygo:rw \
+  --device /dev/net/tun \
   ghcr.io/…/zygo
 ```
+
+(With Docker's `systemd` cgroup driver — the default on Ubuntu and Debian —
+the parent has to be a slice: `--cgroup-parent=zygo.slice` and
+`/sys/fs/cgroup/zygo.slice`.)
 
 * **A seccomp profile that allows `unshare(CLONE_NEWUSER)`.** Docker's default
   profile denies it, and a sandbox does it first. In Kubernetes that is
@@ -699,6 +735,22 @@ docker run \
   container the *host's whole hierarchy*: it can then write to any cgroup on
   the machine, including other containers'. Give it a subtree of its own
   instead, as above.
+* **On an AppArmor host, no AppArmor profile.** Docker's `docker-default`
+  profile denies `mount`, so the user namespace is built and the first mount
+  in it is refused; `zygo doctor` reports "the mount tree could not be made
+  private". In Kubernetes: `securityContext.appArmorProfile: {type:
+  Unconfined}`.
+* **`/dev/net/tun`, for `network = "egress"` and `"full"`.** `pasta` gives a
+  sandbox its interface through it, and container runtimes leave the node out
+  even though they allow the device. In Kubernetes, mount the node's
+  `/dev/net/tun` as a `hostPath` of type `CharDevice`. Sealed sandboxes, the
+  default, do not need it.
+
+A host's own AppArmor policy still applies inside a container: Ubuntu's
+`passt` profile attaches to `/usr/bin/pasta` by path and refuses the pid file
+Zygo asks for. An image that installs `pasta` somewhere else on `PATH` — the
+Zygo image puts nothing at `/usr/bin/pasta` for this reason — is not affected;
+see [troubleshooting](troubleshooting.md#couldnt-open-pid-file--permission-denied).
 
 That is a container that can be escaped from no more easily than the host it
 runs on, which is the point: the boundary Zygo enforces is the one it builds

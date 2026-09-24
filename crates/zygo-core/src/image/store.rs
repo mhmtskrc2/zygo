@@ -150,7 +150,7 @@ impl Store {
         let tmp_path = self
             .paths
             .tmp()
-            .join(format!("blob-{hex}-{}-{attempt}", std::process::id()));
+            .join(format!("blob-{hex}-{}-{attempt}", crate::process_token()));
 
         // And the file is removed on every way out but the successful one.
         // Before, only the digest-mismatch branch cleaned up, so a read error,
@@ -543,14 +543,16 @@ impl Store {
     /// because `rmi` frees disk and a removal that leaves the bytes behind
     /// until a second command is a surprise.
     ///
-    /// Derived images (`<reference>+system.<key>`) go with their base: they
-    /// are that base plus one layer, named after it, and nothing asks for
-    /// one by its own name. Returns what was removed, base first, and
-    /// nothing when the reference was not in the index.
+    /// Derived images (`<reference>+system.<key>`, `<reference>+bytecode.<key>`)
+    /// go with their base: they are that base plus one layer, named after it,
+    /// and nothing asks for one by its own name. Matched on `<reference>+`,
+    /// which only a derived name can start with: an OCI tag has no `+`.
+    /// Returns what was removed, base first, and nothing when the reference
+    /// was not in the index.
     pub fn remove(&self, reference: &Reference) -> Result<Vec<ImageEntry>> {
         let _lock = self.lock("index")?;
         let key = reference.to_string();
-        let derived_prefix = format!("{key}+system.");
+        let derived_prefix = format!("{key}+");
         let (removed, kept): (Vec<ImageEntry>, Vec<ImageEntry>) = self
             .read_index()
             .into_iter()

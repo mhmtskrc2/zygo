@@ -414,7 +414,7 @@ unsafe fn apply(op: &PreparedOp, err_fd: c_int) {
             // exists nowhere until now. Harmless where it is already there,
             // and where the parent is read-only it fails and the mount below
             // reports the real problem.
-            unsafe { ensure_dir(target.as_ptr()) };
+            unsafe { ensure_mount_point(source.as_ptr(), target.as_ptr()) };
             let rc = unsafe {
                 libc::mount(
                     source.as_ptr(),
@@ -425,7 +425,7 @@ unsafe fn apply(op: &PreparedOp, err_fd: c_int) {
                 )
             };
             if rc != 0 {
-                fail(err_fd, Step::MountBind);
+                fail_at(err_fd, Step::MountBind, target.as_ptr());
             }
             if *readonly {
                 let rc = unsafe {
@@ -693,6 +693,51 @@ unsafe fn reset_signals(mask: u64) {
     }
 }
 
+/// The mount point for a bind, made where it is missing.
+///
+/// Every parent first: a target nested in a tmpfs this plan mounted —
+/// `/tmp/windmill/cache/py_runtime`, where Windmill's worker binds its Python —
+/// has no parents until now, and a single `mkdir` of the target failed with
+/// ENOENT. Then a directory, or an empty file when the source is a file: a
+/// file cannot be bound onto a directory. All of it harmless where the path
+/// already exists or the parent is read-only; the mount reports what matters.
+///
+/// No allocation: the path is copied into a stack buffer and cut at each `/`.
+unsafe fn ensure_mount_point(source: *const c_char, target: *const c_char) {
+    let len = unsafe { libc::strlen(target) };
+    let mut buf = [0u8; 4096];
+    if len == 0 || len >= buf.len() {
+        unsafe { ensure_dir(target) };
+        return;
+    }
+    unsafe { core::ptr::copy_nonoverlapping(target.cast::<u8>(), buf.as_mut_ptr(), len) };
+    buf[len] = 0;
+    for i in 1..len {
+        if buf[i] == b'/' {
+            buf[i] = 0;
+            unsafe { libc::mkdir(buf.as_ptr() as *const c_char, 0o755) };
+            buf[i] = b'/';
+        }
+    }
+    let mut st: libc::stat = unsafe { core::mem::zeroed() };
+    let is_file =
+        unsafe { libc::stat(source, &mut st) } == 0 && (st.st_mode & libc::S_IFMT) != libc::S_IFDIR;
+    if is_file {
+        let fd = unsafe {
+            libc::open(
+                target,
+                libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC,
+                0o644,
+            )
+        };
+        if fd >= 0 {
+            unsafe { libc::close(fd) };
+        }
+    } else {
+        unsafe { ensure_dir(target) };
+    }
+}
+
 /// `mkdir` a mount point, ignoring "already there" and "read-only".
 ///
 /// Only useful where the parent is writable — a fresh tmpfs. On the read-only
@@ -808,6 +853,23 @@ pub(super) fn errno() -> c_int {
 /// Report the failing step with the current `errno` and exit.
 pub(super) fn fail(err_fd: c_int, step: Step) -> ! {
     fail_with(err_fd, step, errno())
+}
+
+/// [`fail`], naming the path the step failed on. "Applying a bind mount
+/// failed: No such file or directory" did not say which of a job's twenty
+/// mounts it was; the path follows the eight bytes and [`decode_failure`]
+/// hands it back.
+pub(super) fn fail_at(err_fd: c_int, step: Step, path: *const c_char) -> ! {
+    let errno = errno();
+    let mut payload = [0u8; 8];
+    payload[..4].copy_from_slice(&(step as u32).to_ne_bytes());
+    payload[4..].copy_from_slice(&errno.to_ne_bytes());
+    unsafe {
+        let len = libc::strlen(path).min(4000);
+        libc::write(err_fd, payload.as_ptr() as *const c_void, payload.len());
+        libc::write(err_fd, path as *const c_void, len);
+        libc::_exit(EXIT_LAUNCH_FAILED)
+    }
 }
 
 /// Report a step and an explicit errno, then exit.

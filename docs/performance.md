@@ -143,6 +143,34 @@ every function that names the same file against the same image.
 | First build | 3970 ms |
 | Reused by a second function | 111 ms |
 
+The build installs with the image's own `pip` (`pip --python <venv>`) and skips
+`ensurepip`, which put a second pip into every venv and cost 2.0 s of every
+build before a single package. Building a venv with `requests` in the same
+sandbox took 3.0 s the old way and 1.8 s this way.
+
+## Python bytecode
+
+The official `python:*-slim` images ship no `.pyc` files — 1097 `.py` in
+`python:3.12-slim`'s standard library and not one compiled — and a sandbox's
+root is read-only, so Python cannot cache what it compiles either. Every run
+recompiled every module it imported: `import re` alone was 34 ms.
+
+So the first `zygo pull` or `run` of such an image compiles its standard
+library once, inside a sandbox, into a layer of its own (≈2.4 s and 18.5 MB
+for `python:3.12-slim`), served as `<image>+bytecode.<key>`. The `.pyc` files
+sit beside the sources and are `unchecked-hash`: a layer never changes, so
+there is nothing to check them against.
+
+| run phase, median of seven, Lima VM | without | with |
+|---|---|---|
+| `python -c pass` | 13.7 ms | 13.7 ms |
+| a harness importing `re`, `json`, `hmac`, `urllib.request` and a few more | 190 ms | 47 ms |
+| `import ssl` | — | 26.8 ms |
+
+An image that already has bytecode, or has no Python, is served as it is.
+`ZYGO_BYTECODE=0` turns the layer off; a build that fails is a warning and the
+original image, never a failed run.
+
 The cache is keyed on the image's digest and the file's bytes, so two projects
 with identical requirements share one build, and an edit invalidates it. The
 same cache serves `zygo run --requirements` and `zygo serve`.

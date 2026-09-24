@@ -123,6 +123,14 @@ pub struct SandboxConfig {
     /// Where `pasta` writes its pid, so the sandbox can take it down again.
     /// `None` for a sandbox that needs no `pasta`.
     pub pasta_pid_file: Option<PathBuf>,
+    /// The limits belong to this sandbox alone.
+    ///
+    /// Set for a one-shot ([`ResolvedFn::one_shot`](crate::spec::ResolvedFn)):
+    /// the launcher then gives it a function cgroup of its own instead of the
+    /// one every sandbox of the same name shares, so `--mem` bounds this
+    /// sandbox and not everything running under that name at once. See
+    /// [`crate::cgroup::Hierarchy::function_name`].
+    pub own_limits: bool,
 }
 
 impl SandboxConfig {
@@ -161,6 +169,7 @@ impl SandboxConfig {
             allow_resolved: Default::default(),
             allow_private_net: false,
             pasta_pid_file: None,
+            own_limits: true,
         }
     }
 }
@@ -246,6 +255,15 @@ impl SandboxConfig {
         merged
             .entry("HOME".to_string())
             .or_insert_with(|| "/tmp".to_string());
+        // Thread pools sized to the quota, not to the host. OpenBLAS, OpenMP,
+        // MKL, polars and Rayon count the host's CPUs, start that many
+        // spinning workers, and `cpu.max` then throttles all of them together:
+        // on a 5-CPU host with `cpu = 2`, eight warm numpy requests at once
+        // ran at 24–38 requests a second, and at 155–173 with one BLAS thread
+        // each. Only filled in where the image and the spec said nothing.
+        for (key, value) in thread_hints(f.limits.cpu) {
+            merged.entry(key.to_string()).or_insert(value);
+        }
         let env: Vec<(String, String)> = merged.into_iter().collect();
 
         Self {
@@ -273,14 +291,76 @@ impl SandboxConfig {
             allow_resolved: crate::net::Allowed::default(),
             allow_private_net: f.allow_private_net,
             pasta_pid_file: None,
+            own_limits: f.one_shot,
         }
     }
+}
+
+/// The variables that size a runtime's worker pool, set to the CPU quota
+/// rounded up, and never above what the host has.
+///
+/// `PYTHON_CPU_COUNT` is what `os.cpu_count()` returns from Python 3.13 on,
+/// which `concurrent.futures` and `multiprocessing` size their pools from;
+/// older interpreters ignore it. `GOMAXPROCS` is for a Go program before 1.25,
+/// which does not read `cpu.max` itself.
+pub fn thread_hints(cpu: crate::spec::Cpu) -> Vec<(&'static str, String)> {
+    let host = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let n = (cpu.cores().ceil() as usize)
+        .clamp(1, host.max(1))
+        .to_string();
+    [
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "RAYON_NUM_THREADS",
+        "POLARS_MAX_THREADS",
+        "PYTHON_CPU_COUNT",
+        "GOMAXPROCS",
+    ]
+    .into_iter()
+    .map(|k| (k, n.clone()))
+    .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::spec::{Layer, ResolveOptions, resolve_standalone};
+
+    #[test]
+    fn thread_pools_follow_the_quota_unless_the_spec_says_otherwise() {
+        let mut f = resolve_standalone(
+            "demo",
+            &Layer {
+                image: Some("alpine".into()),
+                cmd: Some(vec!["/bin/true".into()]),
+                cpu: Some(crate::spec::Cpu(0.5)),
+                ..Default::default()
+            },
+            &ResolveOptions::default(),
+        )
+        .unwrap();
+        f.env.insert("OMP_NUM_THREADS".into(), "7".into());
+        let view = RootfsView::Flat {
+            dir: PathBuf::from("/data/flat/x"),
+        };
+        let cfg = SandboxConfig::from_resolved(&f, &view, "/newroot", vec!["x".into()], &[]);
+        let get = |k: &str| {
+            cfg.env
+                .iter()
+                .find(|(a, _)| a == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("OPENBLAS_NUM_THREADS"), Some("1"));
+        assert_eq!(get("PYTHON_CPU_COUNT"), Some("1"));
+        assert_eq!(
+            get("OMP_NUM_THREADS"),
+            Some("7"),
+            "the spec's own value wins"
+        );
+    }
 
     #[test]
     fn config_carries_limits_and_plan_through() {

@@ -375,11 +375,130 @@ pub fn cached(paths: &crate::Paths) -> Report {
     {
         return report.clone();
     }
-    let report = run(paths);
+    // Then this boot's answer from disk: a one-shot `zygo run` is a new
+    // process every time, so the map above never held anything for it and
+    // every run probed the host again — a forked user namespace, a `/proc`
+    // mount, a cgroup `mkdir`, about 3 ms of system CPU per run on an adopter's
+    // benchmark VM, which under concurrent load is throughput.
+    let disk = disk_cache::key(paths);
+    let report = disk
+        .as_ref()
+        .and_then(|k| disk_cache::read(paths, k))
+        .unwrap_or_else(|| {
+            let report = run(paths);
+            // Only a host that can run sandboxes is remembered: one that
+            // cannot is usually being fixed, and must be asked again.
+            if let Some(k) = &disk
+                && report.supports(crate::spec::Isolation::Ns)
+            {
+                disk_cache::write(paths, k, &report);
+            }
+            report
+        });
     if let Ok(mut map) = cache.lock() {
         map.insert(key, report.clone());
     }
     report
+}
+
+/// The host report, kept for the rest of a boot.
+///
+/// Keyed on everything that changes the answer: the boot (`boot_id`), the
+/// kernel, this build of Zygo, the user, the data directory, and where
+/// sandboxes will go in the cgroup tree — the one check that depends on who
+/// is asking. Ten minutes at most, so a host changed under a running system
+/// (an AppArmor sysctl, a delegation drop-in) is noticed without a reboot;
+/// `zygo doctor` always probes afresh.
+mod disk_cache {
+    use super::{Check, Report, Status};
+
+    const MAX_AGE_SECS: u64 = 600;
+
+    pub fn key(paths: &crate::Paths) -> Option<String> {
+        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+        let release = rustix::system::uname()
+            .release()
+            .to_string_lossy()
+            .into_owned();
+        let placement = crate::cgroup::Hierarchy::discover()
+            .map(|h| h.root().display().to_string())
+            .unwrap_or_default();
+        // SAFETY: no arguments, cannot fail.
+        let uid = unsafe { libc::getuid() };
+        Some(format!(
+            "{}|{release}|{}|{uid}|{}|{placement}",
+            boot.trim(),
+            crate::VERSION,
+            paths.data().display()
+        ))
+    }
+
+    fn file(paths: &crate::Paths) -> std::path::PathBuf {
+        paths.runtime().join("host-report.json")
+    }
+
+    fn now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    pub fn read(paths: &crate::Paths, key: &str) -> Option<Report> {
+        let text = std::fs::read_to_string(file(paths)).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+        if v["key"].as_str()? != key || now().saturating_sub(v["written"].as_u64()?) > MAX_AGE_SECS
+        {
+            return None;
+        }
+        let checks = v["checks"]
+            .as_array()?
+            .iter()
+            .map(|c| {
+                Some(Check {
+                    // Names are `&'static str` for the probe's sake; a
+                    // cached report is read once per process, so the handful
+                    // of short strings it leaks is bounded.
+                    name: Box::leak(c["name"].as_str()?.to_string().into_boxed_str()),
+                    status: match c["status"].as_str()? {
+                        "ok" => Status::Ok,
+                        "degraded" => Status::Degraded,
+                        "-" => Status::Absent,
+                        "FAIL" => Status::Failed,
+                        _ => return None,
+                    },
+                    detail: c["detail"].as_str()?.to_string(),
+                    remedy: c["remedy"].as_str().map(str::to_string),
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Report { checks })
+    }
+
+    pub fn write(paths: &crate::Paths, key: &str, report: &Report) {
+        let checks: Vec<serde_json::Value> = report
+            .checks
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "name": c.name,
+                    "status": c.status.as_str(),
+                    "detail": c.detail,
+                    "remedy": c.remedy,
+                })
+            })
+            .collect();
+        let body = serde_json::json!({ "key": key, "written": now(), "checks": checks });
+        let path = file(paths);
+        let tmp = path.with_extension(format!("tmp.{}", crate::process_token()));
+        // Best effort, and atomic: a reader sees the old file or the new one.
+        if std::fs::create_dir_all(paths.runtime()).is_ok()
+            && std::fs::write(&tmp, body.to_string()).is_ok()
+            && std::fs::rename(&tmp, &path).is_err()
+        {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -419,6 +538,15 @@ mod probe {
     /// that only ever runs sealed sandboxes is not broken for lacking these.
     fn egress() -> Check {
         match (which("pasta"), which("nft")) {
+            // Both programs and no device to give the sandbox an interface
+            // through: a container, almost always, since runtimes leave the
+            // node out. `pasta` does not say so usefully — passt 2025_01
+            // prints "Failed to set up tap device" and then does not exit.
+            (Some(_), Some(_)) if !Path::new(crate::net::TUN_DEVICE).exists() => Check::absent(
+                "egress (pasta + nft + tc)",
+                format!("{} does not exist", crate::net::TUN_DEVICE),
+                crate::net::tun_remedy(),
+            ),
             (Some(pasta), Some(_)) => match which("tc") {
                 Some(_) => Check::ok("egress (pasta + nft + tc)", pasta),
                 // Not degraded: `tc` is only needed by a `bandwidth` limit,
@@ -570,13 +698,29 @@ mod probe {
                  sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 \
                  (or ship an AppArmor profile for the `zygo` binary)",
             ),
+            // The namespace was made and then a mount in it refused: that is
+            // not seccomp, which stops `unshare` itself, but an LSM profile —
+            // on Ubuntu and Debian hosts, Docker's `docker-default` AppArmor
+            // profile, which denies `mount`. The seccomp hint was given for
+            // this too, and following it changed nothing.
+            Primitive::NoUserns(reason) if in_a_container() && reason.contains("mount tree") => {
+                Check::failed(
+                    "user namespaces",
+                    reason.clone(),
+                    "a container runtime's AppArmor profile is refusing the mounts a \
+                     sandbox makes: docker run --security-opt apparmor=unconfined \
+                     (beside seccomp=unconfined), or Kubernetes \
+                     `securityContext.appArmorProfile: {type: Unconfined}`",
+                )
+            }
             Primitive::NoUserns(reason) if in_a_container() => Check::failed(
                 "user namespaces",
                 reason.clone(),
                 "a container runtime's seccomp profile is refusing it: \
                  docker run --security-opt seccomp=unconfined, or Kubernetes \
                  `securityContext.seccompProfile: {type: Unconfined}` \
-                 (Docker's default profile denies `unshare(CLONE_NEWUSER)`)",
+                 (Docker's default profile denies `unshare(CLONE_NEWUSER)`); on an \
+                 AppArmor host add --security-opt apparmor=unconfined as well",
             ),
             Primitive::NoUserns(reason) => Check::failed(
                 "user namespaces",
@@ -852,6 +996,23 @@ mod probe {
                 cgroup::DELEGATION_REMEDY,
             );
         };
+        // Where a sandbox will really go, first. From a cgroup that holds its
+        // embedder, that is the top of the delegated tree rather than here —
+        // and asking about here would fall through to a `systemd-run` probe, a
+        // scope and five processes, on every run that consulted this check.
+        if let Ok(h) = cgroup::Hierarchy::discover()
+            && h.usable_from_here()
+            && let Some(parent) = h.root().parent()
+            && parent != own
+        {
+            return Check::ok(
+                "cgroup v2",
+                format!(
+                    "delegated: sandboxes go under {}, the top of this user's delegated tree",
+                    parent.display()
+                ),
+            );
+        }
         // Attempted, not read: see `cgroup::probe_delegation`. This is the R2
         // case — without a cgroup it can own, a sandbox has no limits and must
         // not start at all.

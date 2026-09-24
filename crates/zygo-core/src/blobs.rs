@@ -76,9 +76,11 @@ impl BlobStore {
         // Whole to a temporary name, then renamed: a reader that finds the
         // file finds all of it, and two writers of the same bytes cannot
         // interleave into something that is neither.
-        let temporary = self
-            .dir
-            .join(format!(".{}.{}.incoming", digest.hex(), std::process::id()));
+        let temporary = self.dir.join(format!(
+            ".{}.{}.incoming",
+            digest.hex(),
+            crate::process_token()
+        ));
         std::fs::write(&temporary, bytes).at(&temporary)?;
         let path = self.path(&digest);
         std::fs::rename(&temporary, &path).at(&path)?;

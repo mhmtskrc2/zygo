@@ -168,9 +168,11 @@ impl ScriptStore {
         // The pid in the name keeps two concurrent `put`s of the same script
         // from truncating each other's temporary file; the rename at the end
         // is atomic, and whichever lands second replaces identical bytes.
-        let temporary = self
-            .dir
-            .join(format!(".{}.{}.incoming", digest.hex(), std::process::id()));
+        let temporary = self.dir.join(format!(
+            ".{}.{}.incoming",
+            digest.hex(),
+            crate::process_token()
+        ));
         std::fs::write(&temporary, source).at(&temporary)?;
         std::fs::rename(&temporary, &path).at(&path)?;
         Ok(digest)

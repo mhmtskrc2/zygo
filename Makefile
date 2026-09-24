@@ -515,3 +515,15 @@ seccomp-matrix-linux: poc/zygo-linux-musl
 		sh /src/poc/seccomp_matrix.sh
 	docker run --rm --privileged -v "$(PWD):/src:ro" python:3.12-slim \
 		sh /src/poc/seccomp_matrix_node.sh
+
+# Popular PyPI packages imported in a zygote and forked under load: hangs,
+# disagreeing children, shared randomness, leaked state, the spawn fallback.
+# The data home is a volume, so venvs are built once. `PACKAGES=a,b` narrows
+# it; `HEAVY=1` adds torch.
+fork-sweep-linux: poc/zygo-linux-musl
+	docker run --rm --privileged -v "$(PWD):/src:ro" -v zygo-sweep-data:/zdata \
+		-v "$(PWD)/mhmt:/out" -e REPORT=/out/fork_sweep.json \
+		-e PACKAGES -e HEAVY -e REQUESTS -e PARALLEL python:3.12-slim \
+		sh -c 'apt-get -qq update >/dev/null 2>&1 && \
+		apt-get -qq install -y passt nftables >/dev/null 2>&1; \
+		sh /src/poc/fork_sweep.sh'

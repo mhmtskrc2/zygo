@@ -492,6 +492,7 @@ mod tests {
             allow_resolved: Default::default(),
             allow_private_net: false,
             pasta_pid_file: None,
+            own_limits: true,
         }
     }
 

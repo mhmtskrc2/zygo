@@ -874,6 +874,9 @@ impl Pool {
             Some(_) => crate::venv::Venv::env(),
             None => Vec::new(),
         };
+        // After the venv, which is keyed on the image it was built for. See
+        // `crate::bytecode`: the slim images ship no `.pyc`.
+        let entry = crate::bytecode::ensure(&store, &entry)?.image;
 
         // Which of the two warm modes this is (design doc §3.4). A runtime
         // means an agent in the box that forks per request; none means
@@ -987,7 +990,7 @@ impl Pool {
             self.config
                 .paths
                 .tmp()
-                .join(format!("warm-{}-{}", f.name, std::process::id()));
+                .join(format!("warm-{}-{}", f.name, crate::process_token()));
         std::fs::create_dir_all(&newroot).at(&newroot)?;
 
         let mut config = SandboxConfig::from_resolved(&warm, &view, &newroot, argv, &image_env);
@@ -1257,6 +1260,7 @@ impl Pool {
             }
             None => None,
         };
+        let entry = crate::bytecode::ensure(&store, &entry)?.image;
 
         let net = crate::net::setup(&self.config.paths, &f.name, &f)?;
         if let Some(mount) = net.mount.clone() {
@@ -1308,7 +1312,7 @@ impl Pool {
         let view = store.rootfs_view(&entry.layers, overlay, &mount_points)?;
         let newroot = self.config.paths.tmp().join(format!(
             "run-{}-{}",
-            std::process::id(),
+            crate::process_token(),
             next_request_id()
         ));
         std::fs::create_dir_all(&newroot).at(&newroot)?;
@@ -1387,7 +1391,11 @@ impl Pool {
         if current != agent.source() {
             // Written to a temporary file and renamed, so a sandbox starting
             // concurrently never reads a half-written agent.
-            let tmp = dir.join(format!("{}.{}", name.to_string_lossy(), std::process::id()));
+            let tmp = dir.join(format!(
+                "{}.{}",
+                name.to_string_lossy(),
+                crate::process_token()
+            ));
             let mut file = std::fs::File::create(&tmp).at(&tmp)?;
             file.write_all(agent.source().as_bytes()).at(&tmp)?;
             file.flush().at(&tmp)?;
@@ -2801,7 +2809,7 @@ fn new_script_dir(paths: &Paths, name: &str) -> PathBuf {
     paths.tmp().join(format!(
         "scripts-{}-{}-{generation}",
         crate::cgroup::sanitise(name),
-        std::process::id()
+        crate::process_token()
     ))
 }
 
@@ -4525,16 +4533,18 @@ mod tests {
 
         let a = place_script(&scripts, &dir, "aaa", "a = 1\n").expect("a");
         let b = place_script(&scripts, &dir, "bbb", "b = 2\n").expect("b");
-        assert_eq!(
-            std::fs::read_dir(&dir).expect("readdir").count(),
-            2,
+        // Named rather than listed: the directory is `0311`, so nothing may
+        // read it — this test included, unless it runs as root, which is the
+        // only place the `read_dir` this used to be ever passed.
+        assert!(
+            dir.join("aaa").exists() && dir.join("bbb").exists(),
             "one file per script in flight"
         );
         drop(a);
         assert!(!dir.join("aaa").exists());
         assert!(dir.join("bbb").exists());
         drop(b);
-        assert_eq!(std::fs::read_dir(&dir).expect("readdir").count(), 0);
+        assert!(!dir.join("bbb").exists());
         assert!(
             scripts.lock().expect("scripts").dir.is_none(),
             "the last script out closes the directory it was written through"

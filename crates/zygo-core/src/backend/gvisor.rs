@@ -363,7 +363,7 @@ pub fn container_id(config: &SandboxConfig) -> String {
             .id
             .name
             .replace(|c: char| !c.is_ascii_alphanumeric(), "-"),
-        std::process::id()
+        crate::process_token()
     )
 }
 
@@ -580,6 +580,7 @@ mod tests {
             allow_resolved: Default::default(),
             allow_private_net: false,
             pasta_pid_file: None,
+            own_limits: true,
         }
     }
 
@@ -613,7 +614,7 @@ mod tests {
         config.id = SandboxId::new("weird/name with spaces");
         let id = container_id(&config);
         assert!(id.starts_with("zygo-"), "{id}");
-        assert!(id.ends_with(&std::process::id().to_string()), "{id}");
+        assert!(id.ends_with(crate::process_token()), "{id}");
         assert!(
             id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
             "{id} is not safe as a directory name"

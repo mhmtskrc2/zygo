@@ -312,9 +312,11 @@ impl Tenants {
                 std::io::Error::other(e),
             )
         })?;
-        let temporary = self
-            .dir
-            .join(format!(".{}.{}.incoming", tenant.id, std::process::id()));
+        let temporary = self.dir.join(format!(
+            ".{}.{}.incoming",
+            tenant.id,
+            crate::process_token()
+        ));
         std::fs::write(&temporary, &body).at(&temporary)?;
         let path = self.path(&tenant.id);
         std::fs::rename(&temporary, &path).at(&path)?;

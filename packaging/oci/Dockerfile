@@ -27,12 +27,22 @@ FROM alpine:3.21
 #   namespace's id map. Without them a non-root Zygo can map exactly one uid,
 #   and every sandbox runs as the same one.
 # `ca-certificates`: pulling images from a registry over TLS.
+#
+# `pasta` is then moved off `/usr/bin`. Alpine installs it as a symlink to
+# `/usr/bin/passt`, and Ubuntu and Debian hosts load an AppArmor profile,
+# `passt`, that attaches to that path — inside containers too, because the
+# kernel enforcing it is the host's. It refuses the pid file Zygo asks for,
+# and every networked sandbox fails. A real copy under `/usr/local/bin` is the
+# same program at a path no host profile names; `pasta` picks its mode from
+# its own name, so the copy has to keep it.
 RUN apk add --no-cache \
         passt \
         nftables \
         iproute2 \
         shadow-uidmap \
         ca-certificates \
+    && cp -L /usr/bin/pasta /usr/local/bin/pasta \
+    && rm /usr/bin/pasta \
     && rm -rf /var/cache/apk/*
 
 # A uid of its own, and a subordinate range for the sandboxes it builds.

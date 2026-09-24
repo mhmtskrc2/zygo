@@ -647,19 +647,23 @@ pub fn down(cli: &Cli, file: Option<&std::path::Path>) -> anyhow::Result<u8> {
 
 /// `zygo exec <name> [json]`, or `zygo exec --runtime <name> --script <file>`.
 pub fn exec(cli: &Cli, args: &ExecArgs) -> anyhow::Result<u8> {
-    anyhow::ensure!(
-        !args.batch,
-        "`--batch` is not implemented yet: it needs the supervisor's request queue"
-    );
-
+    if args.batch {
+        return exec_batch(cli, args);
+    }
     let event = read_event(args)?;
     let paths = super::paths(cli);
     let mut client = Client::connect(&paths)?;
+    let request = exec_request(args, event)?;
+    let response = client.send(&request)?;
+    print_exec_response(cli, response)
+}
 
+/// The control request `zygo exec` sends for one event.
+fn exec_request(args: &ExecArgs, event: serde_json::Value) -> anyhow::Result<Request> {
     let timeout_ms = args
         .timeout
         .map_or(DEFAULT_EXEC_TIMEOUT_MS, |t| t.as_millis());
-    let request = match &args.runtime {
+    Ok(match &args.runtime {
         Some(runtime) => Request::ExecScript {
             // `zygo exec` is one shot at a terminal: Ctrl-C ends the client,
             // and the supervisor's own deadline ends the request. It prints
@@ -688,9 +692,119 @@ pub fn exec(cli: &Cli, args: &ExecArgs) -> anyhow::Result<u8> {
             timeout_ms,
             tenant: None,
         },
-    };
-    let response = client.send(&request)?;
+    })
+}
 
+/// How many `--batch` events are in flight at once: the HTTP API's own
+/// `BATCH_IN_FLIGHT`. The function's `concurrency` is what bounds the sandbox
+/// work; this bounds the connections in front of it.
+const BATCH_IN_FLIGHT: usize = 16;
+
+/// `zygo exec <name> --batch`: newline-delimited events on stdin, one JSON
+/// answer per line on stdout, in the order the events came.
+///
+/// Each line carries its own `exit_code` and `error`, as `POST /fn/<name>/batch`
+/// does, so one failing event does not hide the answers to the others. The
+/// exit status is 0 when every event succeeded and 1 otherwise.
+fn exec_batch(cli: &Cli, args: &ExecArgs) -> anyhow::Result<u8> {
+    use std::io::{BufRead, Write};
+
+    anyhow::ensure!(
+        args.event.is_none() && !(args.runtime.is_some() && args.name.is_some()),
+        "`--batch` reads its events from stdin, one JSON value per line"
+    );
+    let mut events = Vec::new();
+    for (n, line) in std::io::stdin().lock().lines().enumerate() {
+        let line = line.context("cannot read the events from stdin")?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        events.push(parse_event(&line).with_context(|| format!("line {}", n + 1))?);
+    }
+    let requests = events
+        .into_iter()
+        .map(|event| exec_request(args, event))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let paths = super::paths(cli);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let answers: Vec<std::sync::Mutex<Option<serde_json::Value>>> =
+        requests.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    std::thread::scope(|scope| {
+        for _ in 0..BATCH_IN_FLIGHT.min(requests.len()) {
+            scope.spawn(|| {
+                let mut client = None;
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(request) = requests.get(i) else {
+                        break;
+                    };
+                    let answer = batch_answer(&paths, &mut client, request);
+                    *answers[i].lock().expect("answer") = Some(answer);
+                }
+            });
+        }
+    });
+
+    let mut failed = false;
+    let mut out = std::io::stdout().lock();
+    for answer in answers {
+        let answer = answer.into_inner().expect("answer").unwrap_or_default();
+        failed |= answer["exit_code"] != 0 || !answer["error"].is_null();
+        writeln!(out, "{}", serde_json::to_string(&answer)?)?;
+    }
+    Ok(u8::from(failed))
+}
+
+/// One batch element's answer line. The connection is opened on first use
+/// and kept for the thread's next event, and dropped after an error so the
+/// next one starts clean.
+fn batch_answer(
+    paths: &zygo_core::Paths,
+    client: &mut Option<Client>,
+    request: &Request,
+) -> serde_json::Value {
+    if client.is_none() {
+        match Client::connect(paths) {
+            Ok(c) => *client = Some(c),
+            Err(e) => return serde_json::json!({ "exit_code": 1, "error": format!("{e:#}") }),
+        }
+    }
+    let reply = client.as_mut().expect("connected").send(request);
+    match reply {
+        Ok(Response::Executed { outcome }) => serde_json::json!({
+            "exit_code": outcome.exit_code,
+            "result": outcome.result,
+            "error": outcome.error,
+            "stdout": outcome.stdout,
+            "stderr": outcome.stderr,
+        }),
+        Ok(Response::Busy {
+            name,
+            in_flight,
+            queued,
+            limit,
+        }) => serde_json::json!({
+            "exit_code": EXIT_BUSY,
+            "error": format!("{name} is busy: {in_flight} of {limit} in flight, {queued} queued"),
+        }),
+        Ok(Response::Error { code, message }) => serde_json::json!({
+            "exit_code": 1,
+            "error": format!("{}: {message}", code.as_str()),
+        }),
+        Ok(other) => serde_json::json!({
+            "exit_code": 1,
+            "error": format!("unexpected reply from the supervisor: {other:?}"),
+        }),
+        Err(e) => {
+            *client = None;
+            serde_json::json!({ "exit_code": 1, "error": format!("{e:#}") })
+        }
+    }
+}
+
+/// Print one `zygo exec` answer the way a single call does.
+fn print_exec_response(cli: &Cli, response: Response) -> anyhow::Result<u8> {
     match response {
         Response::Executed { outcome } => {
             // The handler's own output goes where the caller expects it, so

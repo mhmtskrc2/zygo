@@ -319,6 +319,7 @@ audit has been done.
 
 | | |
 |---|---|
+| [The Zygo book](docs/book/README.md) | A short book from the ground up: the kernel, namespaces, cgroups, seccomp and Landlock; Docker; how Zygo works and where it saves; FreeBSD jails; and every similar project, compared. Diagrams throughout, plain English. |
 | [Quickstart](docs/quickstart.md) | From a checkout to three warm functions behind HTTP. |
 | [The guide](docs/guide.md) | Everything, in the order you meet it: installing, sandboxes, warm functions, limits, networking, secrets, dependencies, images, deploying, production, backends. |
 | [Concepts](docs/concepts.md) | The eight principles, and what each one costs. |

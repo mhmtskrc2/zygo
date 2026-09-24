@@ -309,7 +309,7 @@ impl SecretStore {
             .map_err(|e| bad(format!("cannot serialise the record: {e}")))?;
         let temporary = self
             .dir
-            .join(format!(".{tenant}.{}.incoming", std::process::id()));
+            .join(format!(".{tenant}.{}.incoming", crate::process_token()));
         std::fs::write(&temporary, &body).at(&temporary)?;
         // `0600` before it is in place, as the token store does: a file that
         // is world-readable for a moment is a file that was readable.

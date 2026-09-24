@@ -574,9 +574,11 @@ fn run_build(store: &Store, status: &Status) -> Result<(i32, Vec<u8>)> {
         .any(|c| c.name == "overlayfs (userns)" && c.status == crate::doctor::Status::Ok);
     let view = store.rootfs_view(&image.layers, overlay, &mount_points)?;
 
-    let newroot = paths
-        .tmp()
-        .join(format!("deps-build-{}-{}", std::process::id(), status.id));
+    let newroot = paths.tmp().join(format!(
+        "deps-build-{}-{}",
+        crate::process_token(),
+        status.id
+    ));
     std::fs::create_dir_all(&newroot).at(&newroot)?;
 
     let mut config = SandboxConfig::from_resolved(

@@ -123,6 +123,25 @@ pub fn read_write_rights(abi: u32) -> u64 {
     rights
 }
 
+/// The rights that mean anything on a path that is not a directory.
+///
+/// Landlock refuses a rule that grants a directory right — making, removing or
+/// listing entries — on a file, and it refuses it with `EINVAL`, which fails
+/// the whole ruleset and with it the sandbox. A writable mount of one file
+/// (`--mount result.json:/tmp/result.json:rw`, how nsjail configs hand a job its
+/// output file) asked for exactly that and never started.
+pub const ACCESS_FILE: u64 = ACCESS_FS_EXECUTE
+    | ACCESS_FS_WRITE_FILE
+    | ACCESS_FS_READ_FILE
+    | ACCESS_FS_TRUNCATE
+    | ACCESS_FS_IOCTL_DEV;
+
+/// `rights` narrowed to what the kernel accepts on the kind of object the
+/// rule's path turned out to be.
+pub fn rights_for(rights: u64, is_dir: bool) -> u64 {
+    if is_dir { rights } else { rights & ACCESS_FILE }
+}
+
 /// One `LANDLOCK_RULE_PATH_BENEATH` rule: a path, and what is allowed under it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathRule {
@@ -434,8 +453,14 @@ pub unsafe fn apply(ruleset: &Ruleset) -> Result<(), std::io::Error> {
             continue;
         }
 
+        // Only known once the path is open: the plan names targets, and a
+        // bind mount's target is whatever its source is. A failed `fstat`
+        // keeps the rights as they were, which is what happened before.
+        let mut st: libc::stat = unsafe { core::mem::zeroed() };
+        let is_dir = unsafe { libc::fstat(fd, &mut st) } != 0
+            || (st.st_mode & libc::S_IFMT) == libc::S_IFDIR;
         let beneath = PathBeneathAttr {
-            allowed_access: rule.rights,
+            allowed_access: rights_for(rule.rights, is_dir),
             parent_fd: fd,
         };
         let rc = unsafe {
@@ -620,6 +645,83 @@ mod tests {
         assert_eq!(root(&ro), read_only_rights(1), "a tenant's root is not");
         assert_eq!(root(&rw), read_write_rights(1), "a build's root is");
         assert_ne!(read_only_rights(1), read_write_rights(1));
+    }
+
+    #[test]
+    fn a_file_is_granted_only_the_rights_a_file_can_have() {
+        for abi in 1..=6 {
+            let rw = read_write_rights(abi);
+            let file = rights_for(rw, false);
+            assert_eq!(file & !ACCESS_FILE, 0, "abi {abi}: {file:#x}");
+            assert_ne!(
+                file & ACCESS_FS_WRITE_FILE,
+                0,
+                "a writable file stays writable"
+            );
+            assert_eq!(rights_for(rw, true), rw, "a directory keeps everything");
+        }
+    }
+
+    /// The kernel's own verdict, where there is a kernel to ask: a file rule
+    /// with directory rights is `EINVAL`, and the narrowed one is accepted.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_kernel_accepts_a_writable_rule_on_a_file() {
+        let abi = abi_version();
+        if abi == 0 {
+            return;
+        }
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let attr = RulesetAttr {
+            handled_access_fs: handled_fs_access(abi),
+            handled_access_net: 0,
+        };
+        let size = if abi >= 4 {
+            core::mem::size_of::<RulesetAttr>()
+        } else {
+            8
+        };
+        let ruleset = unsafe {
+            libc::syscall(
+                SYS_LANDLOCK_CREATE_RULESET,
+                &attr as *const RulesetAttr,
+                size,
+                0usize,
+            )
+        };
+        assert!(ruleset >= 0, "{}", std::io::Error::last_os_error());
+        let path = CString::new(file.path().as_os_str().as_encoded_bytes()).unwrap();
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        let add = |rights: u64| {
+            let beneath = PathBeneathAttr {
+                allowed_access: rights,
+                parent_fd: fd,
+            };
+            unsafe {
+                libc::syscall(
+                    SYS_LANDLOCK_ADD_RULE,
+                    ruleset,
+                    RULE_PATH_BENEATH,
+                    &beneath as *const PathBeneathAttr,
+                    0usize,
+                )
+            }
+        };
+        assert_eq!(
+            add(read_write_rights(abi)),
+            -1,
+            "the kernel has started accepting this"
+        );
+        assert_eq!(
+            add(rights_for(read_write_rights(abi), false)),
+            0,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+        unsafe {
+            libc::close(fd);
+            libc::close(ruleset as i32);
+        }
     }
 
     #[test]

@@ -490,6 +490,19 @@ class ProtocolTests(unittest.TestCase):
         values = {h.call({}, request_id=str(i))["result"] for i in range(4)}
         self.assertEqual(len(values), 4, f"forks produced repeated randomness: {values}")
 
+    def test_a_generator_made_at_import_time_is_named(self):
+        """One the agent cannot reseed is at least not a silent one."""
+        import random
+
+        import zygo_agent
+
+        def make():
+            ns = {"random": random, "RNG": random.Random(), "N": 3}
+            exec("def handler(event):\n    return RNG.random()", ns)
+            return ns["handler"]
+
+        self.assertEqual(zygo_agent.shared_generators(make()), ["RNG"])
+
     def test_a_child_killed_mid_request_is_reported(self):
         """OOM kills and deadline kills both look like this to the agent."""
         h = self.harness(
@@ -893,14 +906,14 @@ class ForkFallbackTests(unittest.TestCase):
             forked = h.wire.recv()
             self.assertEqual(forked["type"], "FORKED")
 
-            # A second request arrives before `a` is released. It must be
-            # *answered* — a supervisor that got silence would hold the slot
-            # until the deadline.
+            # A second request arrives before `a` is released. It is taken,
+            # not refused: spawned workers run side by side like forks do.
+            # Answering it `overloaded` failed 40 of 49 requests of a
+            # function served with `concurrency = 8` in the fork sweep.
             h.wire.send({"type": "EXEC", "id": "b", "event": {"n": 9}, "timeout_ms": 30_000})
-            busy = h.wire.recv()
-            self.assertEqual(busy["type"], "ERROR", busy)
-            self.assertEqual(busy["id"], "b")
-            self.assertEqual(busy["code"], "overloaded", busy)
+            second = h.wire.recv()
+            self.assertEqual(second["type"], "FORKED", second)
+            self.assertEqual(second["id"], "b")
 
             # And liveness still works while a request is parked.
             h.wire.send({"type": "PING", "seq": 7})
@@ -908,19 +921,20 @@ class ForkFallbackTests(unittest.TestCase):
             self.assertEqual(pong["type"], "PONG", pong)
             self.assertEqual(pong["seq"], 7)
 
-            # A `GO` for a request nobody is running is reported, not obeyed.
+            # A `GO` for a request nobody is running is not obeyed, and is
+            # not fatal: the same rule as the fork path.
             h.wire.send({"type": "GO", "id": "nonexistent"})
-            confused = h.wire.recv()
-            self.assertEqual(confused["type"], "ERROR", confused)
-            self.assertEqual(confused["code"], "bad_message", confused)
 
-            # The original request is still parked, and still runs.
+            # Both are still parked, and both run.
+            h.wire.send({"type": "GO", "id": "b"})
             h.wire.send({"type": "GO", "id": "a"})
-            done = h.wire.recv()
-            self.assertEqual(done["type"], "DONE", done)
-            self.assertEqual(done["id"], "a")
-            self.assertEqual(done["exit_code"], 0, done.get("error"))
-            self.assertEqual(done["result"], {"n": 2})
+            done = {}
+            for _ in range(2):
+                reply = h.wire.recv()
+                self.assertEqual(reply["type"], "DONE", reply)
+                self.assertEqual(reply["exit_code"], 0, reply.get("error"))
+                done[reply["id"]] = reply["result"]
+            self.assertEqual(done, {"a": {"n": 2}, "b": {"n": 10}})
         finally:
             stderr = h.close()
         self.assertIn("falling back to spawn", stderr)

@@ -114,6 +114,10 @@ spec:
           # customer code directly is a different proposition from a
           # privileged pod whose job is building boundaries around it. Run it
           # on nodes of its own, and read `docs/threat-model.md`.
+          # `privileged` also brings two things a pod without it would have
+          # to ask for, and `docs/guide.md` says how: the node's
+          # `/dev/net/tun`, which a networked sandbox needs, and no AppArmor
+          # profile, which on Ubuntu nodes would refuse the sandbox's mounts.
           securityContext:
             privileged: true
             # Docker's and containerd's default profiles deny

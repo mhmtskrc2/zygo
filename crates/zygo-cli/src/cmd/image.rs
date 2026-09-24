@@ -60,6 +60,20 @@ pub fn pull(cli: &Cli, image: &str, platform: Option<&str>) -> anyhow::Result<u8
         }
     }))?;
 
+    // Python's bytecode, now rather than on the first run, which is where a
+    // server's first event would otherwise pay for it. See `zygo_core::bytecode`.
+    #[cfg(target_os = "linux")]
+    {
+        let store = Store::new(super::paths(cli));
+        let compiled = zygo_core::bytecode::ensure_now(&store, &entry)?;
+        if compiled.built && !quiet {
+            println!(
+                "{} Python bytecode, as one more layer",
+                style.dim("compiled")
+            );
+        }
+    }
+
     if cli.json {
         output::json(&entry)?;
     }
@@ -489,9 +503,24 @@ fn abandoned_roots(tmp: &std::path::Path) -> Vec<std::path::PathBuf> {
         .filter_map(|e| e.ok())
         .filter_map(|entry| {
             let name = entry.file_name();
-            let pid: i32 = name.to_str()?.strip_prefix("root-")?.parse().ok()?;
+            // `root-<pid>-<random>` now, and `root-<pid>` before it.
+            let pid: i32 = name
+                .to_str()?
+                .strip_prefix("root-")?
+                .split('-')
+                .next()?
+                .parse()
+                .ok()?;
             let path = entry.path();
-            (path.is_dir() && !is_running(pid)).then_some(path)
+            // A minute old as well as pid-less: with a store shared between
+            // containers, the pid may belong to another pid namespace and look
+            // dead here while its sandbox is still starting. The directory only
+            // matters until the root is mounted, which takes milliseconds.
+            let settled = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .is_ok_and(|t| t.elapsed().is_ok_and(|age| age.as_secs() > 60));
+            (path.is_dir() && settled && !is_running(pid)).then_some(path)
         })
         .collect();
     out.sort();

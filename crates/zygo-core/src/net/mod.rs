@@ -387,7 +387,28 @@ fn pid_file(paths: &crate::paths::Paths, tenant: &str) -> PathBuf {
         .runtime()
         .join("tenants")
         .join(tenant)
-        .join(format!("pasta-{}-{n}.pid", std::process::id()))
+        .join(format!("pasta-{}-{n}.pid", crate::process_token()))
+}
+
+/// How long `pasta` gets to configure a sandbox's network. It takes tens of
+/// milliseconds; the rest is room for a host under load, and the bound is what
+/// matters — past it the launch fails with what `pasta` said.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const PASTA_START_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The device `pasta` gives a sandbox its interface through.
+pub const TUN_DEVICE: &str = "/dev/net/tun";
+
+/// Why a host with no tun device cannot give a sandbox a network, and what to
+/// do about it. Shared with `zygo doctor`, which asks the same question.
+pub fn tun_remedy() -> String {
+    format!(
+        "`pasta` needs {TUN_DEVICE}. A container runtime does not create it: \
+         docker run --device {TUN_DEVICE}, or in Kubernetes mount the node's \
+         {TUN_DEVICE} as a hostPath volume of type CharDevice (runc and crun allow \
+         the device by default; they only leave the node out). On a host, \
+         `sudo modprobe tun`. Or use `network = \"none\"`, which needs none of it"
+    )
 }
 
 /// The programs on `PATH`, with the reason when one is not.
@@ -404,6 +425,17 @@ pub struct Programs {
 pub fn availability(with_bandwidth: bool) -> std::result::Result<Programs, Error> {
     let pasta = which("pasta").ok_or_else(|| missing("pasta", "passt"))?;
     let nft = which("nft").ok_or_else(|| missing("nft", "nftables"))?;
+    // Checked here rather than left to `pasta`, which on a host without it
+    // prints "Failed to set up tap device in namespace" and — in passt
+    // 2025_01 — does not exit. Only on Linux: elsewhere there is no `pasta` to
+    // find either, and the error above has already said so.
+    if cfg!(target_os = "linux") && !Path::new(TUN_DEVICE).exists() {
+        return Err(Error::BackendUnavailable {
+            backend: "network",
+            reason: format!("{TUN_DEVICE} does not exist on this host"),
+            remedy: tun_remedy(),
+        });
+    }
     let (tc, ip) = if with_bandwidth {
         (
             Some(which("tc").ok_or_else(|| missing("tc", "iproute2"))?),
@@ -586,10 +618,30 @@ pub(crate) mod linux {
     ///
     /// `--netns`/`--userns` rather than a pid: see the module documentation
     /// for why the mount namespace must stay out of this. `pasta` backgrounds
-    /// itself once the namespace is configured, so this returns when the
-    /// sandbox can reach the network — the pid file is what lets the sandbox
-    /// take it down again.
+    /// itself once the namespace is configured, so the process started here
+    /// exits when the sandbox can reach the network — the pid file is what
+    /// lets the sandbox take the daemon down again.
+    ///
+    /// Waited for with a deadline, and only for the process — never for its
+    /// output to end. This used to be `Command::output()`, which returns when
+    /// `pasta` closes its stdout and stderr, and a `pasta` that fails without
+    /// exiting never does: passt 2025_01 in a container with no
+    /// `/dev/net/tun` prints "Failed to set up tap device in namespace" and
+    /// then sits in its event loop. The launch blocked for ever with the
+    /// sandbox's child parked on its ready pipe, and `--timeout` — enforced
+    /// by the same blocked parent — never fired.
     fn start_pasta(pasta: &Path, pid: u32, pid_file: &Path) -> Result<()> {
+        start_pasta_within(pasta, pid, pid_file, PASTA_START_DEADLINE)
+    }
+
+    pub(super) fn start_pasta_within(
+        pasta: &Path,
+        pid: u32,
+        pid_file: &Path,
+        within: std::time::Duration,
+    ) -> Result<()> {
+        use std::process::Stdio;
+
         if let Some(parent) = pid_file.parent() {
             std::fs::create_dir_all(parent).at(parent)?;
         }
@@ -599,7 +651,7 @@ pub(crate) mod linux {
         // SAFETY: neither call takes an argument or can fail.
         let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
 
-        let output = std::process::Command::new(pasta)
+        let mut child = std::process::Command::new(pasta)
             .arg("--config-net")
             .arg("--quiet")
             // Keep our identity. Started as root, `pasta` drops to `nobody`
@@ -623,18 +675,78 @@ pub(crate) mod linux {
             .arg(format!("/proc/{pid}/ns/user"))
             .arg("--netns")
             .arg(format!("/proc/{pid}/ns/net"))
-            .output()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|e| Error::primitive("start pasta", "could not run `pasta`", e))?;
 
-        if !output.status.success() {
-            let said = last_line(&output.stderr);
-            return Err(Error::BackendUnavailable {
-                backend: "network",
-                reason: format!("pasta could not configure the sandbox's network: {said}"),
-                remedy: pasta_remedy(&said),
-            });
+        let deadline = Instant::now() + within;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => return Ok(()),
+                Ok(Some(_)) => {
+                    let said = drain_last_line(child.stderr.take());
+                    return Err(Error::BackendUnavailable {
+                        backend: "network",
+                        reason: format!("pasta could not configure the sandbox's network: {said}"),
+                        remedy: pasta_remedy(&said),
+                    });
+                }
+                Ok(None) if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let said = drain_last_line(child.stderr.take());
+                    return Err(Error::BackendUnavailable {
+                        backend: "network",
+                        reason: format!(
+                            "pasta did not finish configuring the sandbox's network within {} s \
+                             and was stopped; it said: {said}",
+                            within.as_secs()
+                        ),
+                        remedy: pasta_remedy(&said),
+                    });
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(2)),
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(Error::primitive(
+                        "wait for pasta",
+                        "could not wait for `pasta`",
+                        e,
+                    ));
+                }
+            }
         }
-        Ok(())
+    }
+
+    /// What `pasta` wrote to stderr before it exited or was stopped, without
+    /// waiting for more: the pipe is read non-blocking, so a daemon that kept
+    /// it open cannot hold the launch up the way it did through `output()`.
+    fn drain_last_line(stderr: Option<std::process::ChildStderr>) -> String {
+        use std::io::Read;
+
+        let Some(mut stderr) = stderr else {
+            return "no output".to_string();
+        };
+        // SAFETY: `fcntl` on a descriptor this function owns.
+        unsafe {
+            let fd = stderr.as_raw_fd();
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags >= 0 {
+                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+        }
+        let mut said = Vec::new();
+        let mut chunk = [0u8; 4096];
+        while said.len() < 64 * 1024 {
+            match stderr.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => said.extend_from_slice(&chunk[..n]),
+            }
+        }
+        last_line(&said)
     }
 
     /// Run a host program inside the sandbox's user and network namespaces.
@@ -1140,8 +1252,20 @@ fn pasta_remedy(said: &str) -> String {
             at all"
             .to_string();
     }
-    if lower.contains("tun") || lower.contains("no such device") {
-        return "check that /dev/net/tun exists and is usable by this user".to_string();
+    if lower.contains("pid file") && lower.contains("permission denied") {
+        return "`pasta` was refused its own pid file. Ubuntu and Debian ship an \
+            AppArmor profile, `passt`, that attaches to /usr/bin/pasta by path — \
+            inside containers too, since the host's profiles are what the kernel \
+            enforces — and lets it write only where it expects.\n  \
+            → on the host: `sudo aa-complain passt`, or add the data directory \
+            (`ZYGO_DATA_HOME`) to the profile's local override\n  \
+            → in a container image: install `pasta` somewhere else on `PATH`, \
+            e.g. /usr/local/bin, where the profile does not attach\n  \
+            → or run the sandbox with `network = \"none\"`, which needs no `pasta`"
+            .to_string();
+    }
+    if lower.contains("tun") || lower.contains("tap device") || lower.contains("no such device") {
+        return tun_remedy();
     }
     "`zygo doctor` reports what `network = \"egress\"` and `\"full\"` need; \
  `network = \"none\"` needs none of it"
@@ -1451,6 +1575,75 @@ mod tests {
         assert!(e.to_string().contains("iproute2"));
     }
 
+    /// A `pasta` that neither finishes nor exits is stopped at the deadline,
+    /// and what it said comes back.
+    ///
+    /// passt 2025_01 in a container with no `/dev/net/tun` does exactly this,
+    /// and the launch used to wait for its output to end — for ever, with the
+    /// sandbox's own `--timeout` unable to fire.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_pasta_that_hangs_is_stopped_at_the_deadline_with_what_it_said() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("pasta");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\necho 'Failed to set up tap device in namespace' >&2\nexec sleep 60\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let started = std::time::Instant::now();
+        let err = linux::start_pasta_within(
+            &fake,
+            std::process::id(),
+            &dir.path().join("pasta.pid"),
+            std::time::Duration::from_millis(300),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{err}"
+        );
+        assert!(err.contains("tap device"), "{err}");
+        assert!(err.contains("did not finish"), "{err}");
+    }
+
+    /// A `pasta` that exits non-zero is reported with its last line, even when
+    /// something it started keeps its stderr open.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_pasta_that_fails_is_reported_without_waiting_for_its_children() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("pasta");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nsleep 60 &\necho \"Couldn't open PID file /x.pid: Permission denied\" >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let started = std::time::Instant::now();
+        let err = linux::start_pasta_within(
+            &fake,
+            std::process::id(),
+            &dir.path().join("pasta.pid"),
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{err}"
+        );
+        assert!(err.contains("PID file"), "{err}");
+    }
+
     /// The remedy has to match the failure.
     ///
     /// One remedy for every `pasta` failure sent people to `/dev/net/tun` for
@@ -1470,6 +1663,18 @@ mod tests {
 
         let no_device = pasta_remedy("Couldn't open /dev/net/tun: No such device");
         assert!(no_device.contains("/dev/net/tun"), "{no_device}");
+
+        // The shape a tun-less container actually produces, which names the
+        // tap device rather than the tun one.
+        let no_tap = pasta_remedy("Failed to set up tap device in namespace");
+        assert!(no_tap.contains("--device /dev/net/tun"), "{no_tap}");
+
+        // Ubuntu's `passt` profile, attached by path inside a container.
+        let pid_file = pasta_remedy(
+            "Couldn't open PID file /zygo-data/run/tenants/run/pasta-13-1.pid: Permission denied",
+        );
+        assert!(pid_file.contains("passt"), "{pid_file}");
+        assert!(pid_file.contains("/usr/local/bin"), "{pid_file}");
 
         // Anything else gets something true rather than something specific and
         // wrong.

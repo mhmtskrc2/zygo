@@ -853,8 +853,9 @@ pub struct ExecArgs {
     #[arg(long, requires = "script")]
     pub entry_point: Option<String>,
 
-    /// Read newline-delimited JSON events and run them in parallel.
-    #[arg(long)]
+    /// Read newline-delimited JSON events from stdin and run them in
+    /// parallel; one JSON answer per line comes back, in the same order.
+    #[arg(long, conflicts_with = "event")]
     pub batch: bool,
 
     /// Give up on the handler after this long. Defaults to the function's own

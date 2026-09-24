@@ -45,6 +45,7 @@ extern crate krun;
 
 pub mod backend;
 pub mod blobs;
+pub mod bytecode;
 pub mod cgroup;
 pub mod deps;
 pub mod derive;
@@ -74,3 +75,47 @@ pub use spec::{ResolvedFn, Spec};
 /// Version of this crate, surfaced in `zygo --version` and in the `READY`
 /// handshake so agents can detect a supervisor mismatch.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// A name for this process that stays unique beyond its PID namespace.
+///
+/// Everything Zygo names per process — a sandbox's staging root, a build's work
+/// directory, a pid file, a cgroup, a file being written atomically — used the
+/// pid alone. That is unique on one host and not across containers: Windmill's
+/// workers run in three containers sharing one Zygo store, a pid in one is often
+/// a pid in another, and two `zygo run`s named the same `tmp/root-<pid>` — one
+/// removed it while the other was mounting onto it, and a job failed with
+/// "mounting the image as the sandbox root failed: No such file or directory",
+/// two runs in two hundred. The pid stays first, so a name still says whose it
+/// is; 64 random bits after it make it unique.
+pub fn process_token() -> &'static str {
+    static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TOKEN.get_or_init(|| {
+        let mut bytes = [0u8; 8];
+        #[cfg(target_os = "linux")]
+        // SAFETY: an eight-byte buffer, filled by the kernel.
+        let random = unsafe { libc::getrandom(bytes.as_mut_ptr().cast(), bytes.len(), 0) } == 8;
+        #[cfg(not(target_os = "linux"))]
+        let random = false;
+        if !random {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            bytes = (nanos ^ (&bytes as *const _ as u64)).to_le_bytes();
+        }
+        format!("{}-{}", std::process::id(), hex::encode(bytes))
+    })
+}
+
+#[cfg(test)]
+mod process_token_tests {
+    #[test]
+    fn the_token_starts_with_the_pid_and_is_the_same_every_time() {
+        let token = super::process_token();
+        let (pid, rest) = token.split_once('-').unwrap();
+        assert_eq!(pid, std::process::id().to_string());
+        assert_eq!(rest.len(), 16, "{token}");
+        assert!(rest.chars().all(|c| c.is_ascii_hexdigit()), "{token}");
+        assert_eq!(super::process_token(), token);
+    }
+}

@@ -105,6 +105,40 @@ and keeps logging what it would have denied, and `sudo aa-enforce
 
 Or use `network = "none"`, the default, which needs no `pasta` at all.
 
+### "Couldn't open PID file ... Permission denied"
+
+The same distribution policy from the other side: Ubuntu's `passt` AppArmor
+profile attaches to `/usr/bin/passt` — and to `pasta`, which is a link to it —
+by path, and lets it write files only where it expects. Zygo's pid file is in
+its data directory, so it is refused. The kernel enforcing the profile is the
+host's, so this happens **inside a container too**, even one started with
+`--security-opt apparmor=unconfined`; `dmesg` shows `apparmor="DENIED"
+operation="mknod" profile="passt"`.
+
+```bash
+sudo aa-complain passt                     # on the host
+cp -L /usr/bin/pasta /usr/local/bin/pasta  # in an image: a path the profile does not name
+```
+
+The Zygo container image already does the second. Remove the `/usr/bin/pasta`
+link afterwards so `PATH` cannot find the confined one first.
+
+### "Failed to set up tap device in namespace", or "did not finish configuring ... within 10 s"
+
+There is no `/dev/net/tun`. Container runtimes allow the device but do not
+create the node, so this is what a networked sandbox in a container says
+first. `zygo doctor` reports it on the egress line, and a run with a network
+now refuses up front rather than asking `pasta`, which in passt 2025_01 prints
+the line above and then does not exit.
+
+```bash
+docker run --device /dev/net/tun …        # Docker
+sudo modprobe tun                          # a host without the module
+```
+
+In Kubernetes, mount the node's `/dev/net/tun` as a `hostPath` volume of type
+`CharDevice`; runc and crun allow the device by default.
+
 ### "pasta is not on PATH"
 
 ```bash

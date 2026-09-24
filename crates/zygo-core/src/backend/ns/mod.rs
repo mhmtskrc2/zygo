@@ -389,9 +389,10 @@ impl NsSandbox {
                     .unwrap_or(0),
             };
             let _ = cgroup::Hierarchy::remove(dir);
-            // The tenant above it is left for its other generations; if this
-            // was the last, the now-empty directory goes too. `remove_dir` is
-            // not recursive, so a tenant that still holds a generation — a
+            // The function above it is left for its other generations; if
+            // this was the last — always, for a one-shot, whose function is
+            // its own — the now-empty directory goes too. `remove_dir` is not
+            // recursive, so a function that still holds a generation — a
             // replacement — stays, ENOTEMPTY and all.
             if let Some(tenant) = dir.parent() {
                 let _ = std::fs::remove_dir(tenant);
@@ -399,6 +400,49 @@ impl NsSandbox {
         }
         code
     }
+}
+
+/// Wait for `pid` to exit, without polling, until `deadline`.
+///
+/// `Some(true)` when it exited, `Some(false)` when the deadline came first,
+/// `None` when this kernel has no pidfd (before 5.3) and the caller must poll.
+#[cfg(target_os = "linux")]
+fn wait_for_exit(pid: u32, deadline: Instant) -> Option<bool> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    // SAFETY: `pidfd_open` takes a pid and flags, and returns a new
+    // descriptor or -1.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: a descriptor the kernel just returned, owned by nothing else.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) };
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Some(false);
+        }
+        let mut pfd = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ms = left.as_millis().clamp(1, libc::c_int::MAX as u128) as libc::c_int;
+        // SAFETY: one live `pollfd`.
+        let rc = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if rc > 0 {
+            return Some(true);
+        }
+        if rc < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return None;
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn wait_for_exit(_pid: u32, _deadline: Instant) -> Option<bool> {
+    None
 }
 
 /// Convert a `wait` status into a shell-style exit code.
@@ -440,10 +484,26 @@ impl Sandbox for NsSandbox {
             return self.reap_until_it_exits();
         }
 
-        // Poll rather than block, so the wall-clock limit can be enforced.
-        // The supervisor replaces this with a timerfd of its own; for a
-        // one-shot `run` the polling cost is irrelevant next to the program.
         let deadline = Instant::now() + self.timeout;
+
+        // Block until the child exits or the deadline passes: a pidfd becomes
+        // readable at exit, and `poll` on it takes the deadline as its
+        // timeout. The loop below used to be all there was, and its cost was
+        // called irrelevant next to the program. For a short program it is
+        // not: backing off from 0.2 ms to 20 ms, it looks at 0.2, 0.6, 1.4,
+        // 3.0, 6.2, 12.6 and 25.4 ms, so a program that exits at 13 ms is
+        // noticed at 25 — measured, a `python -c pass` whose run phase read
+        // 26 ms, and every embedder's slot held for the difference.
+        if let Some(exited) = wait_for_exit(self.pid, deadline)
+            && exited
+            && let Some(code) = self.reap(false)?
+        {
+            return Ok(code);
+        }
+
+        // Poll rather than block where a pidfd is not available (before
+        // Linux 5.3), so the wall-clock limit can still be enforced; and
+        // after a pidfd wait that reached the deadline, to do the killing.
         let mut backoff = Duration::from_micros(200);
         loop {
             if let Some(code) = self.reap(false)? {
@@ -518,8 +578,9 @@ pub fn launch(config: &SandboxConfig, hierarchy: Option<&cgroup::Hierarchy>) -> 
             // `system`, without which the controllers below cannot be
             // delegated. Idempotent, so every launch may call it.
             h.ensure(cgroup::Hierarchy::host_ram())?;
-            h.create_function(&config.id.tenant, &config.id.name, &config.limits)?;
-            Some(h.create_generation(&config.id.tenant, &config.id.name)?)
+            let function = cgroup::Hierarchy::function_name(&config.id.name, config.own_limits);
+            h.create_function(&config.id.tenant, &function, &config.limits)?;
+            Some(h.create_generation(&config.id.tenant, &function)?)
         }
         None => None,
     };
@@ -550,9 +611,45 @@ pub fn launch(config: &SandboxConfig, hierarchy: Option<&cgroup::Hierarchy>) -> 
         plan.secrets_fd = Some(theirs.as_raw_fd());
     }
 
+    // Born in its cgroup rather than moved there: see `clone::clone3_into`.
+    // A kernel or policy that refuses `CLONE_INTO_CGROUP` gets the old order —
+    // a plain `clone3`, and the move below — rather than a failed start.
+    let cgroup_dir = generation
+        .as_ref()
+        .and_then(|dir| std::fs::File::open(cgroup::Hierarchy::zygote(dir)).ok());
+    let mut placed = false;
     // SAFETY: `plan` is fully materialised, the child touches only syscalls,
     // and both pipe ends are owned here.
-    let result = unsafe { clone::clone3(namespaces.clone_flags()) }.map_err(|e| {
+    let result = match &cgroup_dir {
+        Some(dir) => {
+            match unsafe { clone::clone3_into(namespaces.clone_flags(), Some(dir.as_raw_fd())) } {
+                Ok(r) => {
+                    placed = true;
+                    Ok(r)
+                }
+                Err(e)
+                    if matches!(
+                        e.raw_os_error(),
+                        Some(
+                            libc::EINVAL
+                                | libc::ENOSYS
+                                | libc::EOPNOTSUPP
+                                | libc::EBUSY
+                                | libc::EACCES
+                                | libc::EPERM
+                        )
+                    ) =>
+                {
+                    // SAFETY: as above.
+                    unsafe { clone::clone3(namespaces.clone_flags()) }
+                }
+                Err(e) => Err(e),
+            }
+        }
+        // SAFETY: as above.
+        None => unsafe { clone::clone3(namespaces.clone_flags()) },
+    }
+    .map_err(|e| {
         Error::primitive(
             "clone3",
             "could not create the sandbox namespaces; run `zygo doctor`",
@@ -613,8 +710,10 @@ pub fn launch(config: &SandboxConfig, hierarchy: Option<&cgroup::Hierarchy>) -> 
             // The child is blocked waiting for its identity. Give it one, then
             // put it in its cgroup — both must happen before it runs any code.
             let identity = write_id_maps(pid, &uid_map, &gid_map);
+            drop(cgroup_dir);
             if let Some(dir) = &generation
                 && identity.is_ok()
+                && !placed
                 && let Err(e) = cgroup::attach(&cgroup::Hierarchy::zygote(dir), pid)
             {
                 let _ = sandbox.kill();
@@ -746,13 +845,32 @@ fn launch_failure(payload: &[u8]) -> Error {
         };
     };
 
+    let remedy = step
+        .remedy(errno)
+        .unwrap_or("run `zygo doctor` to check this host's requirements")
+        .to_string();
+    // A step that names its path (`child::fail_at`) sends it after the eight bytes.
+    // The path is the staging root's, so it is shown as the sandbox sees it.
+    let path = (payload.len() > 8).then(|| String::from_utf8_lossy(&payload[8..]).into_owned());
+    let source = std::io::Error::from_raw_os_error(errno);
     Error::Primitive {
         operation: leak_step(step),
-        remedy: step
-            .remedy(errno)
-            .unwrap_or("run `zygo doctor` to check this host's requirements")
-            .to_string(),
-        source: std::io::Error::from_raw_os_error(errno),
+        remedy: match &path {
+            Some(p) => format!("the target was `{}`; {remedy}", inside_sandbox(p)),
+            None => remedy,
+        },
+        source,
+    }
+}
+
+/// A staging-root path as the sandbox will see it: `…/root-<pid>/tmp/x` is `/tmp/x`.
+fn inside_sandbox(path: &str) -> String {
+    match path
+        .find("/root-")
+        .and_then(|i| path[i + 1..].find('/').map(|j| i + 1 + j))
+    {
+        Some(cut) => path[cut..].to_string(),
+        None => path.to_string(),
     }
 }
 
