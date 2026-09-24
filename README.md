@@ -419,4 +419,4 @@ Apache-2.0.
 
 ---
 
-**Next: [About this book](docs/book/README.md) →**
+**Next: [The Zygo booklet](docs/book/README.md) →**
