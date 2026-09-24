@@ -191,11 +191,11 @@ module again; `import re` alone took 34 ms.
 
 The first time Zygo pulls or runs such an image, it compiles the standard
 library once, inside a sandbox, into a layer of its own. For
-`python:3.12-slim` that took about 2.4 s and made 18.5 MB. The
+`python:3.12-slim` that took about 3.2 s and made 18.6 MB. The
 layer is stacked on the image, so the `.pyc` files sit next to the sources.
 They are marked *unchecked*: a layer never changes, so there is nothing to
-check them against. On the Lima VM used for testing, a script that imports `re`,
-`json` and a few more went from 190 ms to 47 ms
+check them against. On the Lima VM used for testing, a script that imports ten common modules
+(`re`, `json`, `urllib.request` and more) went from 165 ms to 35 ms
 ([chapter 25](25-performance.md) has the table).
 
 ```text

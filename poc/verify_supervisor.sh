@@ -720,7 +720,10 @@ if [ $rc -ne 0 ] && grep -q "apt-get exited" /tmp/up-bad.log; then
 else
     bad "unknown package: exit $rc, $(grep -v '^$' /tmp/up-bad.log | tr '\n' ' ' | cut -c1-400)"
 fi
-n=$("$ZYGO" images 2>/dev/null | grep -c 'python:3.12-slim+system\.')
+# The first column only, and a `+system.` layer with nothing after it: the
+# bytecode layer is built on a derived image too, as `…+system.X+bytecode.Y`,
+# and that is the same image compiled, not a second one.
+n=$("$ZYGO" images 2>/dev/null | awk '{print $1}' | grep -cE '^python:3\.12-slim\+system\.[0-9a-f]+$')
 [ "$n" -eq 1 ] && ok "and no half-built image was indexed" || bad "$n derived images indexed after a failed build"
 
 # A name that is not a package name is refused by resolution, before any copy.

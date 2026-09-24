@@ -52,6 +52,11 @@ change"), so a reviewer knows it was considered rather than forgotten.
   add it to the glossary.
 * **Plain English.** Use the most common few thousand words. Short sentences,
   active voice.
+* **Plain words before jargon.** If an everyday phrase says it, use that:
+  "usually 2.1 ms · 1 in 100: 2.9 ms", not "2.07 ms p50, 2.92 ms p99". Keep
+  terms like p50, RSS or PSS for chapter 25, where they are defined. An
+  explanation that needs a paragraph to explain itself is too complicated —
+  cut it down to two sentences and a picture.
 * **Short sections.** Five to ten sentences under a heading — a bird's-eye
   view first, then the detail, then a link. Tables and diagrams do not count.
 * **A diagram wherever one helps.** Text diagrams in ```` ```text ```` blocks,

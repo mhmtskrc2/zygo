@@ -82,7 +82,7 @@ is the thing to confine.
 | File access rules | the jail's root path | the root, **plus** Landlock as a second wall |
 | Limits | rctl, optional | cgroups, mandatory, one set per request |
 | Images | a folder or ZFS dataset you prepare | OCI images from any registry |
-| Warm start | none: you start processes in the jail | a zygote, forked per request in ~1.7 ms |
+| Warm start | none: you start processes in the jail | a zygote, forked per request in ~1.4 ms |
 | Network default | the addresses you give it | nothing at all |
 
 ## The biggest difference: who holds the key

@@ -198,6 +198,41 @@ pub const OVERLAY_KERNEL: (u32, u32) = (5, 11);
 /// Above this everything in appendix C is present: Landlock networking,
 /// `cgroup.kill`, `memory.peak`.
 pub const RECOMMENDED_KERNEL: (u32, u32) = (6, 1);
+/// From this release, moving a process into a cgroup waits for an RCU grace
+/// period after a quiet spell, unless cgroup2 is mounted with `favordynmods`.
+/// Before it, the kernel always behaved as if it were.
+pub const FAVORDYNMODS_KERNEL: (u32, u32) = (6, 0);
+
+/// Whether the cgroup2 hierarchy is mounted with `favordynmods`, from the text
+/// of `/proc/self/mountinfo`. `None` when there is no cgroup2 mount at all.
+///
+/// The option is a property of the one hierarchy rather than of a mount, so
+/// any cgroup2 line answers — including a container's own view of it. It is
+/// looked for among the super-block options (after the ` - ` separator) and,
+/// to be safe, among the mount options too.
+pub fn cgroup2_favors_moves(mountinfo: &str) -> Option<bool> {
+    let mut seen = false;
+    for line in mountinfo.lines() {
+        let Some((mount, fs)) = line.split_once(" - ") else {
+            continue;
+        };
+        let mut fields = fs.split_whitespace();
+        if fields.next() != Some("cgroup2") {
+            continue;
+        }
+        seen = true;
+        let super_options = fields.nth(1).unwrap_or("");
+        let mount_options = mount.split_whitespace().nth(5).unwrap_or("");
+        if super_options
+            .split(',')
+            .chain(mount_options.split(','))
+            .any(|o| o == "favordynmods")
+        {
+            return Some(true);
+        }
+    }
+    seen.then_some(false)
+}
 
 /// When each upstream kernel series was released, as `(major, minor, year,
 /// month)`, ordered oldest first.
@@ -519,6 +554,7 @@ mod probe {
             user_namespaces(&probe),
             procfs(&probe),
             cgroup_v2(),
+            cgroup_moves(),
             overlayfs(),
             landlock(),
             seccomp(),
@@ -790,8 +826,9 @@ mod probe {
     }
 
     /// A rough "is this a container", used only to choose which remedy to
-    /// print. Wrong here costs a less useful sentence, not a wrong verdict.
-    fn in_a_container() -> bool {
+    /// print, and whether `--fix` offers a host-wide change. Wrong here costs
+    /// a less useful sentence, not a wrong verdict.
+    pub(super) fn in_a_container() -> bool {
         Path::new("/.dockerenv").exists()
             || std::env::var_os("KUBERNETES_SERVICE_HOST").is_some()
             || std::fs::read_to_string("/proc/1/cgroup")
@@ -978,6 +1015,58 @@ mod probe {
             None => finish(Primitive::NoUserns(
                 "the child died before it could mount".into(),
             )),
+        }
+    }
+
+    /// Whether moving a request into its cgroup can stall.
+    ///
+    /// A warm request forked by an agent is moved into its own cgroup before
+    /// it runs. The move takes the kernel's thread-group lock for writing, and
+    /// from Linux 6.0 the first writer after a quiet spell waits out an RCU
+    /// grace period — measured at ~9 ms for 1 request in 100 on a 6.8 VM,
+    /// against 0.85 ms with `favordynmods`. Warm-exec and one-shot sandboxes
+    /// are created inside their cgroup and never move, so only the agent path
+    /// pays it; that is why this is degraded, not failed.
+    fn cgroup_moves() -> Check {
+        const NAME: &str = "cgroup moves";
+        let release = rustix::system::uname()
+            .release()
+            .to_string_lossy()
+            .into_owned();
+        if let Some(v) = KernelVersion::parse(&release)
+            && !v.at_least(FAVORDYNMODS_KERNEL.0, FAVORDYNMODS_KERNEL.1)
+        {
+            return Check::ok(
+                NAME,
+                "before Linux 6.0 the kernel always favours moving a process between cgroups",
+            );
+        }
+        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+        match cgroup2_favors_moves(&mountinfo) {
+            None => Check::absent(
+                NAME,
+                "no cgroup2 mount in /proc/self/mountinfo",
+                "see the cgroup v2 line above",
+            ),
+            Some(true) => Check::ok(
+                NAME,
+                "favordynmods: requests enter their cgroup without waiting",
+            ),
+            Some(false) => Check::degraded(
+                NAME,
+                "no favordynmods: ~1 warm request in 100 waits ms to enter its cgroup",
+                if in_a_container() {
+                    "this is the host's setting: on the host, run `mount -o \
+                     remount,favordynmods /sys/fs/cgroup` (and make it survive a \
+                     reboot). It makes every fork and exit on that machine slightly \
+                     dearer. Warm-exec and one-shot runs are not affected either way"
+                } else {
+                    "`zygo doctor --fix` remounts cgroup2 with favordynmods, now and \
+                     at every boot. It makes every fork and exit on this machine \
+                     slightly dearer. Warm-exec and one-shot runs are not affected \
+                     either way"
+                },
+            ),
         }
     }
 
@@ -1372,6 +1461,41 @@ mod probe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lines as Ubuntu 24.04's kernel writes them, before and after
+    /// `mount -o remount,favordynmods /sys/fs/cgroup`.
+    const MOUNTINFO_PLAIN: &str = "\
+22 29 0:21 / /sys rw,nosuid,nodev,noexec,relatime shared:7 - sysfs sysfs rw
+33 22 0:28 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:9 - cgroup2 cgroup2 rw,nsdelegate,memory_recursiveprot
+";
+
+    #[test]
+    fn favordynmods_is_read_from_the_cgroup2_line() {
+        assert_eq!(cgroup2_favors_moves(MOUNTINFO_PLAIN), Some(false));
+        let favoured = MOUNTINFO_PLAIN.replace(
+            "nsdelegate,memory_recursiveprot",
+            "nsdelegate,favordynmods,memory_recursiveprot",
+        );
+        assert_eq!(cgroup2_favors_moves(&favoured), Some(true));
+    }
+
+    #[test]
+    fn no_cgroup2_mount_is_not_a_no() {
+        let v1_only = "30 22 0:26 / /sys/fs/cgroup/memory rw,nosuid - cgroup cgroup rw,memory\n";
+        assert_eq!(cgroup2_favors_moves(v1_only), None);
+        assert_eq!(cgroup2_favors_moves(""), None);
+    }
+
+    #[test]
+    fn the_option_on_another_filesystem_does_not_count() {
+        // A tmpfs whose options happen to contain the word is not the cgroup
+        // hierarchy, and a substring is not an option.
+        let text = "\
+40 22 0:40 / /tmp rw - tmpfs tmpfs rw,favordynmods
+33 22 0:28 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw,nsdelegate,nofavordynmodsx
+";
+        assert_eq!(cgroup2_favors_moves(text), Some(false));
+    }
 
     #[test]
     fn kernel_versions_parse_from_distro_releases() {

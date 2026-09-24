@@ -125,7 +125,7 @@ and the same input and output. The exit status comes back out to your shell.
   ┌───────────────────────────────┐            ┌─────────────────────────────────┐
   │ $ zygo run python:3.12 ...    │   SSH      │ zygo run python:3.12 ...        │
   │   zygo (macOS shim) ──────────┼───────────▶│   └─▶ sandbox (namespaces,      │
-  │                               │  ~20 ms    │        cgroup, seccomp ...)     │
+  │                               │  ~22 ms    │        cgroup, seccomp ...)     │
   │ output + exit status ◀────────┼────────────┼── output + exit status          │
   │                               │            │                                 │
   │ /Users/you/project  ◀─────────┼── same ────┼─▶ /Users/you/project            │
@@ -142,7 +142,7 @@ and the same input and output. The exit status comes back out to your shell.
 | Size | 2 CPUs, 4 GiB of memory, 20 GiB of disk |
 | First start | about a minute: the VM is created on the first command that needs it |
 | Later starts | about 16 seconds, after the VM was stopped |
-| Cost per command, once it is up | about 20 ms, over the SSH connection Lima already holds |
+| Cost per command, once it is up | about 22 ms, over the SSH connection Lima already holds |
 | Stopping it | `zygo stop --all` stops everything, the VM included |
 
 Your home folder is mounted inside the VM at *the same path*, and it is
@@ -158,10 +158,11 @@ If the VM cannot be reached, a command exits with status **111**;
 
 ## What the Mac VM costs
 
-A one-shot `zygo run` typed in a Mac shell takes about 30 ms end to end. About
-10 ms of that is the sandbox, and about 20 ms is the trip into the VM. These
-are medians of nine runs on the Mac that [chapter 25](25-performance.md) names.
-The same run through Docker Desktop on the same Mac was 433 ms.
+A one-shot `zygo run` typed in a Mac shell takes about 29 ms end to end, when
+a supervisor is running in the VM. About 6 ms of that is the sandbox, and
+about 22 ms is the trip into the VM. These are medians of nine runs on the Mac
+that [chapter 25](25-performance.md) names. The same run through Docker
+Desktop on the same Mac took 397 ms.
 
 The trip is paid per *command*, not per request. The millisecond warm path is
 still there when you call functions through the HTTP API or the SDKs,
@@ -210,6 +211,7 @@ and the VM's kernel. You get one report with one verdict.
 | `user namespaces` | Can a normal user create one *and mount inside it*? |
 | `procfs (fully visible)` | Can a fresh `/proc` be mounted inside a sandbox? |
 | `cgroup v2` | Is the unified cgroup tree there, with controllers delegated to you? |
+| `cgroup moves` | On Linux 6.0+, is cgroup2 mounted with `favordynmods`? Without it, about 1 warm request in 100 waits several ms ([chapter 22](22-troubleshooting.md#1-request-in-100-takes-10-ms-and-the-rest-take-15)). |
 | `overlayfs (userns)` | Can image layers be stacked inside a user namespace? |
 | `landlock` | Which Landlock version (ABI) does the kernel offer? |
 | `seccomp` | Can a seccomp filter be installed? |
@@ -272,6 +274,7 @@ zygo doctor --fix --yes     # the same, without asking
 | No cgroup delegation | Writes `~/.config/systemd/user/user@.service.d/delegate.conf` and reloads your systemd user manager | no |
 | Missing `pasta` or `nft` | Installs the `passt` and `nftables` packages with apt, dnf, pacman or apk | yes, through `sudo` |
 | The AppArmor profile that blocks `pasta` | Runs `aa-complain` on the `pasta` profile, so it logs instead of blocks | yes, through `sudo` |
+| Slow cgroup moves (`cgroup moves … degraded`) | Remounts cgroup2 with `favordynmods` now, and installs `zygo-cgroup-favordynmods.service` to do it at every boot. Every fork and exit gets slightly slower. **Machine-wide.** Not offered inside a container | yes, through `sudo` |
 
 ## Ubuntu and Debian: two AppArmor rules
 
@@ -335,7 +338,7 @@ zygo run python:3.12-slim python3 -c 'print("hello")'
 ```
 
 The first run downloads the image, just as `docker run` does. After that, a
-run takes about 18 ms (median, with the image already pulled, measured on the
+run takes about 12 ms (median, with the image already pulled, measured on the
 hosts in [chapter 25](25-performance.md)). The sandbox has a read-only root,
 no network, no capabilities, and memory, CPU and process limits. A few more
 to try:
@@ -380,13 +383,13 @@ no import cost per request and no state left over between requests.
   zygo serve                         zygo exec          zygo exec          zygo exec
   ├─ build sandbox                   ├─ fork            ├─ fork            ├─ fork
   ├─ start Python, import handler    └─ reply           └─ reply           └─ reply
-  └─ park the zygote                   ~1.7 ms            ~1.7 ms            ~1.7 ms
-     ~270 ms, paid once
+  └─ park the zygote                   ~1.4 ms            ~1.4 ms            ~1.4 ms
+     ~150 ms, paid once
 ```
 
 On a Raspberry Pi 5, a Python handler that imports nothing is warm in about
-270 ms, including starting the supervisor. The median overhead per request is
-about 1.7 ms, measured in Docker Desktop's VM on an Apple M1 Max. Both numbers
+150 ms, including starting the supervisor. The median overhead per request is
+about 1.4 ms, measured on a Lima VM on an Apple M1 Max. Both numbers
 and their machines are in [chapter 25](25-performance.md). The same trick
 works from a one-line file:
 
@@ -535,6 +538,7 @@ with the fix for each.
 
 | If you want to… | Read |
 |---|---|
+| see all three ways working in one small app | [`examples/web-api`](../../examples/web-api) — a web API whose three endpoints use a warm function, a pool and a fresh sandbox |
 | use `zygo run` well | [12. One-shot sandboxes](12-one-shot-sandboxes.md) |
 | write handlers in more languages | [13. Warm functions](13-warm-functions.md) |
 | set limits, network and secrets | [14. Limits, network and secrets](14-limits-network-secrets.md) |
@@ -546,8 +550,9 @@ with the fix for each.
 | compare with Docker, gVisor and Firecracker | [10. Similar projects](10-similar-projects.md) |
 | read the security model | [23. Security](23-security.md) |
 
-The [`examples/`](../../examples) folder has complete projects: a webhook, a
-CI job, an LLM tool, a Go program, and agents in Node and POSIX sh.
+The [`examples/`](../../examples) folder has complete projects: a small web
+API, a webhook, a CI job, an LLM tool, a Go program, and agents in Node and
+POSIX sh.
 
 <!-- nav: generated by docs/nav.py, do not edit by hand -->
 

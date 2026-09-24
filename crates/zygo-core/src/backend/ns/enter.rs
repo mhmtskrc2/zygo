@@ -7,11 +7,12 @@
 //! one process:
 //!
 //! ```text
-//!   supervisor ──fork──► helper ──setns(user,pid,net,ipc,uts,cgroup)──fork──► request
-//!                          │                                            │
-//!                          │ reports the request's HOST pid             │ waits for GO
-//!                          │ (fork() returns it in the helper's ns)     │ setns(mnt)
-//!                          │ waits, reports the exit status             │ harden, execve
+//!   supervisor ──fork──► helper ──setns(user,pid,net,ipc,uts)──clone3──► request
+//!                          │                              (into its cgroup) │
+//!                          │ reports the request's HOST pid                │ setns(cgroup)
+//!                          │ (clone3 returns it in the helper's ns)        │ waits for GO
+//!                          │ waits, reports the exit status                │ setns(mnt)
+//!                          │                                               │ harden, execve
 //! ```
 //!
 //! - The helper enters the pid namespace but stays out of the mount
@@ -22,6 +23,17 @@
 //! - The request enters the mount namespace itself, after `GO`. Entering it
 //!   in the helper would take the helper's view of the host away before it
 //!   has reported anything.
+//!
+//! - The request is **born in its own cgroup** (`CLONE_INTO_CGROUP`) when the
+//!   caller hands over the directory. Moving a process into a cgroup after the
+//!   fact takes the kernel's thread-group lock for writing, and on Linux 6.0
+//!   and later the first writer after a quiet spell waits out an RCU grace
+//!   period: measured at ~9 ms for 1 request in 100 on a 6.8 VM. A process
+//!   created inside the cgroup never moves, so never waits. The kernel only
+//!   allows the target to be inside the caller's cgroup namespace, which is
+//!   why the helper stays in the host's and the request enters the sandbox's
+//!   itself. A kernel or policy that refuses gets a plain `fork` and the old
+//!   move, which [`Entered::placed`] tells the caller to make.
 //!
 //! Why this is allowed rootless: `setns` into a user namespace needs
 //! `CAP_SYS_ADMIN` in it, and a process in the parent namespace with the
@@ -48,6 +60,10 @@ pub struct Entered {
     pub helper: u32,
     /// Host pid of the request process, for the cgroup and for the deadline.
     pub pid: u32,
+    /// Whether the request was created inside the cgroup the caller named.
+    /// `false` when none was named, or when the kernel refused
+    /// `CLONE_INTO_CGROUP` — then the caller moves it, as before.
+    pub placed: bool,
     /// Write one byte here once the request is in its cgroup. `Option` so the
     /// caller can take it and drop it — the drop is the close.
     pub go: Option<OwnedFd>,
@@ -88,7 +104,7 @@ impl Entered {
 /// is written, which is the supervisor's moment to put it in a cgroup. Same
 /// handshake as `FORKED`/`GO` on the agent path, for the same reason.
 pub fn enter(plan: &PreparedLaunch, ns: &NamespaceFds) -> Result<Entered> {
-    enter_with(plan, ns, None)
+    enter_with(plan, ns, None, None)
 }
 
 /// The same, with one more argument on this request's argv.
@@ -98,10 +114,15 @@ pub fn enter(plan: &PreparedLaunch, ns: &NamespaceFds) -> Result<Entered> {
 /// materialised by the caller before the fork — see
 /// [`crate::backend::ns::prepare::PreparedLaunch::argv_with`] — because the
 /// side of a fork that `execve`s it may not allocate.
+///
+/// `cgroup` is a descriptor open on the request's own cgroup directory, when
+/// the caller made one: the request is created inside it rather than moved
+/// there. See the module notes, and [`Entered::placed`].
 pub fn enter_with(
     plan: &PreparedLaunch,
     ns: &NamespaceFds,
     argv: Option<&crate::backend::ns::prepare::RequestArgv<'_>>,
+    cgroup: Option<std::os::fd::RawFd>,
 ) -> Result<Entered> {
     let argv_ptr = match argv {
         Some(argv) => argv.as_ptr(),
@@ -137,6 +158,7 @@ pub fn enter_with(
                 plan,
                 ns,
                 argv_ptr,
+                cgroup.unwrap_or(-1),
                 Ends {
                     go_r: go_r.as_raw_fd(),
                     stdin_r: stdin_r.as_raw_fd(),
@@ -178,9 +200,13 @@ pub fn enter_with(
         });
     }
 
+    // The top bit carries whether the request was born in its cgroup; pids
+    // stop at 2^22 (`pid_max`'s ceiling), so it is never part of one.
+    let word = u32::from_ne_bytes(pid_bytes);
     Ok(Entered {
         helper: helper as u32,
-        pid: u32::from_ne_bytes(pid_bytes),
+        pid: word & !PLACED_BIT,
+        placed: word & PLACED_BIT != 0,
         go: Some(go_w),
         stdin: Some(stdin_w),
         stdout: stdout_r,
@@ -189,6 +215,10 @@ pub fn enter_with(
         err: err_r,
     })
 }
+
+/// Set in the pid word the helper reports when the request was created inside
+/// its cgroup.
+const PLACED_BIT: u32 = 1 << 31;
 
 /// Raw descriptors the children work with.
 #[derive(Clone, Copy)]
@@ -240,6 +270,7 @@ unsafe fn helper_main(
     plan: &PreparedLaunch,
     ns: &NamespaceFds,
     argv: *const *const std::os::raw::c_char,
+    into: c_int,
     ends: Ends,
 ) -> ! {
     // Die with the supervisor, so a request cannot outlive the thing that is
@@ -254,9 +285,10 @@ unsafe fn helper_main(
     // and then waiting the full 30 s deadline. Holding another request's
     // stdin does the same to *that* request.
     //
-    // Keep exactly the thirteen descriptors this and the request need, at
-    // known low numbers, and close everything else. Copies are made first so
-    // no `dup2` can overwrite a descriptor that has not been copied yet.
+    // Keep exactly the descriptors this and the request need — thirteen, and
+    // a fourteenth when there is a cgroup to create the request in — at known
+    // low numbers, and close everything else. Copies are made first so no
+    // `dup2` can overwrite a descriptor that has not been copied yet.
     let needed = [
         ns.user.as_raw_fd(),
         ns.pid.as_raw_fd(),
@@ -271,11 +303,19 @@ unsafe fn helper_main(
         ends.stderr_w,
         ends.status_w,
         ends.err_w,
+        into,
     ];
+    // The error pipe's place in `needed`, which a failure below reports down.
+    const ERR: usize = 12;
+    let count = if into >= 0 {
+        needed.len()
+    } else {
+        needed.len() - 1
+    };
     const FIRST: c_int = 3;
     const PARKED: c_int = 64;
-    let mut parked = [0 as c_int; 13];
-    for (i, fd) in needed.iter().enumerate() {
+    let mut parked = [0 as c_int; 14];
+    for (i, fd) in needed.iter().take(count).enumerate() {
         // `F_DUPFD_CLOEXEC`, not `F_DUPFD`. The plain form *clears*
         // close-on-exec on the copy, and nothing set it again — so the tenant
         // program inherited all thirteen descriptors past `execve`: seven
@@ -290,7 +330,7 @@ unsafe fn helper_main(
             child::fail(ends.err_w, Step::Setns);
         }
     }
-    for (i, fd) in parked.iter().enumerate() {
+    for (i, fd) in parked.iter().take(count).enumerate() {
         // `dup3` with `O_CLOEXEC` for the same reason: `dup2` clears the flag
         // on the new descriptor.
         //
@@ -303,10 +343,10 @@ unsafe fn helper_main(
             // already have been one of them — and the original code passed
             // `*fd`, the descriptor being duplicated, so a failure reported
             // itself down whichever pipe happened to be in hand.
-            child::fail(parked[needed.len() - 1], Step::Setns);
+            child::fail(parked[ERR], Step::Setns);
         }
     }
-    unsafe { close_from(FIRST + needed.len() as c_int) };
+    unsafe { close_from(FIRST + count as c_int) };
 
     let user = FIRST;
     let (pid_ns, net, ipc, uts, cgroup, mnt) = (
@@ -325,29 +365,50 @@ unsafe fn helper_main(
         status_w: FIRST + 11,
         err_w: FIRST + 12,
     };
+    let into = if count == needed.len() {
+        FIRST + 13
+    } else {
+        -1
+    };
 
     // User first: it is what grants the capability to enter the others. Mount
-    // is deliberately absent — the request enters that one itself.
+    // and cgroup are deliberately absent — the request enters those itself:
+    // mount because the helper still needs the host's view, cgroup because
+    // `CLONE_INTO_CGROUP` only accepts a cgroup inside the *caller's* cgroup
+    // namespace, and the request's is not inside the sandbox's.
     for (fd, kind) in [
         (user, libc::CLONE_NEWUSER),
         (pid_ns, libc::CLONE_NEWPID),
         (net, libc::CLONE_NEWNET),
         (ipc, libc::CLONE_NEWIPC),
         (uts, libc::CLONE_NEWUTS),
-        (cgroup, libc::CLONE_NEWCGROUP),
     ] {
         if unsafe { libc::setns(fd, kind) } != 0 {
             child::fail(ends.err_w, Step::Setns);
         }
     }
 
+    // Born in its cgroup when there is one to be born in (see the module
+    // notes). Any refusal — a kernel before 5.7, a policy, a cgroup that
+    // went away — falls back to the plain fork and the supervisor's move.
+    //
     // SAFETY: single-threaded here; the request does only syscalls.
-    let request = unsafe { libc::fork() };
+    let (request, placed) = match into {
+        -1 => (unsafe { libc::fork() }, false),
+        dir => match unsafe { super::clone::clone3_into(0, Some(dir)) } {
+            Ok(super::clone::CloneResult::Child) => (0, true),
+            Ok(super::clone::CloneResult::Parent { child }) => (child as libc::pid_t, true),
+            Err(_) => (unsafe { libc::fork() }, false),
+        },
+    };
     if request < 0 {
         child::fail(ends.err_w, Step::Setns);
     }
     if request == 0 {
-        unsafe { request_main(plan, argv, mnt, ends) }
+        unsafe { request_main(plan, argv, cgroup, mnt, ends) }
+    }
+    if into >= 0 {
+        unsafe { libc::close(into) };
     }
 
     // Only the status pipe stays open here. Closing `err_w` matters: the
@@ -362,7 +423,13 @@ unsafe fn helper_main(
     }
 
     // `fork()` returned the request's pid in *this* namespace — the host's.
-    let pid = (request as u32).to_ne_bytes();
+    // The top bit says whether it was born in its cgroup.
+    let word = if placed {
+        request as u32 | PLACED_BIT
+    } else {
+        request as u32
+    };
+    let pid = word.to_ne_bytes();
     write_all_raw(ends.status_w, &pid);
 
     let mut status: c_int = 0;
@@ -379,18 +446,28 @@ unsafe fn helper_main(
 /// The request process: wait for `GO`, enter the mount namespace, wire up
 /// stdio, harden exactly as the sandbox init did, and run the program.
 ///
-/// `mnt` is the mount namespace descriptor, already renumbered by the helper.
+/// `cgroup` and `mnt` are namespace descriptors, already renumbered by the
+/// helper.
 ///
 /// # Safety
 /// As [`helper_main`].
 unsafe fn request_main(
     plan: &PreparedLaunch,
     argv: *const *const std::os::raw::c_char,
+    cgroup: c_int,
     mnt: c_int,
     ends: Ends,
 ) -> ! {
     unsafe {
         libc::close(ends.status_w);
+    }
+
+    // The sandbox's cgroup namespace, entered here rather than in the helper
+    // so the helper could create this process inside its cgroup. It changes
+    // only what `/proc/self/cgroup` shows; the process is already where it
+    // belongs, or about to be moved there by the supervisor.
+    if unsafe { libc::setns(cgroup, libc::CLONE_NEWCGROUP) } != 0 {
+        child::fail(ends.err_w, Step::Setns);
     }
 
     // Parked until the supervisor has put this pid in its cgroup. Until then

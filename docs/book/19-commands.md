@@ -204,6 +204,11 @@ name or `--all`, not both. `--all` with nothing running exits `0`; a named
 stop with no supervisor is an error (`125`). On a Mac, `stop --all` also
 stops the Linux VM afterwards.
 
+**Pools:** `NAME` must be a function; a runtime pool's name gives "no function
+named …" (exit `4`). To end a pool, use `--all` — which ends it with the
+supervisor, even though it prints "nothing to stop" when only pools are
+running — or `DELETE /runtimes/{name}` through the API.
+
 ## `zygo top` — live resource table
 
 ```text
@@ -227,7 +232,7 @@ zygo stats [NAME]
 ```
 
 For each function and pool: `STATE`, `REQUESTS`, `FAILURES`, `SAMPLES`,
-`p50`, `p99`, `MAX`, `KILLED`. Counters run from when the function was
+`p50` (a usual request), `p99` (the slowest 1 in 100), `MAX`, `KILLED`. Counters run from when the function was
 warmed; latencies come from the log ring. `p99` is shown only with 100
 samples or more. `KILLED` counts timeouts and other `137` exits (usually
 out of memory).
@@ -446,7 +451,8 @@ zygo doctor [--fix [--yes]]
 ```
 
 Tries each requirement for real rather than reading a setting: kernel
-version, user namespaces, `/proc`, cgroup v2 delegation, overlayfs, Landlock,
+version, user namespaces, `/proc`, cgroup v2 delegation, whether moving a
+process into a cgroup can stall (`cgroup moves`), overlayfs, Landlock,
 seccomp, subordinate uids, KVM, the guest kernel, `runsc`, and the network
 helpers. Each line says `ok`, `degraded`, `-` (absent) or `FAIL`, with the
 fix under it. On a Mac it checks the host side and then the VM's own doctor.
@@ -454,7 +460,7 @@ fix under it. On a Mac it checks the host side and then the VM's own doctor.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--fix` | off | Apply the fixes that are one command each — the AppArmor user-namespace rule, cgroup delegation, the `passt` and `nftables` packages, the AppArmor profile on `pasta` — after printing every command and asking. |
+| `--fix` | off | Apply the fixes that are one command each — the AppArmor user-namespace rule, cgroup delegation, the `passt` and `nftables` packages, the AppArmor profile on `pasta`, and cgroup2's `favordynmods` option (on the host, never in a container) — after printing every command and what it costs, and asking. |
 | `--yes` | off | With `--fix`: do not ask. |
 
 **Exit:** `0` if no check failed.

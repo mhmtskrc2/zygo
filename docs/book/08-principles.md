@@ -76,7 +76,7 @@ small program that has already imported your handler. Each request is a
 shared until one side changes it, so nothing is copied up front. And because
 each request is a fresh process, no state carries over from the last one.
 
-Measured: a median (p50, the middle value) of 1.7 ms at 250 requests per
+Measured: usually 1.4 ms at 250 requests per
 second, on the machines named in [chapter 25](25-performance.md).
 
 ```text
@@ -84,17 +84,18 @@ second, on the machines named in [chapter 25](25-performance.md).
   ────────────────────────────            ───────────────────
   held sandbox                            held sandbox + agent with handler loaded
      │                                       │
-     ├─ new process enters ─▶ run ~2 ms      ├─ fork ─▶ handler(event) ~1.7 ms
+     ├─ new process enters ─▶ run ~1.4 ms    ├─ fork ─▶ handler(event) ~1.4 ms
      └─ new process enters ─▶ run            └─ fork ─▶ handler(event)
 ```
 
 **What it costs.** A warm function stays in memory. A Python *zygote* (the
-loaded process that is forked for each request) uses about 35 MB. The idle
+loaded process that is forked for each request) uses about 20 MB, of which
+about 11 MB is its own and the rest is shared with other zygotes. The idle
 rules pause it after `idle_timeout`: it is frozen but still in memory. They
 drop it after `cold_after`, and the next request then pays the warm-up again.
 
 ```text
-  serving ──(no calls for idle_timeout)──▶ paused: frozen, still ~35 MB in RAM
+  serving ──(no calls for idle_timeout)──▶ paused: frozen, still ~20 MB in RAM
      ▲                                          │
      │                                    (no calls for cold_after)
      │                                          ▼
@@ -242,7 +243,7 @@ forks it. [Chapter 13](13-warm-functions.md) shows how to write each one.
 |---|---|---|
 | What is warm | the sandbox | the sandbox *and* a loaded interpreter |
 | A request is | a fresh process entered into the sandbox | a `fork()` of the agent |
-| Overhead | ~2 ms + the program's own start | ~1.7 ms |
+| Overhead | ~1.4 ms + the program's own start | ~1.4 ms |
 | Needs | nothing: any image, any language | an agent that speaks the [protocol](../../spec/protocol.md); Python ships, Node and sh are in `examples/` |
 | Use when | the runtime starts fast: Go, Rust, C, sh | starting the runtime is the cost: Python with imports, a JVM, Node with a dependency tree |
 

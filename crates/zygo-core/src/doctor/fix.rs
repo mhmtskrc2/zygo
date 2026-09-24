@@ -116,6 +116,12 @@ impl Fix {
 /// after Zygo so that whoever finds it in a year knows who to blame.
 const SYSCTL_FILE: &str = "/etc/sysctl.d/60-zygo-userns.conf";
 
+/// The unit that remounts cgroup2 with `favordynmods` at every boot. A
+/// `mount -o remount` lasts until the next reboot, for the same reason as the
+/// sysctl above; systemd mounts the hierarchy itself, early, with options no
+/// file controls, so a oneshot unit after it is the durable form.
+const FAVORDYNMODS_UNIT: &str = "zygo-cgroup-favordynmods.service";
+
 /// The fixes this host needs, in the order they should be applied.
 ///
 /// Empty when there is nothing to do, which is the common case and the one
@@ -133,6 +139,11 @@ pub fn plan(report: &Report) -> Vec<Fix> {
             }
             "cgroup v2" if check.status == Status::Failed => {
                 fixes.push(delegation_fix());
+            }
+            // Only on the host: in a container the hierarchy is the host's,
+            // and remounting it from inside is not this tool's to do.
+            "cgroup moves" if check.status == Status::Degraded && !in_a_container() => {
+                fixes.push(favordynmods_fix());
             }
             name if name.starts_with("egress") && check.status != Status::Ok => {
                 if let Some(fix) = egress_fix(&check.detail) {
@@ -220,6 +231,69 @@ fn delegation_fix() -> Fix {
             Command::user(&["systemctl", "--user", "daemon-reexec"]),
         ],
     }
+}
+
+fn favordynmods_fix() -> Fix {
+    let unit = format!("/etc/systemd/system/{FAVORDYNMODS_UNIT}");
+    Fix {
+        check: "cgroup moves",
+        what: "mount cgroup2 with favordynmods, now and at every boot".into(),
+        why: "from Linux 6.0, moving a process into a cgroup waits for an RCU grace \
+              period after a quiet spell. A warm request forked by an agent is moved \
+              into its own cgroup before it runs, so about 1 request in 100 waits \
+              several milliseconds — measured at ~9 ms on a 6.8 VM, against 0.85 ms \
+              with this option. Warm-exec and one-shot runs never move and are not \
+              affected."
+            .into(),
+        cost: Some(
+            "this is a setting of the whole machine's cgroup hierarchy, not only \
+             Zygo's. It keeps the kernel's thread-group lock ready for writers, which \
+             makes every fork and every exit on the machine take a slightly slower \
+             path. It was the kernel's only behaviour before Linux 6.0. Disabling \
+             the unit and rebooting restores the default."
+                .into(),
+        ),
+        commands: vec![
+            Command::root(&["mount", "-o", "remount,favordynmods", "/sys/fs/cgroup"]),
+            // `tee` for the same reason as the sysctl file: no shell to start.
+            Command::root(&["tee", &unit]).writing(favordynmods_unit_contents()),
+            Command::root(&["systemctl", "daemon-reload"]),
+            Command::root(&["systemctl", "enable", FAVORDYNMODS_UNIT]),
+        ],
+    }
+}
+
+/// What the boot-time unit should contain.
+fn favordynmods_unit_contents() -> String {
+    "# Written by `zygo doctor --fix`.\n\
+     #\n\
+     # From Linux 6.0, moving a process into a cgroup waits for an RCU grace\n\
+     # period unless cgroup2 is mounted with favordynmods, and Zygo moves every\n\
+     # warm request it forks. This remounts the hierarchy with the option at\n\
+     # boot. Disable this unit and reboot to restore the kernel's default.\n\
+     [Unit]\n\
+     Description=Mount cgroup2 with favordynmods (Zygo)\n\
+     DefaultDependencies=no\n\
+     Before=sysinit.target\n\
+     ConditionPathIsMountPoint=/sys/fs/cgroup\n\
+     \n\
+     [Service]\n\
+     Type=oneshot\n\
+     ExecStart=/bin/mount -o remount,favordynmods /sys/fs/cgroup\n\
+     \n\
+     [Install]\n\
+     WantedBy=sysinit.target\n"
+        .to_string()
+}
+
+#[cfg(target_os = "linux")]
+fn in_a_container() -> bool {
+    super::probe::in_a_container()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn in_a_container() -> bool {
+    false
 }
 
 /// What the systemd drop-in should contain.
@@ -342,6 +416,53 @@ mod tests {
 
     fn report(checks: Vec<Check>) -> Report {
         Report { checks }
+    }
+
+    #[test]
+    fn slow_cgroup_moves_are_a_root_fix_that_names_its_cost() {
+        let r = report(vec![Check::degraded(
+            "cgroup moves",
+            "without favordynmods",
+            "…",
+        )]);
+        let fixes = plan(&r);
+        if !cfg!(target_os = "linux") || in_a_container() {
+            assert!(
+                fixes.iter().all(|f| f.check != "cgroup moves"),
+                "nothing to offer off Linux or inside a container"
+            );
+            return;
+        }
+        let fix = fixes
+            .iter()
+            .find(|f| f.check == "cgroup moves")
+            .expect("a fix");
+        assert!(fix.needs_root());
+        assert!(
+            fix.cost
+                .as_deref()
+                .is_some_and(|c| c.contains("whole machine")),
+            "a host-wide change says so: {:?}",
+            fix.cost
+        );
+        assert_eq!(
+            fix.commands[0].argv,
+            ["mount", "-o", "remount,favordynmods", "/sys/fs/cgroup"]
+        );
+    }
+
+    #[test]
+    fn favoured_cgroup_moves_need_nothing() {
+        let r = report(vec![Check::ok("cgroup moves", "favordynmods")]);
+        assert!(plan(&r).iter().all(|f| f.check != "cgroup moves"));
+    }
+
+    #[test]
+    fn the_boot_unit_remounts_the_hierarchy_it_checks() {
+        let unit = favordynmods_unit_contents();
+        assert!(unit.contains("ExecStart=/bin/mount -o remount,favordynmods /sys/fs/cgroup"));
+        assert!(unit.contains("WantedBy=sysinit.target"));
+        assert!(unit.lines().all(|l| !l.starts_with(' ')), "{unit}");
     }
 
     #[test]

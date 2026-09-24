@@ -73,7 +73,7 @@ any way to reach the image store it was built from.
 
 The first run of an image pulls it, just as `docker run` does. After that,
 the image is in Zygo's store under your home folder, and a run takes about
-18 ms (median, image already pulled; the hosts are in
+12 ms (median, image already pulled; the hosts are in
 [chapter 25](25-performance.md)). The first run on a kernel older than 5.11
 is also slower, because Zygo has to flatten the image's layers once.
 [Pull policy](#pull-policy) below explains how to control pulling.
@@ -425,10 +425,10 @@ below. Planning and pulling still happen in your process; the supervisor only
 builds and runs the sandbox, and your process passes its streams and signals
 and waits.
 
-| `zygo run python:3.12-slim python3 -c pass`, p50 | |
+| `zygo run python:3.12-slim python3 -c pass`, usually | |
 |---|---|
-| In its own systemd scope | 43–46 ms |
-| Through a running supervisor | 29–30 ms |
+| In its own systemd scope | 25.7 ms |
+| Through a running supervisor | 13.5 ms |
 | Measured on | Ubuntu 24.04 VM, kernel 6.8 |
 
 The hand-off does not happen with `--dry-run` (nothing runs), with `--tty`

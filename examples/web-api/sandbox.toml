@@ -1,0 +1,8 @@
+# Two warm things for app.py to call. The third endpoint, /cold, needs
+# nothing here: it builds a fresh sandbox for every request.
+
+[fn.lower]                 # POST /lower — a warm function, one handler
+entry = "./lower.py"       # the image, python:3.12-slim, is guessed from .py
+
+[runtime.py312]            # POST /script — a runtime pool, no code of ours
+agent = "python"           # each request brings its own script

@@ -162,7 +162,7 @@ say ""
 say "the example specs"
 # Every example ships a `sandbox.toml`; each has to resolve, or the README
 # beside it is describing something that does not run.
-for example in webhook agent-tool warm-exec/go warm-exec/shell workflow-engine; do
+for example in web-api webhook agent-tool warm-exec/go warm-exec/shell workflow-engine; do
     if "$ZYGO" spec -f "$SRC/examples/$example/sandbox.toml" validate >/dev/null 2>&1; then
         ok "examples/$example/sandbox.toml validates"
     else

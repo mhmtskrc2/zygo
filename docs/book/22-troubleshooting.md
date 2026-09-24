@@ -440,6 +440,43 @@ cold_after   = "1h"
 curl -X POST .../fn/<name>/warm       # or client.warm(name) in the SDKs
 ```
 
+### 1 request in 100 takes ~10 ms, and the rest take ~1.5
+
+You see it in `zygo bench warm` or `zygo stats`: the usual request is fast,
+and the slowest 1 in 100 is several times slower. `bench warm` shows where the
+time goes, and says it: `admit` owns most of the slow request, followed by
+`cgroup2 here has no favordynmods`. `zygo doctor` reports the same thing as
+
+```text
+cgroup moves   no favordynmods: ~1 warm request in 100 waits ms to enter its cgroup   degraded
+```
+
+On Linux 6.0 and later, moving a process into a cgroup sometimes waits for the
+kernel to pass a quiet point. Only warm functions with an agent (Python,
+Node) and pools move their requests; warm-exec and one-shot runs are created
+inside their cgroup and do not wait. The fix is a setting of the whole
+machine:
+
+```bash
+zygo doctor --fix       # remounts cgroup2 with favordynmods, now and at boot
+```
+
+It prints the four commands and what they cost before it asks: every fork and
+exit on the machine gets slightly slower (about 2 µs usually, measured). On
+the Lima VM it took the slow 1 in 100 from 10.3 ms to 3.4 ms. Inside a
+container this is the host's setting — `doctor` says so and does not offer to
+change it. To undo it, `sudo systemctl disable zygo-cgroup-favordynmods` and
+reboot. [Chapter 25](25-performance.md#why-1-in-100-is-slow-on-newer-kernels)
+has the numbers.
+
+```text
+  slow 1 in 100 ──▶ zygo bench warm: most of it is `admit`?
+                         │
+                  yes ───┴──▶ zygo doctor: "cgroup moves … degraded"?
+                                   │
+                            yes ───┴──▶ zygo doctor --fix  (host-wide, asks first)
+```
+
 ### "no supervisor running"
 
 Nothing is warm. The supervisor is started by `zygo serve` or `zygo up`, and it
@@ -535,7 +572,7 @@ a *shim*: it forwards each command into the VM over one shared SSH connection.
 
 ### Everything is slow
 
-Crossing into the Linux VM costs about 20 ms per command once the VM is up,
+Crossing into the Linux VM costs about 22 ms per command once the VM is up,
 over the SSH connection Lima keeps open. If every command costs 100 ms or more,
 that connection is not being used. `ssh -F ~/.lima/zygo/ssh.config -O check
 lima-zygo` should say `Master running`. The millisecond warm path is reached

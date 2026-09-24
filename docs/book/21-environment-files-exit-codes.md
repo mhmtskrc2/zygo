@@ -79,8 +79,10 @@ $XDG_RUNTIME_DIR/zygo/                  the runtime folder (ZYGO_RUNTIME_DIR), m
 ```
 
 Beside your project, `zygo up` writes `zygo.lock`, which you should commit.
-`zygo doctor --fix` may write `~/.config/systemd/user/user@.service.d/delegate.conf`
-and `/etc/sysctl.d/60-zygo-userns.conf`, and prints both before it does. On a
+`zygo doctor --fix` may write `~/.config/systemd/user/user@.service.d/delegate.conf`,
+`/etc/sysctl.d/60-zygo-userns.conf` and
+`/etc/systemd/system/zygo-cgroup-favordynmods.service`, and prints each one
+before it does. On a
 Mac, the VM lives in `~/.lima/zygo/`. There is no Zygo config file: the spec
 and the lock are the only configuration.
 

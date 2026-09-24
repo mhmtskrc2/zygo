@@ -213,7 +213,7 @@ zygo api                     # listens on 127.0.0.1:7700, bearer-token auth
 ```python
 import zygo
 client = zygo.connect()
-out = client.fn("resize")({"url": "..."})
+out = client.fn("resize")({"url": "..."}).result   # what the handler returned
 ```
 
 The API starts **call-only**: a token can call the functions somebody
@@ -519,7 +519,7 @@ offers turned on. Every number in this book is measured on it.
 yours: a smaller attack surface, at a cost on every syscall. Warm functions
 and networked sandboxes on it are refused with a reason, never weakened.
 **`vm`** is a hardware wall: libkrun and KVM, with a guest kernel of its own.
-On the Raspberry Pi 5 a one-shot run took about 400 ms, against about 40 ms
+On the Raspberry Pi 5 a one-shot run took about 420 ms, against about 73 ms
 for `ns` on the same machine. The guest writes to a private layer, bounded by
 `scratch`, and nothing it writes reaches the shared image or the next
 sandbox. It has no networking and no warm functions yet.

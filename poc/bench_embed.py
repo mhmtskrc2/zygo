@@ -299,7 +299,7 @@ def main(args: list[str]) -> int:
     print()
     print("Every number above is a whole process: the client starting, the request, the")
     print("answer. An embedder calling `zygo api` over a unix socket does not pay the")
-    print("client start-up — `zygo bench warm` measures that path and reports ~1.7 ms.")
+    print("client start-up — `zygo bench warm` measures that path and reports ~1.4 ms.")
 
     subprocess.run([ZYGO, "stop", "embed"], capture_output=True)
 

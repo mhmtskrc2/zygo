@@ -41,7 +41,7 @@ doing once. Without an agent Zygo uses *warm-exec*: the sandbox is held open
 and each request is a fresh process running your `cmd`, with the event on
 standard input and JSON expected on standard output. That works for every
 image and every language, and needs no code from you at all. It costs a median
-of about 2.2 ms a request, measured in Docker Desktop's VM on an Apple M1 Max
+of about 1.4 ms a request, measured on a Lima VM on an Apple M1 Max
 ([chapter 25](25-performance.md)). An agent is what you write when starting
 your runtime and importing your libraries costs more than that: a Python
 interpreter with its imports, a JVM, a Node process with a large dependency
@@ -269,8 +269,8 @@ from one that is blocked.
 
 For a *runtime pool* ([chapter 13](13-warm-functions.md#runtime-pools)), the
 agent starts with no handler, and each `EXEC` carries a `script`. This lets one
-warm zygote serve thousands of scripts; a warm zygote costs about 10 MB of
-memory, so ten thousand of them would need about 97 GiB.
+warm zygote serve thousands of scripts; a warm zygote costs about 11 MB of
+memory, so ten thousand of them would need about 109 GiB.
 
 | Field | Meaning |
 |---|---|

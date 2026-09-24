@@ -2568,6 +2568,21 @@ fn admit(
     host_pid: u32,
     narrower: Option<&crate::sandbox::limits::Limits>,
 ) -> Option<PathBuf> {
+    let dir = request_cgroup(generation, per_request, id, narrower)?;
+    let _ = crate::cgroup::attach(&dir, host_pid);
+    Some(dir)
+}
+
+/// Make a request's cgroup, with its limits written, before anything is in
+/// it. [`admit`] then moves the request in; the warm-exec path instead
+/// creates the request inside it (`CLONE_INTO_CGROUP`), which never takes the
+/// kernel's thread-group lock for writing and so never waits on it.
+fn request_cgroup(
+    generation: Option<&std::path::Path>,
+    per_request: bool,
+    id: &str,
+    narrower: Option<&crate::sandbox::limits::Limits>,
+) -> Option<PathBuf> {
     if !per_request {
         return None;
     }
@@ -2587,7 +2602,6 @@ fn admit(
     if let Some(limits) = narrower {
         let _ = crate::cgroup::apply(&dir, &limits.cgroup_writes());
     }
-    let _ = crate::cgroup::attach(&dir, host_pid);
     Some(dir)
 }
 
@@ -3168,6 +3182,20 @@ impl WarmExec {
             id: &id,
         };
 
+        // The request's cgroup exists before the request does, so the request
+        // can be created inside it rather than moved there (see
+        // `enter::enter_with`). A warm-exec function is one tenant's and its
+        // limits were set at warm time; there is nothing per-request to narrow.
+        let request_cgroup = request_cgroup(
+            self.generation_cgroup.as_deref(),
+            self.per_request_cgroup,
+            &id,
+            None,
+        );
+        let request_cgroup_dir = request_cgroup
+            .as_deref()
+            .and_then(|dir| std::fs::File::open(dir).ok());
+
         let entered = {
             let sandbox = self.sandbox.lock().expect("sandbox");
             let ns = sandbox
@@ -3177,11 +3205,22 @@ impl WarmExec {
                     reason: "the sandbox has no namespace descriptors".into(),
                     remedy: "internal error; the function will be rewarmed".into(),
                 })?;
-            enter::enter_with(&self.plan, ns, argv.as_ref())
+            enter::enter_with(
+                &self.plan,
+                ns,
+                argv.as_ref(),
+                request_cgroup_dir
+                    .as_ref()
+                    .map(std::os::fd::AsRawFd::as_raw_fd),
+            )
         };
+        drop(request_cgroup_dir);
         let entered = match entered {
             Ok(entered) => entered,
             Err(e) => {
+                if let Some(dir) = &request_cgroup {
+                    let _ = crate::cgroup::Hierarchy::remove(dir);
+                }
                 // Could not even get a process into the sandbox. If the init
                 // is gone the sandbox is gone; otherwise this request failed
                 // and the next may not.
@@ -3196,19 +3235,16 @@ impl WarmExec {
         let forked = Instant::now();
 
         // The request is parked until `go` is written: this is the window in
-        // which it can be put in its cgroup and given its secrets, before it
-        // has run a single instruction of tenant code. Its pid is already a
-        // host pid — `fork()` in the helper returned it in the host's
-        // namespace — so nothing needs translating.
-        let request_cgroup = admit(
-            self.generation_cgroup.as_deref(),
-            self.per_request_cgroup,
-            &id,
-            entered.pid,
-            // A warm-exec function is one tenant's and its limits were set at
-            // warm time; there is nothing per-request to narrow.
-            None,
-        );
+        // which it can be given its secrets — and, when the kernel would not
+        // create it inside its cgroup, moved there — before it has run a
+        // single instruction of tenant code. Its pid is already a host pid —
+        // the helper's `clone3` returned it in the host's namespace — so
+        // nothing needs translating.
+        if let Some(dir) = &request_cgroup
+            && !entered.placed
+        {
+            let _ = crate::cgroup::attach(dir, entered.pid);
+        }
         // Through the descriptor the sandbox handed out at launch, never
         // through `/proc`: a held sandbox is not dumpable, and nothing an
         // unprivileged supervisor does changes that.

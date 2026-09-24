@@ -7,27 +7,37 @@ names the machine it came from. You can run the same commands and check them.
 
 ## The short version
 
+All numbers were measured on 25 September 2026, on the code at commit
+`9607289`, on the **Lima VM** unless marked. [The machines](#the-machines)
+says why that machine.
+
 ```text
-  what one request costs, median, on Docker Desktop's VM unless marked
+  what one request costs, usually (the median), on the Lima VM unless marked
   ──────────────────────────────────────────────────────────────────────────
-  warm function (a fork)          1.70 ms  ▌
-  runtime pool (a fork)           2.07 ms  ▌
-  warm-exec (a new process)        2.2 ms  ▌
-  one-shot sandbox                18.4 ms  ██
-  vm backend, one-shot (Pi 5)     ~400 ms  ████████████████████████████████████
+  warm function (a fork)          1.44 ms  ▌
+  runtime pool (a fork)           1.91 ms  ▌
+  warm-exec (a new process)       1.43 ms  ▌
+  one-shot sandbox                12.3 ms  █
+  vm backend, one-shot (Pi 5)      422 ms  ████████████████████████████████████████
   ──────────────────────────────────────────────────────────────────────────
-  one █ is about 11 ms
+  one █ is about 10.5 ms
 ```
 
-| | Median | Where it was measured |
-|---|---|---|
-| A warm request | 1.70 ms | Docker Desktop's VM |
-| A warm request from a pool, a different script each time | 2.07 ms | Docker Desktop's VM |
-| Sustained throughput through one warm function | 981 requests a second | Docker Desktop's VM |
-| A one-shot sandbox, image already pulled | 18.4 ms | Docker Desktop's VM |
-| A one-shot sandbox under a hardware boundary (`vm`) | ~400 ms | Raspberry Pi 5 |
-| One more warm script, one zygote each | 9.98 MB | Docker Desktop's VM |
-| One more warm script, in a runtime pool | 0.0 kB | Docker Desktop's VM |
+| | Usually | 1 in 100 | Where it was measured |
+|---|---|---|---|
+| A warm request | 1.44 ms | 10.5 ms | Lima VM |
+| A warm request from a pool, a different script each time | 1.91 ms | 11.4 ms | Lima VM |
+| A warm-exec request | 1.43 ms | 4.3 ms | Lima VM |
+| Sustained throughput through one warm function | 1,108 requests a second | | Lima VM |
+| A one-shot sandbox, image already pulled | 12.3 ms | 15.3 ms | Lima VM |
+| A one-shot sandbox under a hardware boundary (`vm`) | 422 ms | | Raspberry Pi 5 |
+| One more warm script, one zygote each | 11.1 MB | | Lima VM |
+| One more warm script, in a runtime pool | 0.0 kB | | Lima VM |
+
+The "1 in 100" column is much higher than the usual one for the warm function
+and the pool. That is a known kernel effect on Linux 6.x, not noise: with the
+`favordynmods` setting `zygo doctor --fix` offers, both fall to about 3.4 ms
+([why](#why-1-in-100-is-slow-on-newer-kernels)).
 
 The rest of the chapter explains each line, and the
 [embedder's benchmark](#the-embedders-benchmark) compares them with what you
@@ -68,19 +78,27 @@ and a user who waits for the slow one does not care about the average.
 
 Every millisecond in this book came from one of these three machines.
 
-| | Raspberry Pi 5 | Docker Desktop's VM | Lima VM (the macOS shim) |
+| | Lima VM (the main one) | Raspberry Pi 5 | Docker Desktop's VM |
 |---|---|---|---|
-| Hardware | 4× Cortex-A76, 8 GiB, aarch64 | 5 vCPU, 8 GiB, of an Apple M1 Max | 2 vCPU, 4 GiB, of the same Mac |
-| OS and kernel | Ubuntu 23.10, Linux 6.5 | LinuxKit, Linux 5.10 | Ubuntu 24.04, Linux 6.8 |
-| How Zygo ran | an ordinary user, under a systemd session — the way a real host runs it | a privileged container, as root | forwarded from the Mac shell, as an ordinary user |
-| What was measured here | the fifty use-case scenarios, the supervisor and MCP suites, warm-up, and the `vm` backend end to end | the warm path, the cold start, throughput, the escape suite, the seccomp sweep and matrix | the shim's own overhead, and the same suites through the hop |
+| Hardware | 2 vCPU, 4 GiB, of an Apple M1 Max | 4× Cortex-A76, 8 GiB, aarch64 | 5 vCPU, 8 GiB, of the same Mac |
+| OS and kernel | Ubuntu 24.04, Linux 6.8 | Ubuntu, Linux 6.5 | LinuxKit, Linux 5.10 |
+| How Zygo ran | an ordinary user under a systemd login, the binary on the VM's own disk | an ordinary user, under a systemd session, everything in RAM (`/dev/shm`) | a privileged container, as root |
+| What is measured here | almost everything: warm path, pool, warm-exec, one-shot, throughput, density, the embedder's benchmark, bytecode, dependencies | the `vm` backend, warm-up times, and the older embedder's table with kern | a check of the warm path on an older kernel |
+
+**Why Lima.** Until 25 September most numbers came from Docker Desktop's VM.
+Re-measured that day, it had become twice as slow at one-shot sandboxes
+(40.7 ms against the 18.4 ms once published) — and a build of Zygo from 20
+September was just as slow there, so the machine had changed, not the code.
+Lima is closer to a real host: a normal Linux, a normal user, overlayfs. On
+Docker Desktop's VM, the same day, the warm path was 1.55 ms usually and
+2.60 ms for 1 in 100; the pool 2.01 / 3.20 ms; throughput 1,043 requests a
+second.
 
 ## Two things to know about these machines
 
-**Unless a section says otherwise, a number is from Docker Desktop's VM.** That
-is the slowest of the three for this work. A cgroup operation there costs
-several times what it does on bare metal ("bare metal" means a real machine,
-not a virtual one). So the warm-path figures are careful, not flattering.
+**Unless a section says otherwise, a number is from the Lima VM.** It is a
+virtual machine on a laptop with two virtual CPUs, not a server. A real
+server is usually faster; the numbers here are careful, not flattering.
 
 **No number here is from an x86_64 machine.** All three hosts are aarch64
 (64-bit ARM). The CI workflow builds and tests on x86_64 runners, and the
@@ -113,18 +131,65 @@ child, and the reply.
   ─────────────────────────────────────────────────────────────────
 ```
 
-| | |
+| Lima VM, 10,000 requests at 250 a second | |
 |---|---|
-| Median request overhead | 1.70 ms |
-| 99th percentile | 2.81 ms |
-| Measured at | 250 requests a second |
-| Sustained throughput | 981 requests a second at a concurrency of 4 |
+| Usually (median) | 1.44 ms |
+| 1 in 100 (99th percentile) | 10.5 ms |
+| Sustained throughput | 1,108 requests a second, 4 clients |
 
 These are overhead: the time Zygo adds around your handler, with the handler's
 own work taken away. `zygo bench warm` reports the two separately. It also
 reports the host's own `fork()` floor next to them, which is the time the
 machine needs for a bare fork. So you can see how much of the number belongs
 to the machine and how much to Zygo.
+
+## Why 1 in 100 is slow on newer kernels
+
+On a stock Linux 6.x, 99 requests in 100 take about 1.5 ms and the last one
+takes about 10. The phase breakdown shows where: 80–87% of that slow request
+is `admit`, the step that puts the new process in its own cgroup. Moving a
+process between cgroups takes one of the kernel's locks for writing, and since
+Linux 6.0 the first writer after a quiet spell waits for the whole kernel to
+pass a quiet point — several milliseconds. Before 6.0 the kernel kept that lock
+ready for writers all the time, which is why Docker Desktop's 5.10 kernel does
+not show it (1 in 100 there: 2.60 ms).
+
+There are two ways to not pay it, and Zygo uses both:
+
+- **Do not move the process at all.** A process *created* inside its cgroup
+  (`clone3` with `CLONE_INTO_CGROUP`, Linux 5.7) never takes the lock for
+  writing. One-shot sandboxes and zygotes have always been started this way,
+  and since 25 September 2026 so is every **warm-exec** request.
+- **Keep the lock ready for writers.** A warm request on the *agent* path is
+  forked by Python inside the sandbox, where `clone3` is refused by the
+  seccomp filter on purpose, so it has to be moved. Mounting the cgroup file
+  system with the `favordynmods` option makes the move cheap. `zygo doctor`
+  reports it as `cgroup moves`, and `zygo doctor --fix` turns it on, now and
+  at every boot.
+
+| Lima VM, Linux 6.8, 10,000 requests at 250 a second | usually | 1 in 100 |
+|---|---|---|
+| agent warm function, as the kernel comes | 1.61 ms | 10.3 ms |
+| agent warm function, with `favordynmods` | 1.61 ms | **3.4 ms** |
+| pooled script, as the kernel comes | 2.06 ms | 11.1 ms |
+| pooled script, with `favordynmods` | 1.99 ms | **3.3 ms** |
+| warm-exec, created in its cgroup, as the kernel comes | 1.43 ms | **4.3 ms** (was 10.5) |
+
+```text
+  1 in 100 warm requests, Lima VM, Linux 6.8
+  ─────────────────────────────────────────────────────────────────
+  agent, as the kernel comes     ████████████████████████  10.3 ms
+  agent, with favordynmods       ████████                   3.4 ms
+  warm-exec, born in its cgroup  ██████████                 4.3 ms
+  ─────────────────────────────────────────────────────────────────
+```
+
+**What `favordynmods` costs.** It is a setting of the whole machine, not only
+Zygo's: every fork and every exit takes a slightly slower path through the
+same lock. Measured on the same VM, a bare fork-and-wait went from 106 to
+108 µs usually and from 206 to 230 µs for 1 in 100. That is why Zygo asks
+before turning it on rather than doing it for you. Inside a container it is
+the host's setting, and `doctor` says so instead of offering a fix.
 
 ## Warming up
 
@@ -134,53 +199,57 @@ the sandbox is dropped and the same cost is paid again.
 
 ```text
   warm-up of a Python handler, Raspberry Pi 5 (includes starting the supervisor)
-  ──────────────────────────────────────────────────────────────────────────
-  imports nothing        ~270 ms  ███████████████████████
-  imports seven modules  ~470 ms  ████████████████████████████████████████
-  ──────────────────────────────────────────────────────────────────────────
+  ────────────────────────────────────────────────────────────────
+  imports nothing        154 ms  █████████████████████████████████
+  imports seven modules  185 ms  ████████████████████████████████████████
+  ────────────────────────────────────────────────────────────────
   the seven: json, re, ssl, decimal, datetime, hashlib, urllib.request
 ```
 
-Both numbers include starting the supervisor, which the first `serve` does.
+Both numbers are the median of five, and both include starting the
+supervisor, which the first `serve` does. With a supervisor already running
+it is less: on the Lima VM, `zygo bench warm` warms a function in 34 ms.
+(Before the [bytecode layer](#python-bytecode), the same two took ~270 and
+~470 ms: most of the seven imports' cost was compiling them.)
 
 ## Warm-exec
 
 In warm-exec, the sandbox is held open but each request is a fresh process, not
 a fork. This is the mode for a compiled program: no agent, no runtime, just
-`cmd`. It costs a median of **2.2 ms**. [Chapter 13](13-warm-functions.md#warm-exec-functions)
+`cmd`. It costs **1.43 ms** usually, and 4.3 ms for 1 in 100. Zygo creates
+each request directly inside its cgroup, so the kernel tail
+[above](#why-1-in-100-is-slow-on-newer-kernels) does not reach it. [Chapter 13](13-warm-functions.md#warm-exec-functions)
 shows how to set it up.
 
 ## A runtime pool
 
 In a runtime pool the zygote holds no code at all. The script arrives with the
-request, and the forked child loads it. It costs a median of **2.07 ms** and a
-99th percentile of **2.92 ms**. That was measured with a *different script on
+request, and the forked child loads it. It costs **1.91 ms** usually and
+**11.4 ms** for 1 in 100. That was measured with a *different script on
 every request*: a thousand scripts, each called once before anything was
 measured.
 
-| | p50 | p99 |
+| One `zygo bench all`, Lima VM | usually | 1 in 100 |
 |---|---|---|
-| A warm function | 1.42 ms | 2.12 ms |
-| A pooled script | 2.07 ms | 2.92 ms |
-| What the pool costs | +0.65 ms | +0.80 ms |
+| A warm function | 1.44 ms | 10.5 ms |
+| A pooled script | 1.91 ms | 11.4 ms |
+| What the pool costs | +0.47 ms | +0.83 ms |
 
-Both rows come from one `zygo bench all` on one host. So the difference belongs
-to the pool, not to the machine. (The 1.42 ms here and the 1.70 ms above are
-two different runs.)
+Both rows come from one run on one host, so the difference belongs to the
+pool, not to the machine. Docker Desktop's VM, the same day, agrees on the
+cost: +0.46 ms usually, +0.60 ms for 1 in 100.
 
 ```text
-  warm function vs pooled script, one run, Docker Desktop's VM
-  ──────────────────────────────────────────────────────────────────
-  p50   warm function   1.42 ms  ██████████████
-        pooled script   2.07 ms  █████████████████████
-  p99   warm function   2.12 ms  █████████████████████
-        pooled script   2.92 ms  █████████████████████████████
-  ──────────────────────────────────────────────────────────────────
+  warm function vs pooled script, usually, one run, Lima VM
+  ────────────────────────────────────────────────────
+  warm function   1.44 ms  ██████████████
+  pooled script   1.91 ms  ███████████████████
+  ────────────────────────────────────────────────────
   one █ is 0.1 ms
 ```
 
-That two-thirds of a millisecond is the whole cost. It is writing the script
-into the sandbox, and the child compiling and loading it.
+That half a millisecond is the whole cost. It is writing the script into the
+sandbox, and the child compiling and loading it.
 `zygo bench warm --pool --scripts 1000` reproduces it. The memory side — a
 thousand scripts in one zygote, flat in the script count — is in
 [density with a runtime pool](#density-with-a-runtime-pool).
@@ -216,39 +285,46 @@ anything.
 
 `zygo run` builds a sandbox, runs a program and tears it down.
 
-| | |
+| Lima VM, `python3 -c pass`, 50 runs | |
 |---|---|
-| Median, image already pulled | 18.4 ms |
+| Usually, image already pulled | 12.3 ms |
+| 1 in 100 | 15.3 ms |
 | Budget it was measured against | 50 ms |
+| The same with `/bin/true` instead of Python | 3.6 ms |
 
-Most of that is the namespace set, the cgroup and the mount plan
-([chapter 6](06-how-zygo-works.md#the-one-shot-sandbox-zygo-run)).
+The `/bin/true` line is the sandbox alone: namespaces, cgroup, mounts
+([chapter 6](06-how-zygo-works.md#the-one-shot-sandbox-zygo-run)). The rest of
+the 12.3 ms is Python starting.
+
 Two first-time costs are not in it. The first run of an image also pulls it.
 The first run on a kernel without unprivileged overlayfs also flattens the
 image's layers into one directory. `zygo bench cold` says which of those
-happened, because a number that hides them is misleading.
+happened, because a number that hides them is misleading. (Docker Desktop's
+VM is such a kernel; there the same run took 40.7 ms on 25 September —
+see [the machines](#the-machines).)
 
 ## A one-shot sandbox on a systemd login
 
 On a normal systemd login, `zygo run` costs more. The shell's own cgroup cannot
 hold a sandbox, so `zygo run` first re-executes itself inside a transient
-systemd *scope* (a small cgroup that systemd makes on request). That is about
-15 ms of scope, a second process and a cgroup tree that is thrown away.
+systemd *scope* (a small cgroup that systemd makes on request). That costs
+about 12 ms: a scope, a second process, and a cgroup tree that is thrown
+away.
 
 When a supervisor is running, `zygo run` hands the sandbox to it instead and
 pays none of that:
 
-| | p50 |
+| `zygo run python:3.12-slim python3 -c pass`, usually, median of 15 | |
 |---|---|
-| `zygo run python:3.12-slim python3 -c pass`, own scope | 43–46 ms |
-| The same, through a running supervisor | 29–30 ms |
-| Measured on | Ubuntu 24.04 VM, kernel 6.8 |
+| in its own scope, no supervisor | 25.7 ms |
+| the same, through a running supervisor | 13.5 ms |
+| Measured on | Lima VM, Ubuntu 24.04, kernel 6.8 |
 
 ```text
-  zygo run python:3.12-slim python3 -c pass, p50, Ubuntu 24.04 VM
+  zygo run python:3.12-slim python3 -c pass, usually, Lima VM
   ────────────────────────────────────────────────────────────────
-  own scope             ████████████████████████████████████████  43–46 ms
-  through supervisor    ██████████████████████████               29–30 ms
+  own scope             ████████████████████████████████████████  25.7 ms
+  through supervisor    █████████████████████                     13.5 ms
   ────────────────────────────────────────────────────────────────
 ```
 
@@ -261,21 +337,20 @@ pays none of that:
 The `vm` backend boots a guest kernel under KVM (the Linux feature that runs
 virtual machines) and runs the program inside it.
 
-| | |
+| Raspberry Pi 5, `zygo run … true`, median of 7 | |
 |---|---|
-| One-shot run, image already in the store | ~400 ms |
-| The same run on `ns`, same host | ~40 ms |
-| Measured on | the Raspberry Pi 5 |
+| `--isolation vm`, image already in the store | 422 ms |
+| `--isolation ns`, same host, own systemd scope | 73 ms |
 
 ```text
   one-shot run, Raspberry Pi 5
-  ──────────────────────────────────────────────────────────
-  ns    ████                                        ~40 ms
-  vm    ████████████████████████████████████████   ~400 ms
-  ──────────────────────────────────────────────────────────
+  ────────────────────────────────────────────────────────
+  ns    ███████                                     73 ms
+  vm    ████████████████████████████████████████   422 ms
+  ────────────────────────────────────────────────────────
 ```
 
-That is ten times the setup cost of `ns`, in exchange for a kernel the tenant
+That is about six times the cost of `ns`, in exchange for a kernel the tenant
 does not share with the host. The first run of an image is several seconds
 longer, because the store flattens it. That is all that is measured: the `vm`
 backend has no warm path and no networking, so there is nothing else to time
@@ -284,23 +359,22 @@ yet ([ADR 0002](adr/0002-warm-paths-stay-on-ns.md) says why).
 ## Dependencies
 
 A `requirements` file is built into a virtual environment (a *venv*: a folder
-with its own Python packages) once. Every function that names the same file
-against the same image then shares it.
+with its own Python packages) once. Every run and every function that names
+the same file against the same image then shares it.
 
-| | |
+| Lima VM, `requirements.txt` = `requests` | |
 |---|---|
-| First build | 3970 ms |
-| Reused by a second function | 111 ms |
+| First build (the `plan` phase of the first `zygo run --requirements`) | 2.5 s |
+| Every later run: finding the built venv | 1–2 ms |
 
 ```text
-  first build  ████████████████████████████████████████  3970 ms
-  reused       █                                          111 ms
+  first build  ████████████████████████████████████████  2516 ms
+  reused       ▏                                            2 ms
 ```
 
 The build installs with the image's own `pip` (`pip --python <venv>`) and skips
-`ensurepip`. `ensurepip` put a second pip into every venv, and it cost 2.0 s of
-every build before a single package was installed. Building a venv with
-`requests` in the same sandbox took 3.0 s the old way and 1.8 s this way.
+`ensurepip`. `ensurepip` put a second pip into every venv, and when this was
+changed it cost 2.0 s of every build before a single package was installed.
 
 The cache is keyed on the image's digest and the file's bytes. So two projects
 with the same requirements share one build, and any edit makes a new one. The
@@ -314,27 +388,27 @@ it, and normally saves that file for next time. The official `python:*-slim`
 images ship no `.pyc` files — 1097 `.py` files in `python:3.12-slim`'s standard
 library and not one compiled. A sandbox's root is read-only, so Python cannot
 save what it compiles either. So every run compiled every module it imported
-again: `import re` alone was 34 ms.
+again.
 
 So the first `zygo pull` or `run` of such an image compiles its standard
-library once, inside a sandbox, into a layer of its own. That takes ≈2.4 s and
-18.5 MB for `python:3.12-slim`. The result is served as
-`<image>+bytecode.<key>`. The `.pyc` files sit next to the sources and are
-`unchecked-hash`: a layer never changes, so there is nothing to check them
-against.
+library once, inside a sandbox, into a layer of its own. On the Lima VM that
+takes 3.2 s and makes an 18.6 MB layer for `python:3.12-slim`. The result is
+served as `<image>+bytecode.<key>`. The `.pyc` files sit next to the sources
+and are `unchecked-hash`: a layer never changes, so there is nothing to check
+them against.
 
-| run phase, median of seven, Lima VM | without | with |
+| Lima VM, the run phase, median of 7 | without the layer | with it |
 |---|---|---|
-| `python -c pass` | 13.7 ms | 13.7 ms |
-| a harness importing `re`, `json`, `hmac`, `urllib.request` and a few more | 190 ms | 47 ms |
-| `import ssl` | — | 26.8 ms |
+| `python3 -c pass` | 9.4 ms | 6.9 ms |
+| `import re, json, hmac, hashlib, base64, datetime, urllib.request, urllib.parse, uuid, decimal` | 164.8 ms | 34.9 ms |
+| `import ssl` | 65.7 ms | 17.1 ms |
 
 ```text
-  a harness importing re, json, hmac, urllib.request and a few more, Lima VM
-  ─────────────────────────────────────────────────────────────────────
-  without bytecode layer   ████████████████████████████████████████  190 ms
-  with bytecode layer      ██████████                                 47 ms
-  ─────────────────────────────────────────────────────────────────────
+  importing ten common modules, Lima VM
+  ────────────────────────────────────────────────────────────────
+  without bytecode layer   ████████████████████████████████████████  164.8 ms
+  with bytecode layer      ████████                                   34.9 ms
+  ────────────────────────────────────────────────────────────────
 ```
 
 An image that already has bytecode, or has no Python, is served as it is.
@@ -344,7 +418,7 @@ get the original image — never a failed run.
 ## On a Mac
 
 Sandboxes are Linux. On macOS every command runs inside a Linux virtual machine
-that Zygo manages. Crossing into it costs about **20 ms per command** once the
+that Zygo manages. Crossing into it costs about **22 ms per command** once the
 VM is up. The shim goes over the SSH connection Lima already holds open
 (`ssh -F ~/.lima/zygo/ssh.config`). It asks `limactl` for nothing unless that
 connection is down — which is when the VM needs booting anyway.
@@ -355,43 +429,39 @@ by the connection, not once per request.
 
 ## Where a one-shot run from a Mac spends its time
 
-Median of nine, after a warm-up, on the Mac this was measured on:
+Median of nine, after a warm-up, on an M1 Max, 25 September 2026:
 
-| | |
-|---|---|
-| one event end to end, from a Mac shell | **30 ms** |
-| of which the sandbox (`zygo run … true` typed *inside* the VM) | ~10 ms |
-| `zygo ps` from the Mac — the pure-hop baseline, no sandbox | 20 ms |
-| `ssh -F … lima-zygo true` — the connection alone | under 10 ms |
-| `zygo --version` — no VM at all | 0 ms |
+| | supervisor running in the VM | no supervisor |
+|---|---|---|
+| `zygo run python:3.12-slim true`, from a Mac shell | **28.7 ms** | 41.8 ms |
+| the same, typed *inside* the VM — the sandbox alone | 6.2 ms | 16.4 ms |
+| `zygo ps` from the Mac — the pure hop, no sandbox | 23.6 ms | |
+| `ssh -F … lima-zygo true` — the connection alone | 10.9 ms | |
+| `zygo --version` — no VM at all | 5.4 ms | |
 
 ```text
-  one zygo run from a Mac shell, 30 ms end to end
-  ──────────────────────────────────────────────────────────
-  ◄───── the hop into the VM: 20 ms ─────►◄─ sandbox ~10 ms ─►
-  ████████████████████████████████████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
-  ──────────────────────────────────────────────────────────
+  one zygo run from a Mac shell, supervisor running, 28.7 ms end to end
+  ──────────────────────────────────────────────────────────────────
+  ◄──────── the hop into the VM: ~22 ms ─────────►◄ sandbox 6 ms ►
+  ████████████████████████████████████████████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
+  ──────────────────────────────────────────────────────────────────
 ```
 
-Before the shim used the connection directly, the same run was **171 ms**. About
-148 ms of that was `limactl shell` (40–50 ms) plus a `limactl list` per command
-to ask whether the VM was running. Both are gone from the hot path.
+Before the shim used the SSH connection directly, the same run was
+**171 ms**. About 148 ms of that was `limactl shell` (40–50 ms) plus a
+`limactl list` per command to ask whether the VM was running. Both are gone
+from the hot path.
 
 ## Why `run` looks slow on a Mac
 
-So "why is `run` 170 ms when `bench cold` says 22?" has one answer: the hop. A
-Linux host sees the 23. The same run through Docker Desktop on the same Mac was
-433 ms. The hop is not being made faster, by decision
+So "why is `run` 29 ms from my Mac when `bench cold` says 12?" has one
+answer: the hop. A Linux host sees the 12. The same `true` through Docker
+Desktop on the same Mac (`docker run --rm python:3.12-slim true`) took
+397 ms. The hop is not being made faster, by decision
 ([ADR 0001](adr/0001-embedded-runtime.md) puts macOS latency on its "not now"
 list). For anything that must be fast on a Mac, use the warm path through the
 API; [chapter 13](13-warm-functions.md#a-multi-tenant-consumer-on-the-warm-path)
 has the worked example of a multi-tenant consumer on the warm path.
-
-| Inside the same Lima VM | |
-|---|---|
-| `bench warm`, p50 | **0.91 ms** |
-| `bench warm`, throughput | 845 requests a second |
-| `bench cold`, p50 | 22.6 ms |
 
 ## What is not measured
 
@@ -516,7 +586,7 @@ make bench-embed            # or: sh poc/bench_embed.sh --runs 100
 
 | | |
 |---|---|
-| Host | Docker Desktop's Linux VM on an Apple M1 Max — 5 vCPU, 8 GiB, **Linux 5.10**, aarch64 |
+| Host | the Lima VM: 2 vCPU, 4 GiB, Ubuntu 24.04, **Linux 6.8**, aarch64 |
 | Image | `python:3.12-slim`, already pulled, **the same one for every runner** |
 | Script | sixteen standard-library modules imported at module level, then a little XML, a hash and a UUID |
 | Runs | 60 per runner, after 3 warm-up calls |
@@ -525,29 +595,40 @@ make bench-embed            # or: sh poc/bench_embed.sh --runs 100
 A *runner* here is one way of running the script: a warm fork, a fresh sandbox
 per call, or a fresh container per call.
 
-## The result on the M1 VM
+## The result on the Lima VM
 
-| runner | p50 | p90 | p99 | min |
+| runner | usually (p50) | p90 | 1 in 100 (p99) | fastest |
 |---|---|---|---|---|
-| **`zygo exec`** (warm fork) | **6.4 ms** | 7.1 ms | 7.8 ms | 5.1 ms |
-| `zygo run` (a fresh sandbox per call) | 384.7 ms | 403.7 ms | 419.0 ms | 371.0 ms |
-| `docker run --rm` | 761.9 ms | 790.6 ms | 827.4 ms | 716.3 ms |
+| **`zygo exec`** (warm fork) | **2.8 ms** | 3.4 ms | 11.2 ms | 2.1 ms |
+| `zygo run` (a fresh sandbox per call) | 70.8 ms | 72.1 ms | 76.1 ms | 67.4 ms |
+| `docker run --rm` | 542.4 ms | 553.2 ms | 559.1 ms | 528.5 ms |
 | `kern box` | not measured on this host — see the Pi table below | | | |
 
 ```text
-  p50 per call, same script, same image, Docker Desktop's VM on an M1 Max
+  usually, per call, same script, same image, Lima VM
   ────────────────────────────────────────────────────────────────────────
-  docker run --rm   ████████████████████████████████████████   761.9 ms
-  zygo run          ████████████████████                       384.7 ms
-  zygo exec         ▌                                            6.4 ms
+  docker run --rm   ████████████████████████████████████████   542.4 ms
+  zygo run          █████▏                                      70.8 ms
+  zygo exec         ▏                                            2.8 ms
   ────────────────────────────────────────────────────────────────────────
 ```
 
-**60× faster than the best one-shot runner.** The one-time cost of getting
-there — warming the function — was 598 ms. Two calls of `zygo run` would have
+**25× faster than the best one-shot runner.** The one-time cost of getting
+there — warming the function — was 114 ms. Two calls of `zygo run` would have
 paid for it.
 
+The ratio was 60× when this was first measured, on Docker Desktop's VM
+(6.4 ms against 384.7 ms, with `docker run` at 761.9 ms). It fell because the
+one-shot path got five times faster — mostly the [bytecode
+layer](#python-bytecode), which stopped Python from compiling its standard
+library on every run — not because the warm path got slower. The gate in
+ADR 0001 is 10×, so it still holds with room.
+
 ## A second host, with `kern` in it
+
+This table is older: it was measured before the bytecode layer existed, and
+was not repeated on 25 September, to keep load off that machine (it is also a
+production server). Read its ratios, not its absolute numbers.
 
 The same benchmark on a **Raspberry Pi 5**: 4× Cortex-A76, 8 GiB, Ubuntu 24.04,
 kernel 6.5, bare metal, nothing else running. It includes
@@ -623,7 +704,7 @@ It is kept only because deleting it would be worse. Forty seconds for
 `docker run --rm` on a Pi is not a believable measurement of Docker. It is a
 measurement of this Pi's storage under a cycle of creating and destroying
 containers, and possibly of the four runners sharing the machine. Do not quote
-it. The M1 figure above (761.9 ms at p50) is the one to read.
+it. The Lima figure above (542.4 ms usually) is the one to read.
 
 ## What the two hosts agree on
 
@@ -633,19 +714,19 @@ fork does not pay it.
 
 ## Reading it honestly: the gap is the interpreter
 
-`zygo run` is 385 ms in the M1 table, while
-[the one-shot number](#a-one-shot-sandbox) is 18 ms. Both are right. The 18 ms
-is the sandbox; the other 367 ms is CPython starting and importing sixteen
-modules. A one-shot runner that was *infinitely* fast would still take 367 ms
-on this script, because the interpreter is the cost. Warming it is the only
-thing that removes it. A fork is the only way to warm it without also keeping
-its state.
+`zygo run` is 70.8 ms in the Lima table, while
+[the one-shot number](#a-one-shot-sandbox) for `/bin/true` is 3.6 ms. Both are
+right. The ~4 ms is the sandbox; the other ~67 ms is CPython starting and
+importing sixteen modules — even with the bytecode layer. A one-shot runner
+that was *infinitely* fast would still take those ~67 ms on this script,
+because the interpreter is the cost. Warming it is the only thing that removes
+it. A fork is the only way to warm it without also keeping its state.
 
 ```text
-  zygo run, 384.7 ms, M1 VM
+  zygo run, 70.8 ms, Lima VM
   ──────────────────────────────────────────────────────────────────
   ██▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
-  █ the sandbox, ~18 ms    ▓ CPython start + sixteen imports, ~367 ms
+  █ the sandbox, ~4 ms    ▓ CPython start + sixteen imports, ~67 ms
   ──────────────────────────────────────────────────────────────────
 ```
 
@@ -654,20 +735,20 @@ imports nothing would show the three runners much closer together. A script
 that imports pandas and Pillow would show them further apart. Sixteen
 standard-library modules is the careful, low end of what a real script does.
 
-## 6.4 ms is the CLI, not the API
+## 2.8 ms is the CLI, not the API
 
-The 6.4 ms includes starting `zygo` itself, which is about 3 ms of a static
-binary over virtiofs (the file sharing between the Mac and the VM). An embedder
-does not pay that. It calls `zygo api` over a unix socket, or links `zygo-core`,
-and gets the ~1.7 ms that [`zygo bench warm`](#the-warm-path) measures. The CLI
-number is used here because it is the only thing `docker run` can be compared
-with.
+The 2.8 ms includes starting the `zygo` program itself for every call, and
+that program talking to the supervisor. An embedder does not pay that. It
+calls `zygo api` over a unix socket, or links `zygo-core`, and gets the
+~1.4 ms that [`zygo bench warm`](#the-warm-path) measures. The CLI number is
+used here because it is the only thing `docker run` can be compared with.
 
-## This host is the slow end
+## This host is a small one
 
-The M1 host is Linux 5.10 in a nested VM, with no unprivileged overlayfs, so the
-image store flattens layers. A Raspberry Pi 5 on bare metal is faster at
-everything in the M1 table.
+The Lima VM is a virtual machine with two CPUs on a laptop. A real server
+with more cores is faster at everything in the table, and a bare-metal
+kernel avoids some of the virtual machine's costs. The ratio between the
+runners is what carries over; the absolute numbers are this machine's.
 
 ## Adding the `kern` column yourself
 
@@ -708,14 +789,17 @@ make bench-density ARGS="--scripts 32"
 ```
 
 Thirty-two distinct scripts (a different constant in each source, so nothing
-can be shared as a duplicate), one image, one runtime, on the M1 VM above:
+can be shared as a duplicate), one image, one runtime, on the Lima VM:
 
 | | |
 |---|---|
-| 32 warm | 524.4 MB resident, 325.7 MB proportional |
-| Time to warm each | 107 ms |
-| **One more script, marginal RSS** | **16.39 MB** |
-| **One more script, marginal PSS** | **9.98 MB** |
+| 32 warm | 672.5 MB resident, 366.5 MB proportional |
+| Time to warm each | 114 ms |
+| **One more script, marginal RSS** | **21.01 MB** |
+| **One more script, marginal PSS** | **11.14 MB** |
+
+(On Docker Desktop's VM, when it was the reference, the same benchmark gave
+16.39 MB and 9.98 MB.)
 
 ## Why PSS, and why the slope
 
@@ -733,7 +817,7 @@ pays for the interpreter's pages, and the thirty-second does not.
   ─────────────────────────────────────────────────────────
   PSS │                                       ●
       │                              ●
-      │                     ●              slope = 9.98 MB
+      │                     ●              slope = 11.14 MB
       │            ●                       per extra script
       │   ●  ◄── the first pays for the interpreter
       └──────────────────────────────────────── scripts
@@ -746,11 +830,11 @@ This is the number a SaaS company asks first:
 
 | scripts | PSS |
 |---|---|
-| 1 000 | ~9.7 GiB |
-| 10 000 | ~97 GiB |
+| 1 000 | ~10.9 GiB |
+| 10 000 | ~109 GiB |
 
 **This does not work, and that is the finding.** Ten thousand scripts is a small
-platform, and ninety-seven gigabytes is not one machine. Idle tiering does not
+platform, and a hundred and nine gigabytes is not one machine. Idle tiering does not
 rescue it either: a paused zygote is still a process holding its memory. (In
 this run nothing was tiered down inside the window at all, and the harness says
 so rather than reporting the warm figure as a paused one.)
@@ -776,14 +860,14 @@ uses, and a `zygo exec` per call would measure process start-up instead.
 
 | | one zygote per script | one runtime pool |
 |---|---|---|
-| 1 000 scripts, proportional memory | ~9.7 GiB (extrapolated from the slope) | **29.4 MB, measured** |
-| One more script | 9.98 MB | **0.0 kB** |
+| 1 000 scripts, proportional memory | ~10.9 GiB (extrapolated from the slope) | **29.4 MB, measured** |
+| One more script | 11.14 MB | **0.0 kB** |
 | Zygotes | 1 000 | **1** |
 
 ```text
-  memory for 1 000 distinct scripts, M1 VM
+  memory for 1 000 distinct scripts, Lima VM
   ────────────────────────────────────────────────────────────────────────
-  one zygote per script   ████████████████████████████████████████  ~9.7 GiB
+  one zygote per script   ████████████████████████████████████████  ~10.9 GiB
   one runtime pool        ▏                                          29.4 MB
   ────────────────────────────────────────────────────────────────────────
 ```
@@ -797,23 +881,31 @@ argument.
 ## The latency half, settled
 
 ```bash
-zygo bench warm --pool --scripts 1000     # or `make bench`, which runs it
+zygo bench warm --pool --scripts 1000     # or `zygo bench all`, which runs it
 ```
 
 A thousand distinct scripts, a **different one on every request**, each called
-once before anything is measured, at 250 requests a second. That is the same
-tool, rate and host as the published warm-path figures:
+once before anything is measured, at 250 requests a second. Phase 1's exit
+criterion is a 1-in-100 time under 5 ms, with memory flat in the script count.
+Measured on both machines on the same day:
 
-| Docker Desktop's VM | p50 | p99 |
+| 25 September 2026 | usually | 1 in 100 |
 |---|---|---|
-| A warm function | 1.42 ms | 2.12 ms |
-| A pooled script | 2.07 ms | 2.92 ms |
-| **What the pool costs** | **+0.65 ms** | **+0.80 ms** |
+| Docker Desktop's VM (Linux 5.10): a warm function | 1.55 ms | 2.60 ms |
+| Docker Desktop's VM: a pooled script | 2.01 ms | **3.20 ms** — inside 5 ms |
+| Lima VM (Linux 6.8): a warm function | 1.44 ms | 10.5 ms |
+| Lima VM: a pooled script | 1.91 ms | **11.4 ms** — outside 5 ms |
 
-**Phase 1's exit criterion is met**: p99 2.92 ms against a budget of 5 ms, with
-a slope of zero. The two-thirds of a millisecond the pool adds is writing the
-script into the sandbox and the child compiling it. The phase breakdown puts it
-in `run` (`GO`→`DONE`), where the load happens, not in `fork` or `admit`.
+**The memory half is met everywhere: the slope is zero.** The latency half is
+met on the older kernel and missed on a stock newer one — and there a warm
+*function*, with no pool at all, misses it by the same amount. The slow 1 in
+100 is the kernel's cgroup move ([why](#why-1-in-100-is-slow-on-newer-kernels)),
+not the pool: with `favordynmods` on the same Lima VM, the pooled script's
+1 in 100 is **3.3 ms**, inside the budget. What the pool itself adds is the same on both machines: about
+half a millisecond usually, and under one millisecond for 1 in 100. It is
+writing the script into the sandbox and the child compiling it; the phase
+breakdown puts it in `run` (`GO`→`DONE`), where the load happens, not in
+`fork` or `admit`.
 
 ## The same thing measured badly, and why it looked like a failure
 
@@ -851,13 +943,16 @@ variance lands in both columns.
 It is kept as a warning about tools, and as the number an embedder calling over
 HTTP from Python will really see on a Raspberry Pi. It is not the number the
 phase gate is written in. (The same run inside Docker Desktop's VM: p50
-3.38 ms, p99 14.74 ms, slope 0.0 kB.)
+3.38 ms, p99 14.74 ms, slope 0.0 kB. On the Lima VM on 25 September: the pool
+2.48 / 5.99 ms over the API, against a warm-function control of
+1.54 / 2.38 ms, slope 0.0 kB.)
 
 ## Memory per warm script on a smaller VM
 
-[ADR 0005](adr/0005-one-warm-zygote-per-script-version.md) repeated the density
-benchmark on the Lima VM (2 vCPU, 3.8 GiB, Ubuntu 24.04, kernel 6.8), with a
-hundred distinct Python handlers, each its own function.
+[ADR 0005](adr/0005-one-warm-zygote-per-script-version.md) ran the density
+benchmark on the Lima VM earlier, with a hundred distinct Python handlers,
+each its own function. It agrees with the 25 September run above (11.14 MB
+proportional per script):
 
 | | per warm script | 100 scripts |
 |---|---|---|
@@ -870,6 +965,10 @@ running, and a thousand would need 11 GB. The same hundred scripts in one pool
 used 29.5 MB, and one more script added 0 kB. The ADR has the latency side too.
 
 ## The other finding: `zygo run` pays for a cgroup it throws away
+
+*This section and the three after it are the story of a fix, with the
+numbers measured while it was made. Today's numbers are in
+[a one-shot sandbox on a systemd login](#a-one-shot-sandbox-on-a-systemd-login).*
 
 This is not part of the gate, but it came out of the same work. It is the
 largest avoidable cost on the one-shot path, and avoiding it took a different
@@ -968,23 +1067,25 @@ else is running.
 ## Verdict of the embedder's benchmark
 
 Phase 0 of the embedded-runtime roadmap ([ADR 0001](adr/0001-embedded-runtime.md))
-passes its gate on both hosts. It is **60×** on an M1 VM against `zygo run`, and
-**100×** on a Raspberry Pi against `kern`, the fastest one-shot runner in the
-field. The bar was 10×.
+passes its gate on every host it was measured on. It is **25×** on the Lima
+VM against `zygo run` today, was **60×** on Docker Desktop's VM before the
+bytecode layer made one-shot runs faster, and **100×** on a Raspberry Pi
+against `kern`, the fastest one-shot runner in the field. The bar was 10×.
 
 ```text
   how much faster the warm fork is than the best one-shot runner
-  ──────────────────────────────────────────────────────────────
-  the gate            ████                                   10×
-  M1 VM               ████████████████████████               60×
-  Raspberry Pi 5      ████████████████████████████████████████  100×
-  ──────────────────────────────────────────────────────────────
+  ──────────────────────────────────────────────────────────────────
+  the gate                 ████                                       10×
+  Lima VM, 25 Sep          ██████████                                 25×
+  Docker Desktop, earlier  ████████████████████████                   60×
+  Raspberry Pi 5, earlier  ████████████████████████████████████████  100×
+  ──────────────────────────────────────────────────────────────────
 ```
 
-It also showed why Phase 1 had to come first. The warm fork is worth sixty to a
-hundred one-shot runs, yet with one zygote per script you could have only about
-five hundred warm scripts per host. The thing that makes Zygo worth embedding
-was the thing it could not yet do at an embedder's scale. The runtime pool
+It also showed why Phase 1 had to come first. The warm fork is worth tens of
+one-shot runs, yet with one zygote per script you could have only a few
+hundred warm scripts per host. The thing that makes Zygo worth embedding was
+the thing it could not yet do at an embedder's scale. The runtime pool
 ([above](#density-with-a-runtime-pool)) is the fix.
 
 ## Two defects the benchmark found

@@ -298,26 +298,30 @@ fn warm(
 /// stays met, the documentation stays wrong, and the first person to notice is
 /// a reader who tried it.
 ///
-/// Every one of these was measured in Docker Desktop's Linux VM on an Apple M1
-/// Max, except where `docs/book/25-performance.md` says otherwise. A different machine
-/// will not reproduce them, which is the point of printing the machine.
+/// Every one of these was measured on 25 September 2026 in the Lima VM on an
+/// Apple M1 Max (2 vCPU, Ubuntu 24.04, Linux 6.8, an ordinary user), except
+/// where `docs/book/25-performance.md` says otherwise. A different machine will
+/// not reproduce them, which is the point of printing the machine.
 mod published {
-    /// The warm path, at 250 requests a second.
-    pub const WARM_P50_MS: f64 = 1.70;
-    pub const WARM_P99_MS: f64 = 2.81;
+    /// The warm path, at 250 requests a second. The p99 is a Linux 6.x cgroup
+    /// cost (the book's "why 1 in 100 is slow on newer kernels"); on 5.10 it
+    /// was 2.60 ms the same day.
+    pub const WARM_P50_MS: f64 = 1.44;
+    pub const WARM_P99_MS: f64 = 10.53;
     pub const WARM_RATE: f64 = 250.0;
     /// Sustained throughput at a concurrency of four.
-    pub const LOAD_PER_SECOND: f64 = 981.0;
+    pub const LOAD_PER_SECOND: f64 = 1108.0;
     /// A one-shot `zygo run`, image already in the store.
-    pub const COLD_P50_MS: f64 = 18.4;
+    pub const COLD_P50_MS: f64 = 12.3;
     /// Warm-exec: a fresh process entered into a held sandbox.
-    pub const EXEC_P50_MS: f64 = 2.2;
+    pub const EXEC_P50_MS: f64 = 1.40;
     /// A runtime pool, a different script with every request, at the same
     /// rate. The roadmap's exit criterion for Phase 1 is the p99 under 5 ms.
-    pub const POOL_P50_MS: f64 = 2.07;
-    pub const POOL_P99_MS: f64 = 2.92;
-    /// What `zygo serve` costs once, for a Python handler with no imports.
-    pub const SERVE_MS: f64 = 270.0;
+    pub const POOL_P50_MS: f64 = 1.91;
+    pub const POOL_P99_MS: f64 = 11.36;
+    /// What `zygo serve` costs once, for a Python handler with no imports, as
+    /// `bench warm` measures it (the supervisor already running).
+    pub const SERVE_MS: f64 = 34.0;
 }
 
 /// How far a measurement may be from the published number before it is worth
@@ -1668,6 +1672,20 @@ fn print_cgroup_note(phases: &[zygo_core::pool::CallTiming], report: &Report, st
             n => format!(" --n {n}"),
         }
     );
+    // The usual cause on a newer kernel, and one a reader can remove: the
+    // move into the request's cgroup waiting for the kernel (see
+    // `zygo doctor`'s "cgroup moves" line).
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    if zygo_core::doctor::cgroup2_favors_moves(&mountinfo) == Some(false) {
+        println!(
+            "{}",
+            style.yellow(
+                "  cgroup2 here has no favordynmods, so on Linux 6.0+ moving a request into\n  \
+                 its cgroup can wait several ms for the kernel. `zygo doctor` says how to\n  \
+                 change that, and what it costs."
+            )
+        );
+    }
 }
 
 fn print_phases(phases: &[zygo_core::pool::CallTiming]) {

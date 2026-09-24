@@ -12,8 +12,8 @@ does instead.
   ─────────────────────────────────────────────────────────────────────────────
   docker run   ░░░░░░░ chain ░░░░░░░▒▓▓▓▓ Python + imports ▓▓▓▓█   300–1000 ms
   docker exec  ░░ daemon ░░█                                        50–100 ms, shared state
-  zygo run     ▒▓▓▓▓ Python + imports ▓▓▓▓█                         18 ms + Python start
-  zygo exec    ▪█                                                   1.7 ms, clean state
+  zygo run     ▒▓▓▓▓ Python + imports ▓▓▓▓█                         12 ms, Python included
+  zygo exec    ▪█                                                   1.4 ms, clean state
   ─────────────────────────────────────────────────────────────────────────────
   ░ programs talking to programs   ▒ the isolation itself (about the same everywhere)
   ▓ interpreter start-up           ▪ a fork            █ your code
@@ -28,7 +28,7 @@ blocks.
 `runc`, with a socket or a new process at each step, and each of them keeps
 its own records. `zygo run` is one process that makes the syscalls itself.
 There is nothing to ask and nothing to wait for. This alone takes a one-shot
-sandbox from hundreds of milliseconds down to about 18 ms, of which most is
+sandbox from hundreds of milliseconds down to about 12 ms, of which most is
 the namespace set, the cgroup and the mounts — work the kernel has to do
 whoever asks for it.
 
@@ -47,20 +47,20 @@ This is the big one. A Python function that imports a few modules needs
 roughly 100 to 500 ms before it can run a single line of your code. A
 container per request pays that every time, however fast the container is. A
 Zygo zygote pays it once, at `zygo serve`, and every request after that is a
-`fork()` of a process where it is already done: about 1.7 ms. The same holds
+`fork()` of a process where it is already done: about 1.4 ms. The same holds
 for Node with a large dependency tree, or any runtime whose start-up is slow.
 
 ```text
   per-request cost, same handler, same host (from the embedder's benchmark)
   ────────────────────────────────────────────────────────────────────────
-  a container per request   ████████████████████████████████████████  761.9 ms
-  a one-shot sandbox        ████████████████████                      384.7 ms
-  a warm fork               ▌                                           6.4 ms
+  a container per request   ████████████████████████████████████████  542.4 ms
+  a one-shot sandbox        █████▏                                     70.8 ms
+  a warm fork               ▏                                           2.8 ms
 ```
 
 The one-shot row is still slow here because it starts Python each time, and
 the warm row includes starting the `zygo` CLI itself — through the API it is
-closer to the 1.7 ms above. [The embedder's benchmark](25-performance.md#the-embedders-benchmark) has
+closer to the 1.4 ms above. [The embedder's benchmark](25-performance.md#the-embedders-benchmark) has
 the full setup.
 
 ## Saving 4: memory is shared, not copied
@@ -78,10 +78,10 @@ to use, so around 300 warm scripts fit in 4 GB.
 
 The official `python:*-slim` images ship no compiled `.pyc` files, and a
 read-only root means Python cannot save the ones it compiles. So every run
-compiled every module it imported again — `import re` alone was 34 ms. Zygo
+compiled every module it imported again — `import ssl` alone took 66 ms. Zygo
 compiles the standard library once, into a layer of its own, the first time
-it sees such an image. A harness importing a handful of common modules went
-from 190 ms to 47 ms. [What Zygo costs](25-performance.md#python-bytecode)
+it sees such an image. Importing ten common modules went from 165 ms to
+35 ms. [What Zygo costs](25-performance.md#python-bytecode)
 has the details.
 
 ## Saving 6: no image builds for dependencies
@@ -112,7 +112,7 @@ often the largest one.
 
 | | What you get | Where it comes from |
 |---|---|---|
-| **Speed** | ~1.7 ms per warm request; ~18 ms per fresh sandbox | no chain of programs, and a fork instead of a start |
+| **Speed** | ~1.4 ms per warm request; ~12 ms per fresh sandbox | no chain of programs, and a fork instead of a start |
 | **Clean state** | request *n* cannot see anything request *n−1* did | every request is a copy of a zygote that never served one |
 | **A limit per request** | memory, CPU, processes and a deadline for each request, not each container | one cgroup per request |
 | **Density** | hundreds of warm functions per machine | copy-on-write sharing between and inside zygotes |
@@ -124,7 +124,7 @@ often the largest one.
 ## What is not saved
 
 Your own code costs what it costs; Zygo only removes the work around it. A
-warm function uses memory while it waits — about 11 to 35 MB for a Python
+warm function uses memory while it waits — about 11 to 21 MB for a Python
 zygote — and after `cold_after` it is dropped and the next request pays the
 warm-up again. The `ns` backend shares the host's kernel, so a kernel bug
 still defeats it, as it defeats every container. And Zygo is one machine: it

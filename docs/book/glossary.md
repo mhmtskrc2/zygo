@@ -28,6 +28,7 @@ One line each. The chapter in brackets explains the term in full; the numbers fo
 | **dynamic linking** | A program that loads shared libraries such as `libc.so` from the machine when it starts; it needs those files inside the sandbox. [6, 12] |
 | **egress** | Traffic going out of the sandbox; Zygo's `egress` mode allows only listed names. [4, 6] |
 | **exec (`execve`)** | Replacing a process's program with a new one from disk. [1] |
+| **favordynmods** | A cgroup2 mount option that makes moving a process between cgroups cheap, at a small cost to every fork and exit; `zygo doctor --fix` can turn it on. [22, 25] |
 | **fork** | Making a copy of the calling process. [1] |
 | **gVisor** | A kernel written in Go that runs in user space and answers a sandbox's syscalls. [10] |
 | **image** | A file system stored as layers, plus a little metadata; the OCI standard defines it. [5] |

@@ -16,7 +16,7 @@ process is the *zygote*. `zygo exec` sends a request; the zygote makes a copy
 of itself with `fork()`, and the copy runs your handler once and exits.
 
 ```text
-  zygo serve ./handler.py --name resize        (once, about 270 ms)
+  zygo serve ./handler.py --name resize        (once, about 150 ms)
         │
         ▼
   ┌────────────────────── warm sandbox "resize" ───────────────────────┐
@@ -30,19 +30,20 @@ of itself with `fork()`, and the copy runs your handler once and exits.
   └────────────────────────────────────────────────────────────────────┘
         ▲
         │
-  zygo exec resize '{"url": "…"}'             (each time, about 1.7 ms)
+  zygo exec resize '{"url": "…"}'             (each time, about 1.4 ms)
 ```
 
 ## Why this is the production shape
 
-A one-shot sandbox (`zygo run`) costs about 18 ms, and most of that is setup.
-A warm function pays the setup once and then costs about **1.7 ms** a
-request: that is the median overhead measured in Docker Desktop's VM on an
-Apple M1 Max ([chapter 25](25-performance.md)). The gap is easy to miss.
-`zygo run` looks like the natural way to say "run this code once", so a
-program that uses Zygo that way gets one sandbox per event. On a 2-vCPU Lima
-VM, `zygo bench cold` says 22.6 ms for that, while `zygo bench warm` says
-**0.91 ms** and 845 requests a second — about twenty-five times faster.
+A one-shot sandbox (`zygo run`) costs about 12 ms, and most of that is setup.
+A warm function pays the setup once and then costs about **1.4 ms** a
+request: that is the median overhead measured on a 2-vCPU Lima VM on an Apple
+M1 Max ([chapter 25](25-performance.md)). The gap is easy to miss. `zygo run`
+looks like the natural way to say "run this code once", so a program that
+uses Zygo that way gets one sandbox per event. On that VM, `zygo bench cold`
+says 12.3 ms for that, while `zygo bench warm` says **1.44 ms** and 1,108
+requests a second — more than eight times faster, and the gap grows with
+every module the handler imports.
 
 A real multi-tenant application that adopted Zygo chose `run` for
 exactly that reason, and the fourth recommendation of its adoption report was
@@ -55,7 +56,7 @@ below](#a-multi-tenant-consumer-on-the-warm-path) shows what that looks like.
   event ─▶ build sandbox ─▶ run ─▶ clean    serve: build sandbox + load code, once
   event ─▶ build sandbox ─▶ run ─▶ clean    event ─▶ fork ─▶ run ─▶ exit
   event ─▶ build sandbox ─▶ run ─▶ clean    event ─▶ fork ─▶ run ─▶ exit
-  22.6 ms each (2-vCPU Lima VM)             0.91 ms each (same VM)
+  12.3 ms each (2-vCPU Lima VM)             1.44 ms each (same VM)
 ```
 
 ## Serving a function
@@ -183,7 +184,7 @@ A warm function does not stay in memory forever. After `idle_timeout`
 so its processes stop using the CPU but stay in memory. The next request wakes
 it with one write, in far less time than a warm-up. After `cold_after`
 (default 1 hour) the sandbox is dropped. The function still exists by name,
-and the next request pays a full warm-up again: about 270 ms for a Python
+and the next request pays a full warm-up again: about 150 ms for a Python
 handler with no imports, measured on a Raspberry Pi 5.
 
 ```text
@@ -194,7 +195,7 @@ handler with no imports, measured on a Raspberry Pi 5.
                            └────────┘   a request wakes it (1 write)  └──────────┘
                                ▲                                           │
                                │ a request warms it again                  │ no request for
-                               │ (about 270 ms for Python)                 │ cold_after (1h)
+                               │ (about 150 ms for Python)                 │ cold_after (1h)
                            ┌───┴────┐                                      │
                            │  cold  │ ◀────────────────────────────────────┘
                            └────────┘   sandbox dropped, name kept
@@ -224,7 +225,7 @@ is the code the same on every request, and does its runtime start slowly?
    AGENT FUNCTION        WARM-EXEC FUNCTION
    entry = "h.py"        cmd = ["/app/bin"]
    fork per request      new process per request
-   ~1.7 ms               ~2.2 ms + your program's start
+   ~1.4 ms               ~1.4 ms + your program's start
 ```
 
 ## A Python handler
@@ -420,7 +421,7 @@ is the simplest one possible: read one JSON event from **stdin**, write one
 JSON result to **stdout**, exit 0. Stderr is kept as the log, and a non-zero
 exit is a failure. `sh -c cat` is the smallest program that obeys it. It works
 with any language and any image, and needs no agent. It costs a median of
-2.2 ms per request, measured in Docker Desktop's VM, plus your program's own
+1.4 ms per request, measured on a Lima VM, plus your program's own
 start.
 
 ```toml
@@ -522,7 +523,7 @@ def run(project, script_source, event, secrets):
 - **`idle_timeout` and `cold_after`** are the eviction policy. A version
   nobody has called for ten minutes is paused (still in memory, one write to
   wake). After an hour it is dropped, and the next call pays a warm-up —
-  about 270 ms for a Python handler, plus its imports.
+  about 150 ms for a Python handler, plus its imports.
 
 Four hundred projects do not mean four hundred warm zygotes. They mean as many
 as were called in the last ten minutes, which is the number that matters, and
@@ -540,7 +541,7 @@ enough to be worth doing only once.
 
 **Warm-exec** is the simple one: give a function a `cmd` and no runtime. Each
 request is a fresh process in the held sandbox, with the event on standard
-input and JSON expected on standard output. That costs about 2.2 ms and needs
+input and JSON expected on standard output. That costs about 1.4 ms and needs
 no code from you beyond the program. Go, Rust, C and `bash` all belong here;
 [`examples/warm-exec/`](../../examples/warm-exec) has Go and shell examples.
 

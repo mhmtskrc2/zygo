@@ -21,47 +21,118 @@ all move quickly; check before quoting.
 
 ## The map
 
-| Wall ↓ · Ready on arrival → | nothing: build it all | the sandbox: enter it | the loaded program: fork it |
+The three questions give every project a place. The table below puts the
+first two on a grid: each **row** is where the wall is, each **column** is
+what is already waiting when a request comes in. Read a column from left to
+right as "less work per request": on the left everything is built for each
+call, on the right the program is already loaded and only copied.
+
+```text
+  what is ready when a request arrives?
+
+  NOTHING                    THE SANDBOX                 THE SANDBOX + THE PROGRAM
+  ───────                    ───────────                 ─────────────────────────
+  build the sandbox          enter the sandbox           fork the loaded program
+  start the program          start the program           run the request
+  run the request            run the request
+  tear it all down
+
+  most tools work here       `docker exec`, warm-exec    only Zygo `exec` works here
+  slowest per call                                       fastest per call
+```
+
+| Wall ↓ · Ready on arrival → | nothing: build it all | the sandbox: enter it | the program: fork it |
 |---|---|---|---|
-| **Virtual machine** | Firecracker, Kata, microsandbox, Zygo `vm` | — | Firecracker from a memory snapshot (a VM per restore) |
+| **Virtual machine** | Firecracker, Kata, microsandbox, Zygo `vm` | — | Firecracker from a memory snapshot (a whole VM per restore) |
 | **Second kernel** | gVisor, Zygo `gvisor` | — | — |
-| **Host kernel** | Docker, Podman, runc, nsjail, bubblewrap, firejail, minijail, kern, Zygo `run` | `docker exec` (shared state), Zygo warm-exec | **Zygo `exec`** |
+| **Host kernel** | Docker, Podman, runc, nsjail, bubblewrap, firejail, minijail, kern, Zygo `run` | `docker exec` (state is shared), Zygo warm-exec | **Zygo `exec`** |
 | **Process confinement only** | nono, Landlock-based tools: they confine a process you already run | | |
 
 The right-hand column is almost empty, and that is the space Zygo was built
 for. Everything else on this page is a good tool for a nearby job.
 
+## What one call costs, tool by tool
+
+The chart shows roughly what one call to a small Python function costs with
+each tool. The scale is **logarithmic**: each mark to the right is **ten
+times** slower than the one before, so a bar twice as long is not twice as
+slow but many times slower. A solid bar (█) is the usual cost; a light part
+(▒) is the range above it. Every bar except the first includes starting Python
+itself; the first does not, because the warm zygote started Python long
+before the request.
+
 ```text
-   per-call cost of a small Python function, roughly (log scale, not exact)
-   1 ms          10 ms          100 ms          1 s
-   ├──────────────┼───────────────┼───────────────┤
-   ▪ Zygo exec (fork of a warm zygote)
-                  ▪─────▪ one-shot host-kernel sandboxes + Python start
-                          (nsjail, bubblewrap, kern, Zygo run)
-                           ▪────▪ microVM or gVisor + Python start
-                                     ▪──────────▪ docker run
+                          1 ms          10 ms         100 ms        1 s
+                          │·············│·············│·············│
+Zygo exec (warm fork)     ██                                           1.4 ms
+Zygo run                  ███████████████                              12 ms
+nsjail, bubblewrap, kern  ████████████████▒▒▒▒▒▒                       ~15–40 ms
+gVisor                    █████████████████████████▒▒▒▒▒▒              ~60–160 ms
+Firecracker microVM       ██████████████████████████████▒▒▒▒           ~140–250 ms
+docker run                ███████████████████████████████████▒▒▒▒▒▒▒   300–1000 ms
 ```
+
+Only the two Zygo rows are measured by this project: `zygo exec` is the warm
+path's median, and `zygo run` is the median of `python3 -c pass` with the
+image already pulled ([chapter 25](25-performance.md)). The other rows are
+rough ranges — each project's own claims or common measurements, plus Python's
+start-up — and are here to show the *order of size*, not exact numbers. The
+lesson is in the shape: the one-shot tools cluster together, because they all
+pay for building a sandbox and starting Python, and only a warm fork leaves
+that cluster.
 
 ## The request path
 
 This table compares what each tool costs on every request, and what it costs
 once, up front. The Zygo columns are measured; the other columns are the
-projects' documented or commonly measured figures. *p50* is the median and
-*p99* is the value that 99 requests in 100 beat.
+projects' documented or commonly measured figures.
 
-| | Docker `run` | Docker `exec` | Firecracker | gVisor `runsc` | AWS Lambda (warm) | **`zygo run`** | **`zygo exec` (warm)** |
-|---|---|---|---|---|---|---|---|
-| Per-request overhead | 300–1000 ms | 50–100 ms | ~125 ms boot; 10–20 ms from a snapshot | 50–150 ms | ~1–5 ms + platform | **18 ms p50** | **1.7 ms p50, 2.8 ms p99** |
-| Paid once, up front | — | a `docker run -d` | the VM's own boot, or a snapshot | — | a cold start, platform-side | — | a `zygo serve`: ~270 ms for a Python handler, plus its imports |
-| Clean state per request | yes | no | yes | yes | no | **yes** | **yes** (a fresh process) |
-| Daemon | yes | yes | yes (a VMM per VM) | yes (`runsc` + shim) | n/a | **no** | **no** |
-| Root | daemon runs as root | same | needs `/dev/kvm` | no | n/a | **no** | **no** |
-| Wall | kernel | kernel | hardware | userspace kernel | hardware | kernel (`ns`); userspace kernel (`gvisor`) | kernel (`ns`); hardware (`vm`, one-shot only) |
+How to read the Zygo numbers: we timed many requests. **"Usually"** is what
+a normal request costs. **"1 in 100"** is what the slowest requests cost —
+only one request in a hundred was slower than that.
+
+```text
+  fast ◀──────────────── 100 requests, sorted ────────────────▶ slow
+        · · · · · · · · · · · · ▲ · · · · · · · · · · · · · · ▲ ·
+                                usually                  1 in 100
+```
+
+These are the time a tool **adds**. Your own code's time comes on top.
+
+| | Docker `run` | Docker `exec` | Firecracker | gVisor `runsc` | AWS Lambda (warm) | **`zygo run`** | **`zygo exec --runtime` (pool)** | **`zygo exec` (warm)** |
+|---|---|---|---|---|---|---|---|---|
+| Per-request overhead | 300–1000 ms | 50–100 ms | ~125 ms boot; 10–20 ms from a snapshot | 50–150 ms | ~1–5 ms + platform | **usually 12 ms** | **usually 1.9 ms** · 1 in 100: 11.4 ms¹ · a different script each time | **usually 1.4 ms** · 1 in 100: 10.5 ms¹ |
+| Paid once, up front | — | a `docker run -d` | the VM's own boot, or a snapshot | — | a cold start, platform-side | — | a `zygo serve --runtime`: the interpreter and its dependencies, once for *every* script | a `zygo serve`: ~150 ms for a Python handler, plus its imports |
+| Clean state per request | yes | no | yes | yes | no | **yes** | **yes** (a fresh process; the script is loaded in it) | **yes** (a fresh process) |
+| Daemon | yes | yes | yes (a VMM per VM) | yes (`runsc` + shim) | n/a | **no** | **no** | **no** |
+| Root | daemon runs as root | same | needs `/dev/kvm` | no | n/a | **no** | **no** | **no** |
+| Wall | kernel | kernel | hardware | userspace kernel | hardware | kernel (`ns`); userspace kernel (`gvisor`); hardware (`vm`) | kernel (`ns` only) | kernel (`ns` only) |
+
+¹ On Linux 6.x, 1 request in 100 waits about 9 ms for the kernel to move it
+into its cgroup; on Linux 5.10 the same is 2.6 ms (warm) and 3.2 ms (pool).
+[Chapter 25](25-performance.md#why-1-in-100-is-slow-on-newer-kernels) explains
+it. Zygo numbers are from a Lima VM, Linux 6.8, 25 September 2026.
 
 The first row is the whole argument. A container's cost is the machinery
 around it and the cold start of the interpreter. Zygo takes the machinery off
 the request path entirely, and it pays the interpreter's start only once, in
 a warm zygote.
+
+The three Zygo columns are three answers to "what is warm?". `zygo run` keeps
+nothing warm. A **pool** keeps the interpreter and its dependencies warm, but
+no code: each request brings its own script, so one pool serves thousands of
+different scripts, for about 0.65 ms more than a function. A warm **function**
+keeps one handler loaded, which is the fastest, but costs one zygote per
+script ([chapter 13](13-warm-functions.md#runtime-pools)).
+
+```text
+  what is warm?        zygo run          pool                 warm function
+                       ────────          ────                 ─────────────
+  sandbox              built each time   ready                ready
+  interpreter + deps   started each time ready                ready
+  your code            loaded each time  loaded per request   ready
+  per request          12 ms             1.9 ms               1.4 ms
+```
 
 ## `docker run` and `zygo run`, side by side
 
@@ -86,7 +157,7 @@ step.
 `clone3` into a fresh set of namespaces. The child applies the mount plan,
 calls `pivot_root`, joins its cgroup, drops every capability, installs
 seccomp and Landlock, and calls `execve`. With the image cached, that takes a
-median of 18 ms. `ps` shows `zygo` with your program directly under it, and
+median of 12 ms. `ps` shows `zygo` with your program directly under it, and
 nothing in between.
 
 ```text
@@ -375,7 +446,7 @@ quickly.
 | Shape | rootless container runtime, one static binary | a confinement you apply to a process you already have | microVM runtime and platform | rootless sandbox runtime **plus a warm-process protocol** |
 | Wall | host kernel (namespaces, seccomp, cgroups) | host kernel (Landlock + seccomp; Seatbelt on macOS) | hardware (libkrun) | host kernel (`ns`), userspace kernel (`gvisor`), hardware (`vm`) |
 | OCI images | yes | no images at all | yes | yes |
-| Per-call cost | a fresh box, single-digit ms | none — it confines a process you were starting anyway | a microVM, boot under ~100 ms | a fresh sandbox, 18 ms — **or a fork into a warm one, 1.7 ms** |
+| Per-call cost | a fresh box, single-digit ms | none — it confines a process you were starting anyway | a microVM, boot under ~100 ms | a fresh sandbox, 12 ms — **or a fork into a warm one, 1.4 ms** |
 | State between calls | none: the box is destroyed | whatever your process kept | a sandbox can be kept, branched and snapshotted | none, and not by destroying anything: each request is a `fork()` of a process that has never served one |
 | Runs on macOS | Linux and WSL2 | yes, natively, with Seatbelt | yes | through a Linux VM it manages |
 | Daemon | no | no | no | no |
@@ -394,9 +465,10 @@ are further down.
 They part ways on what happens next. kern makes the box cheap enough to throw
 away every time, so there is nothing to keep warm. Zygo notes that the
 expensive part is not the box but the *interpreter inside it*: a Python
-process with its imports done is 270 ms that a per-call box pays again on
+process with its imports done is 150 ms or more that a per-call box pays
+again on
 every call, whatever the box costs. `zygo serve` pays it once, and
-`zygo exec` forks into it for 1.7 ms, with request *n* running on a copy of
+`zygo exec` forks into it for 1.4 ms, with request *n* running on a copy of
 the memory the zygote had before request *n−1* existed. That warm path, the
 [protocol](../../spec/protocol.md) behind it, and the per-request cgroup,
 deadline and secrets that hang off it are Zygo's real subject. The one-shot
@@ -409,8 +481,8 @@ process. Zygo has no equivalent and no plans for one.
 ```text
   kern, per call                         Zygo exec, per call
   ┌──────────────────────────────┐       ┌──────────────────────────────┐
-  │ make box (cheap)             │       │ fork warm zygote     ~1.7 ms │
-  │ Python start+imports ~270 ms │       │ (Python + imports paid once) │
+  │ make box (cheap)             │       │ fork warm zygote     ~1.4 ms │
+  │ Python start+imports ~150 ms │       │ (Python + imports paid once) │
   │ run, then destroy box        │       │ run, then child exits        │
   └──────────────────────────────┘       └──────────────────────────────┘
 ```
@@ -460,7 +532,7 @@ everything. Zygo's default is the host kernel, with hardware available as
 command. That is a real trade, and it does not go one way. A microVM per
 request is a wall a kernel bug does not cross, and Zygo's `ns` backend is one
 kernel away from the host, as [chapter 23](23-security.md) says in as many
-words. What Zygo has instead is the warm path — 1.7 ms, a fork, clean state —
+words. What Zygo has instead is the warm path — 1.4 ms, a fork, clean state —
 which a VM per request cannot reach, and which is the only reason the project
 exists.
 
@@ -576,8 +648,8 @@ cover both runs.
 | burst of 200, CPU-bound: jobs/s | 38.0–38.3 | 37.0 | −3% | 33.4 |
 | CPU per job, trivial burst | 32.8 ms | 33.2 ms | +1% | 38.1 ms |
 | CPU per job, CPU-bound burst | 44.7–45.4 ms | 46.2 ms | +2–3% | 50.7 ms |
-| 20/s steady: p50 / p99 | 55–57 / 97–102 ms | 56 / 94 ms | level | 62 / 103 ms |
-| 40/s steady: p50 / p99 | 57–60 / 91–99 ms | 65 / 112 ms | +8–14% / +13–23% | 87 / 156 ms |
+| 20/s steady: usually / 1 in 100 | 55–57 / 97–102 ms | 56 / 94 ms | level | 62 / 103 ms |
+| 40/s steady: usually / 1 in 100 | 57–60 / 91–99 ms | 65 / 112 ms | +8–14% / +13–23% | 87 / 156 ms |
 | highest rate sustained | 48.5–49.6/s | about 47/s | −4–6% | about 41/s |
 | idle memory of the stack | 384–634 MB | 534–590 MB | level | 531–565 MB |
 | failed jobs | 0 | 0 of 2 600 | | 0 |
@@ -625,11 +697,11 @@ hand.
 | **the harness** | | | |
 | runs/s | 60.6–66.8 | 63.2–68.5 | 26.5–28.5 |
 | CPU per run | 29.5–32.7 ms | 28.4–31.2 ms | 69.8–75.3 ms |
-| latency, one at a time (p50) | 25.9 ms | 23.4–23.7 ms | 59.1–59.6 ms |
+| time per call, one at a time (usually) | 25.9 ms | 23.4–23.7 ms | 59.1–59.6 ms |
 | **`/bin/true`** | | | |
 | runs/s | 222–252 | 287–314 | |
 | CPU per run | 7.5–9.4 ms | 5.5–6.6 ms | |
-| latency, one at a time (p50) | 7.0–7.7 ms | 4.0–4.2 ms | |
+| time per call, one at a time (usually) | 7.0–7.7 ms | 4.0–4.2 ms | |
 | failures | 0 | 0 | 0 |
 
 **On the real workload Zygo is within 3–5% of kern at its best, and more than

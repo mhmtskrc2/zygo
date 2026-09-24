@@ -298,9 +298,10 @@ No dependencies. `zygo.connect()` finds the API from its `url` argument, then
 ```python
 import zygo
 client = zygo.connect()
-out = client.fn("resize")({"url": "…"})               # a call; ~2 ms of overhead
-res = client.call("resize", {"url": "…"}, timeout=5)   # the full Result
-print(res.result, res.metrics.wall_ms)
+res = client.fn("resize")({"url": "…"})               # a call; ~2 ms of overhead
+print(res.result)                                      # what the handler returned
+res = client.call("resize", {"url": "…"}, timeout=5)   # the same call, with a timeout
+print(res.result, res.stdout, res.metrics.wall_ms)     # a Result: value, output, timings
 for ev in client.stream("resize", {"url": "…"}):       # live output
     print(ev.kind, ev.data)
 ```

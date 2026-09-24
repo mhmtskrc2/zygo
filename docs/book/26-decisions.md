@@ -97,7 +97,7 @@ declared done by whoever did the work.
   phase                        done when …                                    status
   ─────────────────────────────────────────────────────────────────────────────────
   0 prove the wedge            warm fork ≥ 10× under the best one-shot runner  met
-  1 runtime zygotes            1 000 scripts, p99 < 5 ms, memory flat          met
+  1 runtime zygotes            1 000 scripts, < 5 ms, memory flat              met
   2 embedder API               a plugin host needs only the HTTP API
   3 runtimes                   Python and JavaScript through one API
   4 deployability              kubectl apply → green probe + agent test passes
@@ -107,8 +107,9 @@ declared done by whoever did the work.
 ```
 
 Phase 0 was a real gate: without the 10× ratio, the ADR would be wrong, not
-early. It passed at 60× and 100×. Phase 1 passed with a p99 of 2.92 ms and
-29.4 MB for a thousand scripts in one zygote.
+early. It passed at 60× and 100×. Phase 1 passed too: even the slowest 1 in
+100 calls took only 2.92 ms, and a thousand scripts in one zygote used
+29.4 MB.
 [Chapter 25](25-performance.md#the-embedders-benchmark) has both measurements.
 
 ### What would reopen it
@@ -336,9 +337,9 @@ aarch64, 2 vCPU, 3.8 GiB), `python:3.12-slim`:
 |---|---|
 | memory, whatever the count | 29.5 MB, one zygote |
 | what one more script adds | **0 kB** |
-| second call over the API, p50 / p99 | 1.95 ms / 2.38 ms |
-| a warmed function on the same host, p50 / p99 | 1.36 ms / 1.57 ms |
-| the pool's extra cost | +0.6 ms p50, +0.8 ms p99 |
+| second call over the API: usually / 1 in 100 | 1.95 ms / 2.38 ms |
+| a warmed function on the same host: usually / 1 in 100 | 1.36 ms / 1.57 ms |
+| the pool's extra cost | +0.6 ms usually, +0.8 ms for the slowest 1 in 100 |
 
 So about **300 warm Python scripts fit in 4 GB** on that VM, and a thousand
 would need 11 GB. [Chapter 25](25-performance.md#memory-per-warm-script-on-a-smaller-vm)

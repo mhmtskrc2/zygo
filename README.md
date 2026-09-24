@@ -10,8 +10,8 @@ Docker's ergonomics, but without the container create/destroy cycle. The sandbox
 waits warm; a request costs a `fork()`.
 
 ```bash
-zygo serve ./handler.py --name resize        # a warm zygote: ~270 ms, once
-zygo exec resize '{"url": "..."}'            # 1.7 ms of overhead, a fresh process
+zygo serve ./handler.py --name resize        # a warm zygote: ~150 ms, once
+zygo exec resize '{"url": "..."}'            # 1.4 ms of overhead, a fresh process
 zygo exec resize '{"url": "..."}'            # and again, on a clean copy
 ```
 
@@ -25,15 +25,15 @@ module, an `atexit` handler. A container per request is clean and slow:
 Zygo is the third thing. `zygo serve` starts an interpreter, lets it do its
 imports, and parks it. `zygo exec` forks it. The child is a copy of a process
 that has **never served a request**, so it is as clean as a fresh container
-and as cheap as a fork — a median of **1.7 ms** against 300–1000.
+and as cheap as a fork — a median of **1.4 ms** against 300–1000.
 
 | | `docker exec` | a shared worker process | **`zygo exec`** |
 |---|---|---|---|
-| Overhead per request | 50–100 ms | ~0 | **1.7 ms** (p99 2.8 ms) |
+| Overhead per request | 50–100 ms | ~0 | **1.4 ms** usually (1 in 100: 10.5 ms on Linux 6.x, 2.6 ms on 5.10) |
 | What request *n* can see of *n-1* | everything | everything | **nothing** |
 | Limits per request | the container's | none | **its own cgroup: memory, pids, CPU, a deadline** |
 | A request that overruns | kills the container | kills the worker | killed through its own cgroup; the zygote keeps serving |
-| Paid once, up front | a `docker run -d` | your worker's start | a `zygo serve`: ~270 ms for a Python handler, plus your imports |
+| Paid once, up front | a `docker run -d` | your worker's start | a `zygo serve`: ~150 ms for a Python handler, plus your imports |
 
 ```text
 WARM ── pay once, then request after request
@@ -74,7 +74,7 @@ having by itself:
 
 ```bash
 zygo run --mount ./hello.py:/hello.py:ro python:3.12 python3 /hello.py   # first run pulls the image
-zygo run --mount ./hello.py:/hello.py:ro python:3.12 python3 /hello.py   # second: ~30 ms, mostly Python itself
+zygo run --mount ./hello.py:/hello.py:ro python:3.12 python3 /hello.py   # second: ~12 ms on Linux, mostly Python itself
 ```
 
 Running a 30-line Python function in a container costs 300–1000 ms, and that
@@ -84,9 +84,9 @@ shim → runc, and a container object left behind to remove.
 
 | | `docker run` | `docker exec` | `zygo run` | `zygo exec` (warm) |
 |---|---|---|---|---|
-| Overhead per request | 300–1000 ms | 50–100 ms | **18 ms** | **1.7 ms** |
+| Overhead per request | 300–1000 ms | 50–100 ms | **12 ms** | **1.4 ms** |
 | What that pays for | daemon, shim, `runc`, a container object | the daemon round trip | namespaces, cgroup, mounts — in one process | a `fork()` |
-| Paid once, up front | — | a `docker run -d`: 300–1000 ms | — | a `zygo serve`: ~270 ms for a Python handler, plus your imports |
+| Paid once, up front | — | a `docker run -d`: 300–1000 ms | — | a `zygo serve`: ~150 ms for a Python handler, plus your imports |
 | Daemon | yes | yes | **no** | **no** |
 | Root | yes | yes | **no** | **no** |
 | Clean state per request | yes | no | **yes** | **yes** |
@@ -125,7 +125,7 @@ ONE-SHOT ── one request, one fresh sandbox
      ▼ exit
   container object stays → docker rm
 
-  300–1000 ms                         ~18 ms
+  300–1000 ms                         ~12 ms
 ```
 
 ## Try it
@@ -187,9 +187,9 @@ brew install lima            # what starts the VM
 make guest-build             # the Linux build that runs inside it, compiled in the VM
 ```
 
-Crossing into the VM costs about 20 ms per command once it is up — the shim
+Crossing into the VM costs about 22 ms per command once it is up — the shim
 uses the SSH connection Lima already holds — so a one-shot `run` from a Mac
-shell is about 30 ms, of which ~10 ms is the sandbox. The millisecond warm path
+shell is about 29 ms, of which ~6 ms is the sandbox. The millisecond warm path
 is there through the API and the SDKs, and through `zygo api` running *inside*
 the VM. [Getting started](docs/book/11-getting-started.md) has the details, and
 [what Zygo costs](docs/book/25-performance.md#on-a-mac) has the numbers.
@@ -271,12 +271,12 @@ two dependency-free clients:
 ```python
 import zygo
 client = zygo.connect()                          # a unix socket, or 127.0.0.1:7700
-out = client.fn("resize")({"url": "..."})        # ~2 ms, a fresh process
+out = client.fn("resize")({"url": "..."}).result  # ~2 ms, a fresh process
 ```
 
 ```js
 import { connect } from 'zygo';
-const out = await connect().fn('resize')({ url: '...' });
+const out = (await connect().fn('resize')({ url: '...' })).result;
 ```
 
 For an agent host, `zygo mcp` speaks the Model Context Protocol over a pipe.
@@ -290,10 +290,11 @@ things. Those are set once, by whoever installed the server:
 
 ## Status
 
-**Measured, not asserted.** The warm path is a median of **1.70 ms** and a 99th
-percentile of **2.81 ms** through the shipping code at 250 requests a second,
-sustaining **981 requests a second** at a concurrency of four; a cold `zygo run`
-with the image cached is a median of **18.4 ms**. The warm path is the
+**Measured, not asserted.** On a Linux 6.8 VM, the warm path is a median of
+**1.44 ms** through the shipping code at 250 requests a second — with a 99th
+percentile of **10.5 ms**, a kernel cgroup cost the book explains — sustaining
+**1,108 requests a second** at a concurrency of four; a cold `zygo run` with
+the image cached is a median of **12.3 ms**. The warm path is the
 production shape, and the gap is the argument: [the book](docs/book/13-warm-functions.md)
 shows a multi-tenant consumer — one warm zygote per script version — on it. The suites run in three
 places, which turned out to matter: a privileged container, a Raspberry Pi as
@@ -307,7 +308,7 @@ host, printing the machine it ran on and refusing to give a verdict when that
 machine was throttled or busy.
 
 **Scoped, not unfinished.** The `vm` backend boots a guest and runs one-shot
-sandboxes — about 400 ms against `ns`'s 40 ms on the same host, for a kernel
+sandboxes — about 420 ms against `ns`'s 73 ms on the same host, for a kernel
 of the guest's own. The guest can write, to a private layer bounded by
 `scratch` and never to the shared image. It has no network and no warm
 functions, and `gvisor` has neither either; both refuse them with a reason

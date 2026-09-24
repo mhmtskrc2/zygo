@@ -8,6 +8,7 @@ validated with `zygo spec validate` in the same run.
 
 | | What it shows |
 |---|---|
+| [`web-api/`](web-api) | A tiny web API with three endpoints — a warm function, a runtime pool and a fresh sandbox — side by side. Standard library only; tested end to end. |
 | [`webhook/`](webhook) | One warm Python function behind `zygo api`, with a secret delivered as a per-request file and no network at all. |
 | [`agent-tool/`](agent-tool) | A tool an LLM can call: untrusted input, `seccomp = "strict"`, four pids, a two-second deadline. |
 | [`ci-job/`](ci-job) | `zygo run` as a test runner: the repository mounted read-only, a sealed sandbox, the program's own exit code. |
