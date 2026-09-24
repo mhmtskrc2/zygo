@@ -134,13 +134,17 @@ the cost.
 
 ```text
   one `docker run` of a 10 ms Python function, roughly
-  0 ms                                                                ~500 ms
+
+                ~250 ms           ~1 ms         ~220 ms         ~10 ms
   ┌────────────────────────────────┬─┬───────────────────────────┬──┐
   │ docker → dockerd → containerd  │▒│ Python starts and imports │██│
   │ → shim; record, layer, network │▒│ its modules from nothing  │██│
   └────────────────────────────────┴─┴───────────────────────────┴──┘
-                                    ▒ the isolation itself, ~1 ms
-                                                       ██ your code, ~10 ms
+  ├────────────┼────────────┼─────────────┼────────────┼────────────┤
+  0           100          200           300          400         500 ms
+
+  ▒  the isolation itself
+  ██ your code
 ```
 
 ## What a container leaves behind
