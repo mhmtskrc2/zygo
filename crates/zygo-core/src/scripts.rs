@@ -2,7 +2,7 @@
 //!
 //! Protocol 1.1 lets an `EXEC` carry the code to run, so that one warm
 //! interpreter — a *runtime pool* — serves ten thousand scripts instead of ten
-//! thousand zygotes serving one each (`docs/bench-embed.md` has the number:
+//! thousand zygotes serving one each (`docs/book/25-performance.md` has the number:
 //! 9.98 MB of proportional memory per warm script, which is 97 GiB at that
 //! count). An embedder registers a script once and calls it ten thousand
 //! times; this is where the "once" goes.

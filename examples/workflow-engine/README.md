@@ -28,7 +28,7 @@ request — a tenth of a millisecond, because these handlers do almost nothing.
 The 29.9 ms is this worker's own view of a job: the queue, an HTTP round trip
 to `zygo api`, the fork, and a share of the two ~350 ms warms amortised over
 fifty runs. The fork itself is the ~2 ms in
-[`docs/performance.md`](../../docs/performance.md); the numbers above were
+[`docs/book/25-performance.md`](../../docs/book/25-performance.md); the numbers above were
 taken inside a nested VM on a 5.10 kernel, which is the slow end of both.
 
 ## The whole integration

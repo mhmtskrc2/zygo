@@ -244,14 +244,14 @@ pub fn refuse_what_v1_cannot_do(config: &SandboxConfig) -> Result<()> {
     };
 
     // Not "yet". Warm functions and guest networking are `ns` features by
-    // decision, recorded in docs/adr/0002-warm-paths-stay-on-ns.md: each
+    // decision, recorded in docs/book/adr/0002-warm-paths-stay-on-ns.md: each
     // would be a second implementation to keep correct, benchmark and defend,
     // against the one the product rests on. `vm` is a hardware boundary for
     // work that fits a one-shot sandbox, and these refusals are the design.
     if config.hold {
         return Err(unsupported(
             "warm functions are an `ns` feature: a request would have to enter the \
-             guest over vsock rather than through `setns` (docs/adr/0002)"
+             guest over vsock rather than through `setns` (docs/book/adr/0002)"
                 .into(),
             "use --isolation ns for warm functions; `vm` is for one-shot runs",
         ));
@@ -259,7 +259,7 @@ pub fn refuse_what_v1_cannot_do(config: &SandboxConfig) -> Result<()> {
     if config.agent_fd.is_some() {
         return Err(unsupported(
             "the runtime agent is handed its control socket as an inherited descriptor, \
-             and a guest inherits nothing from the host (docs/adr/0002)"
+             and a guest inherits nothing from the host (docs/book/adr/0002)"
                 .into(),
             "use --isolation ns for agent runtimes; `vm` is for one-shot runs",
         ));
@@ -269,7 +269,7 @@ pub fn refuse_what_v1_cannot_do(config: &SandboxConfig) -> Result<()> {
             format!(
                 "the vm backend has only `network = \"none\"`; this sandbox asks for \
                  `{}`, which would need the VMM inside Zygo's own network namespace \
-                 and a second nftables implementation (docs/adr/0002)",
+                 and a second nftables implementation (docs/book/adr/0002)",
                 config.network
             ),
             "use --isolation ns for a networked sandbox",

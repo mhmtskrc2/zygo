@@ -290,7 +290,7 @@ fn warm(
 // `zygo bench all`
 // ---------------------------------------------------------------------------
 
-/// The numbers the README and `docs/performance.md` print.
+/// The numbers the README and `docs/book/25-performance.md` print.
 ///
 /// They are here, as constants, so that `zygo bench all` compares what it
 /// measured with what is *claimed* rather than only with a budget. A published
@@ -299,7 +299,7 @@ fn warm(
 /// a reader who tried it.
 ///
 /// Every one of these was measured in Docker Desktop's Linux VM on an Apple M1
-/// Max, except where `docs/performance.md` says otherwise. A different machine
+/// Max, except where `docs/book/25-performance.md` says otherwise. A different machine
 /// will not reproduce them, which is the point of printing the machine.
 mod published {
     /// The warm path, at 250 requests a second.
@@ -503,7 +503,7 @@ fn all(cli: &Cli, quick: bool) -> anyhow::Result<u8> {
                 "  * the throughput run lifts the tenant's CPU quota; the latency runs keep it.\n\
                  \n  \
                  \"differs\" is not a failure. These were measured on the machines in\n  \
-                 docs/performance.md; a different host produces different numbers, which\n  \
+                 docs/book/25-performance.md; a different host produces different numbers, which\n  \
                  is why the one above is printed. What a budget says is in each section."
             )
         );

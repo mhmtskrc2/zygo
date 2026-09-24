@@ -25,6 +25,7 @@ One line each. The chapter in brackets explains the term in full; the numbers fo
 | **dependency set** | A venv built once from lock files sent to `POST /deps`, for a runtime pool to use. [17] |
 | **deploy rights** | Permission to create, change or destroy sandboxes through the API, not only call them. [17] |
 | **digest** | `sha256:…`, the hash that names an image, a layer, a script or a blob exactly. [5, 15] |
+| **dynamic linking** | A program that loads shared libraries such as `libc.so` from the machine when it starts; it needs those files inside the sandbox. [6, 12] |
 | **egress** | Traffic going out of the sandbox; Zygo's `egress` mode allows only listed names. [4, 6] |
 | **exec (`execve`)** | Replacing a process's program with a new one from disk. [1] |
 | **fork** | Making a copy of the calling process. [1] |
@@ -60,6 +61,7 @@ One line each. The chapter in brackets explains the term in full; the numbers fo
 | **seccomp** | A filter on which syscalls a process may make. [4] |
 | **setns** | The syscall that joins a namespace that already exists. [2] |
 | **setuid** | A mark on a program that makes it run as its owner, often root. [4] |
+| **static linking** | A program that carries all its library code inside its own file, so it runs on almost any image. [6, 12] |
 | **supervisor** | Zygo's process that keeps zygotes, hands out requests and enforces deadlines, under your user. [6] |
 | **syscall** | A request from a program to the kernel. [1] |
 | **tenant** | One customer of whoever embeds Zygo; has its own scripts, secrets, limits and tokens. [14, 17] |

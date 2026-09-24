@@ -4,7 +4,7 @@
 //! shape for a function that is called often, and the wrong shape for an
 //! embedder with ten thousand of them: a warm zygote costs about 10 MB of
 //! proportional memory, which is 97 GiB at that count
-//! (`docs/bench-embed.md`). A `[runtime.<name>]` is the other shape — a few
+//! (`docs/book/25-performance.md`). A `[runtime.<name>]` is the other shape — a few
 //! anonymous zygotes, an interpreter and a dependency set each, with the
 //! script arriving in the request and loaded in the forked child.
 //!

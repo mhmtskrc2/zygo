@@ -240,7 +240,7 @@ jobs:
 
       # The seccomp profile against real packages, and the examples run for
       # real. Both need the network; both are the checks that found the
-      # `clone3` bug (docs/seccomp-profiles.md).
+      # `clone3` bug (docs/book/24-seccomp-profiles.md).
       - name: Seccomp compatibility matrix
         # Run even when an earlier suite failed: they test different
         # things, and one job that reports all of them is one round trip
@@ -380,7 +380,7 @@ jobs:
   #                          *host's* whole hierarchy, which is worse than the
   #                          privilege it avoids.
   #
-  # `docs/guide.md` carries the same list, and `examples/kubernetes/` the same
+  # `docs/book/16-production.md` carries the same list, and `examples/kubernetes/` the same
   # thing as a `securityContext`.
   unprivileged-container:
     runs-on: ubuntu-24.04

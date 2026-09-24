@@ -167,7 +167,7 @@ fn apparmor_userns_fix() -> Fix {
         cost: Some(
             "this turns the restriction off for every process on the machine, not \
              only for Zygo's. It is a defence against kernel bugs reachable \
-             through user namespaces; docs/threat-model.md says what it was \
+             through user namespaces; docs/book/23-security.md says what it was \
              protecting. The narrower alternative is an AppArmor profile for the \
              `zygo` binary alone, which this cannot write for you because it \
              depends on where you installed it."

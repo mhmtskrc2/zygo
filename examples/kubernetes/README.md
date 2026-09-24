@@ -34,7 +34,7 @@ namespaces, seccomp, Landlock, a cgroup per request — not the container
 itself. A privileged pod running customer code directly is a different
 proposition from a privileged pod whose whole job is building boundaries
 around it. Run it on nodes of its own, and read
-[the threat model](../../docs/threat-model.md).
+[the threat model](../../docs/book/23-security.md).
 
 The day Kubernetes can say "give this pod a delegated cgroup subtree", the
 line goes. Nothing else in the manifest changes.

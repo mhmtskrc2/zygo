@@ -460,7 +460,7 @@ bench-embed: poc/zygo-linux-musl
 
 # What one more warm script costs this host. The number an embedder with ten
 # thousand scripts asks first, and the one Phase 1 of the embedded-runtime
-# roadmap (docs/adr/0001-embedded-runtime.md) is meant to change.
+# roadmap (docs/book/adr/0001-embedded-runtime.md) is meant to change.
 #
 #   ARGS="--scripts 32"            a zygote per script, the Phase 0 shape
 #   ARGS="--pool --scripts 1000"   one runtime pool, the Phase 1 shape, with
@@ -470,7 +470,7 @@ bench-density: poc/zygo-linux-musl
 		-e ZYGO_DATA_HOME=/tmp/zdata-density python:3.12-slim \
 		sh /src/poc/bench_density.sh $(ARGS)
 
-# Every number in the README and docs/performance.md, reproduced on this
+# Every number in the README and docs/book/25-performance.md, reproduced on this
 # host, with the host printed. Privileged because it starts real sandboxes;
 # the container is the machine the numbers will be about, which on Docker
 # Desktop is a VM and will say so.
@@ -498,6 +498,13 @@ fmt:
 lint:
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets -- -D warnings
+	python3 docs/nav.py --check
+
+# The previous / contents / next links at the foot of every book page,
+# rebuilt from the reading order in docs/SUMMARY.md.
+.PHONY: docs-nav
+docs-nav:
+	python3 docs/nav.py
 
 clean:
 	cargo clean
@@ -506,7 +513,7 @@ clean:
 # pydantic, numpy, pandas, Pillow and sqlite3 in one venv, then the same two
 # profiles against Node — worker threads, the standard library, and a handler
 # that starts a program. The output is the compatibility matrix in
-# docs/seccomp-profiles.md.
+# docs/book/24-seccomp-profiles.md.
 #
 # Two containers because they are two images. The Node half is the one that
 # found `socketpair` missing from `strict`.

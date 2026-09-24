@@ -876,7 +876,7 @@ const SCRIPT_MARK: &str = "the-request";
 ///
 /// This is what lets one warm interpreter serve ten thousand scripts instead
 /// of ten thousand zygotes serving one each — the measurement behind it is in
-/// `docs/bench-embed.md`, where a warm script costs 9.98 MB of proportional
+/// `docs/book/25-performance.md`, where a warm script costs 9.98 MB of proportional
 /// memory and an embedder has far more than a thousand of them.
 ///
 /// Optional, and the three outcomes are all legitimate:

@@ -41,7 +41,7 @@ pub struct Spec {
     /// right shape for a function that is called often. An embedder with ten
     /// thousand scripts cannot have ten thousand zygotes — a warm one costs
     /// about 10 MB of proportional memory, which is 97 GiB at that count
-    /// (`docs/bench-embed.md`). A `[runtime.<name>]` is the other shape: a few
+    /// (`docs/book/25-performance.md`). A `[runtime.<name>]` is the other shape: a few
     /// anonymous zygotes that any script can run in, with the script arriving
     /// in the request.
     #[serde(default, rename = "runtime")]

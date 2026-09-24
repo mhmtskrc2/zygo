@@ -256,7 +256,7 @@ done
 say ""
 say "strict removes: socket connect bind listen accept4 ptrace mount umount2"
 say "and, in the forked child only: execve execveat fork vfork, and clone without CLONE_THREAD"
-say "(every strict cell above ran its handler under that child filter; see docs/seccomp-profiles.md)"
+say "(every strict cell above ran its handler under that child filter; see docs/book/24-seccomp-profiles.md)"
 say ""
 say "the pool column is the same code as a *script*: one warm zygote holding no"
 say "tenant code, the script written into the sandbox per request, and \`strict\`"

@@ -10,7 +10,7 @@ use crate::output::Style;
 /// One line of `zygo doctor --json`.
 ///
 /// The shape a health check parses, so it is documented
-/// (`docs/troubleshooting.md`, "What `doctor --json` says") and read back
+/// (`docs/book/22-troubleshooting.md`, "What `doctor --json` says") and read back
 /// here: on macOS the guest's report arrives as this document and is merged
 /// with the Mac's own checks.
 #[derive(Debug, Clone, Serialize, Deserialize)]

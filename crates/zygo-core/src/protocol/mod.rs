@@ -158,7 +158,7 @@ pub enum Message {
         ///
         /// An embedder has ten thousand scripts and cannot hold ten thousand
         /// zygotes — measured at 9.98 MB of PSS each, which is 97 GiB at that
-        /// count (`docs/bench-embed.md`). This field is how one zygote serves
+        /// count (`docs/book/25-performance.md`). This field is how one zygote serves
         /// all of them.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         script: Option<Script>,

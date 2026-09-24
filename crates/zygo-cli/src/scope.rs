@@ -104,7 +104,7 @@
 //! An embedder never saw any of this: it calls a warm function, and its
 //! supervisor paid for its cgroup once at start-up. It was `zygo run` at a
 //! terminal that paid every time, and now only on a machine where nothing
-//! else is running. `docs/bench-embed.md` has the numbers.
+//! else is running. `docs/book/25-performance.md` has the numbers.
 
 use crate::cli::{Cli, Command, SupervisorCommand};
 

@@ -506,7 +506,7 @@ pub enum BenchCommand {
     ///
     /// Runs the warm path, warm-exec, a cold start and sustained throughput,
     /// prints the machine it ran on, and compares what it measured with what
-    /// the README and `docs/performance.md` print — so the numbers there can
+    /// the README and `docs/book/25-performance.md` print — so the numbers there can
     /// be checked rather than trusted.
     ///
     /// It refuses to give a verdict on a host that was throttled or busy

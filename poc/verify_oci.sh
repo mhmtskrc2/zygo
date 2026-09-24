@@ -8,7 +8,7 @@
 # matters, that a sandbox really runs inside a container with no privileges
 # and no capabilities.
 #
-# The flags are the three from `docs/guide.md`, and no more:
+# The flags are the three from `docs/book/16-production.md`, and no more:
 #
 #   --security-opt seccomp=unconfined      `unshare(CLONE_NEWUSER)`
 #   --security-opt systempaths=unconfined  an unmasked /proc

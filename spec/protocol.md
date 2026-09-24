@@ -101,7 +101,7 @@ Present is the **runtime pool**: one zygote per image-and-dependency-set,
 holding no tenant code at all, and the script arrives with the request. An
 embedder has ten thousand scripts and cannot hold ten thousand zygotes — a
 warm one costs about 10 MB of proportional memory, which is 97 GiB at that
-count ([`docs/bench-embed.md`](../docs/bench-embed.md)). This field is how one
+count ([`docs/book/25-performance.md`](../docs/book/25-performance.md)). This field is how one
 zygote serves all of them.
 
 | Field | Type | Meaning |
@@ -508,7 +508,7 @@ child filter, and nothing about the warmed-handler path exercises that.
   the reference agent, a deferred `import inspect` (~10 ms) and `import random`
   (~2 ms) in the child put p50 at 11.8 ms against a 2 ms budget. Hoisting them
   to the agent halved it, and the measured p50 on Linux is now 1.9 ms. See
-  [what Zygo costs](../docs/performance.md).
+  [what Zygo costs](../docs/book/25-performance.md).
 - **Reseed the RNG in the child.** A forked child inherits the parent's seeded
   random state; without a reseed, every request produces identical "random"
   values — tokens, temporary names, jitter.

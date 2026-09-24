@@ -39,7 +39,7 @@ print(r.stdout)
 **No dependencies.** The standard library has an HTTP client, and a unix socket
 is thirty lines on top of it.
 
-Full documentation: [docs/sdk.md](../../docs/sdk.md). The project:
+Full documentation: [docs/book/17-api-sdk-mcp.md](../../docs/book/17-api-sdk-mcp.md). The project:
 [zygo](../../README.md).
 
 ## Tests

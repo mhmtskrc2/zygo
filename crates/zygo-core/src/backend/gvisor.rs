@@ -133,13 +133,13 @@ impl Backend for GvisorBackend {
         };
 
         // Not "yet". Warm functions are an `ns` feature by decision, recorded
-        // in docs/adr/0002-warm-paths-stay-on-ns.md: a second warm path would
+        // in docs/book/adr/0002-warm-paths-stay-on-ns.md: a second warm path would
         // be a second thing to keep correct, benchmark and defend, against
         // the one the product rests on. The refusals below are the design.
         if config.hold {
             return Err(unsupported(
                 "warm functions are an `ns` feature: entering a running gVisor sandbox \
-                 is `runsc exec`, not `setns` (docs/adr/0002)",
+                 is `runsc exec`, not `setns` (docs/book/adr/0002)",
                 "use --isolation ns for warm functions; `gvisor` is for one-shot runs",
             ));
         }
@@ -147,7 +147,7 @@ impl Backend for GvisorBackend {
             return Err(unsupported(
                 "the runtime agent is handed its control socket as an inherited \
                  descriptor, and an OCI runtime closes everything but stdio \
-                 (docs/adr/0002)",
+                 (docs/book/adr/0002)",
                 "use --isolation ns for agent runtimes; `gvisor` is for one-shot runs",
             ));
         }
@@ -156,7 +156,7 @@ impl Backend for GvisorBackend {
                 &format!(
                     "the gvisor backend has only `network = \"none\"`; this function asks \
                      for `{}`, which needs pasta attached to gVisor's own netstack \
-                     (docs/adr/0002)",
+                     (docs/book/adr/0002)",
                     config.network
                 ),
                 "use --isolation ns for a networked sandbox",

@@ -318,7 +318,7 @@ def pool_density(options, client) -> int:
         else:
             print("  A p99 above the budget on a nested-virtualisation host is not a")
             print("  verdict on the design: `admit` alone reaches 11-12 ms at p99 in a")
-            print("  VM inside a VM and 0.8 ms on metal (docs/performance.md). Repeat")
+            print("  VM inside a VM and 0.8 ms on metal (docs/book/25-performance.md). Repeat")
             print("  on bare metal before reading this as a result.")
 
     if options.json:

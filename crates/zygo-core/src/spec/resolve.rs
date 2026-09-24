@@ -192,7 +192,7 @@ fn default_scratch(mem: Bytes) -> Bytes {
 /// Four, because a zygote is not a request: each one already serves
 /// `concurrency` requests at a time, so four is sixteen in flight at the
 /// default. Growing further is a decision about the host's memory — a warm
-/// zygote is about 10 MB of proportional memory (`docs/bench-embed.md`) — and
+/// zygote is about 10 MB of proportional memory (`docs/book/25-performance.md`) — and
 /// that is the operator's to make rather than a default's.
 const DEFAULT_MAX_WARM: u32 = 4;
 

@@ -37,7 +37,7 @@ RUN zygo pull python:3.12-slim \
 
 # A dependency set can be baked in the same way, if every tenant shares one —
 # but most do not, and `POST /deps` exists so each can send their own. See
-# `docs/sdk.md`.
+# `docs/book/17-api-sdk-mcp.md`.
 #
 # RUN zygo ... # nothing here yet: dependency sets are keyed on an image
 #              # digest and arrive over the API.

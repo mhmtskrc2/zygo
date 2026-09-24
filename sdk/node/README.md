@@ -28,7 +28,7 @@ console.log(r.stdout);
 connection reuse; the TypeScript declarations are written by hand and ship
 beside the JavaScript, so what you read in the repository is what executes.
 
-Full documentation: [docs/sdk.md](../../docs/sdk.md). The project:
+Full documentation: [docs/book/17-api-sdk-mcp.md](../../docs/book/17-api-sdk-mcp.md). The project:
 [zygo](../../README.md).
 
 ## Tests

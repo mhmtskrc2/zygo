@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A workflow engine's worker, with Zygo underneath.
 
-This is the integration `docs/comparison.md` names and nothing else in the
+This is the integration `docs/book/10-similar-projects.md` names and nothing else in the
 repository showed: a worker that runs other people's scripts, one process per
 run, with the runtime already warm.
 

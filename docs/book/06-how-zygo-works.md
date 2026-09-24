@@ -203,7 +203,57 @@ read-only unless you say `:rw`.
   └─────────────────────┘           └─────────────────────┘      └─▶ /lib/libc.so …       (host)
 ```
 
-## What you do instead
+## Why not `zygo /usr/bin/python3 app.py`?
+
+Then skip the venv and point at the system's own Python directly? It fails
+for the same reason, and trying it shows why, one wall at a time. The file
+`/usr/bin/python3` is small; the Python it starts is not. On an Ubuntu 24.04
+machine it needs five shared libraries from the host's `/lib`, and then its
+standard library — 1,194 files, 29 MB, in the host's `/usr/lib/python3.12`.
+Mount only the binary into an image, and each missing piece stops it in turn.
+
+```text
+  zygo run --mount /usr/bin/python3:/opt/python3 IMAGE /opt/python3 -c "print(1)"
+
+  wall 1  the loader    alpine:3               "the program does not exist"   exit 125
+          (musl image, and the binary asks for glibc's loader)
+  wall 2  the libraries debian:bookworm-slim   "libexpat.so.1: cannot open    exit 127
+                        python:3.12-slim        shared object file"
+          (the image has glibc, but not the exact libraries this build wants)
+  wall 3  the stdlib    python:3.12-slim       "No module named 'encodings'"  exit 1
+                        + libexpat mounted too
+          (it looks for /usr/lib/python3.12; the image keeps its own elsewhere)
+```
+
+Measured on the Lima VM from [chapter 25](25-performance.md), Ubuntu 24.04,
+Python 3.12.3, aarch64. Notice the last row: even an image with the *same*
+Python version does not help, because the host's binary looks for the host's
+files, in the host's places.
+
+## And if you mounted all of it?
+
+You could keep mounting — `/usr/lib/python3.12`, then the libraries, then
+`/etc/ssl` — until it starts. By then the sandbox can read most of the host's
+`/usr` and `/lib`: every program installed, every version, which is a map for
+anyone looking for a weak spot. Worse, those files are not yours to hold
+still: the next `apt upgrade` replaces them under a zygote that is still
+running, and a warm function breaks in a way nobody can reproduce. The
+system Python is also the operating system's own tool — `apt` and other
+system programs depend on it, and on Debian and Ubuntu `pip` refuses to
+install into it (the "externally managed environment" error). The image's
+Python belongs to your function alone, and never changes unless you change
+its name.
+
+```text
+  the system's Python                     the image's Python
+  ───────────────────                     ──────────────────
+  owned by the OS, used by apt            owned by your function
+  changes with every apt upgrade          changes only when you change its name
+  different on every machine              the same bytes everywhere (a digest)
+  shows the sandbox the host's /usr       shows the sandbox nothing of the host
+```
+
+## What you do instead, for Python
 
 You keep the parts that are *yours* and take the rest from an image. Your
 code comes in with `--mount ./app.py:/app/app.py`. Your packages come from
@@ -217,6 +267,78 @@ the venv is built once, and both are mounted read-only in a few milliseconds.
 # not:  zygo ./venv/bin/python app.py
 zygo run --mount ./app.py:/app/app.py --requirements requirements.txt \
     python:3.12-slim python3 /app/app.py
+```
+
+## Why not `zygo ./my_executable_binary`?
+
+Now take a compiled program instead — a Go server, a C tool. There is no
+interpreter this time, so does it still need an image? It depends on how the
+program was **linked**, which means how it finds the library code it uses.
+A *dynamically linked* program keeps only its own code; when it starts, a
+small loader (`/lib64/ld-linux-x86-64.so.2`) finds `libc.so` and friends on
+the machine and joins them in. That is the default for C (`gcc app.c`), and
+for Go when it uses `cgo`. Such a program has exactly the venv's problem: its
+libraries live in the host's `/lib`, and the sandbox is not meant to see it.
+A *statically linked* program carries every library inside its own file, so
+it needs almost nothing — but "almost" is not "nothing".
+
+```text
+  dynamically linked (gcc app.c)          statically linked (CGO_ENABLED=0 go build)
+  ──────────────────────────────          ─────────────────────────────────────────
+  ┌ my_app ───────┐                       ┌ my_app ────────────────────────┐
+  │ your code     │──▶ ld-linux.so (host) │ your code                      │
+  └───────────────┘──▶ libc.so.6  (host)  │ + the Go runtime               │
+                   ──▶ libssl.so  (host)  │ + every library it uses        │
+                                          └────────────────────────────────┘
+  needs the host's /lib inside            still wants a few files around it:
+  the sandbox: the venv problem again     /etc/ssl/certs, /usr/share/zoneinfo, …
+```
+
+## What a static binary still needs
+
+Even a fully static program expects a small world around it. To call an
+HTTPS API it reads CA certificates from `/etc/ssl/certs`; to show local time
+it reads `/usr/share/zoneinfo`; to turn a uid into a name it reads
+`/etc/passwd`; to resolve a host name it reads `/etc/resolv.conf`; if it runs
+`sh -c`, it needs a `/bin/sh`. And every sandbox needs a root to stand on:
+somewhere to put `/tmp`, `/proc` and `/dev`. An image gives all of this in a
+few megabytes, the same on every machine, downloaded once. So Zygo keeps one
+rule with no exceptions: **the root always comes from an image**, and from
+your machine a sandbox sees only what you `--mount`.
+
+## What you do instead, for Go and C
+
+Mount the binary into a small image and name it as the command. Which image
+depends on how the binary was linked, and `file ./my_app` tells you: it says
+either `statically linked` or `dynamically linked, interpreter …`.
+
+| Your binary | Build it like this | Run it in |
+|---|---|---|
+| Go, static | `CGO_ENABLED=0 go build -o my_app` | `alpine:3` (about 3.5 MB) — or any image |
+| C, static | `gcc -static -o my_app app.c` (or `musl-gcc -static`) | `alpine:3` — or any image |
+| Go or C, dynamic, built on Debian/Ubuntu (glibc) | `go build` with cgo, `gcc app.c` | a glibc image: `debian:bookworm-slim` |
+| Go or C, dynamic, built on Alpine (musl) | the same, on Alpine | `alpine:3` |
+
+```bash
+file ./my_app                              # "statically linked"? then any small image works
+zygo run --mount ./my_app:/app/my_app alpine:3 /app/my_app --port 8080
+
+# a dynamic glibc binary: pick an image with glibc, not Alpine
+zygo run --mount ./my_app:/app/my_app debian:bookworm-slim /app/my_app
+```
+
+The mistake to avoid is a glibc binary in `alpine:3`: it fails with "the
+program does not exist", because the loader it asks for is not in the image
+([chapter 12](12-one-shot-sandboxes.md#programs-from-your-host)). And for a
+binary you call again and again, do not pay even the 18 ms of a fresh
+sandbox: keep the sandbox warm with `cmd`, and each call costs about 2 ms
+([warm-exec](#warm-exec-for-programs-that-start-fast)).
+
+```toml
+[fn.parse]
+image  = "alpine:3"
+mounts = ["./bin/parse:/app/parse:ro"]   # a static Go or C binary you built
+cmd    = ["/app/parse"]                  # event on stdin, JSON result on stdout
 ```
 
 ## Secrets

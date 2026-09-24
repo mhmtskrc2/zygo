@@ -15,7 +15,7 @@
 #     docker build -f packaging/oci/Dockerfile -t zygo packaging/oci
 #
 # What this image needs to run is not `--privileged`; it is three things, and
-# `zygo doctor` names each one when it is missing. See `docs/guide.md`
+# `zygo doctor` names each one when it is missing. See `docs/book/16-production.md`
 # ("Inside a container") and `examples/kubernetes/`.
 
 FROM alpine:3.21

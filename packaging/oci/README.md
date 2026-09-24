@@ -27,7 +27,7 @@ docker run \
 ```
 
 `zygo doctor` names each one when it is missing, and
-[`docs/guide.md`](../../docs/guide.md) explains why each is needed — briefly:
+[`docs/book/16-production.md`](../../docs/book/16-production.md) explains why each is needed — briefly:
 Docker's default seccomp profile refuses `unshare(CLONE_NEWUSER)`, a masked
 `/proc` makes the kernel refuse a fresh `proc` mount inside a user namespace,
 and a sandbox needs a cgroup to be put in.
