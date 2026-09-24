@@ -84,6 +84,39 @@ pub fn is_transport_failure(line: &str) -> bool {
         || line.contains("mux_client_request_session: session request failed")
 }
 
+/// Whether a line of `ssh`'s stderr says it never reached the VM's sshd.
+///
+/// Not a full session cap but no VM to talk to: it is stopping, or booting and
+/// its sshd not listening yet. Found by an embedder's test suite on a Mac,
+/// where one `zygo stop --all` (which stops the VM) followed by a burst of
+/// commands had some of them fail with `ssh: connect to host 127.0.0.1 port N:
+/// Connection refused` and exit 255 — and the adopter read the 255 from `zygo
+/// images --json` as "the image is not here". The guest ran nothing, so a retry
+/// is as safe as for a refused session; what differs is that a short pause does
+/// not help, and the retry waits for the VM to be running first.
+pub fn is_vm_unreachable(line: &str) -> bool {
+    (line.contains("ssh: connect to host")
+        && (line.contains("Connection refused") || line.contains("Operation timed out")))
+        || line.contains("kex_exchange_identification")
+        || line.contains("ssh_exchange_identification")
+}
+
+/// What an attempt at a forwarded command came to, when `ssh` exited 255.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    /// The guest was reached; the status is the command's own.
+    Ran,
+    /// The session was refused on a live connection ([`is_transport_failure`]).
+    SessionRefused,
+    /// The VM's sshd was not reached at all ([`is_vm_unreachable`]).
+    VmUnreachable,
+}
+
+/// How many times a command waits for the VM and tries again after
+/// [`Transport::VmUnreachable`]: pauses of 0.5, 1, 2 and 4 s after the wait
+/// for the start lock.
+pub const UNREACHABLE_RETRIES: u32 = 4;
+
 /// The generation of the VM template this build ships.
 ///
 /// Lima copies the template into the instance when it is created and never
@@ -730,7 +763,7 @@ pub fn host_checks(
                 format!(
                     "`limactl delete {INSTANCE}` — the next command recreates it (about a minute; \
                      nothing under $HOME is lost) — or apply the change by hand: \
-                     docs/troubleshooting.md, \"Session open refused by peer\""
+                     docs/book/22-troubleshooting.md, \"Session open refused by peer\""
                 ),
             ),
         });
@@ -952,10 +985,39 @@ pub fn forward(cli: &Cli) -> anyhow::Result<Option<u8>> {
     // never opened. This is the one layer that can know that, which is why
     // the retry is here and not in every caller.
     let mut attempt = 0;
+    let mut unreachable = 0;
     let status = loop {
-        let (status, transport_failed) = run_forwarded(&program, &args, cli.verbose > 0)?;
-        if !transport_failed {
+        let (status, transport) = run_forwarded(&program, &args, cli.verbose > 0)?;
+        if transport == Transport::Ran {
             break status;
+        }
+        if transport == Transport::VmUnreachable {
+            if unreachable < UNREACHABLE_RETRIES {
+                unreachable += 1;
+                tracing::debug!(unreachable, "the VM's sshd was not reached; waiting for it");
+                // Wait out whoever is booting it first. Lima reports the VM
+                // `Running` while the command that started it is still waiting
+                // for its sshd, so `ensure_running` alone returned at once and
+                // four tries in three seconds all failed for a command started
+                // two to five seconds after a `stop --all`. The booting command
+                // holds the start lock until the VM answers; taking it and
+                // letting go is the wait.
+                drop(paths.lock(VM_START_LOCK)?);
+                // Then boot it if it is stopped, and give a sshd that is a
+                // moment behind a moment.
+                ensure_running(&limactl, &paths)?;
+                std::thread::sleep(std::time::Duration::from_millis(
+                    500 << (unreachable - 1),
+                ));
+                continue;
+            }
+            crate::output::error(&anyhow::anyhow!(
+                "could not reach the Linux VM's ssh server\n  \
+                 → tried {} times, waiting for the VM between them\n  \
+                 → `limactl list` says what state it is in; `zygo doctor` checks the rest",
+                UNREACHABLE_RETRIES + 1
+            ));
+            return Ok(Some(EXIT_VM_UNREACHABLE));
         }
         if attempt < TRANSPORT_RETRIES {
             attempt += 1;
@@ -997,14 +1059,14 @@ pub fn forward(cli: &Cli) -> anyhow::Result<Option<u8>> {
 /// through this process, chunk by chunk as it arrives, so the one thing
 /// SSH says that Zygo has an answer for ([`is_transport_failure`]) can be
 /// recognised, kept back unless `-v` asked for it, and replaced by a
-/// sentence a user can act on. The second value is whether that happened
+/// sentence a user can act on. The second value says whether that happened
 /// *and* `limactl` exited 255, which together mean the guest ran nothing.
 #[cfg(target_os = "macos")]
 fn run_forwarded(
     program: &Path,
     args: &[OsString],
     verbose: bool,
-) -> anyhow::Result<(std::process::ExitStatus, bool)> {
+) -> anyhow::Result<(std::process::ExitStatus, Transport)> {
     use anyhow::Context;
     use std::io::{Read, Write};
 
@@ -1031,6 +1093,7 @@ fn run_forwarded(
         const LOOK_IN: usize = 8 * 1024;
         let mut seen = String::new();
         let mut matched = false;
+        let mut unreachable = false;
         let mut out = std::io::stderr();
         let mut buf = [0u8; 4096];
         loop {
@@ -1042,25 +1105,41 @@ fn run_forwarded(
             if seen.len() < LOOK_IN {
                 seen.push_str(&String::from_utf8_lossy(chunk));
             }
-            let is_ssh = is_transport_failure(&String::from_utf8_lossy(chunk));
+            let text = String::from_utf8_lossy(chunk);
+            let is_ssh = is_transport_failure(&text);
+            let is_down = is_vm_unreachable(&text);
             matched |= is_ssh;
-            if is_ssh && !verbose {
+            unreachable |= is_down;
+            if (is_ssh || is_down) && !verbose {
                 // Zygo's own sentence replaces it, once the retries are spent.
                 continue;
             }
             let _ = out.write_all(chunk);
             let _ = out.flush();
         }
-        matched || is_transport_failure(&seen)
+        if matched || is_transport_failure(&seen) {
+            Transport::SessionRefused
+        } else if unreachable || is_vm_unreachable(&seen) {
+            Transport::VmUnreachable
+        } else {
+            Transport::Ran
+        }
     });
 
     let status = child
         .wait()
         .with_context(|| format!("could not wait for {}", program.display()))?;
     FORWARDED_CHILD.store(0, std::sync::atomic::Ordering::SeqCst);
-    let matched = relay.join().unwrap_or(false);
+    let transport = relay.join().unwrap_or(Transport::Ran);
 
-    Ok((status, matched && status.code() == Some(255)))
+    Ok((
+        status,
+        if status.code() == Some(255) {
+            transport
+        } else {
+            Transport::Ran
+        },
+    ))
 }
 
 /// The `limactl` child's pid while one is running, for the signal relay.
@@ -1719,6 +1798,25 @@ mod tests {
         }
     }
 
+    /// A VM that is not there yet is its own case: retried, after waiting.
+    #[test]
+    fn an_unreachable_vm_is_recognised_and_nothing_else_is() {
+        for line in [
+            "ssh: connect to host 127.0.0.1 port 55246: Connection refused\r\n",
+            "kex_exchange_identification: read: Connection reset by peer\n",
+        ] {
+            assert!(is_vm_unreachable(line), "{line:?}");
+        }
+        for line in [
+            "mux_client_request_session: session request failed: Session open refused by peer\n",
+            "Connection to 127.0.0.1 closed by remote host.\n",
+            "ConnectionRefusedError: [Errno 111] Connection refused\n",
+            "",
+        ] {
+            assert!(!is_vm_unreachable(line), "{line:?}");
+        }
+    }
+
     /// The backoff grows, and the whole retry budget stays well under a
     /// second: a run that needed it should not notice.
     #[test]
@@ -1762,24 +1860,37 @@ mod tests {
             "printf 'Session open refused by peer\\n' >&2; exit 3",
         );
         let fine = fake("fine", "exit 0");
+        let down = fake(
+            "down",
+            "printf 'ssh: connect to host 127.0.0.1 port 55246: Connection refused\\r\\n' >&2; exit 255",
+        );
 
         let (status, transport) = run_forwarded(&refused, &[], false).unwrap();
         assert_eq!(status.code(), Some(255));
-        assert!(transport, "SSH's line and 255: the guest ran nothing");
+        assert_eq!(
+            transport,
+            Transport::SessionRefused,
+            "SSH's line and 255: the guest ran nothing"
+        );
+
+        let (status, transport) = run_forwarded(&down, &[], false).unwrap();
+        assert_eq!(status.code(), Some(255));
+        assert_eq!(transport, Transport::VmUnreachable, "no sshd to reach");
 
         let (status, transport) = run_forwarded(&program_255, &[], false).unwrap();
         assert_eq!(status.code(), Some(255));
-        assert!(!transport, "255 from a program is the program's");
+        assert_eq!(transport, Transport::Ran, "255 from a program is the program's");
 
         let (_, transport) = run_forwarded(&refused_but_ran, &[], false).unwrap();
-        assert!(
-            !transport,
+        assert_eq!(
+            transport,
+            Transport::Ran,
             "the line without 255 is not a transport failure"
         );
 
         let (status, transport) = run_forwarded(&fine, &[], false).unwrap();
         assert!(status.success());
-        assert!(!transport);
+        assert_eq!(transport, Transport::Ran);
     }
 
     /// The generation marker, as the template writes it and an old

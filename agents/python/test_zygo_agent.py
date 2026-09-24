@@ -872,6 +872,38 @@ class ForkFallbackTests(unittest.TestCase):
             stderr = h.close()
         self.assertIn("falling back to spawn", stderr)
 
+    @unittest.skipUnless(os.path.isdir("/proc/self/task"), "counts threads through /proc")
+    def test_native_threads_the_threading_module_cannot_see_fall_back_too(self):
+        """`import duckdb` starts four pthreads; `threading.active_count()` says 1.
+
+        Forked anyway, about half the children died in glibc ("The futex facility
+        returned an unexpected error code") and took the zygote with them. A pthread
+        started through ctypes is the same thing without the package.
+        """
+        h = AgentHarness(
+            """
+            import ctypes, os
+
+            _libc = ctypes.CDLL(None)
+            _BODY = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p)(
+                lambda _: _libc.pause()
+            )
+            _tid = ctypes.c_ulong()
+            _libc.pthread_create(ctypes.byref(_tid), None, _BODY, None)
+
+            def handler(event):
+                return {"n": event["n"] + 1}
+            """
+        )
+        try:
+            self.assertEqual(h.ready()["type"], "READY")
+            done = h.call({"n": 1})
+            self.assertEqual(done["exit_code"], 0, done.get("error"))
+            self.assertEqual(done["result"], {"n": 2})
+        finally:
+            stderr = h.close()
+        self.assertIn("falling back to spawn", stderr)
+
     def test_the_spawn_fallback_answers_everything_while_it_waits_for_go(self):
         """B-09: the fallback took the next frame and demanded it be `GO`.
 
