@@ -319,7 +319,9 @@ CTF challenges. Windmill and other job runners can wrap each job in it. It
 has no images — you give it a folder or bind-mount the host's — and no warm
 path: every run starts the program from nothing. Choose it when you want a
 battle-tested, very configurable jail around a command and you manage the
-root file system yourself.
+root file system yourself. Zygo in nsjail's place inside Windmill's workers
+cost the same per job; [the measurement](#measured-zygo-against-nsjail-and-kern)
+is further down.
 
 ## bubblewrap
 
@@ -385,7 +387,9 @@ daemonless, one static Rust binary, OCI images, namespaces with a seccomp
 allowlist and cgroup v2, a box made and thrown away per call in single-digit
 milliseconds by its own figures. If you want `docker run` without the daemon
 and without the 300 ms, both projects answer the same question, and kern's
-answer is a good one.
+answer is a good one. Measured side by side on a real Python workload, the two
+are within 3–5% of each other; [the numbers](#measured-zygo-against-nsjail-and-kern)
+are further down.
 
 They part ways on what happens next. kern makes the box cheap enough to throw
 away every time, so there is nothing to keep warm. Zygo notes that the
@@ -533,6 +537,143 @@ program that builds Zygo into itself. A worker calls `zygo serve` once per
 script, or uses the SDK, and each script run becomes a `fork()` instead of a
 container. [`examples/workflow-engine/`](../../examples/workflow-engine) is
 such a worker.
+
+## Measured: Zygo against nsjail and kern
+
+nsjail and kern are the two one-shot runners closest to `zygo run`, so both
+were measured against it under load, on 24 September 2026. Every run happened
+in the same VM: Ubuntu 24.04, kernel 6.8, aarch64, 2 vCPU, 4 GB, on an M1 Max.
+Every binary ran from the VM's own disk. The load generator ran outside the VM,
+so its CPU counts for nobody. "CPU per job" is the CPU of the whole stack being
+measured, divided by the jobs it finished.
+
+### Inside Windmill, in place of nsjail
+
+Windmill CE v1.817 with three general workers ran a trivial Python script and a
+CPU-bound one (about 20 ms of Python) through nsjail, using Windmill's own nsjail
+config. Then the same workers ran them through Zygo in nsjail's place, and
+nothing else changed. Zygo ran two ways:
+
+- **Zygo as `nsjail`**: the `zygo` binary, installed under the name `nsjail`,
+  read nsjail's command line and config itself. This translation was built for
+  the benchmark only and is **not in Zygo today**.
+- **Zygo through a script**: a shell stand-in translated the config and called
+  `zygo run`. This is what works with Zygo as it ships.
+
+Per job, 40 runs in a row inside a worker:
+
+| | nsjail | Zygo as `nsjail` |
+|---|---|---|
+| wall time | 19–20 ms | 20 ms |
+| CPU | 18.8–19.0 ms | 18.8–19.3 ms |
+
+Under load, the whole Windmill stack. nsjail was measured twice; its ranges
+cover both runs.
+
+| | nsjail | Zygo as `nsjail` | Zygo against nsjail | Zygo through a script |
+|---|---|---|---|---|
+| burst of 200, trivial: jobs/s | 51.4 | 50.0 | −3% | 43.6 |
+| burst of 200, CPU-bound: jobs/s | 38.0–38.3 | 37.0 | −3% | 33.4 |
+| CPU per job, trivial burst | 32.8 ms | 33.2 ms | +1% | 38.1 ms |
+| CPU per job, CPU-bound burst | 44.7–45.4 ms | 46.2 ms | +2–3% | 50.7 ms |
+| 20/s steady: p50 / p99 | 55–57 / 97–102 ms | 56 / 94 ms | level | 62 / 103 ms |
+| 40/s steady: p50 / p99 | 57–60 / 91–99 ms | 65 / 112 ms | +8–14% / +13–23% | 87 / 156 ms |
+| highest rate sustained | 48.5–49.6/s | about 47/s | −4–6% | about 41/s |
+| idle memory of the stack | 384–634 MB | 534–590 MB | level | 531–565 MB |
+| failed jobs | 0 | 0 of 2 600 | | 0 |
+| per-job cgroup limits | no | memory, processes | | memory, processes |
+| seccomp, Landlock | no | yes, yes | | yes, yes |
+
+**Level per job, and 1–6% behind at saturation, while doing more.** Zygo gave
+every job a cgroup with memory and process limits, a seccomp allowlist and a
+Landlock ruleset, and Windmill's nsjail config sets none of those. The likely
+cost at saturation is the cgroup Zygo creates and removes per job:
+`lru_gen_online_memcg`, `cgroup_addrm_files` and `tg_set_cfs_bandwidth` show in
+`perf`. That was not measured on its own. Below saturation the two cannot be
+told apart. Through a shell script, the same swap costs about 15% of
+throughput, because the script's `sh`, `awk`, `grep` and `env` add about 4 ms
+to every job. Idle memory does not move, because neither sandbox stays resident
+between jobs.
+
+Running it found three defects in Zygo, all fixed:
+
+- **Two runs could share a staging directory.** The three workers shared one
+  Zygo store, but each had its own PID namespace, and a staging root was named
+  after the PID. 2 jobs in 200 failed. Every per-process name now carries the
+  PID and 64 random bits.
+- **A writable mount of a single file never started.** Landlock was given
+  directory rights on a regular file, and the kernel answers that with
+  `EINVAL`. nsjail configs hand a job its `result.json` exactly this way. A rule
+  on a file is now narrowed to the file rights.
+- **The stand-in script itself cost 4 ms a job**, as described above.
+
+### An embedder's harness, against kern
+
+The workload was a real embedder's Python harness: it reads an event, runs a
+user's handler, and writes the result through a read-write scratch mount, under
+the embedder's limits. `/bin/true` measured the runtime alone. There were 64
+runs at each concurrency from 1 to 32, twice. The ranges cover both passes and
+every concurrency level. kern `bc822de` ran with `--security-profile untrusted`.
+
+`python:3.12-slim` ships no bytecode. Zygo compiles it once into a layer of its
+own, automatically ([chapter 15](15-images-and-dependencies.md#the-python-bytecode-layer)).
+kern does not, so it is shown both as it ships and with an image precompiled by
+hand.
+
+| | Zygo | kern, precompiled image | kern, stock image |
+|---|---|---|---|
+| **the harness** | | | |
+| runs/s | 60.6–66.8 | 63.2–68.5 | 26.5–28.5 |
+| CPU per run | 29.5–32.7 ms | 28.4–31.2 ms | 69.8–75.3 ms |
+| latency, one at a time (p50) | 25.9 ms | 23.4–23.7 ms | 59.1–59.6 ms |
+| **`/bin/true`** | | | |
+| runs/s | 222–252 | 287–314 | |
+| CPU per run | 7.5–9.4 ms | 5.5–6.6 ms | |
+| latency, one at a time (p50) | 7.0–7.7 ms | 4.0–4.2 ms | |
+| failures | 0 | 0 | 0 |
+
+**On the real workload Zygo is within 3–5% of kern at its best, and more than
+twice as fast as kern as it ships.** On an empty program kern is about 2 ms of
+CPU per run cheaper. That is the start-up floor: a 7.9 MB binary against
+2.2 MB, a larger plan (≈1.5 ms), and Landlock, which kern does not apply by
+default and Zygo keeps.
+
+Before this comparison, Zygo made 42 harness runs a second at 45 ms of CPU each.
+The comparison found these, all fixed:
+
+1. **Zygo could not run from a delegated cgroup that also held its caller**, a
+   systemd unit with `Delegate=yes` or a service in a container. It exited 125.
+   `zygo.slice` now goes to the top of the tree delegated to the user.
+2. **Every run re-executed under a transient systemd scope**, about 10 ms of
+   CPU, because the delegation check asked about the wrong cgroup.
+3. **The host probe ran on every run.** It is now cached per boot for up to ten
+   minutes.
+4. **Zygo moved its own process into a cgroup on every run**, 1.9–6.0 ms of a
+   6–11 ms start. It now moves only when it is in the way.
+5. **The sandbox child was moved into its cgroup after `clone3`**, which waits
+   out an RCU grace period after a quiet spell. It is now born there with
+   `CLONE_INTO_CGROUP`, the order kern uses, which also puts the limits on from
+   the child's first instruction. The sandbox start went from 6–11 ms to 3–4 ms.
+6. **The exit wait slept** with a backoff, so a program that exited at 13 ms was
+   noticed at 25 ms. It now uses `pidfd_open` and `poll`.
+7. **Every run built a registry client**, with TLS roots and a multi-threaded
+   runtime, to read one local file.
+8. **A failed bytecode build was retried on every run**, at 170–200 ms each. It
+   is now remembered for an hour.
+
+A run now starts 4 processes, down from 13 at the worst.
+
+### What these numbers are not
+
+- **They are all cold.** Every job started a fresh interpreter. Zygo's warm
+  path, a fork into a zygote that has already imported everything, was not part
+  of either comparison. Neither nsjail nor kern has one to compare it with.
+- **One VM, one kernel.** On kernel 5.10, in Docker Desktop's VM, the same
+  sandbox made Python about twice as slow as a plain container did. That cost
+  belongs to the old kernel, and it would have been measured against every
+  namespace-based runner alike.
+- **The raw results and the load generator are not in this repository.** The
+  tables here are their summary.
 
 ## Everything in one table
 
