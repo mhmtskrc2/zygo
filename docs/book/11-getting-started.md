@@ -27,6 +27,7 @@ of Linux kernel features, so the sandboxes themselves always run on Linux.
 |---|---|
 | Linux, kernel 5.3 or newer | Zygo runs directly. Nothing needs root. |
 | macOS | Zygo starts a small Linux virtual machine for you and runs inside it. |
+| A dev container or a Codespace | The repository's `.devcontainer` sets one up with sandboxes working; [see below](#in-a-dev-container-or-a-codespace). |
 | Anything else | Run Zygo in a Linux VM or container; either is fine. |
 
 On Linux you also need *unprivileged user namespaces* (a normal user may
@@ -136,6 +137,32 @@ keeps pulled images across restarts; [chapter 16](16-production.md#running-zygo-
 has the full command. `zygo doctor` names anything that is missing, inside
 the container just as on a host. [`packaging/oci/`](../../packaging/oci) has the details,
 and [chapter 16](16-production.md) covers running it in production.
+
+## In a dev container or a Codespace
+
+The repository has a `.devcontainer` for VS Code's *Reopen in Container* and
+for GitHub Codespaces. It builds Zygo, installs the tools the tests and
+networked sandboxes need, and runs `zygo doctor`. Sandboxes work inside it:
+one-shot runs, warm functions and `egress` networking were checked in it.
+
+It needs two things a default container does not give. The container is
+started `--privileged`, so Zygo may create user namespaces and mount inside
+them. And a small script arranges the container's own cgroup tree at every
+start, because cgroup v2 hands controllers only to a cgroup with no
+processes in it. `zygo` in that container is a wrapper that starts the real
+binary in the empty cgroup the script left for it.
+
+```text
+  /sys/fs/cgroup   (the container's own root: memory, pids, cpu for children)
+  ├── init/        every process the container started, and each new shell
+  └── launch/      empty until zygo starts in it
+      └── zygo.slice/ …  the sandboxes, as on a host
+```
+
+What does not work there: the `vm` backend (no `/dev/kvm`), and on a host
+whose kernel is older than 5.13, Landlock; `zygo doctor` names both. It is a
+development machine, not a production shape — [chapter 16](16-production.md#running-zygo-inside-a-container)
+covers running Zygo in a container for real, without `--privileged`.
 
 ## How Zygo runs on a Mac
 

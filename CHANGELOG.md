@@ -43,6 +43,9 @@ break things and will say so here.
 
 ### Added
 
+- A `.devcontainer` for VS Code and Codespaces in which sandboxes run: it
+  arranges the container's cgroup tree at start and wraps `zygo` to begin in
+  it.
 - `make bench-record` and `bench/`: the raw JSON behind chapter 25's numbers,
   one folder per run, with records from Linux 6.8 and 5.10. Chapter 25 also
   breaks the warm request's 1.4 ms into its phases.

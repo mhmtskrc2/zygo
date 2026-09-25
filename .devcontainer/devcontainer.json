@@ -1,0 +1,26 @@
+// A place to build Zygo and run its sandboxes without setting up a host:
+// VS Code's "Reopen in Container", or a GitHub Codespace.
+//
+// Sandboxes need things a default container does not give: permission to
+// create user namespaces and mount inside them, and a cgroup subtree to put
+// each sandbox in. `--privileged` gives the first; .devcontainer/cgroup.sh
+// arranges the container's own cgroup tree for the second, as
+// `make verify-linux` does for its containers. The container is the
+// development machine here; the sandboxes Zygo builds inside it are the
+// boundary being worked on. docs/book/11-getting-started.md has the details
+// and what does not work.
+{
+  "name": "zygo",
+  "image": "mcr.microsoft.com/devcontainers/rust:1-bookworm",
+  "runArgs": ["--privileged"],
+  // Root inside the container, as in the suites' own containers: the cgroup
+  // tree belongs to root, and the harness knows this case.
+  "remoteUser": "root",
+  "postCreateCommand": "sh .devcontainer/setup.sh",
+  "postStartCommand": "sh .devcontainer/cgroup.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": ["rust-lang.rust-analyzer", "tamasfe.even-better-toml"]
+    }
+  }
+}

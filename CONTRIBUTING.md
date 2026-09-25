@@ -20,7 +20,9 @@ secret that leaks goes through [SECURITY.md](SECURITY.md), privately.
 ## Building
 
 You need Rust 1.88 or newer. Everything that needs a Linux kernel — the
-sandbox itself — runs in Docker, so a Mac works for all of it.
+sandbox itself — runs in Docker, so a Mac works for all of it. Or open the
+repository in its dev container (VS Code, or a Codespace), where the tools are
+installed and sandboxes run directly.
 
 ```bash
 make build          # the zygo binary
