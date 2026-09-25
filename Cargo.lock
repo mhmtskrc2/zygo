@@ -2744,7 +2744,7 @@ dependencies = [
 
 [[package]]
 name = "zygo-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -2770,7 +2770,7 @@ dependencies = [
 
 [[package]]
 name = "zygo-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "chacha20poly1305",
