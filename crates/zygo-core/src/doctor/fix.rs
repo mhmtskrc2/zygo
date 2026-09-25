@@ -128,6 +128,13 @@ const FAVORDYNMODS_UNIT: &str = "zygo-cgroup-favordynmods.service";
 /// Empty when there is nothing to do, which is the common case and the one
 /// worth saying plainly.
 pub fn plan(report: &Report) -> Vec<Fix> {
+    plan_given(report, pasta_is_enforced())
+}
+
+/// [`plan`], with the one fact it reads from the host rather than from the
+/// report passed in — whether AppArmor enforces a profile on `pasta` — so a
+/// test gets the same answer on every machine.
+fn plan_given(report: &Report, pasta_enforced: bool) -> Vec<Fix> {
     let mut fixes = Vec::new();
     if !cfg!(target_os = "linux") {
         return fixes;
@@ -167,8 +174,8 @@ pub fn plan(report: &Report) -> Vec<Fix> {
     // Not tied to a check: `pasta` being *present* is what `doctor` reports,
     // and its being confined is only discovered when a networked sandbox
     // fails to start. Offered whenever the profile is loaded and enforcing.
-    if let Some(fix) = pasta_profile_fix() {
-        fixes.push(fix);
+    if pasta_enforced {
+        fixes.push(pasta_profile_fix());
     }
 
     fixes
@@ -431,11 +438,8 @@ fn egress_fix(detail: &str) -> Option<Fix> {
 /// `aa-complain` rather than unloading the profile: the profile stays loaded
 /// and keeps logging, so what it *would* have denied is still visible in
 /// `dmesg`, and switching it back is one command.
-fn pasta_profile_fix() -> Option<Fix> {
-    if !pasta_is_enforced() {
-        return None;
-    }
-    Some(Fix {
+fn pasta_profile_fix() -> Fix {
+    Fix {
         check: "egress",
         what: "stop AppArmor confining `pasta`".into(),
         why: "the distribution's profile denies `pasta` the sandbox's user \
@@ -451,7 +455,7 @@ fn pasta_profile_fix() -> Option<Fix> {
                 .into(),
         ),
         commands: vec![Command::root(&["aa-complain", "/usr/bin/pasta"])],
-    })
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -537,7 +541,7 @@ mod tests {
             "without favordynmods",
             "…",
         )]);
-        let fixes = plan(&r);
+        let fixes = plan_given(&r, false);
         if !cfg!(target_os = "linux") || in_a_container() {
             assert!(
                 fixes.iter().all(|f| f.check != "cgroup moves"),
@@ -566,7 +570,11 @@ mod tests {
     #[test]
     fn favoured_cgroup_moves_need_nothing() {
         let r = report(vec![Check::ok("cgroup moves", "favordynmods")]);
-        assert!(plan(&r).iter().all(|f| f.check != "cgroup moves"));
+        assert!(
+            plan_given(&r, false)
+                .iter()
+                .all(|f| f.check != "cgroup moves")
+        );
     }
 
     #[test]
@@ -577,19 +585,40 @@ mod tests {
         assert!(unit.lines().all(|l| !l.starts_with(' ')), "{unit}");
     }
 
+    /// The pasta fix follows the host's AppArmor, not the report — which is
+    /// why the other tests pass `false`: on a CI runner with the passt
+    /// profile installed, the real host answer is `true`, and a test that
+    /// asked the host failed there and nowhere else.
+    #[test]
+    fn a_confined_pasta_is_offered_whatever_the_report_says() {
+        let r = report(vec![Check::ok("user namespaces", "fine")]);
+        let fixes = plan_given(&r, true);
+        if !cfg!(target_os = "linux") {
+            assert!(fixes.is_empty());
+            return;
+        }
+        assert!(
+            fixes.iter().any(|f| f
+                .commands
+                .iter()
+                .any(|c| c.argv.first().map(String::as_str) == Some("aa-complain"))),
+            "{fixes:?}"
+        );
+    }
+
     #[test]
     fn a_healthy_host_has_nothing_to_fix() {
         let r = report(vec![
             Check::ok("user namespaces", "one can be built and mounted in"),
             Check::ok("cgroup v2", "delegated (cpu io memory pids)"),
         ]);
-        assert!(plan(&r).is_empty());
+        assert!(plan_given(&r, false).is_empty());
     }
 
     #[test]
     fn a_cgroup_that_cannot_delegate_is_one_users_own_file() {
         let r = report(vec![Check::failed("cgroup v2", "not delegated", "…")]);
-        let fixes = plan(&r);
+        let fixes = plan_given(&r, false);
         if !cfg!(target_os = "linux") {
             assert!(fixes.is_empty(), "there is nothing to fix off Linux");
             return;
