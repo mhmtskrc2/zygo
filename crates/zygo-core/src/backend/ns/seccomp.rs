@@ -90,6 +90,12 @@ fn stmt(code: u16, k: u32) -> SockFilter {
 /// generator sent every `clone` to the deny instead of to its argument check —
 /// a one-instruction error that every structural test passed. Branch targets
 /// are therefore named here and resolved in a second pass.
+///
+/// A label may be defined more than once. A branch goes to the *nearest*
+/// definition after it, which is what keeps every distance under 256 however
+/// long the allowlist grows: [`Assembler::island`] drops a copy of the four
+/// returns into the middle of the chain, and the comparisons around it jump
+/// there instead of to the end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Label {
     /// Fall through to the next instruction.
@@ -101,7 +107,15 @@ enum Label {
     Kill,
     CloneCheck,
     IoctlCheck,
+    /// The start of the one-comparison-per-syscall chain.
+    Chain,
+    /// Just past an island, for the jump that steps over it.
+    Skip,
 }
+
+/// Comparisons between two islands. Anything well under 255 works; the
+/// distance to the next island is this plus the island itself.
+const ISLAND_EVERY: usize = 64;
 
 /// An instruction before its branch distances are known.
 #[derive(Debug, Clone, Copy)]
@@ -157,6 +171,21 @@ impl Assembler {
         self.push(Pending::Mark(label))
     }
 
+    /// The four returns, where straight-line code steps over them and every
+    /// branch before them can land on them.
+    fn island(&mut self) -> &mut Self {
+        self.goto(Label::Skip)
+            .mark(Label::Deny)
+            .ret(RET_ERRNO | libc::EPERM as u32)
+            .mark(Label::NoSys)
+            .ret(RET_ERRNO | libc::ENOSYS as u32)
+            .mark(Label::Kill)
+            .ret(RET_KILL_PROCESS)
+            .mark(Label::Allow)
+            .ret(RET_ALLOW)
+            .mark(Label::Skip)
+    }
+
     /// Resolve labels into distances and emit the program.
     fn assemble(&self) -> Result<Vec<SockFilter>, SeccompError> {
         // First pass: where each label lands, counting only real instructions.
@@ -168,8 +197,12 @@ impl Assembler {
                 _ => index += 1,
             }
         }
-        let position_of = |label: Label| -> Option<usize> {
-            positions.iter().find(|(l, _)| *l == label).map(|(_, p)| *p)
+        // The nearest definition at or after `from`: BPF cannot jump back.
+        let position_of = |label: Label, from: usize| -> Option<usize> {
+            positions
+                .iter()
+                .find(|(l, p)| *l == label && *p >= from)
+                .map(|(_, p)| *p)
         };
 
         // Second pass: emit, converting each target into a distance.
@@ -180,12 +213,16 @@ impl Assembler {
                 if label == Label::Next {
                     return Ok(0);
                 }
-                let target = position_of(label).ok_or(SeccompError::UnresolvedLabel)?;
                 // `here + 1` because a branch counts from the instruction after
                 // it; a backward jump cannot be encoded at all.
-                let delta = target
-                    .checked_sub(here + 1)
-                    .ok_or(SeccompError::BackwardJump)?;
+                let target = position_of(label, here + 1).ok_or(
+                    if positions.iter().any(|(l, _)| *l == label) {
+                        SeccompError::BackwardJump
+                    } else {
+                        SeccompError::UnresolvedLabel
+                    },
+                )?;
+                let delta = target - (here + 1);
                 u8::try_from(delta).map_err(|_| SeccompError::JumpTooFar { delta })
             };
 
@@ -739,23 +776,36 @@ pub enum SeccompError {
 ///   load  nr
 ///   jeq   clone             -> clone_check ; allowed, but not with CLONE_NEW*
 ///   jeq   ioctl             -> ioctl_check ; allowed, but not TIOCSTI
-///   jeq   <allowed>         -> allow       ; one comparison per syscall
-///   ...
-///   goto  deny
+///   goto  chain
 /// clone_check:  load args[0]; and CLONE_NEW*; jeq 0 -> allow, else deny
 /// ioctl_check:  load args[1]; jeq <denied request> -> deny; ...; goto allow
+/// chain:
+///   jeq   <allowed>         -> allow       ; one comparison per syscall
+///   ...                                    ; every 64: an island of the
+///   jgt   <highest known>   -> nosys       ;   four returns, stepped over
+///   goto  deny
 /// deny:  ret ERRNO(EPERM)
+/// nosys: ret ERRNO(ENOSYS)
 /// kill:  ret KILL_PROCESS
 /// allow: ret ALLOW
 /// ```
+///
+/// Classic BPF branches reach at most 255 instructions forward. A single
+/// chain ending in one set of returns hit that wall at about 250 — twenty
+/// more syscalls in `permissive` and the build would have failed. The islands
+/// take the limit away: every branch lands on the nearest copy of its return.
 pub fn program(profile: SeccompProfile) -> Result<Vec<SockFilter>, SeccompError> {
+    build(&allowed_names(profile))
+}
+
+/// [`program`], for any allowlist — the tests hand it far longer ones than
+/// any profile has, to show the length limit is gone.
+fn build(names: &[&str]) -> Result<Vec<SockFilter>, SeccompError> {
     if !syscalls::is_supported() {
         return Err(SeccompError::UnsupportedArch {
             arch: std::env::consts::ARCH,
         });
     }
-
-    let names = allowed_names(profile);
     let clone_nr = syscalls::number("clone");
     let ioctl_nr = syscalls::number("ioctl").filter(|_| names.contains(&"ioctl"));
     // `clone3` takes its flags in a struct the filter cannot read, so a
@@ -793,7 +843,30 @@ pub fn program(profile: SeccompProfile) -> Result<Vec<SockFilter>, SeccompError>
     if let Some(nr) = ioctl_nr {
         asm.jeq(nr, Label::IoctlCheck, Label::Next);
     }
-    for nr in &simple {
+    asm.goto(Label::Chain);
+
+    // The two argument checks sit here, near the top, rather than after the
+    // chain: the branches that reach them are the first few instructions, and
+    // the far end of a long chain would be out of their reach.
+    if clone_nr.is_some() {
+        asm.mark(Label::CloneCheck)
+            .load(OFF_ARG0_LO)
+            .and(CLONE_NEW_MASK)
+            .jeq(0, Label::Allow, Label::Deny);
+    }
+    if ioctl_nr.is_some() {
+        asm.mark(Label::IoctlCheck).load(OFF_ARG1_LO);
+        for (_name, request) in DENIED_IOCTLS {
+            asm.jeq(*request, Label::Deny, Label::Next);
+        }
+        asm.goto(Label::Allow);
+    }
+
+    asm.mark(Label::Chain);
+    for (i, nr) in simple.iter().enumerate() {
+        if i % ISLAND_EVERY == 0 {
+            asm.island();
+        }
         asm.jeq(*nr, Label::Allow, Label::Next);
     }
     // Anything left is refused — but *how* it is refused matters for a number
@@ -818,21 +891,6 @@ pub fn program(profile: SeccompProfile) -> Result<Vec<SockFilter>, SeccompError>
         asm.load(OFF_NR).jgt(highest, Label::NoSys, Label::Deny);
     }
     asm.goto(Label::Deny);
-
-    if clone_nr.is_some() {
-        asm.mark(Label::CloneCheck)
-            .load(OFF_ARG0_LO)
-            .and(CLONE_NEW_MASK)
-            .jeq(0, Label::Allow, Label::Deny);
-    }
-
-    if ioctl_nr.is_some() {
-        asm.mark(Label::IoctlCheck).load(OFF_ARG1_LO);
-        for (_name, request) in DENIED_IOCTLS {
-            asm.jeq(*request, Label::Deny, Label::Next);
-        }
-        asm.goto(Label::Allow);
-    }
 
     asm.mark(Label::Deny)
         .ret(RET_ERRNO | libc::EPERM as u32)
@@ -1676,14 +1734,53 @@ mod tests {
             ] {
                 let p = program(profile).unwrap();
                 assert!(p.len() < 4096, "{profile}: {} instructions", p.len());
-                // BPF jump offsets are 8-bit; a program that needed more would
-                // silently jump to the wrong place.
-                assert!(
-                    p.len() < 250,
-                    "{profile}: {} instructions risks 8-bit jump overflow",
-                    p.len()
+            }
+        }
+
+        /// The 8-bit branch limit used to cap the allowlist at about 250
+        /// instructions — `permissive` was at 232. Every name the table knows,
+        /// three times over, must still assemble, and still
+        /// mean what it says at both ends of the chain.
+        #[test]
+        fn a_far_longer_allowlist_still_assembles_and_still_filters() {
+            let everything: Vec<&str> = syscalls::TABLE
+                .iter()
+                .map(|(name, _)| *name)
+                .filter(|n| !["clone3", "ioctl"].contains(n))
+                .collect();
+            // Three times over: the table has about 220 names on aarch64, and
+            // a repeat costs one comparison like any new name would.
+            let p = build(&everything.repeat(3)).unwrap();
+            assert!(p.len() > 255, "the test must cross the old limit");
+            for name in [
+                everything[0],
+                everything[everything.len() / 2],
+                everything[everything.len() - 1],
+            ] {
+                let nr = syscalls::number(name).unwrap();
+                let arg0 = if name == "clone" { 0x1000_0000 } else { 0 };
+                let expected = if name == "clone" {
+                    Verdict::Deny(libc::EPERM as u32)
+                } else {
+                    Verdict::Allow
+                };
+                assert_eq!(
+                    evaluate(&p, syscalls::AUDIT_ARCH, nr, arg0),
+                    expected,
+                    "{name}"
                 );
             }
+            let clone = syscalls::number("clone").unwrap();
+            assert_eq!(
+                evaluate(&p, syscalls::AUDIT_ARCH, clone, 0x11),
+                Verdict::Allow
+            );
+            assert_eq!(evaluate(&p, 0x1234, 0, 0), Verdict::Kill);
+            let highest = syscalls::TABLE.iter().map(|(_, nr)| *nr).max().unwrap();
+            assert_eq!(
+                evaluate(&p, syscalls::AUDIT_ARCH, highest + 1, 0),
+                Verdict::Deny(libc::ENOSYS as u32)
+            );
         }
 
         #[test]
