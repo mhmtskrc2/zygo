@@ -367,6 +367,37 @@ esac
 [ "$(cat /tmp/escape-ro/host.txt)" = "original" ] \
     && ok "the host file is unchanged" || bad "the host file was modified"
 
+# A mount *below* the read-only source. `MS_REC` carries it into the sandbox,
+# and a remount of the top mount alone leaves it writable — Landlock hid that
+# on 5.13+, nothing did below. Needs a host that can mount a tmpfs.
+mkdir -p /tmp/escape-ro/sub
+if mount -t tmpfs tmpfs /tmp/escape-ro/sub 2>/dev/null; then
+    echo original > /tmp/escape-ro/sub/inner.txt
+    out=$(zygo run --mount /tmp/escape-ro:/ro:ro "$IMAGE" python3 -c "$HELPER
+print(attempt_write('/ro/sub/inner.txt', b'tampered'))" 2>/dev/null)
+    case "$out" in
+        refused:*) ok "a mount below a read-only mount cannot be written ($out)" ;;
+        WROTE)     bad "a mount below a read-only mount was written" ;;
+        *)         if [ -z "$out" ]; then nothing_ran "this case"; else bad "inconclusive: '$out'"; fi ;;
+    esac
+    [ "$(cat /tmp/escape-ro/sub/inner.txt)" = "original" ] \
+        && ok "the file on the submount is unchanged" || bad "the file on the submount was modified"
+    umount /tmp/escape-ro/sub
+else
+    skip "a mount below a read-only mount (this host cannot mount a tmpfs)"
+fi
+
+# A writable bind is still `nosuid,nodev`: a device node or a setuid binary
+# the host left in a shared directory gives the sandbox nothing.
+mkdir -p /tmp/escape-rwflags
+out=$(zygo run --mount /tmp/escape-rwflags:/rwflags:rw "$IMAGE" \
+      sh -c "grep ' /rwflags ' /proc/self/mountinfo" 2>/dev/null)
+case "$out" in
+    *nosuid*nodev*|*nodev*nosuid*) ok "a writable bind is nosuid,nodev" ;;
+    '')                            nothing_ran "this case" ;;
+    *)                             bad "a writable bind keeps setuid or devices: $out" ;;
+esac
+
 # --- 12. escaping through a writable mount with a symlink -------------------
 
 say "12. follow a symlink out of a writable mount"

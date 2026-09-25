@@ -192,16 +192,23 @@ pub enum PreparedOp {
         source: CString,
         target: CString,
         readonly: bool,
+        submounts: Vec<CString>,
     },
     Tmpfs {
         target: CString,
         options: CString,
         flags: u64,
     },
+    /// A user bind mount. Always `nosuid,nodev`; read-only as well for `:ro`,
+    /// and in both cases for every mount beneath it, not only the top one.
     Bind {
         source: CString,
         target: CString,
         readonly: bool,
+        /// Where the mounts below `source` land inside the sandbox — filled
+        /// only on a kernel without `mount_setattr`, where the child has to
+        /// lock each one by hand. See [`submounts_under`].
+        submounts: Vec<CString>,
     },
     Proc {
         target: CString,
@@ -411,6 +418,7 @@ pub fn prepare(config: &SandboxConfig) -> Result<PreparedLaunch, PrepareError> {
                 source: cstr(source)?,
                 target: cstr(target)?,
                 readonly: !config.writable_root,
+                submounts: fallback_submounts(source, target)?,
             },
 
             MountOp::Tmpfs {
@@ -431,6 +439,7 @@ pub fn prepare(config: &SandboxConfig) -> Result<PreparedLaunch, PrepareError> {
                 source: cstr(source)?,
                 target: cstr(target)?,
                 readonly: *mode == MountMode::Ro,
+                submounts: fallback_submounts(source, target)?,
             },
 
             MountOp::Proc { target } => PreparedOp::Proc {
@@ -528,6 +537,108 @@ pub fn prepare(config: &SandboxConfig) -> Result<PreparedLaunch, PrepareError> {
     })
 }
 
+/// `mount_setattr(2)`: 442 on every architecture, being newer than the
+/// unified numbering. Linux 5.12.
+pub const SYS_MOUNT_SETATTR: libc::c_long = 442;
+
+/// Whether this kernel has `mount_setattr`. Asked once, with arguments it
+/// must refuse: a kernel that has the call says `EBADF` or `EINVAL`, one that
+/// does not says `ENOSYS`.
+pub fn has_mount_setattr() -> bool {
+    static ANSWER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ANSWER.get_or_init(|| {
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: an invalid descriptor and a null attribute pointer with
+            // size 0; the kernel reads nothing and changes nothing.
+            let rc = unsafe {
+                libc::syscall(
+                    SYS_MOUNT_SETATTR,
+                    -1,
+                    c"".as_ptr(),
+                    0,
+                    core::ptr::null::<u8>(),
+                    0usize,
+                )
+            };
+            !(rc < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOSYS))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    })
+}
+
+/// The mounts below `source` a recursive bind carries along, for a kernel
+/// that cannot lock them all with one `mount_setattr(AT_RECURSIVE)`. Empty
+/// where it can: the list is only for the fallback, and reading the mount
+/// table on every launch would cost a host with many mounts for nothing.
+fn fallback_submounts(source: &Path, target: &Path) -> Result<Vec<CString>, PrepareError> {
+    if has_mount_setattr() {
+        return Ok(Vec::new());
+    }
+    let Ok(table) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return Ok(Vec::new());
+    };
+    let source = std::fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
+    submounts_under(&table, &source, target)
+        .iter()
+        .map(|p| cstr(p))
+        .collect()
+}
+
+/// Every mount point strictly below `source` in a `/proc/self/mountinfo`
+/// table, moved to where it lands under `target`. Parents come before their
+/// children, which is the table's own order.
+///
+/// A `MS_REC` bind copies these into the sandbox, and a read-only remount of
+/// the top one leaves every one of them writable — the gap this closes.
+pub(crate) fn submounts_under(
+    mountinfo: &str,
+    source: &Path,
+    target: &Path,
+) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for line in mountinfo.lines() {
+        // id parent major:minor root mount-point options ...
+        let Some(field) = line.split(' ').nth(4) else {
+            continue;
+        };
+        let point = unescape_mountinfo(field);
+        let point = Path::new(OsStr::from_bytes(&point));
+        if let Ok(rest) = point.strip_prefix(source)
+            && !rest.as_os_str().is_empty()
+        {
+            let landed = target.join(rest);
+            if !out.contains(&landed) {
+                out.push(landed);
+            }
+        }
+    }
+    out
+}
+
+/// Undo the kernel's octal escapes (`\040` for a space) in a mountinfo path.
+fn unescape_mountinfo(field: &str) -> Vec<u8> {
+    let b = field.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\'
+            && i + 3 < b.len()
+            && b[i + 1..i + 4].iter().all(|c| (b'0'..=b'7').contains(c))
+        {
+            out.push((b[i + 1] - b'0') * 64 + (b[i + 2] - b'0') * 8 + (b[i + 3] - b'0'));
+            i += 4;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Translate the plan's abstract flags into the kernel's `MS_*` bits.
 fn mount_flags(abstract_flags: u64) -> u64 {
     use crate::sandbox::mount::flags;
@@ -585,6 +696,13 @@ fn rlimit_resource(kind: crate::sandbox::RlimitKind) -> i32 {
 
 /// Mount flag set for a read-only bind remount.
 pub const READONLY_REMOUNT: u64 = MS_REMOUNT | MS_BIND | MS_RDONLY | MS_NOSUID | MS_NODEV;
+/// The same for a writable bind: no setuid bits, no device nodes.
+pub const LOCKED_REMOUNT: u64 = MS_REMOUNT | MS_BIND | MS_NOSUID | MS_NODEV;
+/// `mount_setattr`'s attribute bits, and the flag that makes it recurse.
+pub const MOUNT_ATTR_RDONLY: u64 = 0x1;
+pub const MOUNT_ATTR_NOSUID: u64 = 0x2;
+pub const MOUNT_ATTR_NODEV: u64 = 0x4;
+pub const AT_RECURSIVE: libc::c_uint = 0x8000;
 /// Flags for the root mount.
 pub const ROOT_FLAGS: u64 = MS_RDONLY | MS_NOSUID | MS_NODEV;
 /// Flags for `/proc` and `/sys`.
@@ -691,6 +809,37 @@ mod tests {
             })
             .unwrap();
         assert!(!rw, "a `:rw` mount must not be prepared read-only");
+    }
+
+    const MOUNTINFO: &str = "\
+22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw
+30 22 0:26 / /srv/data rw,nosuid shared:2 - ext4 /dev/sdb1 rw
+31 30 0:27 / /srv/data/cache rw shared:3 - tmpfs tmpfs rw
+32 30 0:28 / /srv/data/with\\040space rw shared:4 - tmpfs tmpfs rw
+33 22 0:29 / /srv/database rw shared:5 - tmpfs tmpfs rw
+";
+
+    #[test]
+    fn submounts_are_found_below_the_source_and_moved_under_the_target() {
+        let found = submounts_under(
+            MOUNTINFO,
+            Path::new("/srv/data"),
+            Path::new("/newroot/data"),
+        );
+        assert_eq!(
+            found,
+            vec![
+                PathBuf::from("/newroot/data/cache"),
+                PathBuf::from("/newroot/data/with space"),
+            ],
+            "the source itself and a sibling that only shares a prefix are not submounts"
+        );
+    }
+
+    #[test]
+    fn a_source_with_nothing_below_it_has_no_submounts() {
+        assert!(submounts_under(MOUNTINFO, Path::new("/srv/database"), Path::new("/x")).is_empty());
+        assert!(submounts_under("garbage\n\n", Path::new("/"), Path::new("/x")).is_empty());
     }
 
     #[test]

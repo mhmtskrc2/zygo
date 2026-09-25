@@ -12,8 +12,12 @@
 
 use std::os::raw::{c_char, c_int, c_void};
 
+use std::ffi::CString;
+
 use super::prepare::{
-    PSEUDO_FLAGS, PreparedLaunch, PreparedOp, READONLY_REMOUNT, ROOT_FLAGS, SYSFS_FLAGS, Step,
+    AT_RECURSIVE, LOCKED_REMOUNT, MOUNT_ATTR_NODEV, MOUNT_ATTR_NOSUID, MOUNT_ATTR_RDONLY,
+    PSEUDO_FLAGS, PreparedLaunch, PreparedOp, READONLY_REMOUNT, ROOT_FLAGS, SYS_MOUNT_SETATTR,
+    SYSFS_FLAGS, Step,
 };
 
 /// Byte the parent sends once `uid_map`/`gid_map` are in place.
@@ -347,6 +351,7 @@ unsafe fn apply(op: &PreparedOp, err_fd: c_int) {
             source,
             target,
             readonly,
+            submounts,
         } => {
             let rc = unsafe {
                 libc::mount(
@@ -361,21 +366,10 @@ unsafe fn apply(op: &PreparedOp, err_fd: c_int) {
                 fail(err_fd, Step::MountRoot);
             }
             // A bind mount ignores flags at mount time; read-only has to be a
-            // second, explicit remount. Skipped only for a derived-layer build,
+            // second, explicit step. Skipped only for a derived-layer build,
             // whose root is a private copy made to be written.
             if *readonly {
-                let rc = unsafe {
-                    libc::mount(
-                        null,
-                        target.as_ptr(),
-                        null,
-                        READONLY_REMOUNT as libc::c_ulong,
-                        core::ptr::null(),
-                    )
-                };
-                if rc != 0 {
-                    fail(err_fd, Step::MountRoot);
-                }
+                unsafe { lock_bind(target, true, submounts, err_fd, Step::MountRoot) };
             }
         }
 
@@ -406,6 +400,7 @@ unsafe fn apply(op: &PreparedOp, err_fd: c_int) {
             source,
             target,
             readonly,
+            submounts,
         } => {
             // The mount point, where the image did not already provide one.
             // The rootfs view creates every target the plan names, but only
@@ -427,20 +422,12 @@ unsafe fn apply(op: &PreparedOp, err_fd: c_int) {
             if rc != 0 {
                 fail_at(err_fd, Step::MountBind, target.as_ptr());
             }
-            if *readonly {
-                let rc = unsafe {
-                    libc::mount(
-                        null,
-                        target.as_ptr(),
-                        null,
-                        READONLY_REMOUNT as libc::c_ulong,
-                        core::ptr::null(),
-                    )
-                };
-                if rc != 0 {
-                    fail(err_fd, Step::RemountReadOnly);
-                }
-            }
+            let step = if *readonly {
+                Step::RemountReadOnly
+            } else {
+                Step::MountBind
+            };
+            unsafe { lock_bind(target, *readonly, submounts, err_fd, step) };
         }
 
         PreparedOp::Proc { target } => {
@@ -576,6 +563,122 @@ unsafe fn apply(op: &PreparedOp, err_fd: c_int) {
                 fail(err_fd, Step::RemountReadOnly);
             }
         }
+    }
+}
+
+/// `struct mount_attr`, version 0.
+#[repr(C)]
+struct MountAttr {
+    attr_set: u64,
+    attr_clr: u64,
+    propagation: u64,
+    userns_fd: u64,
+}
+
+/// Make a recursive bind `nosuid,nodev` — and read-only when `readonly` —
+/// all the way down.
+///
+/// A remount changes only the mount it names. Every mount *below* the source
+/// that `MS_REC` carried in would keep its own flags: a `:ro` volume with a
+/// writable filesystem mounted somewhere inside it would be writable there.
+/// Landlock covers that on 5.13 and later, but not below.
+///
+/// `mount_setattr(AT_RECURSIVE)` (5.12) changes the whole subtree in one call,
+/// and only ever adds attributes, so it cannot trip over the flags a user
+/// namespace locks. An older kernel gets the same result one mount at a time,
+/// from the list the parent read out of the mount table before the clone.
+///
+/// # Safety
+/// Child side of the clone: nothing here allocates.
+unsafe fn lock_bind(
+    target: &CString,
+    readonly: bool,
+    submounts: &[CString],
+    err_fd: c_int,
+    step: Step,
+) {
+    let attr = MountAttr {
+        attr_set: MOUNT_ATTR_NOSUID
+            | MOUNT_ATTR_NODEV
+            | if readonly { MOUNT_ATTR_RDONLY } else { 0 },
+        attr_clr: 0,
+        propagation: 0,
+        userns_fd: 0,
+    };
+    let rc = unsafe {
+        libc::syscall(
+            SYS_MOUNT_SETATTR,
+            libc::AT_FDCWD,
+            target.as_ptr(),
+            AT_RECURSIVE,
+            &attr as *const MountAttr,
+            core::mem::size_of::<MountAttr>(),
+        )
+    };
+    if rc == 0 {
+        return;
+    }
+    if errno() != libc::ENOSYS {
+        fail_at(err_fd, step, target.as_ptr());
+    }
+    let flags = if readonly {
+        READONLY_REMOUNT
+    } else {
+        LOCKED_REMOUNT
+    };
+    unsafe { remount_keeping_locks(target.as_ptr(), flags, true, err_fd, step) };
+    for sub in submounts {
+        unsafe { remount_keeping_locks(sub.as_ptr(), flags, false, err_fd, step) };
+    }
+}
+
+/// `mount -o remount,bind,<flags>` that repeats whatever the mount already
+/// has among the flags a user namespace locks — `noexec` and the atime
+/// setting. Dropping one of those is `EPERM`; keeping it costs nothing.
+///
+/// A submount that is no longer there (`must_exist` false) needs no lock: it
+/// went away between the parent reading the table and this remount.
+///
+/// # Safety
+/// Child side of the clone: nothing here allocates.
+unsafe fn remount_keeping_locks(
+    path: *const c_char,
+    flags: u64,
+    must_exist: bool,
+    err_fd: c_int,
+    step: Step,
+) {
+    // `ST_*` as `statvfs` reports them, and the `MS_*` a remount spells them
+    // with. Only relatime's numbers differ. (`statvfs` rather than `statfs`,
+    // whose flag word the `libc` crate keeps private; both libcs build it from
+    // the one `statfs` syscall, with no allocation.)
+    const KEEP: [(u64, u64); 4] = [(8, 8), (1024, 1024), (2048, 2048), (4096, 1 << 21)];
+
+    let mut st: libc::statvfs = unsafe { core::mem::zeroed() };
+    if unsafe { libc::statvfs(path, &mut st) } != 0 {
+        if must_exist {
+            fail_at(err_fd, step, path);
+        }
+        return;
+    }
+    let mut keep = 0;
+    for (st_bit, ms_bit) in KEEP {
+        if st.f_flag & st_bit != 0 {
+            keep |= ms_bit;
+        }
+    }
+    let null = core::ptr::null::<c_char>();
+    let rc = unsafe {
+        libc::mount(
+            null,
+            path,
+            null,
+            (flags | keep) as libc::c_ulong,
+            core::ptr::null(),
+        )
+    };
+    if rc != 0 {
+        fail_at(err_fd, step, path);
     }
 }
 

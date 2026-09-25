@@ -154,7 +154,7 @@ syscall named in the tables below is refused.
   make escape-linux                        make fuzz-linux
   ─────────────────                        ───────────────
   every known attack, really tried         all 469 syscall numbers
-  → 16 blocked, 0 escaped, 1 skipped       × 3 profiles, one forked child each
+  → 25 blocked, 0 escaped, 1 skipped       × 3 profiles, one forked child each
                                            → profiles ordered, nothing kills
                                              the process, clone3 → ENOSYS
 ```
@@ -178,7 +178,8 @@ syscall named in the tables below is refused.
 |---|---|---|
 | Overwriting the runtime binary (CVE-2019-5736 shape) | read-only root; `/proc/self/exe` is not writable | **attempted** |
 | `cgroup` `release_agent` | cgroupfs is not mounted in the sandbox at all | **attempted** |
-| Writing through a read-only bind mount | `MS_RDONLY` remount after the bind | **attempted** |
+| Writing through a read-only bind mount | read-only for the mount *and every mount below it*: `mount_setattr(AT_RECURSIVE)` on 5.12+, one remount per submount (read from the host's mount table) below that | **attempted** — including a tmpfs mounted inside the read-only source |
+| Setuid binaries or device nodes in a shared folder | every bind, `:rw` as well, is `nosuid,nodev`, recursively | **attempted** |
 | Escaping a writable mount by symlink | `pivot_root`; the symlink resolves inside the sandbox root | **attempted** |
 | Reaching the host's filesystem | `pivot_root` with the old root detached | **attempted** |
 | Tampering with shared image layers | the store is not reachable from inside; layers are bound read-only | **attempted** |

@@ -170,7 +170,7 @@ it.
 
 | Field | Type | Default | What it does |
 |---|---|---|---|
-| `mounts` | list of `host:guest[:ro\|rw]` | `[]` | Bind mounts, **read-only unless `:rw`**. `guest` must be absolute. A host path cannot contain `:`. Two mounts cannot share a target. |
+| `mounts` | list of `host:guest[:ro\|rw]` | `[]` | Bind mounts, **read-only unless `:rw`**, and always `nosuid,nodev`. Both apply to every mount below the host path too. `guest` must be absolute. A host path cannot contain `:`. Two mounts cannot share a target. |
 | `env` | table | `{}` | Environment variables for the sandbox. The zygote sees them, so **never put a secret here**. |
 | `secrets` | list of names | `[]` | Each name is read from the environment of the shell that runs `serve`/`up`, and delivered as the file `/run/secrets/<NAME>` (mode 0400), only for the length of one request. A name cannot be in both `env` and `secrets`. |
 
