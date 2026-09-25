@@ -33,8 +33,14 @@ break things and will say so here.
 
 ### Added
 
+- Releases carry an SBOM (`zygo-<version>.cdx.json`, CycloneDX) and a
+  keyless cosign signature over `SHA256SUMS`, so every tarball is verifiable,
+  not only the image.
 - `CONTRIBUTING.md`, a code of conduct, issue and pull request templates, and
   this changelog. `NOTICE`, and an SPDX licence line in every source file.
+- `cargo deny` in CI and as `make deny`: RustSec advisories, licences and
+  sources for the whole dependency tree. Dependabot keeps the pinned actions
+  and the crates current.
 
 ### Fixed
 

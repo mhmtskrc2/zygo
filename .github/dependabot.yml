@@ -1,0 +1,33 @@
+# Dependency updates, as pull requests CI then has to pass.
+#
+# The GitHub Actions are pinned to commit SHAs, which keeps a moved tag from
+# changing what runs — and also keeps anything from updating them. This is the
+# half of the pinning that was missing.
+#
+# No npm or pip entry: both SDKs have no dependencies at all, by design, so
+# there is nothing for an update to find.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # Patch and minor bumps together, one pull request a week; a major bump
+      # gets its own, because it is the one that can change behaviour.
+      cargo-compatible:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directory: /packaging/oci
+    schedule:
+      interval: weekly

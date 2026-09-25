@@ -59,6 +59,7 @@ One line each. The chapter in brackets explains the term in full; the numbers fo
 | **rootless** | Running without root at any point, thanks to user namespaces. [2, 6] |
 | **runtime pool** | Warm zygotes holding an interpreter and no code; each request brings its own script. [13] |
 | **`sandbox.toml`** | The file that describes a project's functions, pools and API. [20] |
+| **SBOM** | "Software bill of materials": the list of every library inside a binary, with versions, published with each release. [11] |
 | **seccomp** | A filter on which syscalls a process may make. [4] |
 | **setns** | The syscall that joins a namespace that already exists. [2] |
 | **setuid** | A mark on a program that makes it run as its owner, often root. [4] |

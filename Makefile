@@ -49,6 +49,7 @@ help:
 	@echo "verify-seccomp-profiles-linux  copy2 and pip --target under every profile; the profiles differ from inside"
 	@echo "syscall-tables  regenerate the seccomp syscall number tables"
 	@echo "fmt / lint   rustfmt / clippy"
+	@echo "deny         advisories, licences and sources of every dependency (cargo-deny)"
 
 build:
 	cargo build --release
@@ -504,6 +505,12 @@ lint:
 	if [ -n "$$missing" ]; then \
 		echo "no SPDX-License-Identifier line in:"; echo "$$missing"; exit 1; \
 	fi
+
+# The dependency tree against RustSec advisories and the licence and source
+# policy in deny.toml. CI pins the version; locally, `cargo install cargo-deny`.
+.PHONY: deny
+deny:
+	cargo deny --locked check
 
 # The previous / contents / next links at the foot of every book page,
 # rebuilt from the reading order in docs/SUMMARY.md.

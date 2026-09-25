@@ -426,14 +426,29 @@ jobs:
     needs: [what, linux, macos, homebrew, oci]
     if: needs.what.outputs.publish == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     permissions:
       contents: write
+      # Keyless signing of SHA256SUMS, as for the image.
+      id-token: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      # What is inside the binary, as a CycloneDX document: every crate and
+      # its version, from Cargo.lock. The question a user's security team
+      # asks first, answered before they ask it.
+      - name: SBOM
+        env:
+          VERSION: ${{ needs.what.outputs.version }}
+        run: |
+          cargo install --locked cargo-cyclonedx@0.5.9
+          cargo cyclonedx --format json --spec-version 1.5
+          mkdir -p release
+          cp crates/zygo-cli/zygo-cli.cdx.json "release/zygo-$VERSION.cdx.json"
 
       - name: Collect
         shell: bash
@@ -441,9 +456,17 @@ jobs:
           mkdir -p release
           find artifacts -type f \( -name '*.tar.gz' -o -name 'zygo.rb' \) \
             -exec cp {} release/ \;
-          (cd release && sha256sum *.tar.gz > SHA256SUMS)
+          (cd release && sha256sum *.tar.gz *.cdx.json > SHA256SUMS)
           ls -l release
           cat release/SHA256SUMS
+
+      - uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3
+
+      # One signature covers every file: SHA256SUMS names them all, so a
+      # verified SHA256SUMS and a matching `sha256sum -c` is a verified
+      # tarball. Keyless, bound to this workflow and this tag.
+      - name: Sign the checksums
+        run: cosign sign-blob --yes --bundle release/SHA256SUMS.sigstore.json release/SHA256SUMS
 
       - name: Release
         env:
@@ -487,7 +510,15 @@ jobs:
           \`zygo doctor\` is the first thing to run anywhere: it attempts every
           requirement on this host and prints the fix for anything missing.
 
-          Checksums are in \`SHA256SUMS\`.
+          Checksums are in \`SHA256SUMS\`, signed the same way; the SBOM
+          (CycloneDX) is \`zygo-$VERSION.cdx.json\`:
+
+          \`\`\`bash
+          cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore.json \\
+            --certificate-identity-regexp '^https://github\.com/.*/\.github/workflows/release\.yml@refs/tags/' \\
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+          sha256sum -c SHA256SUMS --ignore-missing
+          \`\`\`
           EOF
           gh release create "$TAG" release/* \
             --title "$TAG" \

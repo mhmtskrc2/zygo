@@ -57,6 +57,22 @@ release carries, so you know it is the one that was published. The `sudo` is
 only for copying the file into `/usr/local/bin`; Zygo itself never runs as
 root.
 
+`SHA256SUMS` is itself signed, in every release after 0.1.1. With
+[cosign](https://docs.sigstore.dev/) installed, this proves the checksums came
+from this project's release workflow, not only from the same download page:
+
+```bash
+curl -fsSLO "$url/SHA256SUMS"
+curl -fsSLO "$url/SHA256SUMS.sigstore.json"
+cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity-regexp '^https://github\.com/.*/\.github/workflows/release\.yml@refs/tags/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+Each release also carries an SBOM — a list of every library compiled into the
+binary, with its version — as `zygo-<version>.cdx.json`, in the CycloneDX
+format that security scanners read.
+
 ## Installing on macOS
 
 On a Mac, Homebrew installs three things: a small `zygo` *shim* for macOS (a
