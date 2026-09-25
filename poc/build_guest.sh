@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # Builds the Linux `zygo` the macOS shim forwards into — inside the Lima VM
 # itself, so a Mac with no Docker on it can still build its own guest.
 #

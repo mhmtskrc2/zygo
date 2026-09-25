@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `zygo bench` — measure the warm path against the real pool.
 //!
 //! PoC 3 measured p50 1887 µs against a 2000 µs budget: **6% of headroom**. The

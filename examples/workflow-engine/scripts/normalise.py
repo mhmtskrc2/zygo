@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """A user script, as a workflow engine's user would write it.
 
 Nothing here knows about Zygo: it is a `handler(event)` that returns a value,

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Files in and out of one request.
 //!
 //! A script is code and arrives by digest; a **workspace** is data and arrives

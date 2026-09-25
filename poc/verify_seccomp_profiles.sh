@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # What the first adoption report found about seccomp, attempted on a kernel.
 #
 # Three things, each of which was a session to diagnose from the outside and

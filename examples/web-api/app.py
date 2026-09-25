@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """A tiny web API. Each endpoint runs code in Zygo a different way.
 
     POST /lower   {"text": "Hello WORLD"}              a warm function

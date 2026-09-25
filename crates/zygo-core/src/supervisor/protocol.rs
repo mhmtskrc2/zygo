@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The control protocol: CLI ↔ supervisor (design doc §3.4).
 //!
 //! Deliberately **not** the agent wire protocol. The agent runs tenant code, so

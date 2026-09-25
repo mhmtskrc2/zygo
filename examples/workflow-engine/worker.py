@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """A workflow engine's worker, with Zygo underneath.
 
 This is the integration `docs/book/10-similar-projects.md` names and nothing else in the

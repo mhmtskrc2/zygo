@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # Setup for the warm-script density benchmark; the measuring is in
 # `bench_density.py`.
 #

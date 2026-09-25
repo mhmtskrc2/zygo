@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """What a CPU-bound handler costs the rest of the protocol.
 
 A warm agent holds one conversation with the supervisor and runs tenant code

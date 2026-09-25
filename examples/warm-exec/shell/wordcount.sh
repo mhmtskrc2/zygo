@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # One request's script, in a warm-exec pool.
 #
 # The contract is the whole of the integration: the event arrives on stdin as

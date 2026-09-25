@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The `gvisor` backend: the same sandbox, drawn by `runsc` (design doc §3.9).
 //!
 //! `ns` builds the sandbox itself; this hands the same [`MountPlan`] to gVisor

@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 # A sweep of the whole syscall space against each seccomp profile
 # — the fuzz-based extension of the escape suite.
 #

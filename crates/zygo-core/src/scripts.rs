@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! A content-addressed store for the scripts that arrive with requests.
 //!
 //! Protocol 1.1 lets an `EXEC` carry the code to run, so that one warm

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # What a host needs before the `vm` backend can be worked on, as a script.
 #
 # The table of what each test host provides is something somebody produced by

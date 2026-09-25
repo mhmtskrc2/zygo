@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /**
  * What can go wrong, as classes a caller can branch on.
  *

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Scalar types used by `sandbox.toml` and by CLI flags.
 //!
 //! Each type parses from the same string syntax in both places, so

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # `zygo login` against a real registry that really refuses people.
 #
 # Run:  make verify-login-linux

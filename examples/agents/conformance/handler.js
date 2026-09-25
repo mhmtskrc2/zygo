@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // The handler `zygo agent test` expects, for the Node agent.
 //
 // The conformance suite cannot assert anything about an agent's answers unless

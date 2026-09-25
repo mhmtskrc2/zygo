@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # Wait for the test registry to answer, rather than sleeping and hoping.
 #
 # `sleep 3` was right on a warm machine and wrong on a cold one, where the

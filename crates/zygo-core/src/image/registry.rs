@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! OCI Distribution client.
 //!
 //! Pulls a reference into the local [`Store`]: resolve the manifest (following

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `zygo pull`, `zygo images`, `zygo image prune`.
 
 use anyhow::Context;

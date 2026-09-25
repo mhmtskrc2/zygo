@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Getting into a cgroup Zygo can actually build under.
 //!
 //! On a systemd machine an ssh login sits in a `session-N.scope`. systemd owns

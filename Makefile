@@ -499,6 +499,11 @@ lint:
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets -- -D warnings
 	python3 docs/nav.py --check
+	@missing=$$(git ls-files '*.rs' '*.py' '*.sh' '*.js' '*.mjs' '*.ts' '*.c' '*.go' \
+		| xargs grep -L 'SPDX-License-Identifier: Apache-2.0'); \
+	if [ -n "$$missing" ]; then \
+		echo "no SPDX-License-Identifier line in:"; echo "$$missing"; exit 1; \
+	fi
 
 # The previous / contents / next links at the foot of every book page,
 # rebuilt from the reading order in docs/SUMMARY.md.

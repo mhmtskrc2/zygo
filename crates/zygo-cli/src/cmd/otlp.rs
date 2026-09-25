@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! OTLP metrics export from `zygo api` (design doc §3.12).
 //!
 //! OTLP/HTTP with the protocol's JSON encoding, pushed to a collector on an

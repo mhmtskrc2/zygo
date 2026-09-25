@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Bytecode for Python images, compiled once, as a layer of its own.
 //!
 //! The official `python:*-slim` images delete every `.pyc` to save space —

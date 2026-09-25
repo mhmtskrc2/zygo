@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # The examples, run for real: a compiled Go program as a warm-exec function.
 #
 # `examples/warm-exec/go/bin/parse` has to exist — `make examples-go-linux`

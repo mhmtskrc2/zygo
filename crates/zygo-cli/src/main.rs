@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `zygo` — the CLI.
 //!
 //! A thin client over `zygo-core` (ADR-008). Everything interesting lives in

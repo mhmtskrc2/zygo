@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The content-addressed image store (design doc §3.7).
 //!
 //! Blobs land under `images/blobs/sha256/<digest>`, verified on the way in.

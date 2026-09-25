@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # Shared cgroup preparation for the verification suites. Sourced, not run.
 #
 # Every suite needs the same thing, and it is not obvious: each `zygo`

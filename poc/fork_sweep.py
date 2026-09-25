@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Fork-safety sweep: popular PyPI packages imported in a zygote, then forked.
 
 For each package the harness serves a handler that imports it at module

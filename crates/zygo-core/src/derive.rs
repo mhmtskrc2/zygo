@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Derived system layers: apt packages as an OCI layer of their own.
 //!
 //! `system = ["libpq5", "jq"]` in a function's spec → those packages installed

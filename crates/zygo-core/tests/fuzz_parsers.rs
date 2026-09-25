@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Property and fuzz-style tests for everything that parses untrusted input.
 //!
 //! The spec file comes from a user and the wire protocol comes from inside a

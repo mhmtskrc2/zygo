@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `zygo token` — who may talk to the API, and as whom.
 //!
 //! The operator's side of scoped tokens. `zygo api` reads them; this is what

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The workflow engine's half: a job queue, with no idea Zygo exists.
 
 Windmill has this in Postgres (`v2_job_queue`, `SELECT … FOR UPDATE SKIP

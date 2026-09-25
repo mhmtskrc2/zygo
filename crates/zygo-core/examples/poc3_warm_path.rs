@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! PoC 3 — warm request overhead.
 //!
 //! **The gate for the whole architecture.** If a request cannot be served in

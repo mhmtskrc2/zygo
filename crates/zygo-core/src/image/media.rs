@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! OCI manifest and config types.
 //!
 //! Only the fields Zygo acts on are modelled; the rest of the document is

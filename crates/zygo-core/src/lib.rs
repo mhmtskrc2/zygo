@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! # zygo-core
 //!
 //! Core library behind the `zygo` CLI, the Python/TypeScript bindings and any

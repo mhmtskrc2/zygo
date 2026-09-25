@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The `vm` backend: a sandbox whose boundary is hardware.
 //!
 //! libkrun is linked *into* this binary rather than loaded as a shared object.

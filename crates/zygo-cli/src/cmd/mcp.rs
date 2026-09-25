@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `zygo mcp` — Zygo's tools, over the Model Context Protocol.
 //!
 //! An agent host (Claude Code, Claude Desktop, Cursor, and anything else that

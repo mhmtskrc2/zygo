@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # The HTTP API end to end, driven by the client that ships with it.
 #
 # Three runs of the same driver against three listeners:

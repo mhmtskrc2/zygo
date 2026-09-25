@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `zygo doctor` — can this host run sandboxes, and if not, what fixes it.
 
 use serde::{Deserialize, Serialize};

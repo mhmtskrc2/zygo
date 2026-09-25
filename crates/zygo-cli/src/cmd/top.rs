@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `zygo top` — the live table.
 //!
 //! What justifies this existing beside `zygo ps` is the pair of columns `ps`

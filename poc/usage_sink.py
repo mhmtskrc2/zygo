@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """A webhook receiver for `--usage-webhook`, for `poc/verify_api.sh`.
 
 Twenty lines rather than a mock, because what is under test is delivery: that

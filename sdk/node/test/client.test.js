@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /**
  * What the Node client promises, checked against a stand-in API.
  *

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `zygo serve`, `exec`, `ps`, `stop`, and the supervisor process behind them.
 //!
 //! Every command here is the same shape: connect to the supervisor, send one

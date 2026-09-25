@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // The script `zygo agent test --script-spawn` sends (proto 1.1).
 //
 // It starts a program in its **module body**, which is the whole point: a

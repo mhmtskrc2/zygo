@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """A stand-in for ``zygo api``, so the client can be tested without a kernel.
 
 It answers the routes the client calls, records what it received, and can be

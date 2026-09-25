@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! API tokens, and what each one is allowed to be.
 //!
 //! One bearer token for the whole API answers "is this Zygo's owner?" and

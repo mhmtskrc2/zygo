@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The OpenAPI document, and the thing that keeps it honest.
 //!
 //! Hand-written rather than derived from annotations. The alternative on offer

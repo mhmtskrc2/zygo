@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! seccomp-bpf filters (design doc appendix B).
 //!
 //! The filter is an **allowlist**: anything not named returns `EPERM`. That

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Namespace sets and user-namespace id mapping.
 //!
 //! Split out from the launcher itself because it is pure computation: what

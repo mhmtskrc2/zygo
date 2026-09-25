@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # `zygo bench all` with everything it needs already in place.
 #
 # The benchmark itself is in the binary — `zygo bench all` — because the

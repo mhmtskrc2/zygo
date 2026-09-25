@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # Fork-safety sweep across popular PyPI packages. See poc/fork_sweep.py.
 #
 # Run:  make fork-sweep-linux

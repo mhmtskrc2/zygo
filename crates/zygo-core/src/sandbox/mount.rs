@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The mount plan (design doc §3.3, step 2).
 //!
 //! The plan is computed as pure data and only then applied, for three reasons:

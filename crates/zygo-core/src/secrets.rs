@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Per-tenant secrets, encrypted at rest.
 //!
 //! A function's `secrets` have always been the shell's to supply: `zygo serve`

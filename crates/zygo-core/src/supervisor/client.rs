@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The CLI's side of the control socket, including starting a supervisor.
 //!
 //! `zygo serve` is expected to work on a machine where nothing is running yet

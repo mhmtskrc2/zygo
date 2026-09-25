@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """PoC 9 — is a pre-created network namespace reusable?
 
 PoC 1 measured `CLONE_NEWNET` at 2.47 ms, 94% of the whole sandbox setup cost.

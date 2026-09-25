@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The warm execution wire protocol (design doc §3.4).
 //!
 //! Deliberately small and language independent (ADR-009). Anything that speaks

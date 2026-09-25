@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """What the plugin host can do, run end to end against a real Zygo.
 
 The exit criterion for the embedder API, as a program that either works or

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Environment probing behind `zygo doctor` (design doc §4.1).
 //!
 //! The output is the honest answer to "will this host actually enforce what

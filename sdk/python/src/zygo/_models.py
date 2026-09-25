@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The shapes that come back, as plain dataclasses.
 
 Deliberately thin. Every one of these mirrors a JSON object the API already

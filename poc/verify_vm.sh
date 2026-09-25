@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # The `vm` backend against a real KVM, compared with `ns` (requirement N8).
 #
 # Shaped like `verify_gvisor.sh`: the `ns` baseline first, then the same probes

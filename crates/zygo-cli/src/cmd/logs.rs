@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `zygo logs <name>` — a function's recent log.
 //!
 //! The supervisor keeps a bounded ring per function name: the zygote's own

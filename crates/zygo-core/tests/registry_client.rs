@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The registry client, against a registry that really answers.
 //!
 //! Everything below the network was already covered by unit tests; what was

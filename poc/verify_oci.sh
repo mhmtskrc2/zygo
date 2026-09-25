@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # The container image, built and run for real (todo 4.2).
 #
 # What this checks is the image rather than Zygo: that the binary in it is the

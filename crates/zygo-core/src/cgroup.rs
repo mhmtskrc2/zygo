@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The two-level cgroup v2 hierarchy (design doc §3.6).
 //!
 //! ```text

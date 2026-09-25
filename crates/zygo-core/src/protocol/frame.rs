@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Length-prefixed JSON framing.
 //!
 //! Wire format: a 4-byte big-endian unsigned length, then exactly that many

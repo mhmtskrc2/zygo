@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Registry authentication.
 //!
 //! Two pieces, both pure enough to test without a network: reading credentials

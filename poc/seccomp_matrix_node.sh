@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # The other half of the seccomp compatibility matrix: Node.
 #
 # A matrix built entirely out of CPython says nothing about Node, and the two

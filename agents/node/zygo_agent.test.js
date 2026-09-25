@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Unit tests for the Node reference agent.
 //
 // What is under test here is the parts that are decisions rather than

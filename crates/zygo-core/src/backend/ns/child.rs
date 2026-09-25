@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The child side of the launch, between `clone3` and `execve`.
 //!
 //! **Every function here must be async-signal-safe.** No allocation, no

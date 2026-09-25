@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! OCI images: references, the content-addressed store, and the Distribution
 //! client that fills it.
 //!

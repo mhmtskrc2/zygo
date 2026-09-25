@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // The script `zygo agent test --script` sends inside an `EXEC` (proto 1.1),
 // in TypeScript.
 //

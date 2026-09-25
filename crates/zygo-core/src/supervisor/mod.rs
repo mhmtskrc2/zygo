@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The supervisor: the process that owns the warm pool between commands.
 //!
 //! Zygo is daemonless (P5, ADR-005). That is a statement about *whose* process

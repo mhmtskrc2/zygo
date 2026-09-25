@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The warm pool — `Pool`, `WarmFn` (design doc §3.2, ADR-008).
 //!
 //! This is the product. Everything before it exists to get here: a sandbox that

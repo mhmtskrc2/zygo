@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """A dependency set, built for real, and then used by a pool (todo 3.3).
 
 Driven by the client that ships with Zygo, against a real API on a unix

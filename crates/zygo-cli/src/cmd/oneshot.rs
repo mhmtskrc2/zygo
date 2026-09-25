@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! One sandbox, one command, output captured.
 //!
 //! What `zygo run` does, for a caller that is not a terminal: the HTTP API's

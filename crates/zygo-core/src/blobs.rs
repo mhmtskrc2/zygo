@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Blobs: bytes an embedder sends once and names many times.
 //!
 //! A workspace tar can be sent with every call, and for a one-off that is the

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Write the previous / contents / next links at the foot of every book page.
 
 The reading order is `docs/SUMMARY.md`, and nothing else: every `[title](path)`

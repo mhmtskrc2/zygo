@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Command-line surface (design doc §4.3).
 //!
 //! The CLI is a thin client over `zygo-core` (ADR-008), so this module is

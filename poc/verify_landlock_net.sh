@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # Landlock's network rules, run for real.
 #
 # `crates/zygo-core/src/backend/ns/landlock.rs` builds `bind` and `connect`

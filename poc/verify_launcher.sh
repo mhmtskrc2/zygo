@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # Integration check for the `ns` launcher.
 #
 # Running the program is the easy half. This asserts the boundary is actually

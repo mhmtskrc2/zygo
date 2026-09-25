@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Backend-independent description of a sandbox.
 //!
 //! Everything here is pure data: the mount plan, the limit set and the identity

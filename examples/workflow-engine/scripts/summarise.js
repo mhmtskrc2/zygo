@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // The same shape in the other language the engine offers, so the worker has
 // to choose an image per script rather than per platform.
 //

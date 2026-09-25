@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Entering a held sandbox to run one request (warm-exec, design doc §3.4).
 //!
 //! The sandbox was built once and its init is holding it. A request is a

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # Run a repository's tests in a sealed one-shot sandbox. Exit code is theirs.
 #
 #   sh examples/ci-job/run.sh ./repo

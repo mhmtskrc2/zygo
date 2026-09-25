@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """PoC 5 — do real packages survive the `default` seccomp allowlist?
 
 Acceptance: `requests`, `pydantic`, `numpy`, `pandas` and `Pillow`

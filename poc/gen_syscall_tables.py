@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Regenerate `crates/zygo-core/src/backend/ns/syscalls.rs`.
 
 Run after adding a syscall name to any profile in `seccomp.rs`. A name with no

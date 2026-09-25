@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # Twenty use cases for the `vm` backend, on a host where the guest does not boot.
 #
 # `verify_vm.sh` is the suite for a working guest: it runs a program inside one

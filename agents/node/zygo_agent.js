@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// SPDX-License-Identifier: Apache-2.0
 // zygo-agent — the reference runtime agent for Node (design doc §3.4.1).
 //
 // Node has no `fork()` in the Unix sense. `child_process.fork` starts a whole

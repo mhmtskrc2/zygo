@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `zygo api` — the HTTP front door (design doc §4.6, requirement F9).
 //!
 //! A client of the supervisor, not a second copy of it. Every route here turns

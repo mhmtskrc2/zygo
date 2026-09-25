@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # Fifty scenarios, shaped like the seven use cases rather than like the code.
 #
 # The other suites are organised by mechanism: the launcher's isolation, the

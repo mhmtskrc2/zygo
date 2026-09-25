@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # Escape suite for the `ns` backend (design doc §3.10).
 #
 # Each case is an actual attempt to get out, not an inspection of settings: a

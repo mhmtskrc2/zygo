@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The synchronous client.
 
 Built on :mod:`http.client` from the standard library, so this package has no

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! OCI image reference parsing.
 //!
 //! Follows the same rules as `docker pull` and `podman pull`, because

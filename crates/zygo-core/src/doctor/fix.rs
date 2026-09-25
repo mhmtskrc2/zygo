@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! What `zygo doctor --fix` would do, as data.
 //!
 //! `doctor` already prints a remedy beside every check that is not `ok`. A

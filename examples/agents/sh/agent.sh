@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # A Zygo warm agent in POSIX sh. Needs `jq` and nothing else.
 #
 # This exists to keep `spec/protocol.md` honest. It claims the protocol is

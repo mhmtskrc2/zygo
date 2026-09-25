@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """What the Python client promises, checked against a stand-in API.
 
 These do not need Linux, a kernel or a sandbox: what is under test is the

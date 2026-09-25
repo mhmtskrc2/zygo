@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The mount plan, rendered as an OCI runtime `config.json` (design doc §3.9).
 //!
 //! The `ns` backend *executes* a [`MountPlan`]; `gvisor` hands the same plan to

@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 # V1, asked of a real build: does libkrun link against musl?
 #
 # Everything about the `vm` backend's distribution story rests on this

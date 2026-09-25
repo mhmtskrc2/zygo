@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Isolation backends: where the boundary is drawn (design doc §3.9).
 //!
 //! `ns`, `gvisor` and `vm` all consume the same [`SandboxConfig`] and speak the

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """A tool an LLM agent can call: evaluate an arithmetic expression.
 
 The model produces the expression; the model is not trusted. So the tool runs

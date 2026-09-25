@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `zygo shell <name>` — a shell inside a warm sandbox, for debugging.
 //!
 //! The design calls this "a debug fork; it does not touch the zygote"

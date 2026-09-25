@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Per-tenant admission control: `concurrency`, a bounded queue, and the `429`.
 //!
 //! Requirement N4 makes limits mandatory, and a limit nobody is told about is a

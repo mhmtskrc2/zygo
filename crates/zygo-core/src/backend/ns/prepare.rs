@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Everything the child needs, allocated before `clone3`.
 //!
 //! After a fork-like clone the child may only perform async-signal-safe work:

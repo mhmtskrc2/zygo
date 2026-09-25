@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Sandbox networking (design doc §3.8): `none`, `egress`, `full`, `host`.
 //!
 //! `none` is the default and needs nothing — the sandbox gets an empty network

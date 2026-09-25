@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `zygo secrets` — the operator's side of per-tenant secrets.
 //!
 //! The store is in `zygo-core`; this is the terminal in front of it. The one

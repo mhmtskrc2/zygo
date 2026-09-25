@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `zygo agent test <binary> [args…]` — the protocol conformance suite.
 //!
 //! The design's claim is that the warm protocol is language independent

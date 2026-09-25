@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `zygo spec validate` and `zygo spec explain`.
 //!
 //! `explain` prints the *effective* configuration — every default filled in,

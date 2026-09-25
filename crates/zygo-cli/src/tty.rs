@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Pseudo-terminal allocation for `zygo run --tty`.
 //!
 //! Zygo is daemonless, so a sandbox inherits the caller's terminal by default —

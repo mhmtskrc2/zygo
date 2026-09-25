@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /* zygo_child_seccomp — install ZYGO_CHILD_SECCOMP from a shared object's
  * constructor.
  *

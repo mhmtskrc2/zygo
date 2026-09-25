@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """PoC 4 — copy-on-write pollution with and without ``gc.freeze()``.
 
 The density claim (N3: 800+ warm tenants on 64 GB) rests on forked children

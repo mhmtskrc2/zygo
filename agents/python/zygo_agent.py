@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """zygo-agent — the reference runtime agent (design doc §3.4.1).
 
 Loads a handler once, then serves each request from a ``fork()`` of the warmed

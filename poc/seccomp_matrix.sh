@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # The `strict` seccomp profile against real packages.
 #
 # `strict` removes the socket family, `ptrace` and `mount` from the default

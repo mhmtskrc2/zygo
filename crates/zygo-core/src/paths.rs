@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! On-disk layout (design doc §3.13).
 //!
 //! ```text

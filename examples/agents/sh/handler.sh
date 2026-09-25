@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # The handler `zygo agent test` expects, for the sh agent.
 #
 # The event arrives on stdin; the result goes to descriptor 4, and stdout and

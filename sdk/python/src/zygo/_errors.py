@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """What can go wrong, as types a caller can branch on.
 
 The distinctions here are the ones that change what a caller should do next,

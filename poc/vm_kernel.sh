@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # The guest kernel, as a file.
 #
 # libkrun can boot a kernel from a path — `krun_set_kernel` — and that is what

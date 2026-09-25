@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # Concurrent `zygo run` from a Mac, which is Z-2 of the first adoption report.
 #
 # Every forwarded command is a session on one multiplexed SSH connection, and

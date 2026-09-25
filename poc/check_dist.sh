@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # Requirement N6: one static binary, no runtime dependencies, small enough to
 # `curl | sh`.
 #

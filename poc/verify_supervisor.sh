@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # Integration check for the supervisor.
 #
 # The unit tests cover the control protocol, the registry and the admission

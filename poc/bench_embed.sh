@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # Setup for the embedder's benchmark; the measuring is in `bench_embed.py`.
 #
 # The comparison only means something if every runner is on one host. That is

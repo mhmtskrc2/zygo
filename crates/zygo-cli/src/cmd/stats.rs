@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `zygo stats [name]` — what the supervisor has actually seen.
 //!
 //! Two different things, printed side by side and labelled as such, because

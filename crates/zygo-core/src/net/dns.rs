@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The egress resolver: a DNS server of Zygo's own, inside the sandbox.
 //!
 //! An allowlist by *name* cannot be enforced by a packet filter, which only

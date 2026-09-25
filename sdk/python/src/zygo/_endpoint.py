@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Where the API is, and how it was decided.
 
 One function, because the rule has to be the same for the synchronous and the

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # `zygo mcp` against a real kernel, driven the way an agent host drives it.
 #
 # The unit tests in `cmd/mcp.rs` cover the dispatch, the tool list and the

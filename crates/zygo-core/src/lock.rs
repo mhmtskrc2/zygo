@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `zygo.lock` — what a project's functions resolved to (design doc §3.7).
 //!
 //! `sandbox.toml` says `image = "python:3.12-slim"`; a tag is a pointer, and

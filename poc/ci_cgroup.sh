@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # Give this shell a cgroup of its own. Sourced, not run.
 #
 # `poc/cgroup_harness.sh` needs to start in a cgroup it can write, and it has

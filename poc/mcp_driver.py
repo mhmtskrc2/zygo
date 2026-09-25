@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Drive `zygo mcp` the way an agent host does, and check what comes back.
 
 Every check here is an *attempt*. "The sandbox has no network" is checked by

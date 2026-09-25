@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """A plugin host, built on the Zygo API alone.
 
 The exit criterion for the embedder API (roadmap 2.12), and it is written as a

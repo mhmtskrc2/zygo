@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Dependency sets built from files that arrived over the API (todo 3.3).
 //!
 //! [`crate::venv`] builds a venv from a `requirements.txt` **on this host**,

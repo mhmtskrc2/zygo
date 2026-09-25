@@ -34,7 +34,7 @@ break things and will say so here.
 ### Added
 
 - `CONTRIBUTING.md`, a code of conduct, issue and pull request templates, and
-  this changelog.
+  this changelog. `NOTICE`, and an SPDX licence line in every source file.
 
 ### Fixed
 

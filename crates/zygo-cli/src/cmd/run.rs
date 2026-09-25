@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `zygo run` — a one-shot sandbox.
 //!
 //! What this command owns is everything up to the launcher:

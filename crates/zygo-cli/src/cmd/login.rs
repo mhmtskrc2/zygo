@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `zygo login <registry>` — store a credential for a private registry.
 //!
 //! Two decisions worth stating, because both are about what this command

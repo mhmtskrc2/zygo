@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Turning layers into a runnable description, and refusing to run the ones
 //! that cannot be safe.
 //!

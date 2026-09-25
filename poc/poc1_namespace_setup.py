@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """PoC 1 — how long does it take to build a sandbox?
 
 The design claims a namespace set, a mount plan and a `pivot_root` cost 1–3 ms,

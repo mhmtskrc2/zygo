@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """The embedder's benchmark: what one run of somebody else's script costs.
 
 `zygo bench all` measures Zygo against Zygo's own budgets. This measures Zygo

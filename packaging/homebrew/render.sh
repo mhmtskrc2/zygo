@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # Fill `zygo.rb.in` in with the digests of the archives a release just built.
 #
 #   sh packaging/homebrew/render.sh <version> <directory of artifacts> > zygo.rb

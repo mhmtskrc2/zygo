@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # The embedder API's exit criterion (roadmap 2.12), run for real.
 #
 # A plugin host built on the HTTP API alone: no `sandbox.toml`, no file written

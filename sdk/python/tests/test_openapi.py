@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Every operation in the OpenAPI document has a client method.
 
 The conformance the roadmap asks for instead of generating the SDKs from the

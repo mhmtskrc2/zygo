@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # One dependency set, built for real, over the API (todo 3.3).
 #
 # Separate from `verify_api.sh` because it needs what nothing else there does:

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Every operation in the OpenAPI document has a client method.
 //
 // The same conformance the Python suite has, and for the same reason: the

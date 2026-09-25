@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Running a sandbox to completion with its output captured.
 //!
 //! The build steps — installing a requirements file, installing system

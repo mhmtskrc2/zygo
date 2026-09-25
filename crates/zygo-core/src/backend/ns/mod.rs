@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The `ns` backend: namespaces + cgroups + seccomp + Landlock
 //! (design doc §3.3).
 //!

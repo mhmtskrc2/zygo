@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The `sandbox.toml` surface (design doc §4.4) and the layering rules that
 //! turn it into a runnable description.
 //!

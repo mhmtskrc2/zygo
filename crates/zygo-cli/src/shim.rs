@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Shim mode: on macOS, the sandboxes live in a Linux VM.
 //!
 //! Every boundary Zygo builds — user namespaces, cgroups, seccomp, Landlock —

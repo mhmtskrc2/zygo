@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # PoC 2 — cgroup v2 limits actually contain a hostile tenant.
 #
 # Acceptance: a fork bomb and a runaway allocation inside the cgroup must not

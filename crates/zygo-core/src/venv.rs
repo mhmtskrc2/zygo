@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The dependency cache (design doc §3.7, todo 2.7).
 //!
 //! `requirements.txt` → `cache/venvs/<hash>/`, built once and bound read-only

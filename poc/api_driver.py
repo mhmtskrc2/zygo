@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """The HTTP API and the Python client, against a real kernel.
 
 The unit tests on either side of this are thorough and neither can catch what

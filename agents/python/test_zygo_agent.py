@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Conformance tests for the reference Python agent.
 
 The tests drive the agent from the other side of the wire — they are a

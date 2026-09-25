@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # PoC 6 — is overlayfs usable inside a user namespace on this kernel?
 #
 #

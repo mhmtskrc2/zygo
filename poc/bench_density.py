@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """How much a host costs per warm script — the number a SaaS asks first.
 
 An embedder does not have one function. It has ten thousand scripts in a

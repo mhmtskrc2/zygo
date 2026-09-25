@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # Run the `vm` suite on the Raspberry Pi, from this Mac.
 #
 # The Pi is the test target and not the build host: it has no toolchain and

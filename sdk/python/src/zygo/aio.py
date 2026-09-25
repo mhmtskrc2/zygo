@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The asynchronous client: ``from zygo.aio import connect``.
 
 Agent frameworks are asynchronous, and a tool that blocks the event loop for

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Resource limits and their translation to kernel knobs (design doc §3.5).
 //!
 //! The struct is platform independent and so is [`Limits::cgroup_writes`]; the

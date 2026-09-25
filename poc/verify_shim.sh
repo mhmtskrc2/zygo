@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # The macOS shim, end to end.
 #
 # Runs **on macOS**, against a real Lima VM. Nothing here inspects the shim's

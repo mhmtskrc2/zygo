@@ -119,7 +119,7 @@ jobs:
           asset="zygo-${{ matrix.target }}"
           mkdir -p "dist/$name"
           cp target/${{ matrix.target }}/release/zygo "dist/$name/"
-          cp README.md SECURITY.md LICENSE "dist/$name/"
+          cp README.md SECURITY.md LICENSE NOTICE "dist/$name/"
           tar -C dist -czf "dist/$asset.tar.gz" "$name"
           (cd dist && sha256sum "$asset.tar.gz" > "$asset.tar.gz.sha256")
           # The bare binary too: the macOS formula and `limactl copy` both
@@ -182,7 +182,7 @@ jobs:
           cp "linux/zygo-linux-${{ matrix.linux_target }}" \
              "dist/$name/share/zygo/zygo-linux-${{ matrix.arch }}"
           chmod +x "dist/$name/share/zygo/zygo-linux-${{ matrix.arch }}"
-          cp README.md SECURITY.md LICENSE "dist/$name/"
+          cp README.md SECURITY.md LICENSE NOTICE "dist/$name/"
           tar -C dist -czf "dist/$asset.tar.gz" "$name"
           (cd dist && shasum -a 256 "$asset.tar.gz" > "$asset.tar.gz.sha256")
           cat "dist/$asset.tar.gz.sha256"

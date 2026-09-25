@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `zygo backend list` and `zygo backend install`.
 
 use zygo_core::backend;

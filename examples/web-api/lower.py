@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # The warm function behind POST /lower. Loaded once by `zygo up`;
 # every request runs in a fresh copy of this process.
 

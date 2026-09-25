@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Tenants: who the work is for.
 //!
 //! Zygo's own word for "tenant" used to mean one function — one cgroup, one

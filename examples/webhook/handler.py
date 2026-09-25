@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """A webhook handler: validate the payload, do the work, answer.
 
 Imports and anything expensive belong at module level — they run once, in the

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # Stop every Zygo process on this host and free its control sockets.
 #
 # For a development machine between verification runs. The suites clear their

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # One scenario, repeated: a request queued behind a function being replaced.
 #
 # `verify_supervisor.sh` checks this once, inside a thirty-five minute run, and
