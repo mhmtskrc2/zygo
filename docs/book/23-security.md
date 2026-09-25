@@ -163,7 +163,7 @@ syscall named in the tables below is refused.
 
 | Vector | Control | Status |
 |---|---|---|
-| Kernel syscall surface | seccomp allowlist (~190 syscalls named; about 170 of them exist on a given architecture); `bpf`, `io_uring`, `userfaultfd`, `keyctl`, `perf_event_open` and `ptrace` refused | **attempted** — and swept: all 469 syscall numbers under each profile, 300 refused with EPERM under `default` |
+| Kernel syscall surface | seccomp allowlist (~215 syscalls named; about 200 of them exist on a given architecture); `bpf`, `io_uring`, `userfaultfd`, `keyctl`, `perf_event_open` and `ptrace` refused | **attempted** — and swept: all 469 syscall numbers under each profile, 271 refused with EPERM under `default` (Linux 6.8, aarch64); the numbers above the table answer ENOSYS |
 | `mount()` to reach the host | `CAP_SYS_ADMIN` dropped; seccomp refuses `mount` | **attempted** |
 | `setns` into the host's namespaces | refused: no capability in the host's user namespace | **attempted** |
 | Regaining capabilities via a new user namespace | `unshare(CLONE_NEWUSER)` refused by seccomp | **attempted** |

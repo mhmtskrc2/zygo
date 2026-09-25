@@ -273,6 +273,15 @@ impl Assembler {
 /// unprivileged uid before any filter is consulted. So all twelve are allowed
 /// on every profile — `strict` too, because a `network = "none"` function
 /// copies files like any other.
+///
+/// Every syscall the kernel added from 5.10 to 6.10 (numbers 440–462) was
+/// decided one by one when the table grew to cover them; the ones here are the
+/// newer spellings of something already allowed — `fchmodat2` is glibc's
+/// `chmod`, `epoll_pwait2` and the `futex_*` family extend calls in this list
+/// — or calls that can only take privilege away from their caller: Landlock
+/// and `mseal`. `map_shadow_stack` is x86's CET, which glibc uses where the
+/// CPU has it. Docker's default profile allows the same set. The rest are in
+/// [`NEWER_REFUSED`].
 pub const BASE_ALLOWLIST: &[&str] = &[
     "accept4",
     "access",
@@ -298,6 +307,7 @@ pub const BASE_ALLOWLIST: &[&str] = &[
     "epoll_create1",
     "epoll_ctl",
     "epoll_pwait",
+    "epoll_pwait2",
     "epoll_wait",
     "eventfd",
     "eventfd2",
@@ -312,6 +322,7 @@ pub const BASE_ALLOWLIST: &[&str] = &[
     "fchdir",
     "fchmod",
     "fchmodat",
+    "fchmodat2",
     "fchown",
     "fchownat",
     "fcntl",
@@ -337,6 +348,10 @@ pub const BASE_ALLOWLIST: &[&str] = &[
     "fsync",
     "ftruncate",
     "futex",
+    "futex_requeue",
+    "futex_wait",
+    "futex_waitv",
+    "futex_wake",
     "get_robust_list",
     "getcwd",
     "getdents64",
@@ -363,6 +378,9 @@ pub const BASE_ALLOWLIST: &[&str] = &[
     "getxattr",
     "ioctl",
     "kill",
+    "landlock_add_rule",
+    "landlock_create_ruleset",
+    "landlock_restrict_self",
     "lchown",
     "lgetxattr",
     "link",
@@ -375,6 +393,7 @@ pub const BASE_ALLOWLIST: &[&str] = &[
     "lsetxattr",
     "lstat",
     "madvise",
+    "map_shadow_stack",
     "membarrier",
     "memfd_create",
     "mkdir",
@@ -383,6 +402,7 @@ pub const BASE_ALLOWLIST: &[&str] = &[
     "mmap",
     "mprotect",
     "mremap",
+    "mseal",
     "msync",
     "munlock",
     "munmap",
@@ -709,6 +729,50 @@ pub const NEVER_ALLOWED: &[&str] = &[
     "ioperm",
     "iopl",
 ];
+
+/// Syscalls newer than 5.10 that no profile allows, each one decided rather
+/// than left to the default. They answer `EPERM`, like every syscall this
+/// build knows and does not allow; only numbers above the table answer
+/// `ENOSYS`.
+///
+/// The new mount API and `mount_setattr` for the reason `mount` is refused;
+/// `quotactl_fd`, `process_madvise`, `process_mrelease` and `pidfd_getfd`
+/// act on other processes or on the filesystem as a whole; `memfd_secret`
+/// takes memory out of the kernel's direct map; `cachestat` reports what is
+/// in the page cache, a side channel between tenants; `statmount` and
+/// `listmount` describe the host's mounts; `set_mempolicy_home_node` and the
+/// `lsm_*` calls reach NUMA and security-module state no handler needs.
+///
+/// A test holds every table entry above [`REVIEWED_THROUGH`] to one of this
+/// list or an allowlist, so regenerating the table against newer headers
+/// fails until someone has decided on what they brought.
+pub const NEWER_REFUSED: &[&str] = &[
+    "cachestat",
+    "fsconfig",
+    "fsmount",
+    "fsopen",
+    "fspick",
+    "listmount",
+    "lsm_get_self_attr",
+    "lsm_list_modules",
+    "lsm_set_self_attr",
+    "memfd_secret",
+    "mount_setattr",
+    "move_mount",
+    "open_tree",
+    "pidfd_getfd",
+    "process_madvise",
+    "process_mrelease",
+    "quotactl_fd",
+    "set_mempolicy_home_node",
+    "statmount",
+];
+
+/// The highest syscall number decided one by one: `mseal`, Linux 6.10. Above
+/// 439 (`faccessat2`, the newest syscall 5.10 has) each entry is allowed by a
+/// profile or listed in [`NEWER_REFUSED`]; at or below it, anything not
+/// allowed is refused, as it always was.
+pub const REVIEWED_THROUGH: u32 = 462;
 
 /// The syscall names a profile permits, sorted and deduplicated.
 pub fn allowed_names(profile: SeccompProfile) -> Vec<&'static str> {
@@ -1148,6 +1212,45 @@ mod tests {
         }
     }
 
+    /// Every syscall newer than 5.10 is either allowed or refused on purpose,
+    /// and nothing in the table is newer than that review. A table
+    /// regenerated against newer headers fails here until each new name is
+    /// placed in an allowlist or in [`NEWER_REFUSED`].
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn every_syscall_newer_than_5_10_has_been_decided() {
+        let decided: Vec<&str> = BASE_ALLOWLIST
+            .iter()
+            .chain(PERMISSIVE_EXTRA)
+            .chain(NEVER_ALLOWED)
+            .chain(NEWER_REFUSED)
+            .chain(SPECIAL_CASED)
+            .copied()
+            .collect();
+        for (name, nr) in syscalls::TABLE {
+            assert!(
+                *nr <= REVIEWED_THROUGH,
+                "{name} ({nr}) is newer than the review: allow it in BASE_ALLOWLIST or \
+                 refuse it in NEWER_REFUSED, then raise REVIEWED_THROUGH"
+            );
+            if *nr > 439 {
+                assert!(decided.contains(name), "{name} ({nr}) was never decided on");
+            }
+        }
+        for name in NEWER_REFUSED {
+            for profile in [
+                SeccompProfile::Permissive,
+                SeccompProfile::Default,
+                SeccompProfile::Strict,
+            ] {
+                assert!(
+                    !allowed_names(profile).contains(name),
+                    "{profile} allows {name}"
+                );
+            }
+        }
+    }
+
     /// A profile can only grant or deny what it can name. A syscall missing
     /// from the table is silently dropped from the filter, which made
     /// `permissive` unable to allow `unshare` while every structural test
@@ -1174,6 +1277,7 @@ mod tests {
             "lchown",
             "link",
             "lstat",
+            "map_shadow_stack",
             "mkdir",
             "mknod",
             "open",
@@ -1199,6 +1303,7 @@ mod tests {
             .iter()
             .chain(PERMISSIVE_EXTRA)
             .chain(NEVER_ALLOWED)
+            .chain(NEWER_REFUSED)
             .chain(SPECIAL_CASED)
             .copied()
             .collect();

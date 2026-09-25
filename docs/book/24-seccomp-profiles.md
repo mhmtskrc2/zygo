@@ -21,8 +21,35 @@ decides to allow it.
   denylist (Docker)                      allowlist (Zygo)
   ─────────────────                      ────────────────
   "block these"                          "allow these"
-  kernel adds new_syscall() ──▶ ALLOWED  kernel adds new_syscall() ──▶ EPERM
+  kernel adds new_syscall() ──▶ ALLOWED  kernel adds new_syscall() ──▶ refused
   until someone notices                  until someone chooses to allow it
+```
+
+## Refused, or never heard of
+
+A refusal comes in two forms, and the difference matters to a program. Zygo
+carries a table of every syscall in the Linux 6.10 headers. A syscall in that
+table that the profile does not allow answers `EPERM`: "this exists, and you
+may not". A number *above* the table — a syscall newer than this build —
+answers `ENOSYS`: "there is no such syscall here". That is the truth, and it is
+the one answer a C library falls back from. glibc tries `fchmodat2` for
+`chmod` and uses the old call only on `ENOSYS`; on `EPERM`, `python3 -m venv`
+fails.
+
+Each syscall that Linux 5.11 to 6.10 added was decided on its own. The ones
+that are a newer form of something already allowed are allowed: `fchmodat2`,
+`epoll_pwait2`, the `futex_*` family. So are Landlock and `mseal`, which only
+take power away from the caller. The new mount API, `mount_setattr`,
+`pidfd_getfd`, `memfd_secret`, `cachestat`, `statmount`, `listmount` and the
+`lsm_*` calls are refused. A test fails when the table grows past what has
+been decided.
+
+```text
+  syscall number
+  0 ─────────────────── in the table (≤ 462) ──────────────────┬──── above ────▶
+  allowed by the profile ──▶ runs                               │
+  in the table, not allowed ──▶ EPERM  "exists, and refused"    │ ENOSYS
+                                                                │ "no such call"
 ```
 
 ## The three profiles at a glance
@@ -41,7 +68,7 @@ three is refused under every profile, `permissive` included.
   │  │   mount, pivot_root, chroot, mknod, process_vm_readv/writev,│  │
   │  │   personality … (Docker's default set)   NOT for tenants    │  │
   │  │  ┌───────────────────────────────────────────────────────┐  │  │
-  │  │  │ default ≈ 190 syscalls   for everyone (T1, T2)        │  │  │
+  │  │  │ default ≈ 215 syscalls   for everyone (T1, T2)        │  │  │
   │  │  │ clone only without CLONE_NEW*; ioctl minus TIOCSTI    │  │  │
   │  │  │  ┌─────────────────────────────────────────────────┐  │  │  │
   │  │  │  │ strict = default − socket, connect, bind,       │  │  │  │
@@ -55,7 +82,7 @@ three is refused under every profile, `permissive` included.
 
 | Profile | What it is | Who it is for |
 |---|---|---|
-| `default` | ~190 syscalls: the set five reference packages exercise their real code paths under — numpy's BLAS threads, Pillow's codecs, pandas' file I/O, pydantic's Rust core, requests' TLS setup. `clone` is allowed only with every `CLONE_NEW*` flag clear, so a sandbox cannot make a namespace; `ioctl` is allowed except for `TIOCSTI` and its relatives. `bpf`, `io_uring_*`, `userfaultfd`, `keyctl`, `perf_event_open`, `ptrace`, `mount` and `unshare` are absent. | Everyone (T1, T2) |
+| `default` | ~215 syscalls: the set five reference packages exercise their real code paths under — numpy's BLAS threads, Pillow's codecs, pandas' file I/O, pydantic's Rust core, requests' TLS setup. `clone` is allowed only with every `CLONE_NEW*` flag clear, so a sandbox cannot make a namespace; `ioctl` is allowed except for `TIOCSTI` and its relatives. `bpf`, `io_uring_*`, `userfaultfd`, `keyctl`, `perf_event_open`, `ptrace`, `mount` and `unshare` are absent. | Everyone (T1, T2) |
 | `strict` | `default` minus the calls that reach the network — `socket`, `connect`, `bind`, `listen`, `accept4` — and minus `ptrace`, `mount`, `umount2`. In the agent's forked child, additionally minus `execve`, `execveat`, `fork`, `vfork` and any `clone` without `CLONE_THREAD` (see [the child filter](#the-child-filter)). | A `network = "none"` function whose author wants the kernel to refuse a socket, not merely the namespace to have nothing behind it — and **every runtime pool by default**, because a pool's child runs a script that arrived over an API |
 | `permissive` | `default` plus `clone3`, `ptrace`, `unshare`, `setns`, `mount`, `pivot_root`, `chroot`, `mknod`, `process_vm_readv`/`writev`, `personality` and the rest of Docker's default profile. Those eight are the *only* appendix-B exclusions it grants, and a test asserts the list. **It is not "no filter"**: a syscall outside all three lists is refused under `permissive` too. | Debugging a package the tighter profiles break, and Zygo's own derived-layer builds, where `dpkg` uses the legacy `chown`/`chmod`/`mknod` calls. **Not a tenant profile.** |
 
@@ -66,7 +93,7 @@ of syscalls a sandbox should never need.)
 ## `default`
 
 `default` is what a function gets when its author does not choose. It names
-about 190 syscalls, found by running five reference packages through their
+about 215 syscalls, found by running five reference packages through their
 real work: numpy's BLAS threads, Pillow's image codecs, pandas' file I/O,
 pydantic's Rust core, and requests' TLS setup. `clone`, the call that makes a
 new process or thread, is allowed only when no `CLONE_NEW*` flag is set, so a

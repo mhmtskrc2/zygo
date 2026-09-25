@@ -210,7 +210,7 @@ you did not. This is what you get with no flags at all.
 |---|---|---|
 | Root filesystem | writable (a copy-on-write upper layer) | **read-only**; the only writable place is `/tmp`, a tmpfs sized by `scratch` (the smaller of 64M and half of `mem`, so 64M by default) |
 | Capabilities | 14 kept (`NET_RAW`, `SYS_CHROOT`, `MKNOD`, …) | **none** |
-| seccomp | a denylist-shaped profile allowing ~350 syscalls | **an allowlist of ~190**; `bpf`, `io_uring`, `userfaultfd`, `ptrace`, `mount`, `unshare` absent; `clone` refused with any namespace flag |
+| seccomp | a denylist-shaped profile allowing ~350 syscalls | **an allowlist of ~215**; `bpf`, `io_uring`, `userfaultfd`, `ptrace`, `mount`, `unshare` absent; `clone` refused with any namespace flag |
 | Landlock | no | yes, where the kernel has it |
 | Runs as | root in the container, root on the host (outside rootless mode) | the image's uid 1000, mapped to **your** uid |
 | Network | bridge; everything reachable | **`none`**: loopback only |
