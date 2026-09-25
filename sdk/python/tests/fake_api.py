@@ -37,6 +37,9 @@ class Recorder:
         self.connections = 0
         self.answers: Dict[Tuple[str, str], Tuple[int, Any]] = {}
         self.delay = 0.0
+        # Close each connection after answering, without saying so — what a
+        # server that drops idle keep-alive connections looks like to a client.
+        self.hang_up = False
         self.lock = threading.Lock()
 
     def answer(self, method: str, path: str, status: int, body: Any) -> None:
@@ -115,6 +118,8 @@ def _handler(recorder: Recorder):
                 self.send_header("retry-after", "3")
             self.end_headers()
             self.wfile.write(payload)
+            if recorder.hang_up:
+                self.close_connection = True
 
         def do_GET(self) -> None:  # noqa: N802, D102
             self._serve("GET")

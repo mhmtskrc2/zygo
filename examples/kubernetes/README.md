@@ -19,7 +19,7 @@ Zygo builds sandboxes, so the pod it runs in has to let it. Four things:
 |---|---|
 | `seccompProfile: Unconfined` | the default profile denies `unshare(CLONE_NEWUSER)`, which is what a sandbox does first |
 | an unmasked `/proc` | a masked `/proc` is not *fully visible*, and the kernel then refuses a fresh `proc` mount inside a user namespace. `privileged: true` gives one; Kubernetes accepts `procMount: Unmasked` only with `hostUsers: false` |
-| a writable cgroup v2 subtree | **no field expresses this**, which is the whole reason `privileged: true` is here |
+| a writable cgroup v2 subtree | **no field expresses this**, which is the whole reason `privileged: true` and `runAsUser: 0` are here |
 | a kernel that allows unprivileged user namespaces | a node setting (`kernel.unprivileged_userns_clone`, AppArmor on Ubuntu), not a pod one |
 
 `zygo doctor` names each one when it is missing, so a pod that will not build
@@ -27,8 +27,9 @@ sandboxes says which of the four it is rather than failing at the first
 request.
 
 **On `privileged: true`.** It is there for the third row, and brings the
-second with it. What
-that costs is smaller than it looks, and the reason is what the product is:
+second with it. `runAsUser: 0` goes with it: the pod's cgroup belongs to root,
+and `privileged` gives capabilities to root only. No sandbox runs as that
+root — each one is in a user namespace of its own. What that costs is smaller than it looks, and the reason is what the product is:
 the boundary Zygo enforces is the sandbox it builds *inside* this container —
 namespaces, seccomp, Landlock, a cgroup per request — not the container
 itself. A privileged pod running customer code directly is a different

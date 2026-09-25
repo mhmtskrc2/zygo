@@ -218,6 +218,18 @@ class TransportTests(unittest.TestCase):
                     client.call("f", {})
             self.assertEqual(api.connections, 1)
 
+    def test_a_connection_the_server_closed_is_replaced_not_reported(self) -> None:
+        # The server closed the kept-alive connection between two calls. On a
+        # unix socket the next send fails with EPIPE before anything went out,
+        # so the call goes again on a fresh connection instead of failing.
+        with FakeApi(unix=True) as api:
+            api.answer("POST", "/fn/f", 200, OK_RESULT)
+            api.recorder.hang_up = True
+            with zygo.connect(api.url) as client:
+                for _ in range(3):
+                    client.call("f", {})
+            self.assertEqual(len(api.requests), 3)
+
     def test_concurrent_callers_are_concurrent_at_the_socket(self) -> None:
         # A single pooled connection would serialise these, and the elapsed
         # time is the only thing that can tell the difference. Eight calls

@@ -774,9 +774,20 @@ class Client:
             sent["x-zygo-tenant"] = self._tenant
         sent.update(headers or {})
 
-        connection = self._take()
+        connection, reused = self._take()
         try:
-            connection.request(method, path, body=payload, headers=sent)
+            try:
+                connection.request(method, path, body=payload, headers=sent)
+            except (BrokenPipeError, ConnectionResetError):
+                # A kept-alive connection the server had already closed. The
+                # request never went out, so sending it again on a fresh
+                # connection cannot run it twice. Only once, and only for a
+                # reused one: a new connection that fails is a real failure.
+                if not reused:
+                    raise
+                _discard(connection)
+                connection = self._open()
+                connection.request(method, path, body=payload, headers=sent)
             response = connection.getresponse()
             raw = response.read(MAX_BODY)
             status = response.status
@@ -799,11 +810,12 @@ class Client:
 
         return _decode(status, raw, retry_after)
 
-    def _take(self) -> http.client.HTTPConnection:
+    def _take(self) -> tuple[http.client.HTTPConnection, bool]:
+        """A connection, and whether it has been used before."""
         with self._lock:
             if self._idle:
-                return self._idle.pop()
-        return self._open()
+                return self._idle.pop(), True
+        return self._open(), False
 
     def _give_back(self, connection: http.client.HTTPConnection) -> None:
         with self._lock:

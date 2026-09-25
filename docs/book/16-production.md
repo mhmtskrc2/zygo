@@ -246,7 +246,7 @@ and sandboxes with a network need a fifth. `zygo doctor` names each one that
 is missing.
 
 ```bash
-docker run \
+docker run --user 0:0 \
   --security-opt seccomp=unconfined \
   --security-opt systempaths=unconfined \
   --security-opt apparmor=unconfined \
@@ -257,6 +257,10 @@ docker run \
   -p 7700:7700 -e ZYGO_API_TOKEN=... \
   ghcr.io/mhmtskrc2/zygo
 ```
+
+`--user 0:0` is there because the cgroup folder belongs to root. As the
+image's own user, 65532, Zygo could not write it. No sandbox runs as that
+root: each one is in a user namespace of its own.
 
 With Docker's `systemd` cgroup driver — the default on Ubuntu and Debian —
 the parent must be a slice: `--cgroup-parent=zygo.slice` and
@@ -413,10 +417,12 @@ own, two come with `privileged: true`, and one is a node setting:
 |---|---|
 | `seccompProfile: Unconfined` | the default profile denies `unshare(CLONE_NEWUSER)` |
 | an unmasked `/proc` | a masked `/proc` stops a fresh `proc` mount in a user namespace; `privileged: true` leaves it unmasked |
-| a writable cgroup v2 subtree | **no field says this**, and it is the only reason `privileged: true` is there |
+| a writable cgroup v2 subtree | **no field says this**; `privileged: true` with `runAsUser: 0` is the way to get one |
 | unprivileged user namespaces | a setting on the node (`kernel.unprivileged_userns_clone`, AppArmor on Ubuntu), not the pod |
 
-`privileged: true` is there for the third row. It also brings an unmasked
+`privileged: true` is there for the third row, together with `runAsUser: 0`:
+the pod's cgroup belongs to root, and `privileged` gives capabilities to root
+only. It also brings an unmasked
 `/proc`, `/dev/net/tun` and no AppArmor profile, which a pod without it would
 have to ask for as the table above describes. The field for the first,
 `procMount: Unmasked`, is refused by Kubernetes unless the pod also sets

@@ -121,6 +121,12 @@ spec:
           # only from a pod with `hostUsers: false`, so this one does not ask.
           securityContext:
             privileged: true
+            # The pod's cgroup belongs to root, and `privileged` gives
+            # capabilities to root only. As the image's own user, 65532, Zygo
+            # could not make a cgroup for a single sandbox. The sandboxes
+            # themselves never run as this user: each one maps its own ids.
+            runAsUser: 0
+            runAsGroup: 0
             # Docker's and containerd's default profiles deny
             # `unshare(CLONE_NEWUSER)`, which is what a sandbox does first.
             seccompProfile:
