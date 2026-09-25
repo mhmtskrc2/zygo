@@ -379,6 +379,8 @@ jobs:
   #                          usual `-v /sys/fs/cgroup:rw` hands over the
   #                          *host's* whole hierarchy, which is worse than the
   #                          privilege it avoids.
+  #   apparmor=unconfined    on an AppArmor host, `docker-default` refuses
+  #                          the mounts a sandbox makes.
   #
   # `docs/book/16-production.md` carries the same list, and `examples/kubernetes/` the same
   # thing as a `securityContext`.
@@ -400,6 +402,17 @@ jobs:
       - run: cargo build --release
       - run: install -m 0755 target/release/zygo poc/zygo-linux-musl
 
+      # The runner's Docker now uses the systemd cgroup driver, which takes a
+      # slice rather than a path for `--cgroup-parent`. This job tests the
+      # flags, not the driver, so it keeps the path form: back to cgroupfs.
+      - name: Docker with the cgroupfs driver
+        run: |
+          cfg=$(sudo cat /etc/docker/daemon.json 2>/dev/null || echo '{}')
+          echo "$cfg" | jq '. + {"exec-opts": ["native.cgroupdriver=cgroupfs"]}' \
+            | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+          docker info --format 'cgroup driver: {{.CgroupDriver}}'
+
       # A cgroup for the container, and nothing above it. `cgroup-parent` puts
       # the container's own cgroup underneath, and the bind makes exactly that
       # subtree writable inside.
@@ -417,6 +430,7 @@ jobs:
           docker run --rm \
             --security-opt seccomp=unconfined \
             --security-opt systempaths=unconfined \
+            --security-opt apparmor=unconfined \
             --cgroupns=host --cgroup-parent=/zygo-unpriv \
             -v /sys/fs/cgroup/zygo-unpriv:/sys/fs/cgroup/zygo-unpriv:rw \
             -v "$PWD:/src:ro" -e ZYGO_DATA_HOME=/tmp/zdata \
@@ -427,6 +441,7 @@ jobs:
           docker run --rm \
             --security-opt seccomp=unconfined \
             --security-opt systempaths=unconfined \
+            --security-opt apparmor=unconfined \
             --cgroupns=host --cgroup-parent=/zygo-unpriv \
             -v /sys/fs/cgroup/zygo-unpriv:/sys/fs/cgroup/zygo-unpriv:rw \
             -v "$PWD:/src:ro" -e ZYGO_DATA_HOME=/tmp/zdata-sup \
@@ -440,6 +455,7 @@ jobs:
           docker run --rm \
             --security-opt seccomp=unconfined \
             --security-opt systempaths=unconfined \
+            --security-opt apparmor=unconfined \
             --cgroupns=host --cgroup-parent=/zygo-unpriv \
             -v /sys/fs/cgroup/zygo-unpriv:/sys/fs/cgroup/zygo-unpriv:rw \
             -v "$PWD:/src:ro" -e ZYGO_DATA_HOME=/tmp/zdata-api \
@@ -458,6 +474,13 @@ jobs:
           echo "$out" | grep -q "seccomp=unconfined" \
             || { echo "::error::doctor did not name the seccomp profile"; exit 1; }
           out=$(docker run --rm --security-opt seccomp=unconfined \
+            -v "$PWD:/src:ro" -e ZYGO_DATA_HOME=/tmp/zd \
+            python:3.12-slim /src/poc/zygo-linux-musl doctor 2>&1 || true)
+          printf '%s\n' "$out"
+          echo "$out" | grep -q "apparmor=unconfined" \
+            || { echo "::error::doctor did not name the AppArmor profile"; exit 1; }
+          out=$(docker run --rm --security-opt seccomp=unconfined \
+            --security-opt apparmor=unconfined \
             -v "$PWD:/src:ro" -e ZYGO_DATA_HOME=/tmp/zd \
             python:3.12-slim /src/poc/zygo-linux-musl doctor 2>&1 || true)
           printf '%s\n' "$out"

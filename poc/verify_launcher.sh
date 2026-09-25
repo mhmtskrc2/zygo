@@ -80,7 +80,7 @@ out=$(sb 'echo $$')
                  || bad "expected pid 1, got '$out'"
 
 out=$(sb 'hostname')
-[ "$out" = "run" ] && ok "uts namespace: hostname is the tenant name" \
+[ "$out" = "default" ] && ok "uts namespace: hostname is the tenant name" \
                    || bad "uts namespace: hostname is '$out'"
 
 out=$(sb 'cat /proc/self/status | grep ^CapEff | awk "{print \$2}"')

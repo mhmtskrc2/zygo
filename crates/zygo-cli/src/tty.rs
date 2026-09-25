@@ -255,6 +255,16 @@ mod tests {
     /// not settings anyone restored or failed to restore.
     const MEANINGFUL: libc::tcflag_t = libc::ICANON | libc::ECHO | libc::ISIG | libc::IEXTEN;
 
+    /// `restore_all` and the panic hook put back *every* terminal the process
+    /// holds raw, so a test running beside another undoes that one's raw mode
+    /// halfway through. The tests that touch raw mode take turns.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn lflags(fd: RawFd) -> libc::tcflag_t {
         let mut t: libc::termios = unsafe { core::mem::zeroed() };
         assert_eq!(unsafe { libc::tcgetattr(fd, &mut t) }, 0);
@@ -263,6 +273,7 @@ mod tests {
 
     #[test]
     fn raw_mode_restores_the_original_settings_on_drop() {
+        let _serial = serial();
         let pty = open().expect("openpty");
         let fd = pty.slave.as_raw_fd();
 
@@ -298,6 +309,7 @@ mod tests {
     /// `restore_all`.
     #[test]
     fn raw_mode_is_restored_even_when_no_destructor_runs() {
+        let _serial = serial();
         let pty = open().expect("openpty");
         let fd = pty.slave.as_raw_fd();
         let before = lflags(fd);
@@ -317,6 +329,7 @@ mod tests {
     /// `restore_all` cannot write settings back onto a reused descriptor.
     #[test]
     fn a_restored_terminal_is_forgotten() {
+        let _serial = serial();
         let pty = open().expect("openpty");
         let fd = pty.slave.as_raw_fd();
         let before = lflags(fd);
@@ -346,6 +359,7 @@ mod tests {
     /// covered by `raw_mode_is_restored_even_when_no_destructor_runs` above.
     #[test]
     fn raw_mode_restores_even_when_the_scope_panics() {
+        let _serial = serial();
         let pty = open().expect("openpty");
         let fd = pty.slave.as_raw_fd();
 
