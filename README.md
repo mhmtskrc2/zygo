@@ -130,10 +130,6 @@ ONE-SHOT ── one request, one fresh sandbox
 
 ## Try it
 
-> **Not released yet.** The commands below are for the first release, v0.1.0,
-> and start working when it is tagged. Until then, build from a checkout:
-> `cargo build --release -p zygo-cli` gives `target/release/zygo`.
-
 ```bash
 # Linux, x86_64 or aarch64: one static binary, no runtime dependencies
 curl -fsSL "https://github.com/mhmtskrc2/zygo/releases/latest/download/zygo-$(uname -m)-unknown-linux-musl.tar.gz" | tar xz
@@ -145,8 +141,9 @@ brew install mhmtskrc2/zygo/zygo
 # or from source, anywhere with Rust
 cargo install zygo-cli
 
-# or the container image, which needs no privileges and three specific things
-docker run --security-opt seccomp=unconfined --security-opt systempaths=unconfined \
+# or the container image, which needs no privileges, only a few specific flags
+docker run --user 0:0 --security-opt seccomp=unconfined \
+    --security-opt systempaths=unconfined --security-opt apparmor=unconfined \
     --cgroupns=host --cgroup-parent=/zygo -v /sys/fs/cgroup/zygo:/sys/fs/cgroup/zygo:rw \
     -p 7700:7700 -e ZYGO_API_TOKEN=... ghcr.io/mhmtskrc2/zygo
 ```
@@ -155,8 +152,9 @@ Every release lists the archives' checksums in `SHA256SUMS`, and the container
 image is signed with cosign;
 [chapter 11](docs/book/11-getting-started.md) shows how to check both.
 
-[`packaging/oci/`](packaging/oci) says what those three are and why; `zygo
-doctor` names any that are missing, in the container or on a host.
+[Chapter 16](docs/book/16-production.md#running-zygo-inside-a-container) says
+what each flag is for and why; `zygo doctor` names any that are missing, in
+the container or on a host.
 
 ```bash
 zygo doctor                                   # can this host run sandboxes?

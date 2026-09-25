@@ -36,13 +36,6 @@ delegation* (a normal user may own part of the cgroup tree from
 distributions have the first; the second often needs one small fix, which
 `zygo doctor` can apply for you.
 
-## Before the first release
-
-Zygo has not been released yet. The commands in the next three sections are
-for the first release, v0.1.0, and start working when it is published. Until
-then, build it from a checkout, as in [other ways to
-install](#other-ways-to-install).
-
 ## Installing on Linux
 
 Release builds exist for x86_64 and aarch64 (64-bit ARM, such as a Raspberry
