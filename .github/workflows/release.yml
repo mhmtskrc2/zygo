@@ -561,9 +561,11 @@ jobs:
           ## Install
 
           \`\`\`bash
-          # Linux, one static binary (x86_64 or aarch64)
-          curl -fsSL "https://github.com/$REPO/releases/download/$TAG/zygo-\$(uname -m)-unknown-linux-musl.tar.gz" | tar xz
-          sudo install -m 0755 zygo-*/zygo /usr/local/bin/zygo
+          # Linux, one static binary (x86_64 or aarch64), checked before it is unpacked
+          url=https://github.com/$REPO/releases/download/$TAG
+          curl -fsSLO "\$url/zygo-\$(uname -m)-unknown-linux-musl.tar.gz"
+          curl -fsSL "\$url/SHA256SUMS" | sha256sum -c --ignore-missing
+          tar xzf zygo-*-unknown-linux-musl.tar.gz && sudo install -m 0755 zygo-*/zygo /usr/local/bin/
 
           # macOS: the shim, the Linux build the VM needs, and Lima
           brew install $OWNER/zygo/zygo
