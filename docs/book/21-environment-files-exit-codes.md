@@ -43,6 +43,8 @@ else from your shell crosses.
 | `HOME` | Zygo | `/tmp`, unless the image or `env` sets one — so programs that write to `~` work on a read-only root. |
 | `ZYGO_REQUEST_ID` | the agent, per request | The request's id. |
 | `ZYGO_DEADLINE_MS` | the agent, per request | The request's time budget in milliseconds (its `timeout`); `0` means none. |
+| `TMPDIR`, `TMP`, `TEMP` | the agent, per request | The request's own temporary folder: the workspace if one was sent, otherwise `/work/tmp-<random>`. Removed when the request ends. |
+| `ZYGO_AGENT_TMP_PARENT` | you, for an agent's tests | Where the reference agents make those folders instead of `/work`. Nothing in Zygo sets it. |
 | `ZYGO_WORKSPACE` | the agent, per request | The request's workspace folder, when one was sent; the handler starts in it. |
 | your `env` | you | Everything in `env` / `--env`. |
 

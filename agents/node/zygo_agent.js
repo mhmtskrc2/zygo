@@ -606,6 +606,30 @@ function writeStdioSynchronously() {
   }
 }
 
+/// Where each request's private temporary directory goes: the workspace
+/// tmpfs, whose root is `0311`, so a request can create a directory there but
+/// cannot list its neighbours'. `ZYGO_AGENT_TMP_PARENT` moves it, for the
+/// agent's own tests outside a sandbox; nothing in Zygo sets it.
+const PRIVATE_TMP_PARENT = process.env.ZYGO_AGENT_TMP_PARENT || '/work';
+
+/// A name for one request's temporary directory, or `null` where the sandbox
+/// has no workspace tmpfs.
+///
+/// `/tmp` is one tmpfs for the whole sandbox, so a file one request leaves
+/// there is still there for the next — for the next tenant, in a runtime
+/// pool. Each request gets a directory of its own instead, 128 random bits
+/// under a parent that cannot be listed, with `TMPDIR` (which `os.tmpdir()`
+/// reads on every call) pointed at it. Named by the agent, so the agent can
+/// remove it when the worker is gone, however it went.
+function privateTmpName() {
+  try {
+    if (!fs.statSync(PRIVATE_TMP_PARENT).isDirectory()) return null;
+  } catch (e) {
+    return null;
+  }
+  return path.join(PRIVATE_TMP_PARENT, 'tmp-' + crypto.randomBytes(16).toString('hex'));
+}
+
 function worker(argv) {
   writeStdioSynchronously();
   hideTheTypeStrippingWarning();
@@ -658,6 +682,24 @@ function worker(argv) {
         }, () => process.exit(1));
         return;
       }
+    }
+
+    // A temporary directory of this request's own: the workspace when the
+    // caller sent one, otherwise the one the agent named. A directory that
+    // cannot be made leaves the request on the shared `/tmp`, as before.
+    let tmp = message.workspace || null;
+    if (!tmp && message.tmpdir) {
+      try {
+        fs.mkdirSync(message.tmpdir, { mode: 0o700 });
+        tmp = message.tmpdir;
+      } catch (e) {
+        tmp = null;
+      }
+    }
+    if (tmp) {
+      process.env.TMPDIR = tmp;
+      process.env.TMP = tmp;
+      process.env.TEMP = tmp;
     }
 
     process.env.ZYGO_REQUEST_ID = message.id || '';
@@ -867,6 +909,12 @@ class Agent {
   _finish(w, code, signal) {
     const id = w.request.id;
     this._inflight.delete(id);
+    // The worker is gone, so its temporary directory can go too — whether it
+    // answered, threw, or was killed at its deadline.
+    if (w.tmpdir) {
+      fs.rmSync(w.tmpdir, { recursive: true, force: true });
+      w.tmpdir = null;
+    }
     const result = w.result;
     // A worker that refused the request answers `ERROR`, not `DONE`: it is the
     // answer to this `EXEC` either way (§3.5), and a request that was refused
@@ -971,6 +1019,7 @@ class Agent {
     const w = this._inflight.get(message.id);
     if (!w || w.started) return; // a `GO` for nothing: not worth an error
     w.started = true;
+    w.tmpdir = w.request.workspace ? null : privateTmpName();
     w.child.send({
       type: 'run',
       id: w.request.id,
@@ -980,6 +1029,7 @@ class Agent {
       script: w.request.script,
       stream: w.request.stream,
       workspace: w.request.workspace,
+      tmpdir: w.tmpdir,
     });
   }
 

@@ -72,7 +72,7 @@ Anything that crosses one of the boundaries the project claims to hold:
 ## What the project already does about this
 
 Every escape vector in the [threat model](docs/book/23-security.md) is **actually
-attempted** by `make escape-linux` — 18 vectors in 26 checks, currently 25
+attempted** by `make escape-linux` — 19 vectors in 27 checks, currently 26
 blocked, 0 escaped, and 1 skipped where the test image has no setuid binary
 to try. The rule the whole suite is
 built on is that a test must attempt the thing rather than read a setting: a

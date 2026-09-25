@@ -9,6 +9,11 @@ break things and will say so here.
 
 ### Security
 
+- A warm request no longer finds files the previous request left in its
+  temp folder. `/tmp` is one tmpfs per sandbox — per runtime pool, across
+  tenants — and nothing cleared it. Both agents now give each request its own
+  folder under `/work`, point `TMPDIR`/`TMP`/`TEMP` (and Python's `tempfile`)
+  at it, and remove it afterwards. A literal `/tmp/...` path is still shared.
 - A read-only bind mount is now read-only all the way down. Before, a mount
   *below* the source directory stayed writable inside the sandbox; Landlock
   hid that on 5.13 and later, nothing did on older kernels. Uses

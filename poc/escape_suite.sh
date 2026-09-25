@@ -627,6 +627,41 @@ else
 fi
 rm -rf "$WORK"
 
+# --- 18. a temporary file left for the next tenant -------------------------
+
+say "18. leave a file in the temp directory for the next request"
+# `/tmp` is one tmpfs per sandbox, and a runtime pool is one sandbox for many
+# tenants. The agent points every temp-file API at a directory of the
+# request's own; the second script must find nothing the first one left.
+WORK=$(mktemp -d)
+cat > "$WORK/leave.py" <<'PY'
+import os, tempfile
+def handler(event):
+    here = tempfile.gettempdir()
+    open(os.path.join(here, "left-for-you"), "w").write("tenant A was here")
+    return {"here": here}
+PY
+cat > "$WORK/look.py" <<'PY'
+import os, tempfile
+def handler(event):
+    here = tempfile.gettempdir()
+    return {"here": here, "found": os.path.exists(os.path.join(here, "left-for-you"))}
+PY
+if zygo serve --runtime escape-tmp --image "$IMAGE" --agent python >/tmp/escape-tmp.err 2>&1; then
+    first=$(zygo exec --runtime escape-tmp --script "$WORK/leave.py" '{}' 2>>/tmp/escape-tmp.err | tr -d '\n ')
+    out=$(zygo exec --runtime escape-tmp --script "$WORK/look.py" '{}' 2>>/tmp/escape-tmp.err | tr -d '\n ')
+    zygo stop --all >/dev/null 2>&1
+    case "$first/$out" in
+        *'"here":"/tmp"'*) bad "a request's temp directory is the shared /tmp: $first $out" ;;
+        *'"found":false'*) ok "the next tenant's temp directory is empty ($out)" ;;
+        *'"found":true'*)  bad "the next tenant found the file: $out" ;;
+        *) skip "18. the probe said nothing usable: '$first' '$out'" ;;
+    esac
+else
+    skip "18. the pool would not start: $(tail -2 /tmp/escape-tmp.err | tr '\n' ' ')"
+fi
+rm -rf "$WORK"
+
 say ""
 say "----------------------------------------"
 say "escape suite: $PASS blocked, $FAIL escaped, $SKIP skipped"

@@ -84,7 +84,10 @@ A normal worker process that serves many requests slowly collects state: a
 global that one request changed, an open connection, a patched function, a
 file in `/tmp`. Request *n* runs in whatever request *n−1* left. Zygo's
 children never share that problem, because each one is a copy of the zygote,
-and the zygote has never served a request. So a request sees exactly what the
+and the zygote has never served a request. Files are the one place that needs
+more than a fork: each request gets its own temporary folder, named by
+`TMPDIR` and removed afterwards, because the sandbox's `/tmp` is shared by
+every request in it. So a request sees exactly what the
 zygote had after its imports — every time, whatever the requests before it
 did. You get the speed of a shared worker and the cleanliness of a fresh
 container.

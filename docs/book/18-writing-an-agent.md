@@ -334,6 +334,13 @@ listed, the name is 128 random bits, and the folder is removed when the
 request ends. An agent must not look around the parent, which holds other
 requests' folders, including other tenants'.
 
+Every request also needs a temporary folder of its own, workspace or not.
+`/tmp` is one tmpfs for the whole sandbox, so without one a file request 1
+leaves in `/tmp` is there for request 2 — for another tenant, in a pool. Both
+reference agents make `/work/tmp-<128 random bits>` (mode 0700) for each
+child, point `TMPDIR`, `TMP` and `TEMP` at it, and remove it when the child
+is gone. The protocol asks the same of any agent.
+
 ## Versions
 
 `proto` goes up only for a breaking change. Adding an **optional** field or

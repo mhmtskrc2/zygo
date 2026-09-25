@@ -477,6 +477,39 @@ class ProtocolTests(unittest.TestCase):
         done = h.call({}, request_id="abc123", timeout_ms=5000)
         self.assertEqual(done["result"], {"id": "abc123", "deadline": "5000"})
 
+    def test_a_file_left_in_the_temp_dir_is_not_there_for_the_next_request(self):
+        """`/tmp` is one tmpfs per sandbox; every temp-file API must point at
+        a directory the request has to itself, and that is gone afterwards."""
+        parent = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, parent, True)
+        h = AgentHarness(
+            """
+            import os, tempfile
+            CACHED = tempfile.gettempdir()   # asked at import, in the zygote
+            def handler(event):
+                here = tempfile.gettempdir()
+                seen = sorted(os.listdir(here))
+                with open(os.path.join(here, "left-by-" + event["n"]), "w") as f:
+                    f.write("x")
+                return {"here": here, "env": os.environ["TMPDIR"], "seen": seen}
+            """,
+            env={"ZYGO_AGENT_TMP_PARENT": parent},
+        )
+        self.addCleanup(h.close)
+        h.ready()
+
+        first = h.call({"n": "1"}, request_id="a")["result"]
+        second = h.call({"n": "2"}, request_id="b")["result"]
+        self.assertTrue(first["here"].startswith(parent + os.sep), first)
+        self.assertEqual(first["here"], first["env"])
+        self.assertNotEqual(first["here"], second["here"])
+        self.assertEqual(second["seen"], [], "the second request saw the first one's file")
+        # Both directories are removed once their request is over.
+        deadline = time.monotonic() + 5
+        while os.listdir(parent) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(os.listdir(parent), [])
+
     def test_children_do_not_share_random_state(self):
         """Forks inherit the parent's seeded RNG unless it is reseeded."""
         h = self.harness(

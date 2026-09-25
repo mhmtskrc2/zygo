@@ -372,7 +372,7 @@ entry = "./resize.ts"     # runtime = "node", inferred from the extension
 | **The event** | The JSON the caller sent (`null` for an empty body). In Python a JSON object arrives as a `dict` with one extra method, `event.progress(msg)`. |
 | **Environment** | `ZYGO_REQUEST_ID`; `ZYGO_DEADLINE_MS`, the request's time budget in milliseconds; `ZYGO_WORKSPACE` if a workspace was sent; `ZYGO_FUNCTION`, the function's name; plus the function's `env`. `ZYGO_TENANT` holds the same name as `ZYGO_FUNCTION`; it is an older, misleading name kept so that old handlers do not break. |
 | **Secrets** | Files at `/run/secrets/<NAME>`, mode 0400, readable only by this request, gone after it. Never in the environment. |
-| **Files** | The image, read-only; your `mounts`; `/tmp`, a private tmpfs; `/venv` if there are `requirements`. |
+| **Files** | The image, read-only; your `mounts`; a temporary folder of its own, which `TMPDIR` names and which is removed afterwards; `/venv` if there are `requirements`. `/tmp` itself is shared by every request in the sandbox: write through `tempfile`, `os.tmpdir()` or `$TMPDIR`, not to a literal `/tmp/...` path. |
 | **Working folder** | `workdir` (`/app`), or the workspace if one was sent: the agent changes into it before your code runs. |
 | **Memory** | A copy of the zygote's. What you change is yours alone and gone at the end. |
 

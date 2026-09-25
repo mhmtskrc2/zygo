@@ -35,6 +35,7 @@ import os
 import random
 import resource
 import select
+import shutil
 import signal
 import socket
 import struct
@@ -82,6 +83,7 @@ class InFlight:
 
     __slots__ = (
         "request_id", "pid", "result_fd", "go_fd", "chunks", "cancelled", "go_payload", "proc",
+        "tmpdir",
     )
 
     def __init__(
@@ -93,6 +95,7 @@ class InFlight:
         *,
         go_payload: bytes = b"\0",
         proc=None,
+        tmpdir: "str | None" = None,
     ) -> None:
         self.request_id = request_id
         self.pid = pid
@@ -113,6 +116,9 @@ class InFlight:
         #: grandchildren an agent cannot see and does not depend on tenant
         #: code cooperating.
         self.cancelled = False
+        #: The request's private temporary directory, which the agent removes
+        #: if the child could not. See `_private_tmp_name`.
+        self.tmpdir = tmpdir
 
 
 class BadFrame(Exception):
@@ -408,6 +414,59 @@ _EXIT_CHILD_ESCAPED = 122
 unwind into the parent's serve loop."""
 
 
+#: The request key that carries a private temporary directory's name from the
+#: zygote to its child. The agent's own, never sent by a supervisor.
+PRIVATE_TMP_KEY = "_zygo_tmp"
+
+#: Where those directories go: the workspace tmpfs. Its root is `0311`, so a
+#: request can create a directory there but cannot list its neighbours'.
+#: `ZYGO_AGENT_TMP_PARENT` moves it, for the agent's own tests outside a
+#: sandbox; nothing in Zygo sets it.
+PRIVATE_TMP_PARENT = os.environ.get("ZYGO_AGENT_TMP_PARENT", "/work")
+
+
+def _private_tmp_name() -> "str | None":
+    """A name for the next request's temporary directory, or `None` where the
+    sandbox has no workspace tmpfs.
+
+    `/tmp` is one tmpfs for the whole sandbox, so a file one request leaves
+    there is still there for the next — for the next tenant, in a runtime pool.
+    A mount namespace per request would fix that and a forked child cannot make
+    one (see the `workspace` module), so each request gets a directory of its
+    own instead: 128 random bits under a parent that cannot be listed, and
+    every temp-file API pointed at it. Chosen here, in the zygote, so the
+    zygote can remove it if the child dies before it does.
+    """
+    if not os.path.isdir(PRIVATE_TMP_PARENT):
+        return None
+    return os.path.join(PRIVATE_TMP_PARENT, "tmp-" + os.urandom(16).hex())
+
+
+def _enter_private_tmp(path: str, create: bool) -> bool:
+    """Point `TMPDIR`, `TMP`, `TEMP` and `tempfile` at `path`.
+
+    `tempfile.tempdir` as well as the environment: `tempfile` caches the
+    directory the first time anybody asks, and a handler module that asked at
+    import time left the zygote's answer — `/tmp` — in every child.
+    """
+    if create:
+        try:
+            os.mkdir(path, 0o700)
+        except OSError:
+            return False
+    for key in ("TMPDIR", "TMP", "TEMP"):
+        os.environ[key] = path
+    cached = sys.modules.get("tempfile")
+    if cached is not None:
+        cached.tempdir = path
+    return True
+
+
+def _remove_private_tmp(path: "str | None") -> None:
+    if path:
+        shutil.rmtree(path, ignore_errors=True)
+
+
 def run_request(
     handler,
     request: dict,
@@ -429,6 +488,8 @@ def run_request(
     # Set when the request was refused rather than run: the answer is then an
     # `ERROR` frame rather than a `RESULT`. See `_check_digest`.
     refused = None
+    # The private temporary directory this child made, removed on the way out.
+    own_tmp = None
 
     # Proto 1.3: the request asked to watch its own output. The frames go on
     # the same pipe the `RESULT` does, ahead of it, and the agent forwards
@@ -471,6 +532,16 @@ def run_request(
         # parent's seeded state and every child produces identical "random"
         # values — tokens, temp names, jitter.
         _reseed_random()
+
+        # A temporary directory of this request's own, before any request code
+        # runs — the script's module body included. The workspace when the
+        # caller sent one, which is private already and which the supervisor
+        # removes; otherwise the directory the zygote named for this child.
+        if request.get("workspace"):
+            _enter_private_tmp(request["workspace"], create=False)
+        elif request.get(PRIVATE_TMP_KEY):
+            if _enter_private_tmp(request[PRIVATE_TMP_KEY], create=True):
+                own_tmp = request[PRIVATE_TMP_KEY]
 
         # The script, if the supervisor sent one. After the filter on purpose:
         # under `strict` a script that tries to start a program is refused by
@@ -588,6 +659,9 @@ def run_request(
 
     _write_frame(result_fd, message)
     os.close(result_fd)
+    # After the answer, so it is off the request's clock. The zygote removes
+    # it too if this child dies first.
+    _remove_private_tmp(own_tmp)
 
     # Straight out: no atexit handlers, no interpreter teardown, no flushing of
     # buffers the parent also owns.
@@ -847,7 +921,7 @@ class Agent:
         # not fast: measured at p99 32 ms on the request path, against a 2 ms
         # budget. Once the RESULT is in hand the answer owes nothing to the
         # corpse, so it is collected between requests instead.
-        self._unreaped: list[int] = []
+        self._unreaped: list[tuple[int, str | None]] = []
         # Requests that have been forked and not yet answered, keyed by id and
         # by the descriptor their result will arrive on.
         self._inflight: dict[str, InFlight] = {}
@@ -1082,6 +1156,8 @@ class Agent:
             else:
                 _, status = os.waitpid(request.pid, 0)
                 exit_code, error = _exit_code(status), _death_reason(status)
+            # The child is gone and did not clean up after itself.
+            _remove_private_tmp(request.tmpdir)
             result = {
                 "id": request.request_id,
                 "exit_code": exit_code,
@@ -1100,8 +1176,9 @@ class Agent:
             # worker closed its stdout by exiting, so it is reaped at once.
             if request.proc is not None:
                 request.proc.wait()
+                _remove_private_tmp(request.tmpdir)
             else:
-                self._unreaped.append(request.pid)
+                self._unreaped.append((request.pid, request.tmpdir))
 
         # An `ERROR` from the child goes up as an `ERROR`: it is the answer to
         # this `EXEC` either way (§3.5), and a request that was refused is not
@@ -1176,6 +1253,9 @@ class Agent:
             return
 
         request_id = request.get("id", "")
+        tmpdir = None if request.get("workspace") else _private_tmp_name()
+        if tmpdir:
+            request[PRIVATE_TMP_KEY] = tmpdir
         result_r, result_w = os.pipe()
         go_r, go_w = os.pipe()
         # Collected before the fork: afterwards the child cannot ask the parent
@@ -1223,7 +1303,7 @@ class Agent:
         os.close(result_w)
         os.close(go_r)
 
-        request_state = InFlight(request_id, pid, result_r, go_w)
+        request_state = InFlight(request_id, pid, result_r, go_w, tmpdir=tmpdir)
         self._inflight[request_id] = request_state
         self._by_result_fd[result_r] = request_state
 
@@ -1251,6 +1331,9 @@ class Agent:
         import subprocess
 
         request_id = request.get("id", "")
+        tmpdir = None if request.get("workspace") else _private_tmp_name()
+        if tmpdir:
+            request[PRIVATE_TMP_KEY] = tmpdir
         go_r, go_w = os.pipe()
         result_r, result_w = os.pipe()
         try:
@@ -1278,7 +1361,7 @@ class Agent:
         body = json.dumps(request, separators=(",", ":")).encode()
         request_state = InFlight(
             request_id, proc.pid, result_r, go_w,
-            go_payload=HEADER.pack(len(body)) + body, proc=proc,
+            go_payload=HEADER.pack(len(body)) + body, proc=proc, tmpdir=tmpdir,
         )
         self._inflight[request_id] = request_state
         self._by_result_fd[result_r] = request_state
@@ -1291,22 +1374,26 @@ class Agent:
         At most one child is ever outstanding, because requests are serialised.
         """
         still_running = []
-        for pid in self._unreaped:
+        for pid, tmpdir in self._unreaped:
             try:
                 reaped, _ = os.waitpid(pid, os.WNOHANG)
             except ChildProcessError:
-                continue  # already gone
+                reaped = pid  # already gone
             if reaped == 0:
-                still_running.append(pid)
+                still_running.append((pid, tmpdir))
+            elif tmpdir and os.path.lexists(tmpdir):
+                # It answered and then died before removing its directory.
+                _remove_private_tmp(tmpdir)
         self._unreaped = still_running
 
     def _reap_all(self) -> None:
         """Block until every child is gone. Used on shutdown."""
-        for pid in self._unreaped:
+        for pid, tmpdir in self._unreaped:
             try:
                 os.waitpid(pid, 0)
             except ChildProcessError:
                 pass
+            _remove_private_tmp(tmpdir)
         self._unreaped = []
 
     @staticmethod

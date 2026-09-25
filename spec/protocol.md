@@ -229,6 +229,19 @@ Implementing this is **optional**. An agent that ignores the field runs the
 handler wherever it already was; a supervisor that sent one gets a handler that
 cannot find its files, which is a failed request rather than a wrong answer.
 
+#### A temporary directory per request
+
+Not a message, but part of rule 4 below. `/tmp` is one tmpfs for the whole
+sandbox, and in a runtime pool the sandbox is shared by tenants, so a file one
+request leaves there is still there for the next. An agent **should** give
+each child a temporary directory of its own before any request code runs: the
+workspace when there is one, otherwise a new directory under `/work` with a
+128-bit random name, created with mode `0700`. It points `TMPDIR`, `TMP` and
+`TEMP` at it (and any temp-directory cache its runtime keeps, such as
+Python's `tempfile.tempdir`), and removes it once the child is gone, however
+the child went. Both reference agents do. Code that writes to a literal
+`/tmp/...` path still shares it; the book says so.
+
 ### `CHUNK` — child → agent → supervisor (1.3)
 
 ```json

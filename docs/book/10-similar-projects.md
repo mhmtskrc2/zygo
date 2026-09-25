@@ -217,7 +217,7 @@ you did not. This is what you get with no flags at all.
 | Memory, CPU, pids, wall clock | **unlimited** | **all mandatory**: `mem` 256M, `cpu` 1.0, `pids` 64, `timeout` 30s, `nofile` 1024 |
 | Bind mounts | `-v` is **rw** unless `:ro` | `--mount` is **ro** unless `:rw` |
 | cgroupfs inside | mounted read-only | not mounted at all, so `release_agent` is not reachable |
-| Escape suite | — | 18 escape vectors attempted on every change, 0 escaping |
+| Escape suite | — | 19 escape vectors attempted on every change, 0 escaping |
 
 A *denylist* names what is forbidden and allows the rest; an *allowlist*
 names what is allowed and forbids the rest. `release_agent` is an old cgroup

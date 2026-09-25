@@ -137,8 +137,8 @@ out, or find a bug in the kernel underneath them all.
 
 Every row below marked **attempted** is run by `make escape-linux`. It runs
 the escape itself, not a check of a setting, because a test that reads a flag
-also passes on a kernel that ignores that flag. The suite attempts 18 vectors in 26
-checks, and on Linux 5.10 and 6.8 reports **25 blocked, 0 escaped, 1
+also passes on a kernel that ignores that flag. The suite attempts 19 vectors in 27
+checks, and on Linux 5.10 and 6.8 reports **26 blocked, 0 escaped, 1
 skipped** — the setuid case, where the test image has no setuid binary to
 try.
 
@@ -156,7 +156,7 @@ syscall named in the tables below is refused.
   make escape-linux                        make fuzz-linux
   ─────────────────                        ───────────────
   every known attack, really tried         all 469 syscall numbers
-  → 25 blocked, 0 escaped, 1 skipped       × 3 profiles, one forked child each
+  → 26 blocked, 0 escaped, 1 skipped       × 3 profiles, one forked child each
                                            → profiles ordered, nothing kills
                                              the process, clone3 → ENOSYS
 ```
@@ -193,6 +193,7 @@ syscall named in the tables below is refused.
 | Seeing or signalling host processes | separate pid namespace; only the sandbox's own processes are visible | **attempted** |
 | Resource exhaustion | mandatory cgroup limits; `pids.max` always set; `memory.oom.group` | **attempted** separately by `make verify-linux` (the fork bomb is cut off at `pids.max`; the memory hog is OOM-killed inside its own cgroup and the host loses 0 MB) |
 | Zygote contamination | the zygote never handles a request itself; every request is a fresh process that ends in `_exit` | by construction |
+| A file left in the temp folder for the next request (or tenant) | each request's `TMPDIR` is its own folder under `/work`, which cannot be listed, removed when the request ends; a literal `/tmp/...` path is still shared by the sandbox | **attempted** (case 18, in a runtime pool) |
 
 ## Vectors: the network
 
