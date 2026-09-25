@@ -136,7 +136,16 @@ pub fn plan(report: &Report) -> Vec<Fix> {
     for check in &report.checks {
         match check.name {
             "user namespaces" if check.status == Status::Failed && apparmor_restricts_userns() => {
-                fixes.push(apparmor_userns_fix());
+                // A profile for this binary where AppArmor can load one; the
+                // host-wide sysctl only where it cannot.
+                let exe = std::env::current_exe()
+                    .and_then(std::fs::canonicalize)
+                    .ok()
+                    .filter(|_| can_load_apparmor_profiles());
+                fixes.push(match exe {
+                    Some(exe) => apparmor_profile_fix(&exe.to_string_lossy()),
+                    None => apparmor_userns_fix(),
+                });
             }
             "cgroup v2" if check.status == Status::Failed => {
                 fixes.push(delegation_fix());
@@ -165,6 +174,74 @@ pub fn plan(report: &Report) -> Vec<Fix> {
     fixes
 }
 
+/// Where `zygo doctor --fix` writes the profile, and the name it loads under.
+pub const APPARMOR_PROFILE_FILE: &str = "/etc/apparmor.d/zygo";
+
+/// Let this binary, and only it, use user namespaces under Ubuntu's
+/// restriction — the narrow fix, and the one Ubuntu itself uses for the
+/// programs that need them (its own profiles for browsers and container
+/// tools have the same shape).
+///
+/// The profile is `unconfined` apart from the one permission it adds, so it
+/// takes nothing away from `zygo`, and it is attached by path, so it applies to
+/// the binary that is running now. A binary installed somewhere else needs its
+/// own; `doctor` says so when it finds the restriction again.
+fn apparmor_profile_fix(exe: &str) -> Fix {
+    Fix {
+        check: "user namespaces",
+        what: format!("an AppArmor profile that lets {exe} use user namespaces"),
+        why: "Ubuntu 24.04 ships kernel.apparmor_restrict_unprivileged_userns=1. \
+              It lets an unprivileged process create a user namespace and then \
+              refuses the first mount inside it, which is the first thing every \
+              sandbox does. A profile with the `userns` permission is how Ubuntu \
+              lets a named program past it."
+            .into(),
+        cost: Some(format!(
+            "only {exe} gains the permission; the restriction stays on for every \
+             other process. The profile adds nothing else and removes nothing. \
+             A zygo binary at another path needs its own — run `zygo doctor \
+             --fix` with that one. `sudo apparmor_parser -R {APPARMOR_PROFILE_FILE} \
+             && sudo rm {APPARMOR_PROFILE_FILE}` removes it."
+        )),
+        commands: vec![
+            Command::root(&["tee", APPARMOR_PROFILE_FILE]).writing(apparmor_profile(exe)),
+            Command::root(&["apparmor_parser", "-r", APPARMOR_PROFILE_FILE]),
+        ],
+    }
+}
+
+/// The profile itself. Public so the copy shipped in `packaging/apparmor/`
+/// can be checked against it.
+pub fn apparmor_profile(exe: &str) -> String {
+    format!(
+        "# Written by `zygo doctor --fix`.\n\
+         #\n\
+         # Ubuntu restricts unprivileged user namespaces\n\
+         # (kernel.apparmor_restrict_unprivileged_userns=1), and every Zygo sandbox\n\
+         # starts with one. This lets the zygo binary below, and nothing else, use\n\
+         # them. It is unconfined otherwise: it adds one permission and takes none\n\
+         # away. Remove with: apparmor_parser -R {APPARMOR_PROFILE_FILE}\n\
+         \n\
+         abi <abi/4.0>,\n\
+         include <tunables/global>\n\
+         \n\
+         profile zygo \"{exe}\" flags=(unconfined) {{\n\
+         \x20 userns,\n\
+         \n\
+         \x20 include if exists <local/zygo>\n\
+         }}\n"
+    )
+}
+
+/// Whether this host can take a profile: AppArmor 4's policy ABI (the one
+/// with `userns`) and the tool that loads it.
+fn can_load_apparmor_profiles() -> bool {
+    std::path::Path::new("/etc/apparmor.d/abi/4.0").exists()
+        && ["/usr/sbin/apparmor_parser", "/sbin/apparmor_parser"]
+            .iter()
+            .any(|p| std::path::Path::new(p).exists())
+}
+
 fn apparmor_userns_fix() -> Fix {
     Fix {
         check: "user namespaces",
@@ -180,9 +257,9 @@ fn apparmor_userns_fix() -> Fix {
             "this turns the restriction off for every process on the machine, not \
              only for Zygo's. It is a defence against kernel bugs reachable \
              through user namespaces; docs/book/23-security.md says what it was \
-             protecting. The narrower alternative is an AppArmor profile for the \
-             `zygo` binary alone, which this cannot write for you because it \
-             depends on where you installed it."
+             protecting. The narrower fix, an AppArmor profile for the `zygo` \
+             binary alone, is offered instead wherever AppArmor 4 and \
+             apparmor_parser are installed; they are not here."
                 .into(),
         ),
         commands: vec![
@@ -511,6 +588,54 @@ mod tests {
         );
         assert!(fix.commands.iter().all(|c| c.root));
         assert_eq!(fix.commands[0].display().split(' ').next(), Some("sudo"));
+    }
+
+    #[test]
+    fn the_profile_names_the_binary_and_adds_only_userns() {
+        let text = apparmor_profile("/opt/my tools/zygo");
+        assert!(text.contains("profile zygo \"/opt/my tools/zygo\" flags=(unconfined) {"));
+        assert!(text.contains("\n  userns,\n"), "{text}");
+        assert!(text.contains("abi <abi/4.0>,"));
+        let rules: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect();
+        assert_eq!(
+            rules,
+            [
+                "abi <abi/4.0>,",
+                "include <tunables/global>",
+                "profile zygo \"/opt/my tools/zygo\" flags=(unconfined) {",
+                "userns,",
+                "include if exists <local/zygo>",
+                "}",
+            ]
+        );
+        let fix = apparmor_profile_fix("/usr/local/bin/zygo");
+        assert!(fix.needs_root());
+        assert_eq!(fix.commands[0].argv, ["tee", APPARMOR_PROFILE_FILE]);
+        assert_eq!(
+            fix.commands[1].argv,
+            ["apparmor_parser", "-r", APPARMOR_PROFILE_FILE]
+        );
+        assert!(
+            fix.cost
+                .as_deref()
+                .is_some_and(|c| c.contains("stays on for every"))
+        );
+    }
+
+    /// The profile in packaging/apparmor/ is this one, for the install path
+    /// the book uses, so a package or an image can ship it as it is.
+    #[test]
+    fn the_shipped_profile_is_the_generated_one() {
+        let shipped =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/apparmor/zygo");
+        let Ok(text) = std::fs::read_to_string(&shipped) else {
+            return; // a packaged crate has no packaging/ beside it
+        };
+        assert_eq!(text, apparmor_profile("/usr/local/bin/zygo"));
     }
 
     #[test]

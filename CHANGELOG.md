@@ -28,6 +28,11 @@ break things and will say so here.
 
 ### Changed
 
+- `zygo doctor --fix` on Ubuntu 24.04 installs an AppArmor profile that
+  lets the `zygo` binary alone use user namespaces, instead of turning
+  `kernel.apparmor_restrict_unprivileged_userns` off for every process. The
+  sysctl remains the fallback where no profile can be loaded; the profile is
+  also shipped as `packaging/apparmor/zygo`.
 - **Breaking, Python SDK:** the module is `zygo_sdk`, not `zygo`. PyPI's
   `zygo` belongs to another project, and two packages that install the same
   module overwrite each other. `import zygo_sdk as zygo` keeps existing code

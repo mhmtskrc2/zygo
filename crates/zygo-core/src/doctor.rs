@@ -732,8 +732,9 @@ mod probe {
                 "user namespaces",
                 reason.clone(),
                 "AppArmor is restricting unprivileged user namespaces on this host: \
-                 sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 \
-                 (or ship an AppArmor profile for the `zygo` binary)",
+                 `zygo doctor --fix` installs a profile that lets this binary alone \
+                 past it (the same file is in packaging/apparmor/zygo); or, for \
+                 every process, sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0",
             ),
             // The namespace was made and then a mount in it refused: that is
             // not seccomp, which stops `unshare` itself, but an LSM profile —

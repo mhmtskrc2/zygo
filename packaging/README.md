@@ -4,6 +4,8 @@
 |---|---|
 | [`homebrew/zygo.rb.in`](homebrew/zygo.rb.in) | The Homebrew formula, as a template. |
 | [`homebrew/render.sh`](homebrew/render.sh) | Fills the digests in from a built release. |
+| [`apparmor/zygo`](apparmor/zygo) | An AppArmor profile that lets `/usr/local/bin/zygo` alone use user namespaces on Ubuntu 24.04 and later. `zygo doctor --fix` writes the same file for wherever the binary is. |
+| [`demo/zygo.tape`](demo/zygo.tape) | The README's demo, as a [VHS](https://github.com/charmbracelet/vhs) script. |
 
 The formula is a template rather than a formula because a formula's `sha256`
 lines are of archives that do not exist until the release is built. The

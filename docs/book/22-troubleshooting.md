@@ -132,13 +132,19 @@ the first thing every sandbox does.
 
 `zygo doctor` finds this by trying that mount, and prints the fix.
 `zygo doctor --fix` applies it: it prints every command and what it costs, and
-asks first. It also writes `/etc/sysctl.d/60-zygo-userns.conf`, so a machine
-that works today still works after a reboot.
+asks first. Where AppArmor 4 and `apparmor_parser` are installed — Ubuntu
+24.04 has both — the fix is an **AppArmor profile for the `zygo` binary**,
+written to `/etc/apparmor.d/zygo` and loaded. It lets that one program use
+user namespaces and leaves the restriction on for everything else. It is
+attached by path, so a binary you move or install elsewhere needs
+`--fix` again. [`packaging/apparmor/zygo`](../../packaging/apparmor/zygo) is
+the same profile for `/usr/local/bin/zygo`, for an image or a package to ship.
 
-Read [the threat model](23-security.md#on-ubuntu-2404-and-later-zygo-asks-you-to-turn-something-off)
-before you apply it. The fix turns off a protection for **every** process on
-the machine, not only Zygo's, and `--fix` says so in those words above the
-question.
+Where a profile cannot be loaded, `--fix` falls back to the sysctl, and writes
+`/etc/sysctl.d/60-zygo-userns.conf` so it survives a reboot. Read
+[the threat model](23-security.md#on-ubuntu-2404-and-later-zygo-asks-you-to-turn-something-off)
+first: that one turns a protection off for **every** process on the machine,
+and `--fix` says so in those words above the question.
 
 **On a Mac**, when the path is outside your home directory, the cause is
 different. The Linux VM mounts `$HOME` and nothing else, so a path elsewhere

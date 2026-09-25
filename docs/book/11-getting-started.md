@@ -373,9 +373,10 @@ distribution, not from Zygo.
 The first is `kernel.apparmor_restrict_unprivileged_userns=1`. It lets a
 normal process create a user namespace, and then refuses the first mount
 inside it. That mount is the first thing every sandbox does. `zygo doctor`
-finds this by trying the mount, and prints the one-line fix. Read
-[chapter 23](23-security.md) first: the fix turns off a protection for
-*every* process on the machine, not only for Zygo.
+finds this by trying the mount, and `zygo doctor --fix` installs an AppArmor
+profile that lets the `zygo` binary alone past it. The restriction stays on
+for every other program. [Chapter 23](23-security.md) says what the rule
+protects.
 
 The second is an AppArmor profile for `pasta`, the program Zygo uses to give
 a sandbox a network. Where that profile is enforced, it keeps `pasta` out of

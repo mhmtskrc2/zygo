@@ -345,15 +345,19 @@ Node's permission model, which is weaker against a V8 escape and says so in
 
 `kernel.apparmor_restrict_unprivileged_userns=1` stops a normal process from
 mounting inside a user namespace, which is the first thing every sandbox does.
-`zygo doctor` finds this by trying the mount, not by reading the sysctl, and
-prints `sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` as the fix.
-Be clear about what that is. It is a host-wide protection against a class of
+`zygo doctor` finds this by trying the mount, not by reading the sysctl.
+`zygo doctor --fix` then installs an AppArmor profile that gives the `zygo`
+binary alone the `userns` permission — the way Ubuntu lets its own browsers
+and container tools past the same rule — and the restriction stays on for
+every other process. Only where AppArmor cannot load a profile does it offer
+`sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` instead. Be clear
+about what that is. It is a host-wide protection against a class of
 local privilege escalation that starts with an unprivileged user namespace,
 and turning it off removes it for **every** process on the machine, not only
 Zygo's. It is the right call on a host whose job is running sandboxes, and it
 is what `shim/lima.yaml` does inside Zygo's own VM. On a shared workstation,
-the narrower answer is an AppArmor profile that allows it for the `zygo`
-binary alone. Zygo does not ship one yet, and that is a gap.
+the profile is the right answer; [`packaging/apparmor/zygo`](../../packaging/apparmor/zygo)
+is the file.
 [Troubleshooting](22-troubleshooting.md#applying-a-bind-mount-from-the-spec-failed-no-such-file-or-directory)
 shows `zygo doctor --fix`, which applies it after asking.
 

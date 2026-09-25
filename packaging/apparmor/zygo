@@ -1,0 +1,16 @@
+# Written by `zygo doctor --fix`.
+#
+# Ubuntu restricts unprivileged user namespaces
+# (kernel.apparmor_restrict_unprivileged_userns=1), and every Zygo sandbox
+# starts with one. This lets the zygo binary below, and nothing else, use
+# them. It is unconfined otherwise: it adds one permission and takes none
+# away. Remove with: apparmor_parser -R /etc/apparmor.d/zygo
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile zygo "/usr/local/bin/zygo" flags=(unconfined) {
+  userns,
+
+  include if exists <local/zygo>
+}
