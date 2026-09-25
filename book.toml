@@ -1,0 +1,16 @@
+# The book, as a website: `make docs-site`, which stages the pages with
+# docs/site.py and then builds them here. The Markdown in docs/ is the
+# source; target/ holds only generated copies.
+[book]
+title = "The Zygo book"
+authors = ["Zygo contributors"]
+language = "en"
+src = "target/book-src"
+
+[build]
+build-dir = "target/book"
+create-missing = false
+
+[output.html]
+git-repository-url = "https://github.com/mhmtskrc2/zygo"
+site-url = "/zygo/"

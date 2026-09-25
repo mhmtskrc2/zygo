@@ -38,6 +38,8 @@ break things and will say so here.
 
 ### Added
 
+- The book as a searchable website on GitHub Pages, built by mdBook on every
+  pull request and published from `main`; `make docs-site` builds it locally.
 - Releases carry an SBOM (`zygo-<version>.cdx.json`, CycloneDX) and a
   keyless cosign signature over `SHA256SUMS`, so every tarball is verifiable,
   not only the image.

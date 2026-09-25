@@ -41,7 +41,8 @@ commit.** Find the chapter from this table:
 A new chapter goes into `docs/book/README.md` and `docs/SUMMARY.md`; then
 `make docs-nav` rewrites the previous / next links at the foot of every page
 from `SUMMARY.md`'s order (`make lint` fails while they are out of date —
-never edit them by hand). If a
+never edit them by hand). `make docs-site` builds the same pages as the
+website CI publishes, with mdBook; it must keep building. If a
 change needs none of this, say so in the commit message ("no user-visible
 change"), so a reviewer knows it was considered rather than forgotten.
 

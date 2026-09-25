@@ -49,6 +49,7 @@ help:
 	@echo "verify-seccomp-profiles-linux  copy2 and pip --target under every profile; the profiles differ from inside"
 	@echo "syscall-tables  regenerate the seccomp syscall number tables"
 	@echo "fmt / lint   rustfmt / clippy"
+	@echo "docs-site    the book as a website, in target/book (needs mdbook)"
 	@echo "deny         advisories, licences and sources of every dependency (cargo-deny)"
 
 build:
@@ -511,6 +512,13 @@ lint:
 .PHONY: deny
 deny:
 	cargo deny --locked check
+
+# The book as a website, in target/book: docs/site.py stages the pages with
+# the links mdBook needs, then mdBook builds them. Needs `mdbook` on PATH.
+.PHONY: docs-site
+docs-site:
+	python3 docs/site.py
+	mdbook build
 
 # The previous / contents / next links at the foot of every book page,
 # rebuilt from the reading order in docs/SUMMARY.md.

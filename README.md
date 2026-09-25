@@ -328,7 +328,8 @@ audit has been done.
 
 Everything is in **[the Zygo book](docs/book/README.md)** — one book, in plain
 English, with diagrams throughout. It starts from zero and ends with the full
-reference.
+reference. It is also a searchable website, at
+[mhmtskrc2.github.io/zygo](https://mhmtskrc2.github.io/zygo/).
 
 | | |
 |---|---|
