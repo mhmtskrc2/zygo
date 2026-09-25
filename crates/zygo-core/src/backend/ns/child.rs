@@ -43,6 +43,10 @@ const SYS_PIVOT_ROOT: libc::c_long = if cfg!(target_arch = "aarch64") {
 /// Must be called only in the child of a fork-like clone, with `plan` prepared
 /// before that clone, and with both file descriptors owned by this child.
 pub unsafe fn child_main(plan: &PreparedLaunch, ready_fd: c_int, err_fd: c_int) -> ! {
+    // 0. Die with the parent — asked for first, before anything can happen
+    //    that the parent's death should interrupt.
+    unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) };
+
     // 1. Wait for the parent to write the id maps. Until they exist this
     //    process has no valid uid and cannot mount anything.
     let mut signal = [0u8; 1];
@@ -50,10 +54,27 @@ pub unsafe fn child_main(plan: &PreparedLaunch, ready_fd: c_int, err_fd: c_int) 
     if n != 1 {
         fail(err_fd, Step::WaitForIdMaps);
     }
-    unsafe { libc::close(ready_fd) };
     if signal[0] != READY_OK {
         fail_with(err_fd, Step::IdMapsRejected, libc::EPERM);
     }
+    // A parent that died *before* the prctl above sends no signal. It may
+    // still have written the byte first, so the byte proves nothing; the
+    // pipe does. The parent holds its end open until this process has
+    // exec'd or failed, so a hung-up pipe here means it is gone. After this
+    // check a death is the prctl's to handle, and before it, this check's.
+    //
+    // It used to be `getppid() == 1`, after the hardening. In a new pid
+    // namespace the parent is outside it and `getppid` is always 0, so that
+    // check could never fire.
+    let mut pfd = libc::pollfd {
+        fd: ready_fd,
+        events: 0,
+        revents: 0,
+    };
+    if unsafe { libc::poll(&mut pfd, 1, 0) } > 0 && pfd.revents & libc::POLLHUP != 0 {
+        fail_with(err_fd, Step::ParentDied, libc::ESRCH);
+    }
+    unsafe { libc::close(ready_fd) };
 
     // 2. The mount plan.
     for op in &plan.ops {
@@ -136,7 +157,7 @@ pub unsafe fn child_main(plan: &PreparedLaunch, ready_fd: c_int, err_fd: c_int) 
         unsafe { hand_out_secrets_dir(sock, err_fd) };
     }
 
-    // 7–10. Limits, privilege, Landlock, seccomp, and dying with the parent.
+    // 7–10. Limits, privilege, Landlock and seccomp.
     unsafe { harden(plan, err_fd) };
 
     // 11. Hand the sandbox over — to the program, or to a loop that keeps it.
@@ -194,15 +215,6 @@ pub(super) unsafe fn harden(plan: &PreparedLaunch, err_fd: c_int) {
         && let Err(e) = unsafe { super::seccomp::install(&plan.seccomp, plan.seccomp_log) }
     {
         fail_with(err_fd, Step::InstallSeccomp, e.raw_os_error().unwrap_or(0));
-    }
-
-    // Die with the parent. Checked immediately afterwards, because a parent
-    // that exited *before* the prctl would never trigger it. `getppid` is 0
-    // when the parent is outside this pid namespace — the warm-exec helper —
-    // and that is not "the parent died".
-    unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) };
-    if unsafe { libc::getppid() } == 1 {
-        fail_with(err_fd, Step::ParentDied, libc::ESRCH);
     }
 }
 

@@ -2617,7 +2617,13 @@ fn kill_request(request_cgroup: Option<&std::path::Path>, host_pid: u32) {
     {
         return;
     }
-    // SAFETY: `host_pid` names an unreaped process this supervisor created.
+    // SAFETY: `kill` touches no memory, so any pid is sound to pass. Which
+    // process it reaches is the real question, and the answer is not "one
+    // this supervisor holds unreaped": a request is the child of the
+    // warm-exec helper or of the agent, and *they* reap it. Between its exit
+    // and this call the pid can in principle be reused by an unrelated
+    // process. The cgroup path above has no such window; this one is taken
+    // only when there is no request cgroup or killing through it failed.
     unsafe { libc::kill(host_pid as libc::pid_t, libc::SIGKILL) };
 }
 

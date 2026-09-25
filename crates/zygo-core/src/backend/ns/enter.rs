@@ -462,6 +462,12 @@ unsafe fn request_main(
         libc::close(ends.status_w);
     }
 
+    // Die with the helper, asked for first. A helper that died in the moment
+    // between the fork and this line sends nothing; the request then either
+    // never gets `GO` and exits below, or runs to its deadline, which the
+    // supervisor enforces by host pid, not through the helper.
+    unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) };
+
     // The sandbox's cgroup namespace, entered here rather than in the helper
     // so the helper could create this process inside its cgroup. It changes
     // only what `/proc/self/cgroup` shows; the process is already where it

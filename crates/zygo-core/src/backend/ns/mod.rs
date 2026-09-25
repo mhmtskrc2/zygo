@@ -738,8 +738,10 @@ pub fn launch(config: &SandboxConfig, hierarchy: Option<&cgroup::Hierarchy>) -> 
             } else {
                 child::READY_FAILED
             };
+            // Written, but the pipe is kept open until the child has exec'd or
+            // failed: the child reads a hang-up as "the launcher is gone" —
+            // see step 0 of `child::child_main`.
             let _ = write_all(ready_write.as_raw_fd(), &[signal]);
-            drop(ready_write);
 
             if let Err(e) = identity {
                 let _ = sandbox.kill();
@@ -769,6 +771,7 @@ pub fn launch(config: &SandboxConfig, hierarchy: Option<&cgroup::Hierarchy>) -> 
                     return Err(e);
                 }
             };
+            drop(ready_write);
 
             if !payload.is_empty() {
                 let _ = sandbox.kill();
