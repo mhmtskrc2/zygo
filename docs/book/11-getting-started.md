@@ -114,8 +114,7 @@ backends.
 Zygo also ships as a container image, `ghcr.io/mhmtskrc2/zygo`. It is Alpine
 Linux plus the static `zygo` binary and the few helpers networking needs.
 It does not need `--privileged`, but it does need a few specific things from
-Docker, because Zygo builds sandboxes inside it. This is the same command as
-on the README:
+Docker, because Zygo builds sandboxes inside it:
 
 ```bash
 docker run --user 0:0 --security-opt seccomp=unconfined \

@@ -542,7 +542,7 @@ minute from your own users' scripts, Zygo's is the faster one, and
 `--isolation vm` is there for the part that is not safe to run on `ns`.
 Zygo's `vm` backend is also, today, much less than microsandbox: it boots a
 guest and runs one-shot sandboxes, and warm functions and networking inside
-the guest are not built. [The status section](../../README.md#status) says so.
+the guest are not built; [ADR 0002](adr/0002-warm-paths-stay-on-ns.md) says why.
 
 ## gVisor
 

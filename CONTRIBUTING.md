@@ -45,6 +45,26 @@ make conformance              # the agent protocol suite, against all three refe
 mounts or the network should come with `make verify-linux escape-linux
 fuzz-linux` passing; say in the pull request which kernel you ran them on.
 
+## Where things are
+
+```
+crates/zygo-core     the library; the CLI and the bindings sit on top
+  spec/              sandbox.toml surface, layering, validation
+  image/             OCI references, content-addressed store, registry client
+  sandbox/           mount plan and resource limits, backend independent
+  cgroup.rs          the two-level cgroup v2 hierarchy
+  backend/           ns | gvisor | vm
+  protocol/          the warm execution wire protocol
+  doctor.rs          environment probing
+crates/zygo-cli      the `zygo` binary
+agents/python        the reference Python agent and its conformance suite
+agents/node          the reference Node agent: a worker pool, not a fork
+spec/protocol.md     the wire protocol
+sdk/python           the Python client, and the async one beside it
+sdk/node             the Node client, with types and no build step
+packaging/oci        the container image, and a worker image built on it
+```
+
 ## The rules the code is held to
 
 [AGENTS.md](AGENTS.md) is the full list, written for people and coding agents
