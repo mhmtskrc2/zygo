@@ -470,13 +470,47 @@ fn apparmor_restricts_userns() -> bool {
 /// Read from `/sys/kernel/security/apparmor/profiles`, which is the same
 /// place `aa-status` reads and needs no `apparmor-utils` installed to ask.
 /// Lines are `name (mode)`.
+///
+/// Only root may read that file — its mode says 0444, and the kernel refuses
+/// everybody else anyway — and `doctor --fix` is usually run as the user who
+/// wants sandboxes. Reading it was all this did, so on Ubuntu 24.04 the fix
+/// was never offered to the person it is for. Unreadable, the answer comes
+/// from the profile on disk instead: see [`pasta_profile_on_disk_enforces`].
 fn pasta_is_enforced() -> bool {
-    let Ok(text) = std::fs::read_to_string("/sys/kernel/security/apparmor/profiles") else {
-        return false;
-    };
+    match std::fs::read_to_string("/sys/kernel/security/apparmor/profiles") {
+        Ok(text) => loaded_profiles_enforce_pasta(&text),
+        Err(_) => pasta_profile_on_disk_enforces(
+            std::fs::read_to_string("/sys/module/apparmor/parameters/enabled").ok(),
+            std::fs::read_to_string(PASST_PROFILE).ok(),
+            std::path::Path::new(PASST_FORCE_COMPLAIN).exists(),
+        ),
+    }
+}
+
+/// The profile the `passt` package installs, which confines `pasta` too.
+const PASST_PROFILE: &str = "/etc/apparmor.d/usr.bin.passt";
+/// Where `aa-complain` leaves a marker for a profile it cannot edit in place.
+const PASST_FORCE_COMPLAIN: &str = "/etc/apparmor.d/force-complain/usr.bin.passt";
+
+fn loaded_profiles_enforce_pasta(text: &str) -> bool {
     text.lines().any(|line| {
         (line.contains("pasta") || line.contains("passt")) && line.contains("(enforce)")
     })
+}
+
+/// Whether the profile on disk will enforce: AppArmor is on, the package's
+/// profile is there, and nothing has put it in complain mode — `aa-complain`
+/// writes `flags=(complain)` into the file, or a marker beside it. What is
+/// loaded can differ from the file until the next reload; the file is what the
+/// next boot loads, so it is the better guess of the two a user can read.
+fn pasta_profile_on_disk_enforces(
+    enabled: Option<String>,
+    profile: Option<String>,
+    force_complain: bool,
+) -> bool {
+    let on = enabled.is_some_and(|v| v.trim() == "Y");
+    let enforcing = profile.is_some_and(|p| !p.contains("complain"));
+    on && enforcing && !force_complain
 }
 
 fn package_manager() -> Option<&'static str> {
@@ -636,6 +670,50 @@ mod tests {
             return; // a packaged crate has no packaging/ beside it
         };
         assert_eq!(text, apparmor_profile("/usr/local/bin/zygo"));
+    }
+
+    #[test]
+    fn a_user_who_cannot_read_securityfs_is_still_told_about_pasta() {
+        const SHIPPED: &str = "abi <abi/4.0>,\ninclude <tunables/global>\n\
+                               profile passt /usr/bin/passt{,.avx2} {\n}\n";
+        let yes = || Some("Y\n".to_string());
+        assert!(pasta_profile_on_disk_enforces(
+            yes(),
+            Some(SHIPPED.into()),
+            false
+        ));
+        // After `aa-complain`, in either of the two forms it leaves.
+        let complained = SHIPPED.replace("{,.avx2} {", "{,.avx2} flags=(complain) {");
+        assert!(!pasta_profile_on_disk_enforces(
+            yes(),
+            Some(complained),
+            false
+        ));
+        assert!(!pasta_profile_on_disk_enforces(
+            yes(),
+            Some(SHIPPED.into()),
+            true
+        ));
+        // No AppArmor, or no passt profile: nothing to fix.
+        assert!(!pasta_profile_on_disk_enforces(
+            Some("N".into()),
+            Some(SHIPPED.into()),
+            false
+        ));
+        assert!(!pasta_profile_on_disk_enforces(
+            None,
+            Some(SHIPPED.into()),
+            false
+        ));
+        assert!(!pasta_profile_on_disk_enforces(yes(), None, false));
+    }
+
+    #[test]
+    fn loaded_profiles_are_read_by_mode() {
+        assert!(loaded_profiles_enforce_pasta(
+            "passt (enforce)\nfoo (complain)\n"
+        ));
+        assert!(!loaded_profiles_enforce_pasta("passt (complain)\n"));
     }
 
     #[test]

@@ -76,6 +76,10 @@ break things and will say so here.
 
 ### Fixed
 
+- `zygo doctor --fix` never offered to take `pasta` out of AppArmor's
+  enforce mode unless it ran as root: it read a file only root may read. It
+  now falls back to the profile on disk, so the user who needs `egress` on
+  Ubuntu is told.
 - `spec/openapi.json` said version 0.1.0 in the 0.1.1 release.
 - The docs disagreed with themselves: the escape suite's size (16, 17 or 22),
   the container's flags (5, 7 or 9), and the cost of reaching the Mac's VM
