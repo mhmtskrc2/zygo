@@ -744,8 +744,10 @@ A run now starts 4 processes, down from 13 at the worst.
   sandbox made Python about twice as slow as a plain container did. That cost
   belongs to the old kernel, and it would have been measured against every
   namespace-based runner alike.
-- **The raw results and the load generator are not in this repository.** The
-  tables here are their summary.
+- **The raw results and the load generator were not kept.** The tables here
+  are their summary, and they cannot be repeated from this repository. The
+  numbers in [chapter 25](25-performance.md) can: `make bench-record` writes
+  them as JSON, and [`bench/`](../../bench) holds the records so far.
 
 ## Everything in one table
 

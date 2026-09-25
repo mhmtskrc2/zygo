@@ -558,6 +558,15 @@ Each command has a *budget*: the number it must beat to print PASS.
 | `load --concurrency` | 4 | how many clients call at once |
 | `load --cpu` | none | the tenant's CPU quota, in cores |
 
+## The raw records
+
+`make bench-record` runs `bench all` and the warm path with and without a
+per-request cgroup, and keeps what they printed as JSON in
+[`bench/results/`](../../bench), one folder per run, named after the date, the
+kernel and the architecture. A run that missed a budget is kept as well.
+Records from Linux 6.8 and 5.10, both aarch64, are there now; there is no
+x86_64 record yet.
+
 ## Two things `bench all` does that most benchmarks do not
 
 **It lifts the tenant's CPU quota for the throughput run, and only for that

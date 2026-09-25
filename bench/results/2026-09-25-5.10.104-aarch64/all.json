@@ -1,0 +1,190 @@
+{
+  "disturbance": [],
+  "host": {
+    "arch": "aarch64",
+    "cores": 5,
+    "cpu_model": "unknown",
+    "data_root": "/tmp/zdata-bench",
+    "governor": null,
+    "kernel": "5.10.104-linuxkit",
+    "max_mhz": null,
+    "memory_kb": 8039792,
+    "virtualised": null,
+    "zygo": "0.1.1"
+  },
+  "published": [
+    {
+      "close": true,
+      "measured": 1.52875,
+      "published": 1.44,
+      "unit": "ms",
+      "what": "warm request, median"
+    },
+    {
+      "close": true,
+      "measured": 2.3147879200000006,
+      "published": 10.53,
+      "unit": "ms",
+      "what": "warm request, 99th percentile"
+    },
+    {
+      "close": true,
+      "measured": 2.010542,
+      "published": 1.4,
+      "unit": "ms",
+      "what": "warm-exec request, median"
+    },
+    {
+      "close": true,
+      "measured": 1.9854375,
+      "published": 1.91,
+      "unit": "ms",
+      "what": "pooled script request, median"
+    },
+    {
+      "close": true,
+      "measured": 2.813851750000001,
+      "published": 11.36,
+      "unit": "ms",
+      "what": "pooled script request, 99th percentile"
+    },
+    {
+      "close": false,
+      "measured": 39.335375,
+      "published": 12.3,
+      "unit": "ms",
+      "what": "cold `zygo run`, median"
+    },
+    {
+      "close": true,
+      "measured": 958.9371524896319,
+      "published": 1108.0,
+      "unit": "req/s",
+      "what": "throughput at concurrency 4 *"
+    },
+    {
+      "close": false,
+      "measured": 321.40633299999996,
+      "published": 34.0,
+      "unit": "ms",
+      "what": "`zygo serve`, once"
+    }
+  ],
+  "results": {
+    "cold": {
+      "budget_ms": 50.0,
+      "command": [
+        "python3",
+        "-c",
+        "pass"
+      ],
+      "image": "python:3.12-slim",
+      "max_ms": 42.317,
+      "p50_ms": 39.335375,
+      "p90_ms": 41.2688586,
+      "p99_ms": 42.203585579999995,
+      "pass": true,
+      "rootfs": "flattened",
+      "runs": 50
+    },
+    "load": {
+      "budget": {
+        "p50_us": 2000.0,
+        "p99_us": 10000.0
+      },
+      "concurrency": 4,
+      "cpu": null,
+      "failures": 1,
+      "headroom_p50_percent": -104.98332499999997,
+      "lock_max_us": 1893.916,
+      "lock_p50_us": 3.834,
+      "max_us": 16441.416,
+      "mean_us": 4169.452587763171,
+      "meets_target": true,
+      "p50_us": 4099.666499999999,
+      "p90_us": 5234.8045,
+      "p999_us": 11422.384500000036,
+      "p99_measured": true,
+      "p99_us": 6439.35675,
+      "pass": false,
+      "requests": 9594,
+      "requests_per_client": [
+        2393,
+        2400,
+        2400,
+        2402
+      ],
+      "requests_per_second": 958.9371524896319,
+      "target_per_second": 600.0
+    },
+    "pool": {
+      "budget": {
+        "p50_us": 5000.0,
+        "p99_us": 5000.0
+      },
+      "cpu": null,
+      "headroom_p50_percent": 60.29125,
+      "imports_ms": 17.062375001842156,
+      "max_us": 37062.541999999994,
+      "mean_us": 2003.5680951999925,
+      "p50_us": 1985.4375,
+      "p90_us": 2311.4292,
+      "p999_us": 4032.184292000004,
+      "p99_measured": true,
+      "p99_us": 2813.8517500000007,
+      "pass": true,
+      "requests": 10000,
+      "requests_per_second": 250.01029328003898,
+      "rss_kb": 24116,
+      "runtime": "python/3.12.14",
+      "scripts": 1000,
+      "warm_ms": 346.909833
+    },
+    "warm": {
+      "budget": {
+        "p50_us": 2000.0,
+        "p99_us": 10000.0
+      },
+      "cpu": null,
+      "headroom_p50_percent": 23.5625,
+      "imports_ms": 0.7623330020578578,
+      "max_us": 98107.625,
+      "mean_us": 1573.7578171000005,
+      "p50_us": 1528.75,
+      "p90_us": 1891.6375,
+      "p999_us": 5427.380667000189,
+      "p99_measured": true,
+      "p99_us": 2314.7879200000007,
+      "pass": true,
+      "requests": 10000,
+      "requests_per_second": 250.01201296471754,
+      "rss_kb": 19320,
+      "runtime": "python/3.12.14",
+      "warm_ms": 321.40633299999996
+    },
+    "warm_exec": {
+      "budget": {
+        "p50_us": 3000.0,
+        "p99_us": 10000.0
+      },
+      "cpu": null,
+      "headroom_p50_percent": 32.98193333333333,
+      "imports_ms": 0.0,
+      "max_us": 24768.167,
+      "mean_us": 2033.1242306000058,
+      "p50_us": 2010.5420000000001,
+      "p90_us": 2254.0923,
+      "p999_us": 4226.090041000044,
+      "p99_measured": true,
+      "p99_us": 2710.9702400000006,
+      "pass": true,
+      "requests": 10000,
+      "requests_per_second": 250.01235049760902,
+      "rss_kb": 360,
+      "runtime": "exec",
+      "warm_ms": 440.532
+    }
+  },
+  "verdict": "within budget"
+}
+

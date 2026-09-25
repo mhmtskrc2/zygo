@@ -43,6 +43,9 @@ break things and will say so here.
 
 ### Added
 
+- `make bench-record` and `bench/`: the raw JSON behind chapter 25's numbers,
+  one folder per run, with records from Linux 6.8 and 5.10. Chapter 25 also
+  breaks the warm request's 1.4 ms into its phases.
 - A book page on fork safety: memory, ASLR, secrets, threads, random
   numbers, inherited connections, seccomp and shared pages, question by
   question. The pages on secrets now say that requests of the same function

@@ -1,0 +1,189 @@
+{
+  "disturbance": [],
+  "host": {
+    "arch": "aarch64",
+    "cores": 2,
+    "cpu_model": "unknown",
+    "data_root": "/tmp/zdata-bench",
+    "governor": null,
+    "kernel": "6.8.0-142-generic",
+    "max_mhz": null,
+    "memory_kb": 3998416,
+    "virtualised": "Apple Virtualization Generic Platform",
+    "zygo": "0.1.1"
+  },
+  "published": [
+    {
+      "close": true,
+      "measured": 1.2098449999999998,
+      "published": 1.44,
+      "unit": "ms",
+      "what": "warm request, median"
+    },
+    {
+      "close": true,
+      "measured": 15.430628080000002,
+      "published": 10.53,
+      "unit": "ms",
+      "what": "warm request, 99th percentile"
+    },
+    {
+      "close": true,
+      "measured": 1.247201,
+      "published": 1.4,
+      "unit": "ms",
+      "what": "warm-exec request, median"
+    },
+    {
+      "close": true,
+      "measured": 1.6698525,
+      "published": 1.91,
+      "unit": "ms",
+      "what": "pooled script request, median"
+    },
+    {
+      "close": true,
+      "measured": 15.407403630000015,
+      "published": 11.36,
+      "unit": "ms",
+      "what": "pooled script request, 99th percentile"
+    },
+    {
+      "close": true,
+      "measured": 10.585586,
+      "published": 12.3,
+      "unit": "ms",
+      "what": "cold `zygo run`, median"
+    },
+    {
+      "close": true,
+      "measured": 1176.3480710065185,
+      "published": 1108.0,
+      "unit": "req/s",
+      "what": "throughput at concurrency 4 *"
+    },
+    {
+      "close": true,
+      "measured": 32.913830999999995,
+      "published": 34.0,
+      "unit": "ms",
+      "what": "`zygo serve`, once"
+    }
+  ],
+  "results": {
+    "cold": {
+      "budget_ms": 50.0,
+      "command": [
+        "python3",
+        "-c",
+        "pass"
+      ],
+      "image": "python:3.12-slim",
+      "max_ms": 15.093936000000001,
+      "p50_ms": 10.585586,
+      "p90_ms": 11.640259799999999,
+      "p99_ms": 13.648633469999995,
+      "pass": true,
+      "rootfs": "overlayfs",
+      "runs": 50
+    },
+    "load": {
+      "budget": {
+        "p50_us": 2000.0,
+        "p99_us": 10000.0
+      },
+      "concurrency": 4,
+      "cpu": null,
+      "failures": 0,
+      "headroom_p50_percent": -61.67515000000001,
+      "lock_max_us": 1971.3310000000001,
+      "lock_p50_us": 2.0090000000000003,
+      "max_us": 15675.521,
+      "mean_us": 3399.8468270587227,
+      "meets_target": true,
+      "p50_us": 3233.503,
+      "p90_us": 4343.5924,
+      "p999_us": 11920.449714000253,
+      "p99_measured": true,
+      "p99_us": 7879.943420000005,
+      "pass": false,
+      "requests": 11767,
+      "requests_per_client": [
+        2935,
+        2940,
+        2945,
+        2947
+      ],
+      "requests_per_second": 1176.3480710065185,
+      "target_per_second": 600.0
+    },
+    "pool": {
+      "budget": {
+        "p50_us": 5000.0,
+        "p99_us": 5000.0
+      },
+      "cpu": null,
+      "headroom_p50_percent": 66.60295,
+      "imports_ms": 16.133027005707845,
+      "max_us": 38279.029,
+      "mean_us": 2639.9636338999994,
+      "p50_us": 1669.8525,
+      "p90_us": 5820.714300000003,
+      "p999_us": 24785.32734000008,
+      "p99_measured": true,
+      "p99_us": 15407.403630000015,
+      "pass": false,
+      "requests": 10000,
+      "requests_per_second": 250.01398125685844,
+      "rss_kb": 24176,
+      "runtime": "python/3.12.14",
+      "scripts": 1000,
+      "warm_ms": 44.18756
+    },
+    "warm": {
+      "budget": {
+        "p50_us": 2000.0,
+        "p99_us": 10000.0
+      },
+      "cpu": null,
+      "headroom_p50_percent": 39.50775000000001,
+      "imports_ms": 0.7575780036859214,
+      "max_us": 32938.804000000004,
+      "mean_us": 2480.6240352999944,
+      "p50_us": 1209.8449999999998,
+      "p90_us": 6621.310300000002,
+      "p999_us": 22717.599506000017,
+      "p99_measured": true,
+      "p99_us": 15430.628080000002,
+      "pass": false,
+      "requests": 10000,
+      "requests_per_second": 250.01396323609427,
+      "rss_kb": 19440,
+      "runtime": "python/3.12.14",
+      "warm_ms": 32.913830999999995
+    },
+    "warm_exec": {
+      "budget": {
+        "p50_us": 3000.0,
+        "p99_us": 10000.0
+      },
+      "cpu": null,
+      "headroom_p50_percent": 58.426633333333335,
+      "imports_ms": 0.0,
+      "max_us": 30424.288,
+      "mean_us": 2015.8089539999987,
+      "p50_us": 1247.201,
+      "p90_us": 4707.6230000000005,
+      "p999_us": 19144.061413000065,
+      "p99_measured": true,
+      "p99_us": 8860.462860000001,
+      "pass": true,
+      "requests": 10000,
+      "requests_per_second": 249.98292041067918,
+      "rss_kb": 800,
+      "runtime": "exec",
+      "warm_ms": 5.628286
+    }
+  },
+  "verdict": "a budget was missed"
+}

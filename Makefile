@@ -2,7 +2,7 @@
         verify-mcp check check-linux test-linux \
         verify-linux verify-supervisor-linux escape-linux dist-linux \
         fuzz-linux gvisor-linux verify-login-linux verify-shim verify-deps-linux \
-        repro-blue-green-linux verify-api-linux verify-plugin-host vm-build vm-probe vm-kernel \
+        repro-blue-green-linux bench-record verify-api-linux verify-plugin-host vm-build vm-probe vm-kernel \
         verify-vm-pi use-cases-linux vm-use-cases-linux \
         syscall-tables conformance conformance-node conformance-node-seccomp \
         examples-go-linux oci-image verify-oci \
@@ -38,6 +38,7 @@ help:
 	@echo "bench        reproduce every published number on this host"
 	@echo "bench-embed  the warm fork against a container, one import-heavy script"
 	@echo "bench-density  what one more warm script costs this host"
+	@echo "bench-record  make bench, kept as JSON in bench/results/"
 	@echo "dist-linux   build the static musl binary and check it against N6"
 	@echo "verify-login-linux  zygo login against a registry that really refuses people"
 	@echo "examples-go-linux   the Go warm-exec example, built and run for real"
@@ -484,6 +485,20 @@ bench: poc/zygo-linux-musl
 	docker run --rm --privileged -v "$(PWD):/src:ro" \
 		-e ZYGO_DATA_HOME=/tmp/zdata-bench python:3.12-slim \
 		sh /src/poc/bench_all.sh
+
+# `make bench`, and the warm path's phases with and without a per-request
+# cgroup, kept as JSON in bench/results/<date>-<kernel>-<arch>/ — the raw
+# record behind docs/book/25-performance.md. A missed budget is recorded too.
+bench-record: poc/zygo-linux-musl
+	@mkdir -p bench/results
+	docker run --rm --privileged -v "$(PWD):/src:ro" -v "$(PWD)/bench/results:/out" \
+		-e ZYGO_DATA_HOME=/tmp/zdata-bench python:3.12-slim sh -c '\
+		dir=/out/$$(date +%Y-%m-%d)-$$(uname -r | cut -d- -f1)-$$(uname -m); mkdir -p $$dir; \
+		sh /src/poc/bench_all.sh --json | sed -n "/^{/,\$$p" > $$dir/all.json; \
+		. /src/poc/cgroup_harness.sh >/dev/null; zygo=/src/poc/zygo-linux-musl; \
+		$$zygo bench warm --n 3000 --rate 250 --json > $$dir/warm.json; \
+		$$zygo bench warm --n 3000 --rate 250 --no-cgroup --json > $$dir/warm-no-cgroup.json; \
+		echo "recorded in bench/results/$${dir#/out/}; add a line for it to bench/README.md"'
 
 # Requirement N6: one static binary, no runtime dependencies, small enough to
 # `curl | sh`. Fails if it stops being static or grows past the budget.
