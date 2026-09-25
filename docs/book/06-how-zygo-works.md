@@ -347,11 +347,11 @@ cmd    = ["/app/parse"]                  # event on stdin, JSON result on stdout
 ## Secrets
 
 A secret, such as an API key, is never put in the environment and never in
-the zygote's memory. For each request, the supervisor writes it as a file,
-`/run/secrets/NAME`, readable only by that request's process, from *outside*
-the sandbox, and removes it when the request ends. A request that is
-compromised can read its own secret, but not a secret of the next request,
-and not one that some other function uses.
+the zygote's memory. While a request runs, the supervisor writes it as a
+file, `/run/secrets/NAME`, from *outside* the sandbox, readable only inside
+that function's sandbox, and removes it when the function's last request
+ends. A request that is compromised can read the secrets its own function
+was given, while it runs, and never one that another function uses.
 
 ## The network, off by default
 

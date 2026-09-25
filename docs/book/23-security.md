@@ -402,4 +402,4 @@ These points come from [SECURITY.md](../../SECURITY.md):
 
 ---
 
-← [22. Troubleshooting](22-troubleshooting.md) · [Contents](README.md) · **Next: [24. Seccomp profiles](24-seccomp-profiles.md) →**
+← [22. Troubleshooting](22-troubleshooting.md) · [Contents](README.md) · **Next: [Fork safety, question by question](fork-safety.md) →**

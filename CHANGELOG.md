@@ -43,6 +43,10 @@ break things and will say so here.
 
 ### Added
 
+- A book page on fork safety: memory, ASLR, secrets, threads, random
+  numbers, inherited connections, seccomp and shared pages, question by
+  question. The pages on secrets now say that requests of the same function
+  running at once share its secret files.
 - `ROADMAP.md`: where the plan stands and what is next. The ADRs point at it
   instead of at planning notes that were never in the repository.
 - The book as a searchable website on GitHub Pages, built by mdBook on every

@@ -66,6 +66,7 @@ changes, the book changes in the same commit ([`AGENTS.md`](../../AGENTS.md)).
 | | | |
 |---|---|---|
 | 23 | [Security: the threat model](23-security.md) | Every attack, what stops it, and whether a test tries it. |
+| | [Fork safety, question by question](fork-safety.md) | What a forked request shares, what it does not, and where that is weaker than it sounds. |
 | 24 | [Seccomp profiles](24-seccomp-profiles.md) | The three syscall profiles, and which to choose. |
 | 25 | [What Zygo costs](25-performance.md) | Every measured number, and the machine it came from. |
 

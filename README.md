@@ -63,8 +63,8 @@ Every vector in [the threat model](docs/book/23-security.md) is attempted
 by `make escape-linux` — 19 vectors, 0 escapes — and every syscall number is
 swept against the seccomp profiles. The same chapter says where the boundary
 is weaker than it looks. **No external audit has been done.**
-[Warm functions](docs/book/13-warm-functions.md) covers what a fork shares
-with its parent and what it does not.
+[Fork safety, question by question](docs/book/fork-safety.md) covers what
+a fork shares with its parent and what it does not.
 
 ## Install
 

@@ -44,6 +44,7 @@ is the project README.
 # Part V — Security and speed
 
 - [23. Security: the threat model](book/23-security.md)
+  - [Fork safety, question by question](book/fork-safety.md)
 - [24. Seccomp profiles](book/24-seccomp-profiles.md)
 - [25. What Zygo costs](book/25-performance.md)
 

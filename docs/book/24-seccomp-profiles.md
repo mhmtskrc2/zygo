@@ -410,4 +410,4 @@ the child filter.
 
 ---
 
-← [23. Security: the threat model](23-security.md) · [Contents](README.md) · **Next: [25. What Zygo costs](25-performance.md) →**
+← [Fork safety, question by question](fork-safety.md) · [Contents](README.md) · **Next: [25. What Zygo costs](25-performance.md) →**

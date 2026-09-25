@@ -333,14 +333,16 @@ def handler(event):
 For each request, the supervisor writes the file `/run/secrets/<NAME>` from
 *outside* the sandbox. It is created with mode 0400 — readable only by its
 owner — from the first moment, not changed to that mode afterwards, so there
-is no instant when anyone else could read it. Only the request's own process
-can read it, and the file is removed when the request ends.
+is no instant when anyone else could read it. Inside the sandbox, only this
+function's requests can read it — this one, and any other request of the same
+function running at the same moment, which has the same value anyway. The
+file is removed when the last of them ends.
 
 ```text
   supervisor (holds the value)
       │
       │ request 7 arrives
-      ├──▶ write /run/secrets/STRIPE_KEY  (0400, only request 7 can read it)
+      ├──▶ write /run/secrets/STRIPE_KEY  (0400, this function's requests only)
       │        │
       │        ▼
       │    ┌─────────────────────────────┐
@@ -349,13 +351,13 @@ can read it, and the file is removed when the request ends.
       │        │ request 7 ends
       ├──▶ file removed
       │
-      │ request 8 arrives ──▶ a new file, only request 8 can read it
+      │ request 8 arrives ──▶ written again, removed again
 
   never in: the environment · the zygote's memory · the control socket
 ```
 
-A request that is taken over can read its own secret, but not the next
-request's, and not a secret that another function uses. This matters most for
+A request that is taken over can read its own function's secret while it
+runs, and never a secret that another function uses. This matters most for
 AI agent tools: a model that writes the code cannot print a secret it never
 had in its environment.
 
