@@ -196,7 +196,7 @@ syscall named in the tables below is refused.
 
 | Vector | Control | Status |
 |---|---|---|
-| Reaching the host over the network | default `network = "none"`; under `egress`/`full`, RFC1918, CGNAT, link-local and loopback are rejected *above* every allow rule, so a hostname that resolves into one is refused too | **attempted** by the supervisor suite, and measured from outside by the first consumer: under `--net full` the cloud metadata address, the host's own Postgres and the LAN router are all *no route*, where Docker's default bridge reaches two of the three (see [below](#measured-against-docker)) |
+| Reaching the host over the network | default `network = "none"`; under `egress`/`full`, RFC1918, CGNAT, link-local, loopback, multicast and reserved ranges are rejected *above* every allow rule, so a hostname that resolves into one is refused too | **attempted** by the supervisor suite, and measured from outside by the first consumer: under `--net full` the cloud metadata address, the host's own Postgres and the LAN router are all *no route*, where Docker's default bridge reaches two of the three (see [below](#measured-against-docker)) |
 | Using a resolver of one's own to dodge the allowlist | DNS is forced to one address; port 53 to anything else is rejected | **attempted** |
 
 ## Vectors: secrets and the supervisor
@@ -222,8 +222,8 @@ belong on the `vm` backend and on separate hosts.
 *Egress* is traffic from the sandbox out to the network. Under
 `network = "egress"` or `"full"`, a sandbox **cannot reach** the cloud
 metadata endpoint (`169.254.169.254`), any RFC1918 address (the host, its
-neighbours, the LAN's router), any CGNAT or link-local address, or the host's
-loopback — whatever name they resolve from — unless the operator passes
+neighbours, the LAN's router), any CGNAT, link-local, multicast or reserved
+address, or the host's loopback — whatever name they resolve from — unless the operator passes
 `--allow-private-net`. This is enforced inside the sandbox's own network
 namespace by nftables rules that sit *above* every allow rule, and by a
 resolver that admits only what the allowlist names. What Zygo does *not*

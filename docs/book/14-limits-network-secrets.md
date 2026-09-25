@@ -278,8 +278,12 @@ with a namespace — `none`, `egress` and `full` — these ranges stay closed:
 
 ```text
 10.0.0.0/8   172.16.0.0/12   192.168.0.0/16   127.0.0.0/8   169.254.0.0/16
-100.64.0.0/10   fe80::/10   fc00::/7
+100.64.0.0/10   0.0.0.0/8   224.0.0.0/4 (multicast)   240.0.0.0/4 (reserved)
+::1   ::   fe80::/10   fc00::/7   ff00::/8 (multicast)
 ```
+
+Multicast is on the list because a multicast group is a way to talk to the
+neighbours without naming any of them.
 
 Only `--allow-private-net` opens them. An `allow` rule with a CIDR inside one
 of these ranges is refused unless you pass that flag.

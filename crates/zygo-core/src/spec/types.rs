@@ -653,10 +653,14 @@ pub fn is_private_addr(addr: IpAddr) -> bool {
             v4.is_private()
                 || v4.is_loopback()
                 || v4.is_link_local()
-                || v4.is_unspecified()
+                // 0.0.0.0/8, "this network".
+                || o[0] == 0
                 // 100.64.0.0/10, carrier-grade NAT: the range a cloud provider
                 // puts its own services on.
                 || (o[0] == 100 && (o[1] & 0xC0) == 64)
+                // 224.0.0.0/4 multicast and 240.0.0.0/4 reserved, broadcast
+                // included.
+                || o[0] >= 224
         }
         IpAddr::V6(v6) => {
             v6.is_loopback()
@@ -664,6 +668,8 @@ pub fn is_private_addr(addr: IpAddr) -> bool {
                 // fe80::/10 link-local, fc00::/7 unique-local.
                 || (v6.segments()[0] & 0xffc0) == 0xfe80
                 || (v6.segments()[0] & 0xfe00) == 0xfc00
+                // ff00::/8 multicast.
+                || v6.is_multicast()
         }
     }
 }

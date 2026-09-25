@@ -161,8 +161,9 @@ The forms an `allow` rule takes:
 | IPv6 | `[2001:db8::1]:443`, `2001:db8::/32` | brackets when a port follows |
 
 Private and link-local ranges — `10/8`, `172.16/12`, `192.168/16`,
-`127/8`, `169.254/16` (the cloud metadata address), `100.64/10`, `fe80::/10`,
-`fc00::/7` — are never reachable in a namespaced mode unless you pass
+`127/8`, `169.254/16` (the cloud metadata address), `100.64/10`, `0/8`,
+multicast and reserved (`224/4`, `240/4`), `::1`, `fe80::/10`, `fc00::/7`,
+`ff00::/8` — are never reachable in a namespaced mode unless you pass
 `--allow-private-net`, and a CIDR rule inside one of them is refused without
 it.
 

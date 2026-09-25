@@ -129,6 +129,10 @@ pub fn needs_configuration(network: Network) -> bool {
 
 /// Blocks that reach the host and its neighbours. Rejected before any allow
 /// rule unless `--allow-private-net` was given (design doc §3.10).
+///
+/// Multicast, `0.0.0.0/8` and the reserved `240.0.0.0/4` (broadcast included)
+/// as well: none of them is "the internet", and under `full` an open
+/// multicast group is a way to talk to the neighbours without naming one.
 const PRIVATE_V4: &[&str] = &[
     "10.0.0.0/8",
     "172.16.0.0/12",
@@ -136,9 +140,12 @@ const PRIVATE_V4: &[&str] = &[
     "169.254.0.0/16",
     "127.0.0.0/8",
     "100.64.0.0/10",
+    "0.0.0.0/8",
+    "224.0.0.0/4",
+    "240.0.0.0/4",
 ];
 
-const PRIVATE_V6: &[&str] = &["::1/128", "fc00::/7", "fe80::/10"];
+const PRIVATE_V6: &[&str] = &["::1/128", "::/128", "fc00::/7", "fe80::/10", "ff00::/8"];
 
 /// The allowlist's addresses known before the sandbox starts.
 ///
@@ -223,7 +230,9 @@ fn element(ip: IpAddr, port: Option<u16>) -> String {
 /// 6. what the spec allowed — CIDRs as written, names through the sets the
 ///    resolver fills;
 /// 7. reject, with ICMP rather than a silent drop so a blocked program fails
-///    immediately instead of waiting out a connect timeout.
+///    immediately instead of waiting out a connect timeout. `icmpx`, the
+///    `inet` table's family-neutral form: `icmp` alone quietly adds "IPv4
+///    only", and every IPv6 packet fell through to the drop policy.
 pub fn ruleset(
     network: Network,
     rules: &[AllowRule],
@@ -317,7 +326,7 @@ pub fn ruleset(
         }
     }
 
-    out.push_str("    reject with icmp type admin-prohibited\n");
+    out.push_str("    reject with icmpx type admin-prohibited\n");
     out.push_str("  }\n}\n");
     out
 }
@@ -1294,9 +1303,14 @@ mod tests {
             "169.254.169.254",
             "127.0.0.1",
             "100.64.0.1",
+            "0.0.0.1",
+            "224.0.0.251",
+            "240.0.0.1",
             "::1",
+            "::",
             "fc00::1",
             "fe80::1",
+            "ff02::1",
         ];
         for a in inside {
             let addr: std::net::IpAddr = a.parse().expect("an address");
@@ -1370,6 +1384,13 @@ mod tests {
             .rfind(|l| l.trim().starts_with("reject"))
             .expect("a final reject");
         assert!(last.contains("admin-prohibited"), "{text}");
+        // Both families: `reject with icmp` matches IPv4 alone, and IPv6 then
+        // meets the silent drop the reject exists to avoid.
+        assert_eq!(
+            last.trim(),
+            "reject with icmpx type admin-prohibited",
+            "{text}"
+        );
         // A bare address is an `Exact` host, resolved to itself, and lands in
         // the set as an element — above the final reject.
         let elem = text.find("1.2.3.4 . 443").expect("the element");
