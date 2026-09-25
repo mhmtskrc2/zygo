@@ -275,6 +275,87 @@ jobs:
             echo "::warning::CARGO_REGISTRY_TOKEN is not set, so nothing went to crates.io"
           fi
 
+  # The two SDKs, `zygo-sdk` on PyPI and on npm. Both are built and tested on
+  # every run; they are uploaded only on a real tag, and only where the
+  # repository has been set up for it — otherwise the job says so, as the
+  # crates job does.
+  #
+  # PyPI by trusted publishing: no token at all, PyPI trusts this workflow
+  # on this repository. Turned on by the repository variable
+  # `PYPI_TRUSTED_PUBLISHING=true` once the publisher is registered on
+  # pypi.org. npm with provenance, from the `NPM_TOKEN` secret.
+  sdks:
+    needs: what
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      # Trusted publishing and npm provenance both prove who built the
+      # package with this workflow's OIDC token.
+      id-token: write
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+      PYPI_TRUSTED_PUBLISHING: ${{ vars.PYPI_TRUSTED_PUBLISHING }}
+      VERSION: ${{ needs.what.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+          registry-url: https://registry.npmjs.org
+
+      # The same rule as for Cargo.toml: the tag and the manifests agree, or
+      # the upload is a version nobody can check out.
+      - name: The SDK versions match the tag
+        if: needs.what.outputs.publish == 'true'
+        run: |
+          py=$(grep -m1 '^version' sdk/python/pyproject.toml | cut -d'"' -f2)
+          js=$(node -p "require('./sdk/node/package.json').version")
+          for v in "$py" "$js"; do
+            if [ "$v" != "$VERSION" ]; then
+              echo "::error::an SDK says $v, the tag says $VERSION"
+              exit 1
+            fi
+          done
+
+      - name: Test
+        run: make test-sdk
+
+      - name: Build the Python package
+        run: |
+          python -m pip install --quiet build==1.6.1
+          python -m build sdk/python --outdir dist/python
+
+      - name: Pack the Node package
+        run: npm pack ./sdk/node --pack-destination dist
+
+      - name: Publish to PyPI
+        if: needs.what.outputs.publish == 'true' && env.PYPI_TRUSTED_PUBLISHING == 'true'
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: dist/python
+
+      - name: Publish to npm
+        if: needs.what.outputs.publish == 'true' && env.NPM_TOKEN != ''
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish ./sdk/node --provenance --access public
+
+      - name: Say what was not published
+        if: needs.what.outputs.publish != 'true' || env.PYPI_TRUSTED_PUBLISHING != 'true' || env.NPM_TOKEN == ''
+        run: |
+          if [ "${{ needs.what.outputs.publish }}" != true ]; then
+            echo "a rehearsal: built and tested, not published"
+            exit 0
+          fi
+          [ "$PYPI_TRUSTED_PUBLISHING" = true ] || \
+            echo "::warning::PYPI_TRUSTED_PUBLISHING is not true, so nothing went to PyPI"
+          [ -n "$NPM_TOKEN" ] || \
+            echo "::warning::NPM_TOKEN is not set, so nothing went to npm"
+
   # The release itself. Last, so a build that fails leaves no half-release.
   # The container image, one per architecture, then one manifest list over
   # both. Built from the binary the `linux` job already produced and checked

@@ -27,8 +27,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-import zygo  # noqa: E402
-import zygo.aio  # noqa: E402
+import zygo_sdk as zygo  # noqa: E402
+import zygo_sdk.aio  # noqa: E402
 
 #: Operation to the client method that calls it.
 #:

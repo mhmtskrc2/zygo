@@ -23,6 +23,11 @@ break things and will say so here.
 
 ### Changed
 
+- **Breaking, Python SDK:** the module is `zygo_sdk`, not `zygo`. PyPI's
+  `zygo` belongs to another project, and two packages that install the same
+  module overwrite each other. `import zygo_sdk as zygo` keeps existing code
+  working. Both SDKs are 0.1.1, and the release publishes them to PyPI and
+  npm as `zygo-sdk`.
 - The seccomp syscall table covers every syscall in the Linux 6.10 headers.
   Each syscall Linux 5.11–6.10 added was decided on: `fchmodat2`,
   `epoll_pwait2`, the `futex_*` family, Landlock, `mseal` and

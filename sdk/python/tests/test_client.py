@@ -21,8 +21,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import zygo  # noqa: E402
-import zygo.aio  # noqa: E402
+import zygo_sdk as zygo  # noqa: E402
+import zygo_sdk.aio  # noqa: E402
 from fake_api import FakeApi  # noqa: E402
 
 OK_RESULT = {
@@ -35,7 +35,7 @@ OK_RESULT = {
 
 class EndpointTests(unittest.TestCase):
     def test_every_address_form_is_understood(self) -> None:
-        from zygo._endpoint import parse
+        from zygo_sdk._endpoint import parse
 
         unix = parse("unix:///run/user/1000/zygo/api.sock")
         self.assertTrue(unix.is_unix)
@@ -52,7 +52,7 @@ class EndpointTests(unittest.TestCase):
         self.assertTrue(secure.tls)
 
     def test_an_address_that_cannot_work_is_refused_here(self) -> None:
-        from zygo._endpoint import parse
+        from zygo_sdk._endpoint import parse
 
         # Reported where the mistake is, rather than as a connection failure
         # thirty seconds later against a host nobody meant.
@@ -609,7 +609,7 @@ class CancelTests(unittest.TestCase):
         """
         import asyncio
 
-        import zygo.aio
+        import zygo_sdk.aio
 
         with FakeApi() as api:
             # Long enough that the task is still waiting when it is cancelled.

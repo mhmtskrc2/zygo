@@ -55,7 +55,7 @@ from typing import Dict, Optional, Tuple
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../sdk/python/src"))
 
-import zygo  # noqa: E402
+import zygo_sdk as zygo  # noqa: E402
 
 from jobqueue import Job, Queue  # noqa: E402
 

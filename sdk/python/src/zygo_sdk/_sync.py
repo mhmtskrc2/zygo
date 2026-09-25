@@ -210,7 +210,7 @@ class Client:
     ) -> List[Any]:
         """Call a function with several events at once, answers in order.
 
-        Each element is a :class:`~zygo._models.Result` or the exception that
+        Each element is a :class:`~zygo_sdk._models.Result` or the exception that
         element would have raised — returned rather than raised, because one
         event being refused must not hide the answers to the others.
         """
@@ -334,7 +334,7 @@ class Client:
     ) -> "Iterator[Event]":
         """Call a function and yield its output as it is produced.
 
-        Each item is an :class:`~zygo._models.Event`: ``stdout``, ``stderr`` or
+        Each item is an :class:`~zygo_sdk._models.Event`: ``stdout``, ``stderr`` or
         ``progress`` while the request runs, then exactly one ``result`` —
         which carries what :meth:`call` would have returned, or raises what it
         would have raised.
@@ -407,7 +407,7 @@ class Client:
         """Stop a request that is running.
 
         ``request_id`` comes from the ``X-Zygo-Request-Id`` header of the call
-        in flight, or from a :class:`~zygo._models.Result` that has already
+        in flight, or from a :class:`~zygo_sdk._models.Result` that has already
         come back. Answers as soon as the kill has been sent, not when the
         request has stopped — the caller waiting on that request is the one who
         gets the outcome, and they get :class:`~zygo.Cancelled`.

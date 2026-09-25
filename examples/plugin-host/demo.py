@@ -21,7 +21,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.environ.get("ZYGO_SDK", "/src/sdk/python/src"))
 
-import zygo  # noqa: E402
+import zygo_sdk as zygo  # noqa: E402
 
 from host import PluginHost  # noqa: E402
 

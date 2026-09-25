@@ -288,15 +288,20 @@ address.
 ## The Python client
 
 ```bash
-pip install zygo-sdk        # or: pip install -e sdk/python; you still `import zygo`
+pip install zygo-sdk        # or: pip install -e sdk/python; then `import zygo_sdk`
 ```
+
+The module is `zygo_sdk`, not `zygo`: a different, older project owns the
+name `zygo` on PyPI, and two packages that install the same module name
+overwrite each other. `import zygo_sdk as zygo` keeps the short name in your
+code.
 
 No dependencies. `zygo.connect()` finds the API from its `url` argument, then
 `ZYGO_API_URL`, then `http://127.0.0.1:7700`, and its token from `token=` or
 `ZYGO_API_TOKEN`.
 
 ```python
-import zygo
+import zygo_sdk as zygo
 client = zygo.connect()
 res = client.fn("resize")({"url": "…"})               # a call; ~2 ms of overhead
 print(res.result)                                      # what the handler returned
@@ -1171,7 +1176,7 @@ export ZYGO_API_TOKEN=$(head -c 32 /dev/urandom | base64)
 zygo up                            # warm what sandbox.toml declares
 zygo api --allow-deploy &          # 127.0.0.1:7700
 
-python -c "import zygo; print(zygo.connect().functions())"
+python -c "import zygo_sdk as zygo; print(zygo.connect().functions())"
 ```
 
 For one customer rather than the whole host:

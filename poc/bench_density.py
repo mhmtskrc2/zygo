@@ -370,7 +370,7 @@ def main(args: list[str]) -> int:
 
     if options.pool:
         sys.path.insert(0, os.path.join(HERE, "..", "sdk", "python", "src"))
-        import zygo
+        import zygo_sdk as zygo
 
         if not options.api:
             print("  --pool needs an API: pass --api unix:///path/to/api.sock")

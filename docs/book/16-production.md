@@ -211,7 +211,7 @@ zygo api                     # listens on 127.0.0.1:7700, bearer-token auth
 ```
 
 ```python
-import zygo
+import zygo_sdk as zygo
 client = zygo.connect()
 out = client.fn("resize")({"url": "..."}).result   # what the handler returned
 ```

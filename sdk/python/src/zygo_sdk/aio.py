@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The asynchronous client: ``from zygo.aio import connect``.
+"""The asynchronous client: ``from zygo_sdk.aio import connect``.
 
 Agent frameworks are asynchronous, and a tool that blocks the event loop for
 the length of a sandbox request is not usable inside one. This is the same API
@@ -138,7 +138,7 @@ class AsyncClient:
     ):
         """Call a function and yield its output as it is produced.
 
-        An async iterator of :class:`~zygo._models.Event`; see
+        An async iterator of :class:`~zygo_sdk._models.Event`; see
         :meth:`zygo.Client.stream` for what the items are.
 
         Cancelling the task cancels the request, like :meth:`call` — the key

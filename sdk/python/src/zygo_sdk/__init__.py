@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Zygo — warm sandboxes for function-shaped code, from Python.
 
-    import zygo
+    import zygo_sdk as zygo
 
     client = zygo.connect()                      # `zygo api` on loopback
     resize = client.fn("resize")                 # a function from sandbox.toml
@@ -58,7 +58,7 @@ from ._models import (
 )
 from ._sync import Client, FunctionHandle, connect
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "Client",

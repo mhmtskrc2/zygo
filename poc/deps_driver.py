@@ -32,7 +32,7 @@ import time
 
 sys.path.insert(0, "/src/sdk/python/src")
 
-import zygo  # noqa: E402
+import zygo_sdk as zygo  # noqa: E402
 
 SOCK = os.environ.get("SOCK", "/tmp/api.sock")
 IMAGE = os.environ.get("IMAGE", "python:3.12-slim")

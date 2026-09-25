@@ -13,7 +13,7 @@ no dependencies of its own. The README says how to start it.
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import zygo
+import zygo_sdk as zygo
 
 client = zygo.connect()  # finds the API through ZYGO_API_URL and ZYGO_API_TOKEN
 

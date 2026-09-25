@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "zygo-sdk"
-version = "0.1.0"
+version = "0.1.1"
 description = "Python client for Zygo — warm, isolated sandboxes for function-shaped code"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -28,4 +28,4 @@ Homepage = "https://github.com/mhmtskrc2/zygo"
 Source = "https://github.com/mhmtskrc2/zygo/tree/main/sdk/python"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/zygo"]
+packages = ["src/zygo_sdk"]

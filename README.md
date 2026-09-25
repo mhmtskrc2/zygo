@@ -274,7 +274,7 @@ From a program, the same functions are behind an HTTP API with bearer auth and
 two dependency-free clients:
 
 ```python
-import zygo
+import zygo_sdk as zygo
 client = zygo.connect()                          # a unix socket, or 127.0.0.1:7700
 out = client.fn("resize")({"url": "..."}).result  # ~2 ms, a fresh process
 ```

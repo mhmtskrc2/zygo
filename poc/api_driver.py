@@ -48,7 +48,7 @@ def main() -> int:
     workspace = sys.argv[2]
     image = sys.argv[3] if len(sys.argv) > 3 else "python:3.12-slim"
 
-    import zygo
+    import zygo_sdk as zygo
 
     url = f"unix://{socket_path}"
     print("the HTTP API, through the client that ships with it")
@@ -913,7 +913,7 @@ def main() -> int:
 
 def call_only(socket_path: str, image: str = "python:3.12-slim") -> int:
     """The same API without `--allow-deploy`: the deploy routes, all refused."""
-    import zygo
+    import zygo_sdk as zygo
 
     global FAIL
     print("\nwithout --allow-deploy")
@@ -983,7 +983,7 @@ def drain(socket_path: str, image: str) -> int:
     """
     import threading
 
-    import zygo
+    import zygo_sdk as zygo
 
     url = f"unix://{socket_path}"
     print("\ndrain")
@@ -1051,7 +1051,7 @@ def tokens(socket_path: str, image: str) -> int:
     So this phase gets a listener with bearer auth and a bootstrap token, and
     asks the only question tokens exist to answer — *whose request is this?*
     """
-    import zygo
+    import zygo_sdk as zygo
 
     url = f"unix://{socket_path}"
     bootstrap = os.environ["ZYGO_API_TOKEN"]

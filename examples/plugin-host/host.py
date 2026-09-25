@@ -40,7 +40,7 @@ import tarfile
 
 sys.path.insert(0, os.environ.get("ZYGO_SDK", "../../sdk/python/src"))
 
-import zygo  # noqa: E402
+import zygo_sdk as zygo  # noqa: E402
 
 #: One runtime per language, and no more than that. Each holds an interpreter
 #: and a dependency set and **no code at all**, which is what makes it safe for
