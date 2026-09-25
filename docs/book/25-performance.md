@@ -143,6 +143,34 @@ reports the host's own `fork()` floor next to them, which is the time the
 machine needs for a bare fork. So you can see how much of the number belongs
 to the machine and how much to Zygo.
 
+## What the 1.4 ms is made of
+
+`zygo bench warm` times each phase of every request. One run of 3,000
+requests at 250 a second, on the Lima VM (Linux 6.8) inside a privileged
+container, on 25 September 2026 — so a little noisier than the table above:
+
+| phase | what happens | usually | 1 in 100 |
+|---|---|---:|---:|
+| fork | the agent copies the zygote, and says `FORKED` | 507 µs | 4.9 ms |
+| admit | the supervisor makes the request's cgroup and moves the child in | 156 µs | 9.7 ms |
+| run | `GO` to `DONE`: the child wakes, reseeds, makes its temp folder, runs the handler, writes the answer | 496 µs | 4.1 ms |
+| — of which the handler | an empty one | 17 µs | 85 µs |
+| release | the request's cgroup is removed, after the answer has gone | 26 µs | 217 µs |
+| **the whole request** | | **1.19 ms** | 15.6 ms |
+
+The same host's bare `fork()` and `wait()` take 95 µs, so most of `fork` is
+Python and the protocol, not the kernel. Without a cgroup per request
+(`--no-cgroup`), `admit` drops to 27 µs and the median to 1.0 ms: per-request
+containment costs about a fifth of the median, and most of the slow tail.
+
+What is **not** in the number, because it happens once, when the zygote
+starts (`zygo serve`, about 150 ms):
+
+- creating the namespaces and mounting the root, `/proc` and `/tmp`;
+- loading the seccomp filter and the Landlock rules — a child inherits both,
+  and only `strict` adds a small filter of its own per request;
+- starting the interpreter and running your imports.
+
 ## Why 1 in 100 is slow on newer kernels
 
 On a stock Linux 6.x, 99 requests in 100 take about 1.5 ms and the last one
