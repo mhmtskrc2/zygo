@@ -113,11 +113,13 @@ backends.
 
 Zygo also ships as a container image, `ghcr.io/mhmtskrc2/zygo`. It is Alpine
 Linux plus the static `zygo` binary and the few helpers networking needs.
-It does not need `--privileged`, but it does need three specific things from
-Docker, because Zygo builds sandboxes inside it.
+It does not need `--privileged`, but it does need a few specific things from
+Docker, because Zygo builds sandboxes inside it. This is the same command as
+on the README:
 
 ```bash
-docker run --security-opt seccomp=unconfined --security-opt systempaths=unconfined \
+docker run --user 0:0 --security-opt seccomp=unconfined \
+    --security-opt systempaths=unconfined --security-opt apparmor=unconfined \
     --cgroupns=host --cgroup-parent=/zygo -v /sys/fs/cgroup/zygo:/sys/fs/cgroup/zygo:rw \
     -p 7700:7700 -e ZYGO_API_TOKEN=... ghcr.io/mhmtskrc2/zygo
 ```
@@ -127,9 +129,13 @@ docker run --security-opt seccomp=unconfined --security-opt systempaths=unconfin
 | `seccomp=unconfined` | Docker's own seccomp filter refuses to create a user namespace. |
 | `systempaths=unconfined` | Docker hides parts of `/proc`, and then the kernel refuses a fresh `/proc` inside a user namespace. |
 | `--cgroupns=host --cgroup-parent=/zygo` and the `/sys/fs/cgroup/zygo` mount | A sandbox needs a cgroup to live in. This gives the container one subtree of its own, not the whole host tree. |
+| `--user 0:0` | The cgroup folder belongs to root. No sandbox runs as that root: each has a user namespace of its own. |
+| `apparmor=unconfined` | Only on a host with AppArmor, such as Ubuntu, whose default Docker profile refuses the mounts a sandbox makes. Harmless elsewhere. |
 
-`zygo doctor` names any of the three that is missing, inside the container
-just as on a host. [`packaging/oci/`](../../packaging/oci) has the details,
+Sandboxes with a network need `--device /dev/net/tun` as well, and a volume
+keeps pulled images across restarts; [chapter 16](16-production.md#running-zygo-inside-a-container)
+has the full command. `zygo doctor` names anything that is missing, inside
+the container just as on a host. [`packaging/oci/`](../../packaging/oci) has the details,
 and [chapter 16](16-production.md) covers running it in production.
 
 ## How Zygo runs on a Mac

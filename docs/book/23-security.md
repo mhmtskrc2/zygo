@@ -137,8 +137,10 @@ out, or find a bug in the kernel underneath them all.
 
 Every row below marked **attempted** is run by `make escape-linux`. It runs
 the escape itself, not a check of a setting, because a test that reads a flag
-also passes on a kernel that ignores that flag. The suite currently reports
-**16 blocked, 0 escaped, 1 skipped**.
+also passes on a kernel that ignores that flag. The suite attempts 18 vectors in 26
+checks, and on Linux 5.10 and 6.8 reports **25 blocked, 0 escaped, 1
+skipped** — the setuid case, where the test image has no setuid binary to
+try.
 
 Beside it, `make fuzz-linux` sweeps *every* syscall number the architecture
 has — 469 of them — against all three seccomp profiles. Each call is made in a

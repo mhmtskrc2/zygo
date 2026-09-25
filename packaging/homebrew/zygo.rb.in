@@ -69,7 +69,7 @@ class Zygo < Formula
         zygo run python:3.12-slim python3 -c 'print("hello")'
 
       The first command takes about a minute while the VM is created. Crossing
-      into it costs ~100 ms per command, which hides the warm path from a Mac
+      into it costs about 22 ms per command, which hides the warm path from a Mac
       shell; it is still there through `zygo api` and the SDKs.
     EOS
   end

@@ -54,6 +54,9 @@ break things and will say so here.
 ### Fixed
 
 - `spec/openapi.json` said version 0.1.0 in the 0.1.1 release.
+- The docs disagreed with themselves: the escape suite's size (16, 17 or 22),
+  the container's flags (5, 7 or 9), and the cost of reaching the Mac's VM
+  (100 ms or 22 ms). One answer each now, taken from the suite and chapter 25.
 
 ## [0.1.1] — 2026-09-25
 

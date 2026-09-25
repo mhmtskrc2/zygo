@@ -60,7 +60,7 @@ Written down so nobody re-opens them by accident. This is the same list as
   benchmark and defend, against the one everything rests on. See
   [ADR 0002](0002-warm-paths-stay-on-ns.md).
 - **macOS shim latency.** A Mac is where Zygo is developed and tested; Linux
-  is where it runs. The hop costs ~100 ms per *command*, which a developer
+  is where it runs. The hop costs about 22 ms per *command*, which a developer
   notices and a production embedder never sees. Keep it working.
 - **Windows.** Embedders deploy on Linux.
 - **A hosted service.** It would compete with the people this is for.

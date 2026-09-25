@@ -69,7 +69,7 @@ jobs:
         include:
           - os: ubuntu-24.04      # kernel 6.8 — Landlock v4+, cgroup.kill
             label: linux/x86_64
-          - os: ubuntu-22.04      # kernel 5.15 — the oldest supported
+          - os: ubuntu-22.04      # kernel 5.15 — the oldest a runner offers; the floor is 5.3
             label: linux/x86_64/old
           - os: ubuntu-24.04-arm
             label: linux/aarch64

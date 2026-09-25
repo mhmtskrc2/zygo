@@ -370,7 +370,7 @@ make check-linux    # type-check the Linux-only code from a non-Linux host
 make test-linux     # the full suite inside a Linux container
 make verify-linux   # 36 isolation and limit checks against a real kernel
 make verify-supervisor-linux  # 139 end-to-end supervisor lifecycle checks
-make escape-linux   # 22 escape attempts against a real kernel
+make escape-linux   # 18 escape vectors, 26 checks, against a real kernel
 make fuzz-linux     # every syscall number, against all three seccomp profiles
 make landlock-net-linux  # Landlock's bind/connect rules, on a 6.7+ kernel
 make verify-deps-linux   # a dependency set built from a lockfile, over the API

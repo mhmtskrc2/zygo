@@ -16,9 +16,9 @@
 # it must not ask anybody anything.
 
 # 24.04 is kernel 6.8: Landlock ABI v4 (network rules, 6.7), `cgroup.kill`
-# (5.14) and unprivileged overlayfs (5.11) are all present. The docs' support
-# floor is 5.15, and a VM is the one place the kernel is Zygo's own choice
-# rather than the host's, so it takes the newer one.
+# (5.14) and unprivileged overlayfs (5.11) are all present. Zygo runs from
+# 5.3 up, but a VM is the one place the kernel is Zygo's own choice rather
+# than the host's, so it takes a new one.
 images:
   - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
     arch: "aarch64"
