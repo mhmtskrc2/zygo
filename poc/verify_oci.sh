@@ -8,11 +8,12 @@
 # matters, that a sandbox really runs inside a container with no privileges
 # and no capabilities.
 #
-# The flags are the three from `docs/book/16-production.md`, and no more:
+# The flags are the ones from `docs/book/16-production.md`, and no more:
 #
 #   --security-opt seccomp=unconfined      `unshare(CLONE_NEWUSER)`
 #   --security-opt systempaths=unconfined  an unmasked /proc
 #   a cgroup v2 subtree of its own         and only its own
+#   --security-opt apparmor=unconfined     on AppArmor hosts, such as Ubuntu
 #
 # Run:  make verify-oci
 set -u
@@ -94,6 +95,7 @@ docker run -d --rm --name "$NAME" \
     --user 0:0 \
     --security-opt seccomp=unconfined \
     --security-opt systempaths=unconfined \
+    --security-opt apparmor=unconfined \
     --cgroupns=host --cgroup-parent="/$PARENT" \
     -v "/sys/fs/cgroup/$PARENT:/sys/fs/cgroup/$PARENT:rw" \
     -p "$PORT:7700" \
@@ -166,6 +168,7 @@ docker run -d --rm --name "$NAME" \
     --user 0:0 \
     --security-opt seccomp=unconfined \
     --security-opt systempaths=unconfined \
+    --security-opt apparmor=unconfined \
     --cgroupns=host --cgroup-parent="/$PARENT" \
     -v "/sys/fs/cgroup/$PARENT:/sys/fs/cgroup/$PARENT:rw" \
     -p "$PORT:7700" -e ZYGO_API_TOKEN="$TOKEN" "$IMAGE" >/dev/null 2>&1
