@@ -4,11 +4,11 @@ Warm, isolated sandboxes for function-shaped code. A warm function costs about
 a millisecond and gets a clean process per request.
 
 ```bash
-npm install zygo
+npm install zygo-sdk
 ```
 
 ```js
-import { connect } from 'zygo';
+import { connect } from 'zygo-sdk';
 
 const client = connect();               // `zygo api`, on loopback or a unix socket
 const resize = client.fn('resize');     // a function declared in sandbox.toml

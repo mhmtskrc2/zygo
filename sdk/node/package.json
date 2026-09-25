@@ -1,5 +1,5 @@
 {
-  "name": "zygo",
+  "name": "zygo-sdk",
   "version": "0.1.0",
   "description": "Node client for Zygo — warm, isolated sandboxes for function-shaped code",
   "license": "Apache-2.0",
@@ -31,8 +31,8 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/zygo-dev/zygo.git",
+    "url": "git+https://github.com/mhmtskrc2/zygo.git",
     "directory": "sdk/node"
   },
-  "homepage": "https://github.com/zygo-dev/zygo/tree/main/sdk/node"
+  "homepage": "https://github.com/mhmtskrc2/zygo/tree/main/sdk/node"
 }

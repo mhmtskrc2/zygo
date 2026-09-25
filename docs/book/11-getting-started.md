@@ -36,6 +36,13 @@ delegation* (a normal user may own part of the cgroup tree from
 distributions have the first; the second often needs one small fix, which
 `zygo doctor` can apply for you.
 
+## Before the first release
+
+Zygo has not been released yet. The commands in the next three sections are
+for the first release, v0.1.0, and start working when it is published. Until
+then, build it from a checkout, as in [other ways to
+install](#other-ways-to-install).
+
 ## Installing on Linux
 
 Release builds exist for x86_64 and aarch64 (64-bit ARM, such as a Raspberry
@@ -44,15 +51,18 @@ library that is linked into the binary, so it does not depend on the
 host's own libraries.
 
 ```bash
-url=https://github.com/zygo-dev/zygo/releases/latest/download
-curl -fsSL $url/zygo-x86_64-unknown-linux-musl.tar.gz | tar xz
+url=https://github.com/mhmtskrc2/zygo/releases/latest/download
+curl -fsSLO "$url/zygo-$(uname -m)-unknown-linux-musl.tar.gz"
+curl -fsSL "$url/SHA256SUMS" | sha256sum -c --ignore-missing   # prints "OK"
+tar xzf zygo-*-unknown-linux-musl.tar.gz
 sudo install -m 0755 zygo-*/zygo /usr/local/bin/zygo
 ```
 
-For aarch64, put `aarch64` in place of `x86_64` in the file name. The `sudo`
-is only for copying the file into `/usr/local/bin`; Zygo itself never runs
-as root. Every release carries a `SHA256SUMS` file, so you can check that the
-archive you downloaded is the one that was published.
+`uname -m` prints `x86_64` or `aarch64`, which picks the right file. The
+second line checks the archive against the `SHA256SUMS` file that every
+release carries, so you know it is the one that was published. The `sudo` is
+only for copying the file into `/usr/local/bin`; Zygo itself never runs as
+root.
 
 ## Installing on macOS
 
@@ -61,12 +71,13 @@ thin program that passes your commands on), the Linux build of Zygo that the
 shim forwards into, and Lima, the tool that starts the Linux VM.
 
 ```bash
-brew install lima
-brew install --formula https://github.com/zygo-dev/zygo/releases/latest/download/zygo.rb
+brew install mhmtskrc2/zygo/zygo
 ```
 
-The formula's checksums are computed from the same archives during the
-release build, not typed in by hand. The section
+The formula lives in a *tap* (a small GitHub repository of Homebrew formulas),
+`mhmtskrc2/homebrew-zygo`; Homebrew finds it from the name. The release build
+writes the formula there, with checksums computed from the same archives, not
+typed in by hand. The section
 [How Zygo runs on a Mac](#how-zygo-runs-on-a-mac) below explains what the VM
 is and what it costs.
 
@@ -86,11 +97,12 @@ backend is not in it. That backend links a virtual machine monitor from a
 pinned git tag, and a crate published on crates.io may not point at a git
 tag. So `make vm-build` from a checkout is the way to get it, and
 `zygo doctor` tells you this on a host where `vm` would otherwise work.
-[Chapter 9](09-jails.md) explains the backends.
+[Chapter 16](16-production.md#choosing-an-isolation-backend) explains the
+backends.
 
 ## The container image
 
-Zygo also ships as a container image, `ghcr.io/zygo-dev/zygo`. It is Alpine
+Zygo also ships as a container image, `ghcr.io/mhmtskrc2/zygo`. It is Alpine
 Linux plus the static `zygo` binary and the few helpers networking needs.
 It does not need `--privileged`, but it does need three specific things from
 Docker, because Zygo builds sandboxes inside it.
@@ -98,7 +110,7 @@ Docker, because Zygo builds sandboxes inside it.
 ```bash
 docker run --security-opt seccomp=unconfined --security-opt systempaths=unconfined \
     --cgroupns=host --cgroup-parent=/zygo -v /sys/fs/cgroup/zygo:/sys/fs/cgroup/zygo:rw \
-    -p 7700:7700 -e ZYGO_API_TOKEN=... ghcr.io/zygo-dev/zygo
+    -p 7700:7700 -e ZYGO_API_TOKEN=... ghcr.io/mhmtskrc2/zygo
 ```
 
 | Option | Why Zygo needs it |

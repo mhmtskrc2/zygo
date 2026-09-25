@@ -130,23 +130,30 @@ ONE-SHOT ── one request, one fresh sandbox
 
 ## Try it
 
+> **Not released yet.** The commands below are for the first release, v0.1.0,
+> and start working when it is tagged. Until then, build from a checkout:
+> `cargo build --release -p zygo-cli` gives `target/release/zygo`.
+
 ```bash
-# Linux: one static binary, no runtime dependencies
-curl -fsSL https://github.com/zygo-dev/zygo/releases/latest/download/zygo-x86_64-unknown-linux-musl.tar.gz | tar xz
+# Linux, x86_64 or aarch64: one static binary, no runtime dependencies
+curl -fsSL "https://github.com/mhmtskrc2/zygo/releases/latest/download/zygo-$(uname -m)-unknown-linux-musl.tar.gz" | tar xz
 sudo install -m 0755 zygo-*/zygo /usr/local/bin/zygo
 
-# macOS: the shim, plus the Linux build it forwards into, plus Lima
-brew install lima && brew install --formula \
-    https://github.com/zygo-dev/zygo/releases/latest/download/zygo.rb
+# macOS: the shim, the Linux build it forwards into, and Lima
+brew install mhmtskrc2/zygo/zygo
 
-# or from source, anywhere
+# or from source, anywhere with Rust
 cargo install zygo-cli
 
 # or the container image, which needs no privileges and three specific things
 docker run --security-opt seccomp=unconfined --security-opt systempaths=unconfined \
     --cgroupns=host --cgroup-parent=/zygo -v /sys/fs/cgroup/zygo:/sys/fs/cgroup/zygo:rw \
-    -p 7700:7700 -e ZYGO_API_TOKEN=... ghcr.io/zygo-dev/zygo
+    -p 7700:7700 -e ZYGO_API_TOKEN=... ghcr.io/mhmtskrc2/zygo
 ```
+
+Every release lists the archives' checksums in `SHA256SUMS`, and the container
+image is signed with cosign;
+[chapter 11](docs/book/11-getting-started.md) shows how to check both.
 
 [`packaging/oci/`](packaging/oci) says what those three are and why; `zygo
 doctor` names any that are missing, in the container or on a host.
@@ -275,7 +282,7 @@ out = client.fn("resize")({"url": "..."}).result  # ~2 ms, a fresh process
 ```
 
 ```js
-import { connect } from 'zygo';
+import { connect } from 'zygo-sdk';
 const out = (await connect().fn('resize')({ url: '...' })).result;
 ```
 

@@ -5,7 +5,7 @@ make oci-image      # build it from the binary make already checked
 make verify-oci     # build it and run a sandbox inside it, unprivileged
 ```
 
-`ghcr.io/zygo/zygo:<version>` for `linux/amd64` and `linux/arm64`, signed with
+`ghcr.io/mhmtskrc2/zygo:<version>` for `linux/amd64` and `linux/arm64`, signed with
 [cosign](https://docs.sigstore.dev/) and listed in the release's
 `SHA256SUMS`. It is Alpine plus five things: the static `zygo` binary,
 `pasta`, `nft`, `tc` and `newuidmap`.
@@ -23,7 +23,7 @@ docker run \
   -v /sys/fs/cgroup/zygo:/sys/fs/cgroup/zygo:rw \
   -v zygo-data:/var/lib/zygo \
   -p 7700:7700 -e ZYGO_API_TOKEN=... \
-  ghcr.io/zygo/zygo
+  ghcr.io/mhmtskrc2/zygo
 ```
 
 `zygo doctor` names each one when it is missing, and
@@ -61,7 +61,7 @@ plane.
 ## Verifying a published image
 
 ```bash
-cosign verify ghcr.io/zygo/zygo:0.1.0 \
+cosign verify ghcr.io/mhmtskrc2/zygo:0.1.0 \
   --certificate-identity-regexp '^https://github\.com/.*/\.github/workflows/release\.yml@refs/tags/' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```

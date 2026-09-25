@@ -17,7 +17,7 @@
 # Nothing here is required. A worker that pulls its images on first use works;
 # it is slower exactly once per image per node.
 
-ARG ZYGO_IMAGE=ghcr.io/zygo/zygo:latest
+ARG ZYGO_IMAGE=ghcr.io/mhmtskrc2/zygo:latest
 FROM ${ZYGO_IMAGE}
 
 # Back to root for the build, and back to 65532 at the end. Everything below

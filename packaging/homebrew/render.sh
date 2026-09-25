@@ -13,7 +13,7 @@ set -u
 
 VERSION=${1:-}
 ARTIFACTS=${2:-}
-REPO=${ZYGO_REPO:-zygo-dev/zygo}
+REPO=${ZYGO_REPO:-mhmtskrc2/zygo}
 TEMPLATE=$(dirname "$0")/zygo.rb.in
 
 if [ -z "$VERSION" ] || [ -z "$ARTIFACTS" ]; then

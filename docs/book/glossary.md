@@ -65,6 +65,7 @@ One line each. The chapter in brackets explains the term in full; the numbers fo
 | **static linking** | A program that carries all its library code inside its own file, so it runs on almost any image. [6, 12] |
 | **supervisor** | Zygo's process that keeps zygotes, hands out requests and enforces deadlines, under your user. [6] |
 | **syscall** | A request from a program to the kernel. [1] |
+| **tap** | A GitHub repository of Homebrew formulas; `brew install mhmtskrc2/zygo/zygo` installs Zygo from one. [11] |
 | **tenant** | One customer of whoever embeds Zygo; has its own scripts, secrets, limits and tokens. [14, 17] |
 | **tmpfs** | A file system in memory that disappears when no longer used. [4] |
 | **token** | A secret a caller sends to the API to prove who it is: operator or tenant. [17] |

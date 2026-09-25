@@ -1,7 +1,7 @@
 /**
  * Zygo — warm sandboxes for function-shaped code, from Node.
  *
- *     import { connect } from 'zygo';
+ *     import { connect } from 'zygo-sdk';
  *
  *     const client = connect();                    // `zygo api` on loopback
  *     const resize = client.fn('resize');          // a function from sandbox.toml

@@ -255,7 +255,7 @@ docker run \
   --device /dev/net/tun \
   -v zygo-data:/var/lib/zygo \
   -p 7700:7700 -e ZYGO_API_TOKEN=... \
-  ghcr.io/zygo-dev/zygo
+  ghcr.io/mhmtskrc2/zygo
 ```
 
 With Docker's `systemd` cgroup driver — the default on Ubuntu and Debian —
@@ -321,7 +321,7 @@ make oci-image      # build it from the binary make already checked
 make verify-oci     # build it and run a sandbox inside it, unprivileged
 ```
 
-The published image is `ghcr.io/zygo-dev/zygo:<version>`, for `linux/amd64` and
+The published image is `ghcr.io/mhmtskrc2/zygo:<version>`, for `linux/amd64` and
 `linux/arm64`. It is signed with [cosign](https://docs.sigstore.dev/) and
 listed in the release's `SHA256SUMS`. It is Alpine plus a few programs:
 
@@ -357,7 +357,7 @@ thing in front of the API is your own control plane. The worker image does.
 ## Verifying a published image
 
 ```bash
-cosign verify ghcr.io/zygo-dev/zygo:0.1.0 \
+cosign verify ghcr.io/mhmtskrc2/zygo:0.1.0 \
   --certificate-identity-regexp '^https://github\.com/.*/\.github/workflows/release\.yml@refs/tags/' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```

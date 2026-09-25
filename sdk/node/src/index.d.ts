@@ -3,7 +3,7 @@
  *
  * Hand-written rather than generated, because the package has no build step:
  * it ships the JavaScript that runs, and a declaration file beside it. That
- * keeps `npm install zygo` free of a compiler and keeps what you read in the
+ * keeps `npm install zygo-sdk` free of a compiler and keeps what you read in the
  * repository identical to what executes.
  */
 

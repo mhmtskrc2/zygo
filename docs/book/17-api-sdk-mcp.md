@@ -288,7 +288,7 @@ address.
 ## The Python client
 
 ```bash
-pip install zygo            # or: pip install -e sdk/python
+pip install zygo-sdk        # or: pip install -e sdk/python; you still `import zygo`
 ```
 
 No dependencies. `zygo.connect()` finds the API from its `url` argument, then
@@ -337,7 +337,7 @@ is rare and fits the plain client; the async one is for the hot path.
 ## The Node client
 
 ```bash
-npm install zygo
+npm install zygo-sdk
 ```
 
 No dependencies, Node 18 or newer, ES modules. The same methods in
@@ -345,7 +345,7 @@ camelCase — `runScript`, `serveRuntime`, `putSecret` — with timeouts in
 seconds and an `AbortSignal` that cancels the request for you.
 
 ```js
-import { connect } from 'zygo';
+import { connect } from 'zygo-sdk';
 const client = connect();                         // ZYGO_API_URL, ZYGO_API_TOKEN
 const resize = client.fn('resize');
 const out = await resize({ url: 'https://example.com/a.png' });

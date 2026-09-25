@@ -119,7 +119,7 @@ jobs:
           asset="zygo-${{ matrix.target }}"
           mkdir -p "dist/$name"
           cp target/${{ matrix.target }}/release/zygo "dist/$name/"
-          cp README.md SECURITY.md "dist/$name/"
+          cp README.md SECURITY.md LICENSE "dist/$name/"
           tar -C dist -czf "dist/$asset.tar.gz" "$name"
           (cd dist && sha256sum "$asset.tar.gz" > "$asset.tar.gz.sha256")
           # The bare binary too: the macOS formula and `limactl copy` both
@@ -182,7 +182,7 @@ jobs:
           cp "linux/zygo-linux-${{ matrix.linux_target }}" \
              "dist/$name/share/zygo/zygo-linux-${{ matrix.arch }}"
           chmod +x "dist/$name/share/zygo/zygo-linux-${{ matrix.arch }}"
-          cp README.md SECURITY.md "dist/$name/"
+          cp README.md SECURITY.md LICENSE "dist/$name/"
           tar -C dist -czf "dist/$asset.tar.gz" "$name"
           (cd dist && shasum -a 256 "$asset.tar.gz" > "$asset.tar.gz.sha256")
           cat "dist/$asset.tar.gz.sha256"
@@ -446,13 +446,12 @@ jobs:
           ## Install
 
           \`\`\`bash
-          # Linux, one static binary
-          curl -fsSL https://github.com/$REPO/releases/download/$TAG/zygo-x86_64-unknown-linux-musl.tar.gz | tar xz
+          # Linux, one static binary (x86_64 or aarch64)
+          curl -fsSL "https://github.com/$REPO/releases/download/$TAG/zygo-\$(uname -m)-unknown-linux-musl.tar.gz" | tar xz
           sudo install -m 0755 zygo-*/zygo /usr/local/bin/zygo
 
-          # macOS, with the Linux build the VM needs
-          brew install lima
-          brew install --formula ./zygo.rb
+          # macOS: the shim, the Linux build the VM needs, and Lima
+          brew install $OWNER/zygo/zygo
 
           # from source
           cargo install zygo-cli
@@ -483,3 +482,45 @@ jobs:
             --title "$TAG" \
             --generate-notes \
             --notes-file notes.md
+
+  # The Homebrew tap. Current Homebrew refuses a formula that is not in a tap
+  # ("Homebrew requires formulae to be in a tap"), so the zygo.rb attached to
+  # the release cannot be installed on its own. This copies it into
+  # <owner>/homebrew-zygo, which is what `brew install <owner>/zygo/zygo`
+  # reads. It needs a token that may push to that repository; without one it
+  # says so, and the rest of the release is complete regardless.
+  tap:
+    needs: [what, homebrew, publish]
+    if: needs.what.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: homebrew-formula
+          path: formula
+      - name: Push the formula to the tap
+        if: env.HOMEBREW_TAP_TOKEN != ''
+        env:
+          TAP: ${{ github.repository_owner }}/homebrew-zygo
+          VERSION: ${{ needs.what.outputs.version }}
+        run: |
+          git clone --depth 1 "https://x-access-token:$HOMEBREW_TAP_TOKEN@github.com/$TAP.git" tap
+          mkdir -p tap/Formula
+          cp formula/zygo.rb tap/Formula/zygo.rb
+          cd tap
+          git config user.name "zygo release"
+          git config user.email "zygo-release@users.noreply.github.com"
+          git add Formula/zygo.rb
+          if git diff --cached --quiet; then
+            echo "the tap already has $VERSION"
+            exit 0
+          fi
+          git commit -m "zygo $VERSION"
+          git push origin HEAD
+      - name: Say why the tap was not updated
+        if: env.HOMEBREW_TAP_TOKEN == ''
+        run: |
+          echo "::warning::HOMEBREW_TAP_TOKEN is not set, so the tap was not updated and brew still installs the previous version"

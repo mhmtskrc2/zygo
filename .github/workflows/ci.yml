@@ -506,7 +506,7 @@ jobs:
       # this job built, and one replica rather than two.
       - name: Apply the example
         run: |
-          sed -e 's|ghcr.io/zygo-dev/zygo:latest|zygo:ci|' \
+          sed -e 's|ghcr.io/mhmtskrc2/zygo:latest|zygo:ci|' \
               -e 's|replicas: 2|replicas: 1|' \
               examples/kubernetes/deployment.yaml > /tmp/zygo.yaml
           kubectl apply -f /tmp/zygo.yaml

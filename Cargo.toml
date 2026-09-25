@@ -11,7 +11,7 @@ edition = "2024"
 # machine was newer, which is how an MSRV drifts.
 rust-version = "1.88"
 license = "Apache-2.0"
-repository = "https://github.com/zygo-dev/zygo"
+repository = "https://github.com/mhmtskrc2/zygo"
 authors = ["Zygo contributors"]
 
 [workspace.dependencies]

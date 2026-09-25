@@ -76,7 +76,7 @@ spec:
       terminationGracePeriodSeconds: 120
       containers:
         - name: zygo
-          image: ghcr.io/zygo-dev/zygo:latest
+          image: ghcr.io/mhmtskrc2/zygo:latest
           args:
             - api
             - --listen
