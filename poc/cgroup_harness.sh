@@ -117,6 +117,26 @@ else
     echo "    systemd-run --user --scope -p Delegate=yes -- sh \$0" >&2
 fi
 
+# Pull an image, and say why when it cannot be pulled.
+#
+# The suites used to pull with `>/dev/null 2>&1` and carry on. A pull that
+# failed — a registry hiccup, a rate limit — then surfaced forty checks later
+# as forty failures reading "image … is not in the local store", in a CI run
+# where nothing said the pull was the cause. Three tries, a pause between
+# them, and the last error on stderr if all three fail.
+pull_image() {
+    pull_try=1
+    while :; do
+        pull_out=$(zygo pull "$1" 2>&1) && return 0
+        [ "$pull_try" -ge 3 ] && break
+        sleep $((pull_try * 5))
+        pull_try=$((pull_try + 1))
+    done
+    echo "  could not pull $1 after 3 tries:" >&2
+    printf '%s\n' "$pull_out" | tail -5 | sed 's/^/    /' >&2
+    return 1
+}
+
 # Printed under a suite's summary line.
 #
 # A failure count collected without a usable cgroup is not a count of bugs,

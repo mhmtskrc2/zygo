@@ -81,7 +81,7 @@ nothing_ran() {
 
 say "escape suite — every case is an attempt, not an inspection"
 say "  kernel $(uname -r)"
-zygo pull "$IMAGE" >/dev/null 2>&1
+pull_image "$IMAGE"
 
 # Nothing below is a result unless a sandbox runs. Every case here reads the
 # attempt's *output*, and an empty answer looks exactly like a refusal that

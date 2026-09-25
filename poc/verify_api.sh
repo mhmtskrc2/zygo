@@ -53,10 +53,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-"$ZYGO" pull "$IMAGE" >/dev/null 2>&1
+pull_image "$IMAGE"
 # The warm-exec pool checks run a shell rather than an interpreter: what is
 # under test there is a pool with no agent at all.
-"$ZYGO" pull alpine:3 >/dev/null 2>&1
+pull_image alpine:3
 
 # Every listener runs in the harness's cgroup, like every other long-lived
 # process here: the API spawns `zygo run` children and they need somewhere to

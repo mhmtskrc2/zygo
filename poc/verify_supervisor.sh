@@ -113,7 +113,7 @@ printf 'import time\n\n\ndef handler(event):\n    time.sleep(0.4)\n    return {"
 printf 'def handler(event):\n    while True:\n        pass\n' > spin.py
 printf 'import os\n\n\ndef handler(event):\n    for _ in range(4):\n        if os.fork() == 0:\n            while True:\n                pass\n    while True:\n        pass\n' > spawn.py
 
-"$ZYGO" pull "$IMAGE" >/dev/null 2>&1
+pull_image "$IMAGE"
 
 say ""
 say "before anything is running"

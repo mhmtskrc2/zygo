@@ -49,7 +49,7 @@ why() {
 
 say "ns launcher verification"
 say "  kernel $(uname -r)"
-zygo pull "$IMAGE" >/dev/null 2>&1
+pull_image "$IMAGE"
 say ""
 
 # --- it runs at all ---------------------------------------------------------
