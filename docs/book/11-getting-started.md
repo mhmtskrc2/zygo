@@ -27,6 +27,7 @@ of Linux kernel features, so the sandboxes themselves always run on Linux.
 |---|---|
 | Linux, kernel 5.3 or newer | Zygo runs directly. Nothing needs root. |
 | macOS | Zygo starts a small Linux virtual machine for you and runs inside it. |
+| Windows | Zygo runs inside WSL2, Windows' Linux VM; [see below](#on-windows-through-wsl2). |
 | A dev container or a Codespace | The repository's `.devcontainer` sets one up with sandboxes working; [see below](#in-a-dev-container-or-a-codespace). |
 | Anything else | Run Zygo in a Linux VM or container; either is fine. |
 
@@ -137,6 +138,40 @@ keeps pulled images across restarts; [chapter 16](16-production.md#running-zygo-
 has the full command. `zygo doctor` names anything that is missing, inside
 the container just as on a host. [`packaging/oci/`](../../packaging/oci) has the details,
 and [chapter 16](16-production.md) covers running it in production.
+
+## On Windows, through WSL2
+
+WSL2 is a real Linux kernel in a small VM that Windows manages, so Zygo runs
+there as on any Linux host. **The project has not tested it yet** — no CI
+runner or development machine here is Windows — so treat this as the route
+that should work, and tell us if it does not. Three settings matter:
+
+1. **A distribution with systemd.** In Ubuntu 24.04 under WSL2, put this in
+   `/etc/wsl.conf`, then run `wsl --shutdown` from Windows:
+
+   ```ini
+   [boot]
+   systemd=true
+   ```
+
+   systemd is what gives your user a delegated cgroup, as on a desktop Linux.
+2. **cgroup v2 only.** WSL2 can mount the old cgroup v1 hierarchy beside v2,
+   and Zygo needs v2 on its own. In `%UserProfile%\.wslconfig` on the Windows
+   side, then `wsl --shutdown` again:
+
+   ```ini
+   [wsl2]
+   kernelCommandLine = cgroup_no_v1=all
+   ```
+3. **Install as on Linux**, with the commands [above](#installing-on-linux),
+   then run `zygo doctor`. It checks the kernel version, user namespaces and
+   cgroup delegation there, and `zygo doctor --fix` applies what it can.
+
+WSL2's kernel is 5.15 or newer, well above Zygo's 5.3 floor; below 6.1
+`doctor` calls it degraded, as on any host, and it reports whether the
+kernel was built with Landlock. There is no `/dev/kvm` by default, so the
+`vm` backend is off.
+[Troubleshooting](22-troubleshooting.md) covers what `doctor` reports.
 
 ## In a dev container or a Codespace
 
