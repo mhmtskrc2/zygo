@@ -1211,6 +1211,21 @@ That is the whole installation. On macOS it is forwarded into the Linux VM
 like every other sandbox command, and the VM hop is paid once, when the host
 starts the server, rather than once per tool call.
 
+Two hosts have a command for it instead of a file:
+
+```bash
+# Claude Code, for this project; add --scope user for every project
+claude mcp add zygo -- zygo mcp --mem 512M --timeout 60s
+
+# Codex: in ~/.codex/config.toml
+#   [mcp_servers.zygo]
+#   command = "zygo"
+#   args = ["mcp", "--mem", "512M", "--timeout", "60s"]
+```
+
+The flags after `mcp` are the ceiling the model works under — the next section
+explains why they belong to whoever installs the server.
+
 ```text
   ┌────────────┐  stdin/stdout, JSON-RPC  ┌──────────┐      ┌────────────────────────────┐
   │ agent host │◀────────────────────────▶│ zygo mcp │─────▶│ run_code: a fresh one-shot │

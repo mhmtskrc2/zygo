@@ -48,6 +48,7 @@ break things and will say so here.
 
 ### Added
 
+- Chapter 17: adding `zygo mcp` to Claude Code and Codex.
 - Chapter 11: Windows through WSL2 — systemd, cgroup v2 only, then the
   Linux install. Not yet tested by the project, and marked so.
 - A `.devcontainer` for VS Code and Codespaces in which sandboxes run: it
