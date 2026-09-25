@@ -13,13 +13,12 @@ illustrated.
 
 ## What `securityContext` is for
 
-Zygo builds sandboxes, so the pod it runs in has to let it. Four things, and
-three of them have fields of their own:
+Zygo builds sandboxes, so the pod it runs in has to let it. Four things:
 
 | | |
 |---|---|
 | `seccompProfile: Unconfined` | the default profile denies `unshare(CLONE_NEWUSER)`, which is what a sandbox does first |
-| `procMount: Unmasked` | a masked `/proc` is not *fully visible*, and the kernel then refuses a fresh `proc` mount inside a user namespace |
+| an unmasked `/proc` | a masked `/proc` is not *fully visible*, and the kernel then refuses a fresh `proc` mount inside a user namespace. `privileged: true` gives one; Kubernetes accepts `procMount: Unmasked` only with `hostUsers: false` |
 | a writable cgroup v2 subtree | **no field expresses this**, which is the whole reason `privileged: true` is here |
 | a kernel that allows unprivileged user namespaces | a node setting (`kernel.unprivileged_userns_clone`, AppArmor on Ubuntu), not a pod one |
 
@@ -27,7 +26,8 @@ three of them have fields of their own:
 sandboxes says which of the four it is rather than failing at the first
 request.
 
-**On `privileged: true`.** It is buying the third row and nothing else. What
+**On `privileged: true`.** It is there for the third row, and brings the
+second with it. What
 that costs is smaller than it looks, and the reason is what the product is:
 the boundary Zygo enforces is the sandbox it builds *inside* this container —
 namespaces, seccomp, Landlock, a cgroup per request — not the container

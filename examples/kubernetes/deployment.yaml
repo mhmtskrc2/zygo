@@ -101,11 +101,9 @@ spec:
           # ---- what makes a sandbox possible -----------------------------
           #
           # `privileged` is buying **one** thing here, and it is worth naming
-          # which: a cgroup this pod can write. The other three are expressible
-          # on their own — `seccompProfile: Unconfined` and `procMount:
-          # Unmasked` below say them — but Kubernetes has no field for "give
-          # this pod a delegated cgroup subtree", so the only way to get one
-          # today is this. `zygo doctor` says so if you try without it.
+          # which: a cgroup this pod can write. Kubernetes has no field for
+          # "give this pod a delegated cgroup subtree", so the only way to get
+          # one today is this. `zygo doctor` says so if you try without it.
           #
           # What that costs is smaller than it looks, and the reason is the
           # product: the boundary Zygo enforces is the sandbox it builds
@@ -114,20 +112,19 @@ spec:
           # customer code directly is a different proposition from a
           # privileged pod whose job is building boundaries around it. Run it
           # on nodes of its own, and read `docs/book/23-security.md`.
-          # `privileged` also brings two things a pod without it would have
-          # to ask for, and `docs/book/16-production.md` says how: the node's
-          # `/dev/net/tun`, which a networked sandbox needs, and no AppArmor
-          # profile, which on Ubuntu nodes would refuse the sandbox's mounts.
+          # `privileged` also brings three things a pod without it would have
+          # to ask for, and `docs/book/16-production.md` says how: an unmasked
+          # `/proc`, without which the kernel refuses a sandbox its own `proc`
+          # mount; the node's `/dev/net/tun`, which a networked sandbox needs;
+          # and no AppArmor profile, which on Ubuntu nodes would refuse the
+          # sandbox's mounts. Kubernetes now accepts `procMount: Unmasked`
+          # only from a pod with `hostUsers: false`, so this one does not ask.
           securityContext:
             privileged: true
             # Docker's and containerd's default profiles deny
             # `unshare(CLONE_NEWUSER)`, which is what a sandbox does first.
             seccompProfile:
               type: Unconfined
-            # A masked `/proc` is not *fully visible*, and the kernel then
-            # refuses a fresh `proc` mount inside a user namespace. Without
-            # this every sandbox dies on "mounting /proc failed".
-            procMount: Unmasked
             allowPrivilegeEscalation: true
             readOnlyRootFilesystem: false
 

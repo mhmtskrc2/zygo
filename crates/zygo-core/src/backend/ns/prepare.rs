@@ -154,8 +154,8 @@ impl Step {
                 "a container is probably masking parts of /proc, and the kernel then \
                  refuses a fresh `proc` mount inside a user namespace: \
                  docker run --security-opt systempaths=unconfined, or Kubernetes \
-                 `securityContext.procMount: Unmasked`. Run `zygo doctor`, which \
-                 checks this directly",
+                 `privileged: true` (or `procMount: Unmasked` with `hostUsers: false`). \
+                 Run `zygo doctor`, which checks this directly",
             ),
             (Execve, libc::ENOENT) => Some(
                 "the program does not exist inside the image — check the command and the image",

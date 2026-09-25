@@ -788,7 +788,7 @@ mod probe {
                 "a container is masking parts of /proc, and the kernel then refuses a \
                  fresh `proc` mount inside a user namespace: \
                  docker run --security-opt systempaths=unconfined, or Kubernetes \
-                 `securityContext.procMount: Unmasked`",
+                 `privileged: true` (or `procMount: Unmasked` with `hostUsers: false`)",
             ),
             // Nothing to say when the namespace could not be made at all: the
             // check above is the one to read, and two failures for one cause

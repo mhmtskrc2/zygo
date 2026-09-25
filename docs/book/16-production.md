@@ -283,7 +283,7 @@ the parent must be a slice: `--cgroup-parent=zygo.slice` and
 | Need | Why | In Kubernetes |
 |---|---|---|
 | A seccomp profile that allows `unshare(CLONE_NEWUSER)` | Docker's default profile denies it, and it is the first thing a sandbox does | `securityContext.seccompProfile: {type: Unconfined}` |
-| An unmasked `/proc` | runtimes cover parts of `/proc` (`kcore`, `acpi` …); the kernel then refuses a new `proc` mount inside a user namespace, because the old one is not *fully visible*. Sandboxes die on "mounting /proc failed: Operation not permitted" | `securityContext.procMount: Unmasked` |
+| An unmasked `/proc` | runtimes cover parts of `/proc` (`kcore`, `acpi` …); the kernel then refuses a new `proc` mount inside a user namespace, because the old one is not *fully visible*. Sandboxes die on "mounting /proc failed: Operation not permitted" | `privileged: true` gives one. `securityContext.procMount: Unmasked` is accepted only with `hostUsers: false` |
 | A writable cgroup v2 subtree of its own | every sandbox goes in a cgroup, and the container's `/sys/fs/cgroup` is read-only | no field exists; see below |
 | No AppArmor profile, on AppArmor hosts | Docker's `docker-default` profile denies `mount`; `zygo doctor` reports "the mount tree could not be made private" | `securityContext.appArmorProfile: {type: Unconfined}` |
 | `/dev/net/tun`, for `egress` and `full` | `pasta` gives a sandbox its network card through it, and runtimes leave the device node out | a `hostPath` of type `CharDevice` |
@@ -406,19 +406,21 @@ request, and a pod-wide CPU ceiling would also slow the supervisor itself.
 
 ## What `securityContext` is for, and `privileged: true`
 
-A pod needs the same things as the container above. Three have fields of
-their own; one is a node setting:
+A pod needs the same things as the container above. One has a field of its
+own, two come with `privileged: true`, and one is a node setting:
 
 | | |
 |---|---|
 | `seccompProfile: Unconfined` | the default profile denies `unshare(CLONE_NEWUSER)` |
-| `procMount: Unmasked` | a masked `/proc` stops a fresh `proc` mount in a user namespace |
+| an unmasked `/proc` | a masked `/proc` stops a fresh `proc` mount in a user namespace; `privileged: true` leaves it unmasked |
 | a writable cgroup v2 subtree | **no field says this**, and it is the only reason `privileged: true` is there |
 | unprivileged user namespaces | a setting on the node (`kernel.unprivileged_userns_clone`, AppArmor on Ubuntu), not the pod |
 
-`privileged: true` buys the third row and nothing else. It also happens to
-bring `/dev/net/tun` and no AppArmor profile, which a pod without it would
-have to ask for as the table above describes. The cost is smaller than it
+`privileged: true` is there for the third row. It also brings an unmasked
+`/proc`, `/dev/net/tun` and no AppArmor profile, which a pod without it would
+have to ask for as the table above describes. The field for the first,
+`procMount: Unmasked`, is refused by Kubernetes unless the pod also sets
+`hostUsers: false`, so the example does not use it. The cost is smaller than it
 looks, because the wall Zygo enforces is the sandbox it builds inside the pod
 — namespaces, seccomp, Landlock, a cgroup per request — not the pod itself.
 Still, run it on nodes of its own, and read [chapter 23](23-security.md).
@@ -470,10 +472,8 @@ a worker image with the images baked in, which costs nothing at run time. No
 
 [`kind.yaml`](../../examples/kubernetes/kind.yaml) creates a one-node *kind*
 cluster (Kubernetes in Docker) that can run the manifest. It needs cgroup v2
-on the host, and it turns on the `ProcMountType` feature gate. Without that
-gate the API server removes `procMount: Unmasked`, and every sandbox dies on
-"mounting /proc". A real cluster does not need this file, but it needs the
-same two things.
+on the host. A real cluster does not need this file, but it needs cgroup v2
+too.
 
 ## What the Kubernetes example leaves out
 

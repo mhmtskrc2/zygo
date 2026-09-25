@@ -579,7 +579,10 @@ PY
 
 if zygo serve --runtime escape-pool --image "$IMAGE" --agent python >/tmp/escape-pool.err 2>&1; then
     out=$(zygo exec --runtime escape-pool --script "$WORK/probe.py" '{}' 2>>/tmp/escape-pool.err | tr -d '\n ')
-    zygo stop escape-pool >/dev/null 2>&1
+    # `stop <name>` stops functions, not runtime pools, and `serve` started a
+    # supervisor for this one. Leaving either running hands the next suite a
+    # sandbox it did not start.
+    zygo stop --all >/dev/null 2>&1
     case "$out" in
         *'"unlinked":false'*)
             ok "a script cannot remove the file it was loaded from ($out)" ;;

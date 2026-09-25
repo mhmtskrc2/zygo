@@ -1,24 +1,12 @@
 # A kind cluster that can run the deployment beside this file.
 #
-# One node, and two things it needs beyond the default:
+# One node, and one thing it needs beyond the default: cgroup v2. kind's node
+# image uses whatever the host does; on a host still on v1 nothing here works,
+# and `zygo doctor` says so rather than failing mysteriously.
 #
-#   * cgroup v2. kind's node image uses whatever the host does; on a host
-#     still on v1 nothing here works, and `zygo doctor` says so rather than
-#     failing mysteriously.
-#   * the kubelet's `procMount: Unmasked`, which is behind a feature gate
-#     before it is on by default. The pod asks for it; without the gate the
-#     API server strips it and every sandbox dies on `mounting /proc`.
-#
-# Used by the `kubernetes` CI job. A real cluster needs neither file — it
-# needs the same two properties.
+# Used by the `kubernetes` CI job. A real cluster does not need this file — it
+# needs the same property.
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
-featureGates:
-  ProcMountType: true
 nodes:
   - role: control-plane
-    kubeadmConfigPatches:
-      - |
-        kind: KubeletConfiguration
-        featureGates:
-          ProcMountType: true
