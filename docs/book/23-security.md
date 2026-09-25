@@ -138,9 +138,9 @@ out, or find a bug in the kernel underneath them all.
 Every row below marked **attempted** is run by `make escape-linux`. It runs
 the escape itself, not a check of a setting, because a test that reads a flag
 also passes on a kernel that ignores that flag. The suite attempts 19 vectors in 27
-checks, and on Linux 5.10 and 6.8 reports **26 blocked, 0 escaped, 1
-skipped** — the setuid case, where the test image has no setuid binary to
-try.
+checks, and on Linux 5.10 and 6.8 reports **27 blocked, 0 escaped, 0
+skipped**. Run rootless, it skips one: setting up a file capability to try
+needs root on the host.
 
 Beside it, `make fuzz-linux` sweeps *every* syscall number the architecture
 has — 469 of them — against all three seccomp profiles. Each call is made in a
@@ -156,7 +156,7 @@ syscall named in the tables below is refused.
   make escape-linux                        make fuzz-linux
   ─────────────────                        ───────────────
   every known attack, really tried         all 469 syscall numbers
-  → 26 blocked, 0 escaped, 1 skipped       × 3 profiles, one forked child each
+  → 27 blocked, 0 escaped, 0 skipped       × 3 profiles, one forked child each
                                            → profiles ordered, nothing kills
                                              the process, clone3 → ENOSYS
 ```
@@ -170,7 +170,7 @@ syscall named in the tables below is refused.
 | `setns` into the host's namespaces | refused: no capability in the host's user namespace | **attempted** |
 | Regaining capabilities via a new user namespace | `unshare(CLONE_NEWUSER)` refused by seccomp | **attempted** |
 | Rewriting `uid_map` to become another uid | the map is written by the parent and is then read-only | **attempted** |
-| Regaining privilege through a setuid binary | `no_new_privs`, `nosuid` | **skipped** where the test image has no setuid binary to try |
+| Regaining privilege through a setuid or file-capability binary | one uid mapped, so setuid has no other identity to switch to; every mount `nosuid`; `no_new_privs`; an empty bounding set | **attempted** — a copy of `python3` given `CAP_DAC_OVERRIDE` reads a mode-000 file outside a sandbox and cannot inside; with the three controls switched off in a test build, it could |
 | Reading kernel memory (`/dev/mem`, `/proc/kcore`) | masked and not present | **attempted** |
 | Creating a block device to read the host's disk | `mknod` refused; no block devices in `/dev` | **attempted** |
 

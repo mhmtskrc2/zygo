@@ -444,30 +444,64 @@ rm -f "$RW/root-link" "$MARKER"
 
 # --- 13. regaining privilege through a setuid binary ------------------------
 
-say "13. regain privilege through a setuid binary"
-out=$(py "
-import os, stat
-found = []
-for d in ('/usr/bin', '/bin', '/usr/sbin', '/sbin'):
-    try:
-        for name in os.listdir(d):
-            p = os.path.join(d, name)
-            try:
-                if os.lstat(p).st_mode & stat.S_ISUID:
-                    found.append(p)
-            except OSError:
-                pass
-    except OSError:
-        pass
-print(','.join(found[:5]) if found else 'none')")
-if [ "$out" = "none" ]; then
-    skip "the image ships no setuid binary to try"
+say "13. regain privilege through a setuid or file-capability binary"
+# An attempt, not a reading of NoNewPrivs. Setuid itself has nothing to switch
+# to here: the sandbox maps exactly one uid, the caller's, so a setuid file
+# is either owned by the process's own uid or by an unmapped one, whose bit
+# the kernel ignores. File capabilities are the vector that survives that
+# mapping: a `security.capability` set by the host's root belongs to an
+# ancestor namespace's root, and the kernel honours it inside a child one.
+# Three things in Zygo stand in its way — every mount is nosuid, the sandbox
+# runs with no_new_privs, and its bounding set is empty — so this gives a
+# copy of python3 CAP_DAC_OVERRIDE, proves it works *outside* a sandbox, then
+# runs it inside and uses it: reading a file of mode 000. That is a plain
+# `open`, which neither seccomp nor Landlock refuses, so the answer is the
+# capability's alone.
+FCAP=/tmp/escape-fcap-$(id -u)
+rm -rf "$FCAP" && mkdir -p "$FCAP"
+cp "$(readlink -f "$(command -v python3)")" "$FCAP/py" && chmod 0755 "$FCAP/py"
+if python3 - "$FCAP/py" <<'PY' 2>/dev/null
+import os, struct, sys
+# struct vfs_cap_data, revision 2 with the effective bit; CAP_DAC_OVERRIDE is 1.
+os.setxattr(sys.argv[1], "security.capability",
+            struct.pack("<5I", 0x02000001, 1 << 1, 0, 0, 0))
+PY
+then
+    # The positive case: an ordinary user outside any sandbox gains it.
+    outside=$(python3 -c '
+import os, sys
+os.setgroups([]); os.setgid(65534); os.setuid(65534)
+os.execv(sys.argv[1], ["py", "-c",
+    "print([l.split()[1] for l in open(\"/proc/self/status\") if l.startswith(\"CapEff\")][0])"])' \
+        "$FCAP/py" 2>/dev/null)
+    if [ "$outside" != "0000000000000002" ]; then
+        skip "13. the file capability did not work even outside a sandbox ('$outside')"
+    else
+        out=$(zygo run --mount "$FCAP:/fcap:ro" "$IMAGE" /fcap/py -c '
+import os
+eff = [l.split()[1] for l in open("/proc/self/status") if l.startswith("CapEff")][0]
+path = "/tmp/mode-000"
+open(path, "w").write("secret")
+os.chmod(path, 0)
+try:
+    open(path).read()
+    used = "read-a-mode-000-file"
+except OSError as e:
+    used = "refused:%d" % e.errno
+print(eff, used)' 2>/dev/null)
+        case "$out" in
+            "0000000000000000 refused:"*)
+                ok "a CAP_DAC_OVERRIDE file capability gives nothing inside (outside: $outside; inside: $out)" ;;
+            "")
+                nothing_ran "this case" ;;
+            *)
+                bad "a file capability raised privilege inside the sandbox: $out" ;;
+        esac
+    fi
 else
-    say "   image has setuid binaries: $out"
-    nnp=$(py "print(open('/proc/self/status').read().split('NoNewPrivs:')[1].split()[0])")
-    [ "$nnp" = "1" ] && ok "no_new_privs is set, so setuid cannot raise privilege" \
-                     || bad "no_new_privs is $nnp"
+    skip "13. cannot set security.capability here (needs root on the host)"
 fi
+rm -rf "$FCAP"
 
 # --- 14. the host's filesystem ----------------------------------------------
 #

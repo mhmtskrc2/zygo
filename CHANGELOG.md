@@ -76,6 +76,9 @@ break things and will say so here.
 
 ### Fixed
 
+- The escape suite's setuid case was always skipped, and when it ran it only
+  read `NoNewPrivs`. It now gives a binary a file capability, shows it works
+  outside a sandbox, and fails to use it inside.
 - `zygo doctor --fix` never offered to take `pasta` out of AppArmor's
   enforce mode unless it ran as root: it read a file only root may read. It
   now falls back to the profile on disk, so the user who needs `egress` on
