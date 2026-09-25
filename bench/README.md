@@ -13,6 +13,10 @@ make bench-record     # zygo bench all, and the warm path with and without a
                       # per-request cgroup, into bench/results/<today>-…/
 ```
 
+The `bench` workflow (`.github/workflows/bench.yml`) makes the same record
+on GitHub's x86_64 and arm64 runners every week, as an artifact; copy one
+here when it is worth keeping.
+
 What is **not** here: the load generator and results behind chapter 10's
 Windmill and kern comparisons, which were not kept. Those tables are a
 summary of runs that cannot be repeated from this repository, and the chapter

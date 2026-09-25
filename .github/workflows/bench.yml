@@ -1,0 +1,65 @@
+name: bench
+
+# The published numbers, measured on the architecture no development machine
+# here has: x86_64. Every figure in docs/book/25-performance.md came from
+# aarch64 hosts. A GitHub runner is a shared VM, so its numbers are noisier
+# than a quiet machine's — `zygo bench all` records any disturbance it sees,
+# and a run whose machine was busy says so rather than giving a verdict.
+#
+# Weekly, and by hand. The JSON is uploaded as an artifact in the same form
+# `make bench-record` writes into bench/results/, to be copied there when it
+# is worth keeping.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  record:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    name: record (${{ matrix.os }})
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      # As in ci.yml: Ubuntu 24.04 refuses the first mount in an unprivileged
+      # user namespace until this is off.
+      - name: Let unprivileged user namespaces mount
+        run: |
+          if [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
+      - run: cargo build --release
+
+      - name: Record
+        env:
+          SRC: ${{ github.workspace }}
+          ZYGO_DATA_HOME: /tmp/zygo-bench
+        run: |
+          . poc/ci_cgroup.sh
+          install -m 0755 target/release/zygo poc/zygo-linux-musl
+          dir="bench-results/$(date +%Y-%m-%d)-$(uname -r | cut -d- -f1)-$(uname -m)"
+          mkdir -p "$dir"
+          # Exit 1 is a missed budget and 2 a disturbed machine: both are
+          # results worth keeping, so neither stops the step.
+          sh poc/bench_all.sh --json | sed -n '/^{/,$p' > "$dir/all.json" || true
+          ./target/release/zygo bench warm --n 3000 --rate 250 --json > "$dir/warm.json" || true
+          ./target/release/zygo bench warm --n 3000 --rate 250 --no-cgroup --json \
+            > "$dir/warm-no-cgroup.json" || true
+          python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d['verdict']); [print(p['what'], round(p['measured'], 2), 'published', p['published']) for p in d['published']]" "$dir/all.json"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bench-${{ matrix.os }}
+          path: bench-results

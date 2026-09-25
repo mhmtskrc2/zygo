@@ -564,8 +564,10 @@ Each command has a *budget*: the number it must beat to print PASS.
 per-request cgroup, and keeps what they printed as JSON in
 [`bench/results/`](../../bench), one folder per run, named after the date, the
 kernel and the architecture. A run that missed a budget is kept as well.
-Records from Linux 6.8 and 5.10, both aarch64, are there now; there is no
-x86_64 record yet.
+Records from Linux 6.8 and 5.10, both aarch64, are there now. The `bench`
+workflow makes the same record on GitHub's x86_64 and arm64 runners every
+week; those are shared VMs, so their numbers are noisier than a quiet host's,
+and a run that saw the machine busy says so.
 
 ## Two things `bench all` does that most benchmarks do not
 
