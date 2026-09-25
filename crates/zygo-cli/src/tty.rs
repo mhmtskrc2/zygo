@@ -139,20 +139,28 @@ fn forget(fd: RawFd) {
     }
 }
 
-/// Put every terminal this process changed back the way it found it.
+/// Put every terminal this process changed back the way it found it, and
+/// forget them.
 ///
 /// Public because a panic is not the only way out that skips destructors: the
 /// binary aborts on one, and a future signal path would want the same thing.
+///
+/// Forgetting matters as much as restoring. An entry is a descriptor
+/// *number*: once its terminal is put back and closed, the number goes to the
+/// next file opened, and a later `restore_all` would write old settings onto
+/// that. A pty's master and slave share one set of settings, so a stale entry
+/// that lands on a new pty's master rewrites its slave — which is how the
+/// `mem::forget` test below broke a neighbouring test, 2 runs in 40.
 pub fn restore_all() {
     // A poisoned lock still holds the settings, and a terminal left raw is
     // worse than reading data a panicking thread was halfway through writing.
-    let saved = match SAVED.lock() {
+    let mut saved = match SAVED.lock() {
         Ok(saved) => saved,
         Err(poisoned) => poisoned.into_inner(),
     };
-    for (fd, original) in saved.iter() {
+    for (fd, original) in saved.drain(..) {
         // SAFETY: `original` was read from this descriptor by `tcgetattr`.
-        unsafe { libc::tcsetattr(*fd, libc::TCSANOW, original) };
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &original) };
     }
 }
 
@@ -350,6 +358,43 @@ mod tests {
             lflags(fd),
             deliberate,
             "a descriptor nobody is holding was overwritten"
+        );
+    }
+
+    /// A terminal `restore_all` has put back is forgotten too, so its number,
+    /// once it belongs to another file, is not written to again.
+    ///
+    /// The stale number is made a copy of a new pty's *master*: master and
+    /// slave share their settings, so writing through it rewrites the slave.
+    /// `dup2` onto a number this test still owns, rather than waiting for the
+    /// kernel to hand it out again, so no other test's file is involved.
+    /// Before `restore_all` forgot what it restored, this failed every time.
+    #[test]
+    fn a_terminal_restored_by_restore_all_is_forgotten_too() {
+        let _serial = serial();
+        let first = open().expect("openpty");
+        let stale = first.slave.as_raw_fd();
+        std::mem::forget(RawMode::enable(stale).expect("enable").expect("a terminal"));
+        restore_all();
+
+        let second = open().expect("openpty");
+        assert_eq!(
+            unsafe { libc::dup2(second.master.as_raw_fd(), stale) },
+            stale
+        );
+        let fd = second.slave.as_raw_fd();
+
+        let mut raw: libc::termios = unsafe { core::mem::zeroed() };
+        assert_eq!(unsafe { libc::tcgetattr(fd, &mut raw) }, 0);
+        unsafe { libc::cfmakeraw(&mut raw) };
+        assert_eq!(unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) }, 0);
+        let deliberate = lflags(fd);
+
+        restore_all();
+        assert_eq!(
+            lflags(fd),
+            deliberate,
+            "settings saved for descriptor {stale} were written to the file that now has it"
         );
     }
 
