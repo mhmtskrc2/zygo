@@ -441,6 +441,20 @@ mod tests {
         assert_eq!(captured.stdout.trim(), (1 << 20).to_string());
     }
 
+    /// Whether `pid` has exited and is only waiting to be reaped: state `Z`
+    /// in `/proc/<pid>/stat`, the field after the parenthesised command name.
+    /// Elsewhere there is no `/proc` to ask, and `false` keeps the stricter
+    /// signal-0 answer.
+    fn is_zombie(pid: i32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                let (_, after) = stat.rsplit_once(')')?;
+                after.trim_start().chars().next()
+            })
+            == Some('Z')
+    }
+
     /// A deadline that expires kills the child *and everything it started*,
     /// and says so.
     ///
@@ -507,11 +521,16 @@ mod tests {
             .parse()
             .expect("a pid");
         // Signal 0 asks whether the process could be signalled: 0 means it is
-        // still there. Reaping is the shell's business and it is gone, so a
-        // survivor stays visible rather than becoming a zombie this would miss.
+        // still there. A killed process whose parent has gone is reparented
+        // to pid 1, which reaps it — unless pid 1 is not an init. In a
+        // container started without `--init` it is a shell that reaps only
+        // when it waits for its own children, so the grandchild sits there
+        // dead but unreaped, and a zombie answers signal 0 like the living:
+        // the full suite in a `sh -c 'for …'` container failed here every
+        // time. So a zombie counts as dead, which it is.
         std::thread::sleep(Duration::from_millis(100));
         // SAFETY: signal 0 delivers nothing; it only reports reachability.
-        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        let alive = unsafe { libc::kill(pid, 0) } == 0 && !is_zombie(pid);
         assert!(!alive, "the grandchild outlived the deadline (pid {pid})");
     }
 }
