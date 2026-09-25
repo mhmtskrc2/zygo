@@ -383,8 +383,15 @@ fn build_spec(image: &str, packages: &[String]) -> ResolvedFn {
 /// `seteuid(42)` fails with EINVAL and the http method dies. The first run
 /// had the option on `install` only, and `update` is where the download is.
 fn build_argv(packages: &[String]) -> Vec<String> {
+    // The image's own package lists go first. Official images ship the ones
+    // they were built with, and apt revalidates a cached `InRelease` with
+    // If-Modified-Since: a mirror that answers "not modified" leaves apt on
+    // an index whose Valid-Until has passed, and `update` fails with "Release
+    // file … is expired" — for every build, until the image is rebuilt. An
+    // index is a few seconds to fetch and this build fetches one anyway.
     let script = "set -e\n\
                   export DEBIAN_FRONTEND=noninteractive\n\
+                  rm -rf /var/lib/apt/lists/*\n\
                   apt-get -o APT::Sandbox::User=root update\n\
                   apt-get -o APT::Sandbox::User=root install -y --no-install-recommends \"$@\"\n\
                   apt-get clean\n\

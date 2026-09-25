@@ -891,6 +891,46 @@ pub(crate) fn is_internal_entry(name: &std::ffi::OsStr) -> bool {
 /// `etc/passwd` would be created **on the host** (B-04, the code review).
 /// `create_dir_all` follows a symlink, and `Path::exists` is false for a
 /// dangling one — so both branches wrote through it.
+/// Give `path` the access and modification times in `md`, without following
+/// a symlink.
+///
+/// A flattened rootfs used to have every file stamped with the moment it was
+/// flattened, and the image's own timestamps matter to what runs in it. apt
+/// asks the mirror "changed since <mtime of my cached InRelease>?": with the
+/// flatten's "now" the answer was always "no", apt kept the index the image
+/// shipped with, and once that passed its Valid-Until every system-layer
+/// build failed with "Release file … is expired". Python's bytecode checks
+/// the same way.
+///
+/// Best effort: a timestamp that cannot be set leaves a working rootfs, which
+/// a failed flatten would not.
+fn keep_times(path: &Path, md: &std::fs::Metadata) {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return;
+    };
+    let times = [
+        libc::timespec {
+            tv_sec: md.atime() as libc::time_t,
+            tv_nsec: md.atime_nsec() as _,
+        },
+        libc::timespec {
+            tv_sec: md.mtime() as libc::time_t,
+            tv_nsec: md.mtime_nsec() as _,
+        },
+    ];
+    // SAFETY: a valid C string and a two-element array, as utimensat takes.
+    unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            c.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+}
+
 fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     for entry in std::fs::read_dir(src).at(src)? {
         let entry = entry.at(src)?;
@@ -916,6 +956,8 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
             }
             std::fs::create_dir_all(&to).at(&to)?;
             copy_tree(&from, &to)?;
+            // After its contents, whose arrival changed it.
+            keep_times(&to, &md);
         } else {
             if existing.is_ok() {
                 remove_whatever_is_there(&to)?;
@@ -929,6 +971,7 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
             } else {
                 std::fs::copy(&from, &to).at(&to)?;
             }
+            keep_times(&to, &md);
         }
     }
     Ok(())
@@ -1392,6 +1435,38 @@ mod tests {
                 .file_type()
                 .is_symlink(),
             "the link is still there"
+        );
+    }
+
+    /// A flattened file keeps the time the layer gave it, not the time it was
+    /// copied — apt's cache check and Python's bytecode both read it.
+    #[test]
+    fn flattening_keeps_the_layers_timestamps() {
+        let (_t, s) = store();
+        let mut layer = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(5);
+        header.set_mode(0o644);
+        header.set_mtime(1_758_215_626); // 2025-09-18
+        header.set_cksum();
+        layer
+            .append_data(&mut header, "etc/stamp", &b"hello"[..])
+            .unwrap();
+        let bytes = layer.into_inner().unwrap();
+        let digest = sha256_of(&bytes);
+        s.write_blob(&digest, &bytes[..]).unwrap();
+        s.unpack_layer(&digest, LayerCompression::None).unwrap();
+        let flat = s.flatten(&[digest]).expect("flatten");
+        let mtime = std::fs::metadata(flat.join("etc/stamp"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(
+            mtime
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            1_758_215_626
         );
     }
 

@@ -76,6 +76,12 @@ break things and will say so here.
 
 ### Fixed
 
+- `system = [...]` builds failed with "Release file … is expired" once the
+  package index an image shipped with passed its Valid-Until. Flattening an
+  image stamped every file with the current time, so apt believed its cached
+  index was fresh, the mirror answered "not modified", and apt kept the
+  expired one. Flattening now keeps the layers' timestamps, and the build
+  drops the image's package lists before `apt-get update`.
 - The escape suite's setuid case was always skipped, and when it ran it only
   read `NoNewPrivs`. It now gives a binary a file capability, shows it works
   outside a sandbox, and fails to use it inside.
