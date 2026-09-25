@@ -38,6 +38,8 @@ break things and will say so here.
 
 ### Added
 
+- `ROADMAP.md`: where the plan stands and what is next. The ADRs point at it
+  instead of at planning notes that were never in the repository.
 - The book as a searchable website on GitHub Pages, built by mdBook on every
   pull request and published from `main`; `make docs-site` builds it locally.
 - Releases carry an SBOM (`zygo-<version>.cdx.json`, CycloneDX) and a

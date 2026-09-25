@@ -1,7 +1,7 @@
 # ADR 0001 — Zygo is the embedded script runtime
 
 **Status:** accepted, 2026-09-21. This is the decision
-`script_runtime.md` (the project's planning notes, kept outside the repository) is the plan for; the roadmap
+[the roadmap](../../../ROADMAP.md) is the plan for; the roadmap
 says *what* and *when*, and this says *who for* and *what that costs*.
 
 ## Context
@@ -52,7 +52,7 @@ What that decides, in order of how often it comes up:
 ## What is deprioritised, and why
 
 Written down so nobody re-opens them by accident. This is the same list as
-`script_runtime.md`'s, with the reasoning kept here.
+[the roadmap](../../../ROADMAP.md)'s, with the reasoning kept here.
 
 - **Services, ports, compose, restart policies.** A different product. kern and
   Docker both do it; Zygo runs functions, not servers.
@@ -67,7 +67,7 @@ Written down so nobody re-opens them by accident. This is the same list as
 
 ## Exit criteria
 
-Each phase of `script_runtime.md` has one; they are the same criteria, here,
+Each phase of [the roadmap](../../../ROADMAP.md) has one; they are the same criteria, here,
 so that a phase cannot be declared done by whoever is doing it.
 
 | Phase | Done when |

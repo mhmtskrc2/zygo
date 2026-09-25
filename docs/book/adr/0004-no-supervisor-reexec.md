@@ -1,7 +1,7 @@
 # ADR 0004 — A supervisor upgrade re-warms; there is no `--reexec`
 
-**Status:** accepted, 2026-09-23. Records the time-boxed investigation in
-`script_runtime.md` (the project's planning notes, kept outside the repository) §4.4.
+**Status:** accepted, 2026-09-23. Records the time-boxed investigation
+that closed Phase 4 of [the roadmap](../../../ROADMAP.md).
 
 ## Context
 

@@ -1,7 +1,7 @@
 # ADR 0005 — One warm zygote per script version, and what evicts it
 
 **Status:** accepted, 2026-09-23. Answers the open question the first adoption
-report (`mhmt/cmd_report.md`) ends on, with numbers from
+report — a consumer's own write-up, not in this repository — ends on, with numbers from
 `poc/bench_density.py` on the 2-core, 4 GB Lima VM.
 
 ## Context
@@ -39,7 +39,7 @@ would need 11 GB. The cost of evicting one and warming it again is the
 `idle_timeout`) keeps its pages resident and costs one write to wake.
 
 The same hundred scripts through **one runtime pool** (`--pool`), which is
-the shape Phase 1 of `script_runtime.md` built for exactly this question:
+the shape Phase 1 of [the roadmap](../../../ROADMAP.md) built for exactly this question:
 
 | | one pool |
 |---|---|

@@ -31,8 +31,8 @@ Warm functions are an `ns` feature. `vm` and `gvisor` run one-shot sandboxes
 and refuse warm modes with a reason, and that refusal is **the design**, not a
 gap. `vm` networking is refused for the same reason.
 
-This is the decision `script_runtime.md` (the project's planning notes, kept outside the repository) records
-under "Explicitly deprioritised", and it is written here so that the backends'
+This is the decision [the roadmap](../../../ROADMAP.md) records
+under "Not planned", and it is written here so that the backends'
 error messages can point at something rather than saying "yet".
 
 ## Consequences

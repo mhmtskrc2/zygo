@@ -1,7 +1,7 @@
 # ADR 0003 — No Deno or Bun agent until an embedder asks
 
-**Status:** accepted, 2026-09-22. Records the roadmap decision in
-`script_runtime.md` (the project's planning notes, kept outside the repository) §3.5 and what would reopen it.
+**Status:** accepted, 2026-09-22. Records the decision taken in Phase 3 of
+[the roadmap](../../../ROADMAP.md), and what would reopen it.
 
 ## Context
 

@@ -481,7 +481,7 @@ def main(args: list[str]) -> int:
         print("warm cost again rather than a paused one. Raise --idle-timeout, or")
         print("read it as \"nothing had happened yet\" and not as \"pausing is free\".")
     print()
-    print("Either way this is the number Phase 1 of script_runtime.md exists to")
+    print("Either way this is the number Phase 1 of ROADMAP.md exists to")
     print("change: a zygote per *runtime* rather than per script.")
 
     subprocess.run([ZYGO, "stop", "--all"], capture_output=True)
