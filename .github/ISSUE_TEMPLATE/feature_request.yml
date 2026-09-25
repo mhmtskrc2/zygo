@@ -1,0 +1,21 @@
+name: Feature request or question
+description: An idea, a missing piece, or something the book did not answer.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do
+      description: The problem, in terms of what you are building — not yet the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would help
+      description: A flag, a field, an API, a paragraph in the book. Say what you tried already.
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else
+      description: Other projects that do this, the scale you run at, links.

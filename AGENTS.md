@@ -74,6 +74,10 @@ change"), so a reviewer knows it was considered rather than forgotten.
 ## Before you commit
 
 * `make test` passes; `make lint` is clean.
+* Anything a user would notice has a line under *Unreleased* in
+  [CHANGELOG.md](CHANGELOG.md). That file, [CONTRIBUTING.md](CONTRIBUTING.md)
+  and [SECURITY.md](SECURITY.md) are about the project, not about using Zygo,
+  which is why they sit beside the book rather than in it.
 * Every new flag appears in chapter 19 with its default, and
   `zygo <command> --help` agrees with it.
 * Every new `sandbox.toml` field appears in chapter 20.

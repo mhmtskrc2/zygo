@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/mhmtskrc2/zygo/security/advisories/new
+    about: Privately, as SECURITY.md describes. Never as a public issue.
+  - name: Read the book
+    url: https://github.com/mhmtskrc2/zygo/blob/main/docs/book/README.md
+    about: Most questions — install, limits, networking, the API — are answered there.

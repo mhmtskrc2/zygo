@@ -1,0 +1,53 @@
+name: Bug report
+description: Something does not work the way the book says it does.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **A sandbox escape, a policy bypass or a leaked secret is not a bug report** —
+        report it privately, as [SECURITY.md](https://github.com/mhmtskrc2/zygo/blob/main/SECURITY.md) says.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: The command or spec you ran, what you got, and what you expected instead.
+      placeholder: |
+        zygo run python:3.12-slim python3 -c 'print(1)'
+        → error: …
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce it
+      description: The shortest sequence of commands that shows it. A `sandbox.toml` if one is involved.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: zygo version
+      placeholder: zygo --version
+    validations:
+      required: true
+  - type: input
+    id: kernel
+    attributes:
+      label: Host
+      description: "`uname -srm`, the distribution, and whether Zygo ran as root."
+      placeholder: Linux 6.8.0 aarch64, Ubuntu 24.04, rootless
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: zygo doctor
+      description: The output of `zygo doctor`.
+      render: text
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Anything relevant from `ZYGO_LOG=debug`.
+      render: text
