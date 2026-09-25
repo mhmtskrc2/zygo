@@ -919,7 +919,7 @@ mod probe {
                 // launcher does it.
                 let grandchild = libc::fork();
                 if grandchild < 0 {
-                    let answer = [b'n'];
+                    let answer = *b"n";
                     libc::write(up_write, answer.as_ptr() as *const c_void, 1);
                     libc::_exit(0);
                 }
@@ -936,7 +936,7 @@ mod probe {
                     std::ptr::null(),
                 ) == 0;
                 if !ok {
-                    let answer = [b'n'];
+                    let answer = *b"n";
                     libc::write(up_write, answer.as_ptr() as *const c_void, 1);
                     libc::_exit(0);
                 }

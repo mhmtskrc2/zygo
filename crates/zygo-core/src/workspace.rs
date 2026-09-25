@@ -381,7 +381,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         // `'2'` is a symlink; `'1'` is a hard link. Both are ways to name a
         // file outside the directory without the path itself saying so.
-        for kind in [b'2', b'1'] {
+        for kind in *b"21" {
             let err = unpack(&hostile("link", b"", kind), dir.path()).expect_err("a link entry");
             assert!(
                 format!("{err}").contains("files and directories only"),

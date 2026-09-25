@@ -160,7 +160,7 @@ jobs:
       - name: Isolation and limits
         run: |
           . poc/ci_cgroup.sh
-          install -m 0755 target/release/zygo poc/zygo-linux
+          install -m 0755 target/release/zygo poc/zygo-linux-musl
           if [ "${{ matrix.privilege }}" = root ]; then
             sudo -E sh poc/verify_launcher.sh
           else
@@ -181,7 +181,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           . poc/ci_cgroup.sh
-          install -m 0755 target/release/zygo poc/zygo-linux
+          install -m 0755 target/release/zygo poc/zygo-linux-musl
           sh poc/escape_suite.sh
         env:
           ZYGO_DATA_HOME: /tmp/zygo-ci
@@ -227,7 +227,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           . poc/ci_cgroup.sh
-          install -m 0755 target/release/zygo poc/zygo-linux
+          install -m 0755 target/release/zygo poc/zygo-linux-musl
           # Not fatal: `passt` is not packaged before Ubuntu 23.04, and the
           # suite has a prerequisite check that skips the egress section and
           # says so. A failed `apt-get` here ended the whole step instead,
@@ -272,7 +272,7 @@ jobs:
       - name: Registry credentials
         if: ${{ !cancelled() && matrix.os == 'ubuntu-24.04' && matrix.privilege == 'rootless' }}
         run: |
-          install -m 0755 target/release/zygo poc/zygo-linux
+          install -m 0755 target/release/zygo poc/zygo-linux-musl
           make verify-login-linux
 
       - name: Examples
@@ -479,7 +479,10 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Let unprivileged user namespaces mount
         run: |
