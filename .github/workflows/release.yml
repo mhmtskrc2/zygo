@@ -320,6 +320,17 @@ jobs:
           docker build -f packaging/oci/Dockerfile \
             -t "zygo:${{ matrix.arch }}" packaging/oci
 
+      # The runner's Docker uses the systemd cgroup driver, which takes a
+      # slice rather than a path for `--cgroup-parent`, so the container in
+      # `verify_oci.sh` never starts. Back to cgroupfs, as CI does.
+      - name: Docker with the cgroupfs driver
+        run: |
+          cfg=$(sudo cat /etc/docker/daemon.json 2>/dev/null || echo '{}')
+          echo "$cfg" | jq '. + {"exec-opts": ["native.cgroupdriver=cgroupfs"]}' \
+            | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+          docker info --format 'cgroup driver: {{.CgroupDriver}}'
+
       # It has to run before it is pushed. Not the full suite — that is CI's
       # job — but the image's own contract: a non-root user, `/healthz`, and
       # the four programs egress needs.
