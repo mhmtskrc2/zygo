@@ -45,7 +45,7 @@ jobs:
       CARGO_DENY_VERSION: "0.20.2"
       CARGO_DENY_SHA256: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install cargo-deny
         run: |
           name="cargo-deny-$CARGO_DENY_VERSION-x86_64-unknown-linux-musl"
@@ -79,7 +79,7 @@ jobs:
     timeout-minutes: 30
     name: unit (${{ matrix.label }})
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           components: clippy, rustfmt
@@ -153,7 +153,7 @@ jobs:
     timeout-minutes: 20
     name: msrv (rust-version)
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Read rust-version from Cargo.toml
         id: msrv
         run: |
@@ -193,7 +193,7 @@ jobs:
     timeout-minutes: 30
     name: launcher (${{ matrix.os }}, ${{ matrix.privilege }})
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
@@ -364,7 +364,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
@@ -408,7 +408,7 @@ jobs:
     timeout-minutes: 30
     name: static (${{ matrix.target }})
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: ${{ matrix.target }}
@@ -422,7 +422,7 @@ jobs:
       - name: It must be static, and inside the size budget
         run: sh tests/linux/check_dist.sh target/${{ matrix.target }}/release/zygo
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: zygo-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/zygo
@@ -453,7 +453,7 @@ jobs:
     timeout-minutes: 30
     name: unprivileged container
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
@@ -564,7 +564,7 @@ jobs:
     timeout-minutes: 30
     name: kubernetes (kind)
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: x86_64-unknown-linux-musl
@@ -585,7 +585,7 @@ jobs:
           install -m 0755 "$binary" packaging/oci/zygo
           docker build -f packaging/oci/Dockerfile -t zygo:ci packaging/oci
 
-      - uses: helm/kind-action@a1b0e391336a6ee6713a0583f8c6240d70863de3 # v1
+      - uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1
         with:
           config: examples/kubernetes/kind.yaml
           cluster_name: zygo
@@ -686,8 +686,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3    # for the non-native architecture
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v3    # for the non-native architecture
       - run: python3 tools/gen_syscall_tables.py
       - name: The committed tables must match
         run: |
@@ -700,7 +700,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: What is still unverified
         run: |
           echo "KVM (the vm backend, PoC 8): $([ -e /dev/kvm ] && echo present || echo ABSENT)"

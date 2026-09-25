@@ -26,7 +26,7 @@ jobs:
       MDBOOK_VERSION: v0.5.4
       MDBOOK_SHA256: 5222beabd3e37dc5be0d18ff99b79058469354db5c220153a1b92db5ba12be89
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install mdBook
         run: |
           curl -fsSL -o mdbook.tar.gz \
