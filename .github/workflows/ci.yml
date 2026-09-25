@@ -528,12 +528,17 @@ jobs:
 
       - run: kind load docker-image zygo:ci --name zygo
 
-      # The example, with two edits a cluster of one node needs: the image
-      # this job built, and one replica rather than two.
+      # The example, with two edits a cluster of one node needs — the image
+      # this job built, and one replica rather than two — and the two values
+      # every operator fills in. The placeholder key is refused, as it should
+      # be, and the supervisor does not start with it.
       - name: Apply the example
         run: |
+          key=$(packaging/oci/zygo secrets keygen 2>/dev/null)
           sed -e 's|ghcr.io/mhmtskrc2/zygo:latest|zygo:ci|' \
               -e 's|replicas: 2|replicas: 1|' \
+              -e "s|replace-me-with-zygo-secrets-keygen|$key|" \
+              -e "s|replace-me-with-32-random-bytes|$(openssl rand -hex 32)|" \
               examples/kubernetes/deployment.yaml > /tmp/zygo.yaml
           kubectl apply -f /tmp/zygo.yaml
           kubectl -n zygo rollout status deployment/zygo --timeout=5m
