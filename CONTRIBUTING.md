@@ -117,6 +117,25 @@ alike. The ones a first pull request most often trips on:
 By sending a pull request you agree that your contribution is licensed under
 the [Apache License 2.0](LICENSE), the same as the rest of the project.
 
+## Maintainers
+
+Zygo has one maintainer, named in [`.github/CODEOWNERS`](.github/CODEOWNERS).
+That is a risk worth stating plainly: if the maintainer stops, so does the
+project, until someone forks it. Three things reduce that risk:
+
+* **Every decision is written down.** The book is the source of truth and
+  each design decision has an ADR in [`docs/book/adr/`](docs/book/adr/),
+  so a new maintainer inherits the reasoning, not only the code.
+* **The licence lets anyone continue it.** Apache-2.0, with no contributor
+  agreement beyond the sentence above, so a fork needs nobody's permission.
+* **A second maintainer is the goal, not a rule.** Anyone whose pull
+  requests land regularly and who wants the role will be offered commit
+  access, and named in `CODEOWNERS` and here.
+
+Until then, the maintainer decides what goes in, in the open, on the issue
+or pull request, and says why. A disagreement about design goes into an ADR
+so the answer outlives the thread.
+
 ## Conduct
 
 Everyone taking part is expected to follow the

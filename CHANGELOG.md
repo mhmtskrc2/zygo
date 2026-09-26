@@ -109,6 +109,9 @@ break things and will say so here.
   Vercel, Cloudflare, Docker's own — sit on the map, what a session is
   against a call, and when to pick which. The README named three of them
   and the book had one sentence.
+- `SUPPORT.md`: where to ask, and what a useful report contains.
+  `CONTRIBUTING.md` says who maintains the project, what the risk of one
+  maintainer is, and how a second one is added.
 - The examples suite (`make examples-go-linux`) now runs the web-api example
   end to end: `zygo up`, `zygo serve --runtime`, `zygo api`, the stdlib web
   server, and the four answers its README prints.
