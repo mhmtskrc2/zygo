@@ -51,6 +51,22 @@ break things and will say so here.
 
 ### Fixed
 
+- A sandbox whose `setgroups` file could not be written no longer fails one
+  line later with "the kernel refused the group namespace mapping"; the error
+  now names `setgroups`, the file that was refused.
+- The book agrees with itself and the code again: chapter 10 counted 19
+  escape vectors where the suite attempts 20; chapter 15 quoted venv build
+  times from the retired Docker Desktop VM; chapter 13's multi-tenant example
+  still imported `zygo` rather than `zygo_sdk`; chapter 11's `doctor --fix`
+  table described the machine-wide sysctl where the fix installs an AppArmor
+  profile for the `zygo` binary first; chapter 25 listed x86_64 as unmeasured
+  under its own x86_64 table; chapter 12 sent `--isolation` to the jails
+  chapter; the README's `zygo exec` comment quoted the API's 1.4 ms for a CLI
+  call that measures 2.8 ms. SECURITY.md no longer recommends `isolation =
+  "vm"` without saying what the `vm` backend is today.
+- Chapter 10 places Sandlock and Zeroboot, two 2026 projects that fork a
+  warm process per call, on the map, and chapter 23 lists the
+  tenant-against-tenant vectors the escape suite does not attempt yet.
 - **Warm functions and runtime pools:** a request that goes over `mem` is
   now killed alone. The limit and the group kill used to sit on the
   function's cgroup, one budget for the zygote and every request at once, so

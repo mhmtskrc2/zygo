@@ -85,8 +85,12 @@ range is missing, each of which weakens a boundary.
 
 ## Hardening the deployment
 
-* Prefer `isolation = "vm"` for code you did not write. The `ns` backend leans
-  on one kernel and does not hide it.
+* The `ns` backend leans on one kernel and does not hide it. For code that is
+  hostile rather than semi-trusted, the wall is `isolation = "vm"` — today
+  one-shot only, without a network or a warm path, and in a `make vm-build`
+  binary on a host with KVM ([chapter 23](docs/book/23-security.md#the-vm-backend-today)).
+  Until that is more, the honest answer for anonymous code is a separate
+  machine.
 * Keep `network = "none"` unless a function genuinely needs egress, and keep the
   `allow` list to the hosts it needs.
 * Do not run Zygo as root. It does not need it, and `pasta`, `newuidmap` and the

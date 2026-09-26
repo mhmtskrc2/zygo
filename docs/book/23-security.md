@@ -209,6 +209,25 @@ syscall named in the tables below is refused.
 | Using a resolver of one's own to dodge the allowlist | DNS is forced to one address; port 53 to anything else is rejected | **attempted** |
 | Reaching a service the host bound to `127.0.0.1` only, through the sandbox's own loopback or the gateway address | `pasta` is started with `--tcp-ns none --udp-ns none --no-map-gw`: it neither splices the sandbox's loopback ports through to the host's nor answers for the gateway itself. Before 0.1.4 both were on by default, and an `allow` rule for any name on port *N* also opened the host's `127.0.0.1:N`; below Linux 6.7, every loopback port | **attempted** (case 19: under `egress` with the port allowed, under `full`, and by the gateway address with `--allow-private-net`; a host whose gateway reflects loopback ports back on its own, as a Lima VM's does, skips the last) |
 
+## Vectors: tenant against tenant
+
+A runtime pool is one sandbox for many tenants: its zygotes are shared, and
+every process inside runs as one uid. The rows the suite attempts today are
+about one request reaching the traces of another. The rows it does not yet
+attempt are listed too, because a multi-tenant claim that rests on
+construction alone is not a tested one; [the roadmap](../../ROADMAP.md)'s
+phase 5 is that work.
+
+| Vector | Control | Status |
+|---|---|---|
+| Listing or reading another request's workspace in a shared pool | `/work` is a tmpfs of Zygo's own, mode 0311, one folder with a random name per request | **attempted** (case 14b) |
+| A file left in the temp folder for the next tenant's request | each request's `TMPDIR` is its own folder under `/work` (above) | **attempted** (case 18) |
+| Tenant A running or reading tenant B's script in the same pool | scripts are bound read-only under `/run/script/<digest>` | **not yet attempted** |
+| Tenant A reading tenant B's secret file while both requests are in flight | secret files are written per request, mode 0400, and removed after | **not yet attempted** as a cross-tenant case |
+| Tenant A reaching tenant B's process through `/proc/<pid>` in a shared pool | one pid namespace and one uid for the whole pool; what one fork may read of another is what this row would test | **not yet attempted** |
+| Tenant A reaching a service tenant B started on the pool's loopback | one network namespace for the whole pool | **not yet attempted** |
+| Tenant A at its `pids` limit, with a full scratch or a spinning CPU, slowing tenant B | per-tenant cgroups under `zygo.slice/tenants/<id>` | **not measured**: no bound on B's 1-in-100 time is published |
+
 ## Vectors: secrets and the supervisor
 
 | Vector | Control | Status |

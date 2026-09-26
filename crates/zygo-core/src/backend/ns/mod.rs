@@ -911,8 +911,16 @@ fn write_id_maps(pid: u32, uid_map: &str, gid_map: &str) -> Result<()> {
     }
 
     // `setgroups` must be denied before `gid_map` can be written by an
-    // unprivileged process.
-    let _ = std::fs::write(format!("/proc/{pid}/setgroups"), "deny");
+    // unprivileged process. A failure here used to be ignored, and surfaced
+    // one line later as a refused `gid_map` — a symptom pointing at the
+    // wrong file.
+    std::fs::write(format!("/proc/{pid}/setgroups"), "deny").map_err(|e| {
+        Error::primitive(
+            "write setgroups",
+            "the kernel refused to deny setgroups in the user namespace; run `zygo doctor`",
+            e,
+        )
+    })?;
 
     // Without the helpers exactly one entry may be written: the caller's own.
     // Which line that is depends on the sandbox user — see `identity_line`.

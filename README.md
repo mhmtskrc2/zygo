@@ -10,7 +10,7 @@ the web at [mhmtskrc2.github.io/zygo](https://mhmtskrc2.github.io/zygo/).*
 
 ```bash
 zygo serve ./handler.py --name resize        # a warm zygote: ~150 ms, once
-zygo exec resize '{"url": "..."}'            # a fresh, sandboxed process: 1.4 ms
+zygo exec resize '{"url": "..."}'            # a fresh, sandboxed process: 2.8 ms (1.4 by API)
 zygo exec resize '{"url": "..."}'            # and again, from the same clean copy
 ```
 
@@ -56,6 +56,7 @@ and forks it per request.
 | nono, sandbox-runtime | confinement for a command you were running anyway (Landlock and seccomp, or bubblewrap and Seatbelt) | a sandbox with its own root filesystem and limits, for code you did not write |
 | kern | a daemonless, rootless container per call, in a few ms | a warm interpreter: no interpreter start and no imports on the request path |
 | E2B, Modal, Daytona | a microVM per session, in their cloud | runs on your hardware, and costs a fork rather than a VM per call |
+| Sandlock, Zeroboot | a copy-on-write fork of a Landlock-confined process, or of a Firecracker snapshot | a fork that lands in a sandbox with its own root, pid namespace, cgroup and network — and the tenants, secrets and API around it |
 
 [Similar projects](docs/book/10-similar-projects.md) compares each of them,
 flag by flag, with measurements against nsjail and kern.

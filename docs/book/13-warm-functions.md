@@ -505,7 +505,8 @@ one-shot mapping is one sandbox per event. The warm mapping is **one warm
 zygote per script version**, forked per run, and it looks like this:
 
 ```python
-import hashlib, zygo
+import hashlib
+import zygo_sdk as zygo
 
 client = zygo.connect()                      # zygo api --allow-deploy, in the VM on a Mac
 

@@ -37,19 +37,21 @@ call, on the right the program is already loaded and only copied.
   run the request            run the request
   tear it all down
 
-  most tools work here       `docker exec`, warm-exec    only Zygo `exec` works here
+  most tools work here       `docker exec`, warm-exec    Zygo `exec`; Sandlock, Zeroboot
   slowest per call                                       fastest per call
 ```
 
 | Wall ↓ · Ready on arrival → | nothing: build it all | the sandbox: enter it | the program: fork it |
 |---|---|---|---|
-| **Virtual machine** | Firecracker, Kata, microsandbox, Zygo `vm` | — | Firecracker from a memory snapshot (a whole VM per restore) |
+| **Virtual machine** | Firecracker, Kata, microsandbox, Zygo `vm` | — | Firecracker from a memory snapshot (a whole VM per restore); Zeroboot (a copy-on-write fork of one) |
 | **Second kernel** | gVisor, Zygo `gvisor` | — | — |
 | **Host kernel** | Docker, Podman, runc, nsjail, bubblewrap, firejail, minijail, kern, Zygo `run` | `docker exec` (state is shared), Zygo warm-exec | **Zygo `exec`** |
-| **Process confinement only** | nono, Landlock-based tools: they confine a process you already run | | |
+| **Process confinement only** | nono, Landlock-based tools: they confine a process you already run | | Sandlock (a copy-on-write fork of a confined Python process) |
 
-The right-hand column is almost empty, and that is the space Zygo was built
-for. Everything else on this page is a good tool for a nearby job.
+The right-hand column was empty when Zygo started, and it is the space Zygo
+was built for. Since 2026 two more projects fork there, each from a different
+row: [Sandlock and Zeroboot](#sandlock-and-zeroboot-two-other-forks), below.
+Everything else on this page is a good tool for a nearby job.
 
 ## What one call costs, tool by tool
 
@@ -228,7 +230,7 @@ you did not. This is what you get with no flags at all.
 | Memory, CPU, pids, wall clock | **unlimited** | **all mandatory**: `mem` 256M, `cpu` 1.0, `pids` 64, `timeout` 30s, `nofile` 1024 |
 | Bind mounts | `-v` is **rw** unless `:ro` | `--mount` is **ro** unless `:rw` |
 | cgroupfs inside | mounted read-only | not mounted at all, so `release_agent` is not reachable |
-| Escape suite | — | 19 escape vectors attempted on every change, 0 escaping |
+| Escape suite | — | 20 escape vectors attempted on every change, 0 escaping |
 
 A *denylist* names what is forbidden and allows the rest; an *allowlist*
 names what is allowed and forbids the rest. `release_agent` is an old cgroup
@@ -449,7 +451,8 @@ Docker, Firecracker, gVisor and Lambda are the landmarks; they are not the
 shortlist. Someone looking for "run this agent's code somewhere safe" ends up
 comparing Zygo with three much closer projects: kern, nono and microsandbox.
 In two of the three cases the honest answer is that they solve a different
-problem. Their claims below are theirs, not measured here, and all three move
+problem. Two more, [Sandlock and Zeroboot](#sandlock-and-zeroboot-two-other-forks),
+fork a warm process as Zygo does and have a section of their own below. Their claims below are theirs, not measured here, and all three move
 quickly.
 
 | | [kern](https://github.com/getkern/kern) | [nono](https://nono.sh) | [microsandbox](https://github.com/superradcompany/microsandbox) | **Zygo** |
@@ -554,6 +557,41 @@ minute from your own users' scripts, Zygo's is the faster one, and
 Zygo's `vm` backend is also, today, much less than microsandbox: it boots a
 guest and runs one-shot sandboxes, and warm functions and networking inside
 the guest are not built; [ADR 0002](adr/0002-warm-paths-stay-on-ns.md) says why.
+
+## Sandlock and Zeroboot: two other forks
+
+Two projects from 2026 fork a warm process for each call, as `zygo exec` does.
+Each does it from a different row of the map. Their numbers below are their
+own claims, from their pages, not measured here.
+
+**Sandlock** (Multikernel) confines a process with Landlock and seccomp — no
+namespaces, no cgroups, no image. Its template mode starts a Python process
+once, lets it run its `init()`, then forks it for each call: about 0.7 ms a
+clone by its own figures, with the interpreter's state and imported modules
+shared copy-on-write. It is a library with Rust, Python and Go bindings, a
+CLI, and a shim that lets it stand in as an OCI runtime; its README names
+Linux 6.12 for the current release. On the map it is the bottom row: the
+clone runs as you, in your filesystem narrowed by Landlock, with no root of
+its own, no pid namespace and no cgroup. Zygo's fork lands in a sandbox with
+its own root, its own pid namespace, a cgroup and a deadline per request, and
+the supervisor, tenants, secrets and HTTP API around it.
+
+**Zeroboot** snapshots a Firecracker microVM with the runtime loaded and maps
+the snapshot's memory copy-on-write for every new VM: 0.79 ms usually and
+1.74 ms for 1 in 100 by its own figures, each fork a VM with a kernel of its
+own. A fork has no network — serial I/O only — and one vCPU; it needs KVM,
+and the project calls itself a working prototype that is not production-
+hardened. It is the top row's answer to the same question, and the one to
+watch for T3 code, where Zygo has only a one-shot `vm` today.
+
+```text
+  Sandlock clone                  Zygo exec                       Zeroboot fork
+  ──────────────                  ─────────                       ─────────────
+  fork a confined process         fork a sandboxed zygote         fork a VM snapshot
+  Landlock + seccomp              namespaces, cgroup, seccomp,    KVM, own kernel
+  your files, narrowed            Landlock; own root, own pids    no network, 1 vCPU
+  ~0.7 ms (its claim)             1.4 ms (measured, chapter 25)   0.8 ms (its claim)
+```
 
 ## gVisor
 
@@ -817,6 +855,8 @@ A run now starts 4 processes, down from 13 at the worst.
 | minijail | host kernel | no | some | no | usually | OS services |
 | kern | host kernel | OCI | cgroups | no | no | fast throwaway boxes |
 | nono | host kernel (Landlock) | no | no | n/a | no | confining an agent |
+| Sandlock | host kernel (Landlock, seccomp) | no | some, through seccomp notification (its claim) | **yes**, of a confined process | no | forking a warm Python without a container |
+| Zeroboot | VM | a snapshot | the VM's | **yes**, of a VM snapshot | KVM access | sub-millisecond VMs for hostile code; a prototype |
 | gVisor | second kernel | OCI | cgroups | no | no, in rootless mode (how Zygo runs it); then its cgroup limits are advisory | safer containers |
 | microsandbox | VM | OCI | the VM's | no (snapshots) | no | hostile code |
 | Firecracker | VM | no (a disk image) | the VM's | no (snapshots) | KVM access | serverless platforms |

@@ -517,7 +517,9 @@ has the worked example of a multi-tenant consumer on the warm path.
   and a `429` answer past it.
 - Receive-side bandwidth shaping (limiting how fast data comes *in*). It needs
   an `ifb` device the test hosts do not have.
-- Any timing on x86_64, as said [above](#two-things-to-know-about-these-machines).
+- x86_64 on a machine of the project's own. The one x86_64 record is from a
+  shared GitHub runner, a cross-check and not a publication, as said
+  [above](#two-things-to-know-about-these-machines).
 
 ## Reproducing them
 

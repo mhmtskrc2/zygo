@@ -131,9 +131,9 @@ packages apart from the system's. Zygo builds one from your
 `requirements.txt`, **inside a sandbox**, with the image's own `pip`. That is
 the only way to be sure the packages match the Python that will run them. The
 venv is mounted read-only at `/venv`, with `/venv/bin` first on `PATH`. On the
-Docker Desktop VM used for the measurements, the first build took about
-4 seconds and a second function reusing it about 0.1 seconds
-([chapter 25](25-performance.md) has the numbers and the machine).
+Lima VM, the first build of `requests` took about 2.5 seconds, and every
+later run found the built venv in a millisecond or two
+([chapter 25](25-performance.md#dependencies) has the numbers and the machine).
 
 ## System packages: `system`
 

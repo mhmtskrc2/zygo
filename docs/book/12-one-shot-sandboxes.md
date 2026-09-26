@@ -161,7 +161,7 @@ A limit cannot be switched off unless you also pass `--allow-unlimited`.
 
 | Flag | What it chooses |
 |---|---|
-| `--isolation ns\|gvisor\|vm` | The *backend*: the kind of wall around the program. `ns` is the default. See [chapter 9](09-jails.md). |
+| `--isolation ns\|gvisor\|vm` | The *backend*: the kind of wall around the program. `ns` is the default. See [chapter 6](06-how-zygo-works.md#three-backends-one-command) for how each works and [chapter 16](16-production.md#choosing-an-isolation-backend) for choosing. |
 | `--seccomp default\|strict\|permissive` | Which list of system calls is allowed. See [chapter 24](24-seccomp-profiles.md). |
 | `--net none\|egress\|full\|host` | The network. `none` is the default. |
 | `--allow HOST:PORT` | With `--net egress`, one name and port the program may reach. Repeatable. |

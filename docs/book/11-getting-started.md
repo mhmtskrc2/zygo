@@ -391,7 +391,7 @@ zygo doctor --fix --yes     # the same, without asking
 
 | What it can fix | What it does | Needs root |
 |---|---|---|
-| The AppArmor block on user namespaces | Sets `kernel.apparmor_restrict_unprivileged_userns=0` now and in a file under `/etc/sysctl.d/`, so it stays after a reboot. **Machine-wide.** | yes, through `sudo` |
+| The AppArmor block on user namespaces | Installs an AppArmor profile, `/etc/apparmor.d/zygo`, that lets the `zygo` binary alone create user namespaces; the restriction stays on for every other program. Only where AppArmor cannot load a profile: sets `kernel.apparmor_restrict_unprivileged_userns=0` now and in a file under `/etc/sysctl.d/`, so it stays after a reboot — **machine-wide** in that case | yes, through `sudo` |
 | No cgroup delegation | Writes `~/.config/systemd/user/user@.service.d/delegate.conf` and reloads your systemd user manager | no |
 | Missing `pasta` or `nft` | Installs the `passt` and `nftables` packages with apt, dnf, pacman or apk | yes, through `sudo` |
 | The AppArmor profile that blocks `pasta` | Runs `aa-complain` on the `pasta` profile, so it logs instead of blocks | yes, through `sudo` |
