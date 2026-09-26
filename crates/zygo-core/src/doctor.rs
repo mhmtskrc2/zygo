@@ -1425,12 +1425,7 @@ mod probe {
     }
 
     fn which(bin: &str) -> Option<String> {
-        std::env::var_os("PATH").and_then(|paths| {
-            std::env::split_paths(&paths)
-                .map(|d| d.join(bin))
-                .find(|p| p.is_file())
-                .map(|p| p.display().to_string())
-        })
+        crate::paths::which(bin).map(|p| p.display().to_string())
     }
 }
 

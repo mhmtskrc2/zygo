@@ -133,6 +133,9 @@ break things and will say so here.
 
 ### Fixed
 
+- The `cargo check` for the musl target warned twice about `libc::time_t`,
+  which the libc crate has deprecated on musl; the timestamp cast no longer
+  names it.
 - Python SDK: the README's async example imported `zygo.aio`, a module that
   does not exist; it now imports `zygo_sdk`. Docstring cross-references named
   `zygo.` instead of `zygo_sdk.`.

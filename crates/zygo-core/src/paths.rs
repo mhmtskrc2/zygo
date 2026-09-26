@@ -20,6 +20,18 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{IoContext, Result};
 
+/// The first regular file named `program` on `PATH`, like `which(1)`.
+///
+/// One definition for the whole workspace: the network setup, the doctor and
+/// the macOS shim all ask the same question, and four private copies of it
+/// drifted in how they treated an empty `PATH`.
+pub fn which(program: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(program))
+        .find(|candidate| candidate.is_file())
+}
+
 /// Resolved directory layout. Construct once and pass down; tests build one
 /// rooted at a `tempfile::TempDir`.
 #[derive(Debug, Clone)]

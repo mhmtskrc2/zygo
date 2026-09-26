@@ -51,6 +51,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, IoContext, Result};
+use crate::paths::which;
 use crate::spec::{AllowRule, HostPattern, Network};
 
 /// Where a `full` sandbox sends DNS. `pasta` intercepts this address and
@@ -466,14 +467,6 @@ fn missing(binary: &'static str, package: &str) -> Error {
              `sudo dnf install {package}`), or use `network = \"none\"`"
         ),
     }
-}
-
-fn which(binary: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|d| d.join(binary))
-            .find(|p| p.is_file())
-    })
 }
 
 /// The last non-empty line of a program's stderr, for an error message.

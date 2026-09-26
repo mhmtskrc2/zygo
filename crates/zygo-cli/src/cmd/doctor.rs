@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 use zygo_core::doctor::{self, Status};
+use zygo_core::paths::which;
 use zygo_core::spec::Isolation;
 
 use crate::cli::Cli;
@@ -414,13 +415,6 @@ fn run_command(command: &doctor::fix::Command) -> anyhow::Result<()> {
         command.display()
     );
     Ok(())
-}
-
-fn which(program: &str) -> Option<std::path::PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|d| d.join(program))
-        .find(|p| p.is_file())
 }
 
 fn is_root() -> bool {

@@ -34,6 +34,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use zygo_core::paths::which;
 use zygo_core::spec::Mount;
 
 use crate::cli::{AgentCommand, Cli, Command};
@@ -1592,13 +1593,6 @@ fn exit_status(status: &std::process::ExitStatus) -> u8 {
 }
 
 #[cfg(target_os = "macos")]
-fn which(binary: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(binary))
-        .find(|candidate| candidate.is_file())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

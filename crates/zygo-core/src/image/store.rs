@@ -911,11 +911,11 @@ fn keep_times(path: &Path, md: &std::fs::Metadata) {
     };
     let times = [
         libc::timespec {
-            tv_sec: md.atime() as libc::time_t,
+            tv_sec: md.atime() as _,
             tv_nsec: md.atime_nsec() as _,
         },
         libc::timespec {
-            tv_sec: md.mtime() as libc::time_t,
+            tv_sec: md.mtime() as _,
             tv_nsec: md.mtime_nsec() as _,
         },
     ];
