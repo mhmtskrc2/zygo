@@ -242,9 +242,10 @@ pub fn wanted_member(path: &Path) -> bool {
 ///
 /// The archive is a zstd-compressed tar of around 300 MB unpacked, so it is
 /// *streamed* rather than held in memory. The decoder is the one the image
-/// store already uses for zstd layers.
+/// store already uses for zstd layers, with the same window limit: the
+/// archive is written with a 128 MiB window, over ruzstd's own default.
 pub fn extract_release(archive: impl std::io::Read, dir: &Path) -> Result<PathBuf> {
-    let decoder = ruzstd::decoding::StreamingDecoder::new(archive)
+    let decoder = crate::image::media::zstd_decoder(archive)
         .map_err(|e| unpack_error(format!("the archive is not zstd: {e}")))?;
     extract_release_from_tar(decoder, dir)
 }

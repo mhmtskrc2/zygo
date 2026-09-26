@@ -174,6 +174,30 @@ impl ImageConfig {
     }
 }
 
+/// The widest zstd window a stream Zygo unpacks may ask for: 256 MiB.
+///
+/// A zstd frame names the window the decoder must hold in memory. ruzstd 0.9
+/// refuses anything over 100 MiB by default, which is the right instinct for
+/// an untrusted stream — the window is an allocation the sender chooses — but
+/// too tight for what actually arrives here: the gVisor release archive is
+/// written with a 128 MiB window, and `zstd --long` produces the same. So the
+/// limit is raised, once, to a number that fits those and still bounds a
+/// hostile layer at a quarter of a gigabyte rather than at "whatever the
+/// header says".
+pub const MAX_ZSTD_WINDOW: u64 = 256 << 20;
+
+/// A streaming zstd decoder over `source` that accepts windows up to
+/// [`MAX_ZSTD_WINDOW`]. The one place the limit is chosen, so the image
+/// store and the gVisor installer cannot disagree about it.
+pub fn zstd_decoder<R: std::io::Read>(
+    source: R,
+) -> std::result::Result<
+    ruzstd::decoding::StreamingDecoder<R, ruzstd::decoding::FrameDecoder>,
+    ruzstd::decoding::errors::FrameDecoderError,
+> {
+    ruzstd::decoding::StreamingDecoder::new_with_max_window_size(source, MAX_ZSTD_WINDOW)
+}
+
 /// Whether a layer's media type is one Zygo can unpack, and how it is
 /// compressed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,6 +316,26 @@ mod tests {
             ],
         };
         assert_eq!(idx.available(), ["linux/amd64", "linux/arm64/v8"]);
+    }
+
+    #[test]
+    fn a_zstd_frame_with_a_128_mib_window_is_accepted() {
+        use std::io::Read;
+        // A complete zstd frame: magic, a frame header whose window descriptor
+        // (exponent 17, mantissa 0) declares 2^27 = 128 MiB, and one empty raw
+        // block marked last. That is the window the gVisor release archive
+        // uses; ruzstd's default limit (100 MiB) rejects it at `new`.
+        let frame: [u8; 9] = [0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x88, 0x01, 0x00, 0x00];
+        assert!(
+            ruzstd::decoding::StreamingDecoder::new(&frame[..]).is_err(),
+            "the default limit should reject this frame, or the helper is redundant"
+        );
+        let mut out = Vec::new();
+        zstd_decoder(&frame[..])
+            .expect("a 128 MiB window is within MAX_ZSTD_WINDOW")
+            .read_to_end(&mut out)
+            .expect("an empty raw block decodes to nothing");
+        assert!(out.is_empty());
     }
 
     #[test]
