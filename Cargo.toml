@@ -23,7 +23,7 @@ toml = "0.8"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 # Secrets at rest. RustCrypto, pure Rust, and the same family as
 # `sha2` above — a cipher is the one thing this project will not write itself,
@@ -34,7 +34,7 @@ hex = "0.4"
 # C and assembly. It builds statically against musl — the release checks that
 # — so the rule is "no C this project adds by choice", not "no C at all".
 chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
-base64 = "0.22"
+base64 = "0.23"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net", "process", "signal", "time", "sync"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 # The HTTP API. hyper is already in the tree through reqwest, so the server
@@ -46,7 +46,7 @@ bytes = "1"
 futures-util = "0.3"
 tar = "0.4"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-ruzstd = "0.7"
+ruzstd = "0.9"
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 clap_complete = "4"
 anyhow = "1"

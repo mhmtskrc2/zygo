@@ -18,7 +18,7 @@
 # `zygo doctor` names each one when it is missing. See `docs/book/16-production.md`
 # ("Inside a container") and `examples/kubernetes/`.
 
-FROM alpine:3.21
+FROM alpine:3.24
 
 # `pasta`, `nft`, `tc`: `network = "egress"` is the only feature with
 #   userland dependencies, and a host without them refuses egress with a

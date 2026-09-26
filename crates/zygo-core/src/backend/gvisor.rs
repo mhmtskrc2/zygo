@@ -244,7 +244,7 @@ pub fn wanted_member(path: &Path) -> bool {
 /// *streamed* rather than held in memory. The decoder is the one the image
 /// store already uses for zstd layers.
 pub fn extract_release(archive: impl std::io::Read, dir: &Path) -> Result<PathBuf> {
-    let decoder = ruzstd::StreamingDecoder::new(archive)
+    let decoder = ruzstd::decoding::StreamingDecoder::new(archive)
         .map_err(|e| unpack_error(format!("the archive is not zstd: {e}")))?;
     extract_release_from_tar(decoder, dir)
 }

@@ -230,7 +230,7 @@ impl Store {
             LayerCompression::None => extract_tar(file, &dir),
             LayerCompression::Gzip => extract_tar(flate2::read::GzDecoder::new(file), &dir),
             LayerCompression::Zstd => {
-                let dec = ruzstd::StreamingDecoder::new(file)
+                let dec = ruzstd::decoding::StreamingDecoder::new(file)
                     .map_err(|e| ImageError::unpack_with("zstd", e))?;
                 extract_tar(dec, &dir)
             }

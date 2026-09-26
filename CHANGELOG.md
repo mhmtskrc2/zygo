@@ -33,6 +33,7 @@ break things and will say so here.
 
 ### Changed
 
+- The container image is built on Alpine 3.24 (was 3.21).
 - The kernel-level test suites moved from `poc/` to `tests/linux/`, the
   Phase 0 proofs of concept to `tests/poc/`, and the syscall table generator
   to `tools/`. The `make` targets are unchanged, except the one named after
