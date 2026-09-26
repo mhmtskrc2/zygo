@@ -1,5 +1,7 @@
 # ADR 0003 — No Deno or Bun agent until an embedder asks
 
+*A record of the decision as it was taken; the numbers in it are as of its date. Today's numbers are in [chapter 25](../25-performance.md).*
+
 **Status:** accepted, 2026-09-22. Records the decision taken in Phase 3 of
 [the roadmap](../../../ROADMAP.md), and what would reopen it.
 

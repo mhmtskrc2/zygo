@@ -35,7 +35,8 @@ of itself with `fork()`, and the copy runs your handler once and exits.
 
 ## Why this is the production shape
 
-A one-shot sandbox (`zygo run`) costs about 12 ms, and most of that is setup.
+A one-shot sandbox (`zygo run`) costs about 12 ms with Python in it: about
+3.6 ms is the sandbox itself, the rest is Python starting.
 A warm function pays the setup once and then costs about **1.4 ms** a
 request: that is the median overhead measured on a 2-vCPU Lima VM on an Apple
 M1 Max ([chapter 25](25-performance.md)). The gap is easy to miss. `zygo run`

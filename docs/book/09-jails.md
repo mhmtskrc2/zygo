@@ -1,4 +1,4 @@
-# 8. FreeBSD jails, and Zygo
+# 9. FreeBSD jails, and Zygo
 
 Linux was not first. FreeBSD had a working "container" in 2000, thirteen years
 before Docker, and many ideas in this book are easier to see there.

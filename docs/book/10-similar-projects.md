@@ -65,21 +65,25 @@ before the request.
                           1 ms          10 ms         100 ms        1 s
                           │·············│·············│·············│
 Zygo exec (warm fork)     ██                                           1.4 ms
-Zygo run                  ███████████████                              12 ms
-nsjail, bubblewrap, kern  ████████████████▒▒▒▒▒▒                       ~15–40 ms
+Zygo run, nsjail, kern    ███████████████▒▒▒▒▒▒                        12–40 ms
 gVisor                    █████████████████████████▒▒▒▒▒▒              ~60–160 ms
 Firecracker microVM       ██████████████████████████████▒▒▒▒           ~140–250 ms
 docker run                ███████████████████████████████████▒▒▒▒▒▒▒   300–1000 ms
 ```
 
-Only the two Zygo rows are measured by this project: `zygo exec` is the warm
-path's median, and `zygo run` is the median of `python3 -c pass` with the
-image already pulled ([chapter 25](25-performance.md)). The other rows are
-rough ranges — each project's own claims or common measurements, plus Python's
-start-up — and are here to show the *order of size*, not exact numbers. The
-lesson is in the shape: the one-shot tools cluster together, because they all
-pay for building a sandbox and starting Python, and only a warm fork leaves
-that cluster.
+The Zygo numbers are measured by this project: `zygo exec` is the warm
+path's median, and `zygo run` the median of `python3 -c pass` with the image
+already pulled ([chapter 25](25-performance.md)). The one-shot row is one
+cluster on purpose. `zygo run` is not drawn faster than nsjail or kern,
+because it is not: inside Windmill, nsjail and Zygo in its place cost the
+same 19–20 ms per job ([measured below](#measured-zygo-against-nsjail-and-kern)),
+and on the Raspberry Pi `kern box` and `zygo run` tied
+([chapter 25](25-performance.md#a-second-host-with-kern-in-it)).
+The light part of that bar is where the same tools land with a heavier
+script or an older kernel. The rows below it are each project's own claims,
+here to show the *order of size*. The lesson is in the shape: the one-shot
+tools cluster together, because they all pay for building a sandbox and
+starting Python, and only a warm fork leaves that cluster.
 
 ## The request path
 
@@ -121,7 +125,9 @@ memory layout, a socket opened at import time, a literal `/tmp/...` path.
 The first row is the whole argument. A container's cost is the machinery
 around it and the cold start of the interpreter. Zygo takes the machinery off
 the request path entirely, and it pays the interpreter's start only once, in
-a warm zygote.
+a warm zygote. That is not a new observation: SOCK (USENIX ATC 2018) and
+Catalyzer (ASPLOS 2020) made the same one for serverless platforms, with a
+zygote and a snapshot respectively ([chapter 6](06-how-zygo-works.md#the-idea-of-a-zygote)).
 
 The three Zygo columns are three answers to "what is warm?". `zygo run` keeps
 nothing warm. A **pool** keeps the interpreter and its dependencies warm, but

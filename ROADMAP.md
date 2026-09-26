@@ -34,8 +34,9 @@ What an embedder asks for, in the order they ask:
 **Phase 5 — multi-tenant hardening.** Done when the threat model has no
 "untested" row for a multi-tenant claim.
 
-- Refuse to start multi-tenant without uid separation, instead of running
-  "degraded".
+- ~~Refuse to start multi-tenant without uid separation, instead of running
+  "degraded".~~ Done: a tenant cannot be registered on a host without a
+  subordinate uid range unless `ZYGO_ALLOW_SHARED_UID=1` says so.
 - Tenant-against-tenant escape cases: A tries B's script, secret file,
   scratch, `/proc/<pid>` and loopback, each proving the positive path first.
 - Resource isolation with a stated bound: a tenant at its pid limit, with a
@@ -60,9 +61,11 @@ Zygo in production for user scripts and says so.
   frozen, a deprecation window of two minor versions.
 
 **Open source.** A contributor guide, a changelog, templates, supply-chain
-checks and the book as a website are in; still to come are a
-`.devcontainer`, a WSL2 page, an AppArmor profile for Ubuntu, and the
-benchmark load generator with its raw results in the repository.
+checks, the book as a website, a `.devcontainer`, a WSL2 page
+([chapter 11](docs/book/11-getting-started.md#on-windows-through-wsl2)), an
+AppArmor profile for Ubuntu (`packaging/apparmor/`) and the raw benchmark
+records (`bench/results/`) are in; still to come is the benchmark load
+generator itself.
 
 ## Not planned
 

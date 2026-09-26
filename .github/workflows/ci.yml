@@ -104,6 +104,16 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
       - run: cargo test --workspace
+      # The library as an embedder gets it, with no feature on: the `vm`
+      # feature is off by default and a `cfg(feature)` that only ever compiled
+      # one way is a build nobody has tried.
+      - run: cargo test -p zygo-core --no-default-features
+
+      # The two SDKs against their stand-in API. Both have Python and Node on
+      # every runner in this matrix; the release workflow runs the same suite
+      # again before it publishes them.
+      - name: SDK tests
+        run: make test-sdk
 
       - name: Python agent unit tests
         run: python3 -W error::ResourceWarning -m unittest discover -s agents/python

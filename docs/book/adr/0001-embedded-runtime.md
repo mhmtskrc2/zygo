@@ -1,5 +1,7 @@
 # ADR 0001 — Zygo is the embedded script runtime
 
+*A record of the decision as it was taken; the numbers in it are as of its date. Today's numbers are in [chapter 25](../25-performance.md).*
+
 **Status:** accepted, 2026-09-21. This is the decision
 [the roadmap](../../../ROADMAP.md) is the plan for; the roadmap
 says *what* and *when*, and this says *who for* and *what that costs*.

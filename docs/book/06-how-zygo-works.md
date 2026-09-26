@@ -34,7 +34,10 @@ capability, installs Landlock and seccomp, and calls `execve`. There is no
 daemon, no RPC, and no container record. When the program exits, the kernel
 removes the namespaces and the tmpfs, Zygo removes the cgroup, and nothing
 is left to clean up. With the image already pulled, this takes a median of
-12 ms on a Linux 6.8 VM.
+12 ms on a Linux 6.8 VM. That is `python3 -c pass`. The 70.8 ms on the
+README's table is the same command running a script that imports sixteen
+modules: the sandbox costs the same 3.6 ms, and the rest is Python doing the
+imports — the work a warm function does once ([chapter 25](25-performance.md)).
 
 ```text
   docker run                                   zygo run
@@ -56,6 +59,15 @@ copy-on-write. Zygo applies the same trick to a sandbox. The expensive part of
 running a Python function is not the sandbox, it is Python itself — starting
 the interpreter and importing modules often takes hundreds of milliseconds.
 So Zygo does that once, inside the sandbox, and forks the result.
+
+The same idea reached serverless before Zygo. SOCK (Oakes et al., *SOCK:
+Rapid Task Provisioning with Serverless-Optimized Containers*, USENIX ATC
+2018) forks Python handlers from a zygote that has already imported their
+packages, and Catalyzer (Du et al., *Catalyzer: Sub-millisecond Startup for
+Serverless Computing with Initialization-less Booting*, ASPLOS 2020) restores
+a function from a snapshot instead of starting it. Zygo's contribution is the
+packaging — one static binary, rootless, every limit on, an agent protocol any
+language can speak — not the idea.
 
 ## The warm path
 

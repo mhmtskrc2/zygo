@@ -1,4 +1,4 @@
-# 21. Environment variables, files and exit codes
+# 21. Environment, files and exit codes
 
 Everything Zygo reads from its environment, everything it writes to disk, and
 every way it can end. Written from the code; if you script around Zygo, this
@@ -16,6 +16,7 @@ is the chapter to keep open.
 | `ZYGO_API_URL` | SDKs | Where the API is: `unix:///path`, `http://host:port` or `host:port`. | `http://127.0.0.1:7700` |
 | `ZYGO_SECRETS_KEY` | supervisor | The 32-byte key of the secret store, as 64 hex characters or base64. | none: secret routes refused |
 | `ZYGO_SECRETS_KEY_FILE` | supervisor | A file holding that key. Setting both is an error. | |
+| `ZYGO_ALLOW_SHARED_UID` | supervisor | `1` lets tenants be registered on a host whose user has no subordinate uid range, where every tenant's sandbox runs as the same host uid. Without it, `POST /tenants` is refused there ([chapter 23](23-security.md#hardening-your-deployment)). | unset: refused |
 | `ZYGO_BYTECODE` | image store | `0` turns off the Python bytecode layer. | on |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `zygo api` | Same as `--otlp-endpoint`. | |
 | `OTEL_EXPORTER_OTLP_HEADERS` | `zygo api` | Extra headers for OTLP, as `key=value,key=value`. | |

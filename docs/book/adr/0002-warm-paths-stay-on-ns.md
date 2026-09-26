@@ -1,5 +1,7 @@
 # ADR 0002 — Warm functions stay on `ns`; `vm` and `gvisor` stay one-shot
 
+*A record of the decision as it was taken; the numbers in it are as of its date. Today's numbers are in [chapter 25](../25-performance.md).*
+
 **Status:** accepted, 2026-09-21. Supersedes the "not built yet" wording in
 [`docs/comparison.md`](../10-similar-projects.md), the backends' own refusal messages
 and the `## Status` section of the README.

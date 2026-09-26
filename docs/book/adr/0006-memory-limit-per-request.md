@@ -1,5 +1,7 @@
 # ADR 0006 — The memory limit is each request's, not the function's
 
+*A record of the decision as it was taken; the numbers in it are as of its date. Today's numbers are in [chapter 25](../25-performance.md).*
+
 **Status:** accepted, 2026-09-26. Prompted by a defect found in the Lima VM
 (kernel 6.8) with two runtime pools at default limits.
 

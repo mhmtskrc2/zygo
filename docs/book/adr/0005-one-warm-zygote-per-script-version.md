@@ -1,5 +1,7 @@
 # ADR 0005 — One warm zygote per script version, and what evicts it
 
+*A record of the decision as it was taken; the numbers in it are as of its date. Today's numbers are in [chapter 25](../25-performance.md).*
+
 **Status:** accepted, 2026-09-23. Answers the open question the first adoption
 report — a consumer's own write-up, not in this repository — ends on, with numbers from
 `tests/linux/bench_density.py` on the 2-core, 4 GB Lima VM.

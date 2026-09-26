@@ -124,7 +124,7 @@ least two characters of `a-z 0-9 + . -`, optionally followed by
 | Field | Values | Default | What it does |
 |---|---|---|---|
 | `isolation` | `ns` \| `gvisor` \| `vm` | `ns` | Where the wall is ([chapter 6](06-how-zygo-works.md#three-backends-one-command)). `ns` is the only backend with warm functions and networking; `gvisor` (after `zygo backend install gvisor`) and `vm` run one-shot sandboxes and refuse the rest with a reason. |
-| `seccomp` | `default` \| `strict` \| `permissive` | `default` for a function, **`strict` for a pool** | The syscall allowlist ([seccomp profiles](24-seccomp-profiles.md)). A pool with anything but `strict` gets a warning, because its zygotes are shared between tenants. |
+| `seccomp` | `default` \| `strict` \| `permissive` | `default` for a function, **`strict` for a pool** | The syscall allowlist ([seccomp profiles](24-seccomp-profiles.md)). A pool with anything but `strict` gets a warning, because its zygotes are shared between tenants. Chapter 23's T2 — contracted customers' code — is `strict`, set here. |
 
 ## Limits
 

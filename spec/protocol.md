@@ -1,6 +1,10 @@
 # Zygo warm execution protocol — v1
 
-Status: **draft**, implemented by `zygo-core` and by the reference Python agent.
+Status: **v1, in use**. Implemented by `zygo-core` and by the reference
+Python and Node agents (`agents/`), with a complete agent in POSIX sh under
+`examples/agents/sh/`. The additions 1.1 to 1.5 — a script-carrying `EXEC`,
+`CANCEL`, streamed `CHUNK`s, `PING` ids and `workspace` — are optional
+fields and messages on the same `proto: 1`; [§5](#5-versioning) says why.
 
 This is the contract between the **supervisor** (on the host) and a **runtime
 agent** (inside the sandbox). It is deliberately small and language independent:

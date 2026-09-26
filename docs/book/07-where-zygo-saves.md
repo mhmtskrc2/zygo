@@ -28,9 +28,10 @@ blocks.
 `runc`, with a socket or a new process at each step, and each of them keeps
 its own records. `zygo run` is one process that makes the syscalls itself.
 There is nothing to ask and nothing to wait for. This alone takes a one-shot
-sandbox from hundreds of milliseconds down to about 12 ms, of which most is
-the namespace set, the cgroup and the mounts — work the kernel has to do
-whoever asks for it.
+sandbox from hundreds of milliseconds down to about 12 ms with Python in it.
+The sandbox itself — the namespace set, the cgroup and the mounts — is about
+3.6 ms of that, work the kernel has to do whoever asks for it; the other 8 to
+9 ms is Python starting ([chapter 25](25-performance.md#a-one-shot-sandbox)).
 
 ## Saving 2: no container object to create or remove
 

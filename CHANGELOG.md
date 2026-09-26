@@ -7,6 +7,16 @@ break things and will say so here.
 
 ## [Unreleased]
 
+### Security
+
+- A host whose user has no subordinate uid range no longer becomes
+  multi-tenant quietly: `POST /tenants` is refused there, with the fix in
+  the message, unless the supervisor runs with `ZYGO_ALLOW_SHARED_UID=1`.
+  Before, every tenant's sandbox ran as the same host uid and only `zygo
+  doctor` said so.
+- The secret store's key is held once, wiped from memory when the supervisor
+  drops it, and can no longer be copied.
+
 ### Added
 
 - `zygo doctor` has a `systemd OOM policy` check, and `zygo api` warns at
@@ -261,7 +271,12 @@ The first public version.
 - `egress` networking with an allowlist, a resolver of its own, and private
   ranges closed by default.
 - `gvisor` and `vm` backends for one-shot sandboxes.
-- `zygo doctor`, and the book.
+- `zygo doctor`, and the book. `doctor` checks whether cgroup2 is mounted
+  with `favordynmods` (`cgroup moves`), and `doctor --fix` remounts it so,
+  now and at every boot: without it, about 1 warm request in 100 waits
+  several milliseconds to enter its cgroup on Linux 6.0 and later.
+- A warm-exec request is created inside its cgroup (`CLONE_INTO_CGROUP`,
+  Linux 5.7+) rather than moved there, so it never waits on that lock.
 
 [Unreleased]: https://github.com/mhmtskrc2/zygo/compare/v0.1.3...HEAD
 [0.1.3]: https://github.com/mhmtskrc2/zygo/compare/v0.1.2...v0.1.3
