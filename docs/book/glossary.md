@@ -84,4 +84,4 @@ One line each. The chapter in brackets explains the term in full; the numbers fo
 
 ---
 
-← [ADR 0006 — The memory limit is each request's](adr/0006-memory-limit-per-request.md) · [Contents](README.md)
+← [ADR 0007 — A third SDK, in Elixir](adr/0007-elixir-sdk.md) · [Contents](README.md)

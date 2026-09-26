@@ -57,4 +57,5 @@ is the project README.
   - [ADR 0004 — A supervisor upgrade re-warms](book/adr/0004-no-supervisor-reexec.md)
   - [ADR 0005 — One warm zygote per script version](book/adr/0005-one-warm-zygote-per-script-version.md)
   - [ADR 0006 — The memory limit is each request's](book/adr/0006-memory-limit-per-request.md)
+  - [ADR 0007 — A third SDK, in Elixir](book/adr/0007-elixir-sdk.md)
 - [Glossary](book/glossary.md)

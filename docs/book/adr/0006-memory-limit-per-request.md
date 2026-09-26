@@ -71,4 +71,4 @@ wrong process.
 
 ---
 
-← [ADR 0005 — One warm zygote per script version](0005-one-warm-zygote-per-script-version.md) · [Contents](../README.md) · **Next: [Glossary](../glossary.md) →**
+← [ADR 0005 — One warm zygote per script version](0005-one-warm-zygote-per-script-version.md) · [Contents](../README.md) · **Next: [ADR 0007 — A third SDK, in Elixir](0007-elixir-sdk.md) →**
