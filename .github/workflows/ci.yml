@@ -548,6 +548,12 @@ jobs:
       - name: The HTTP API, unprivileged
         # Run even when the suite above failed: they test different things,
         # and one job that reports both is one round trip instead of two.
+        #
+        # ZYGO_ALLOW_SHARED_UID: the container's user has no subordinate uid
+        # range, and since 0.1.4 `POST /tenants` refuses such a host unless the
+        # operator says so. This suite is about the API's tenant logic, not
+        # about uid separation, which `zygo doctor` and the launcher jobs
+        # cover; without the variable it stops at the first tenant.
         if: ${{ !cancelled() }}
         run: |
           docker run --rm \
@@ -557,6 +563,7 @@ jobs:
             --cgroupns=host --cgroup-parent=/zygo-unpriv \
             -v /sys/fs/cgroup/zygo-unpriv:/sys/fs/cgroup/zygo-unpriv:rw \
             -v "$PWD:/src:ro" -e ZYGO_DATA_HOME=/tmp/zdata-api \
+            -e ZYGO_ALLOW_SHARED_UID=1 \
             python:3.12-slim sh /src/tests/linux/verify_api.sh
 
       # The negative half: without the two `--security-opt`s, `zygo doctor`
