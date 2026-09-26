@@ -550,7 +550,7 @@
             "description": "a failure, as JSON with an `error` and often a `code`"
           }
         },
-        "summary": "Prometheus text exposition.",
+        "summary": "Prometheus text exposition. A tenant token sees its own functions' series; the process-wide counters are everybody's.",
         "x-zygo-deploy": false,
         "x-zygo-who": "any"
       }

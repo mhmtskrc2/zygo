@@ -9,6 +9,11 @@ break things and will say so here.
 
 ### Security
 
+- `GET /metrics` no longer shows a tenant token every function name on the
+  host. A tenant token now gets the process-wide counters and the series for
+  its own functions only, the same scope as `GET /fn`; an operator token
+  still sees everything. Metric names are unchanged.
+
 - A warm request no longer finds files the previous request left in its
   temp folder. `/tmp` is one tmpfs per sandbox — per runtime pool, across
   tenants — and nothing cleared it. Both agents now give each request its own
@@ -27,6 +32,10 @@ break things and will say so here.
   (`getppid() == 1`) could never fire inside a new pid namespace.
 
 ### Changed
+
+- CI builds with the `rust-version` the manifest declares and treats a broken
+  rustdoc link as an error; `make lint` does the same. The lint policy is
+  written down in `Cargo.toml`'s `[workspace.lints]`.
 
 - `zygo doctor --fix` on Ubuntu 24.04 installs an AppArmor profile that
   lets the `zygo` binary alone use user namespaces, instead of turning
@@ -47,6 +56,24 @@ break things and will say so here.
 - The seccomp compiler no longer has a length limit near 250 instructions.
 
 ### Added
+
+- SDKs: an `Unavailable` error (Python and Node) for every `503` —
+  dependencies still building, a zygote that failed to warm, or an API that
+  is stopping — with `code` and `retry_after`/`retryAfter`. It was a plain
+  `ZygoError`; it is still a subclass of it.
+- SDKs: opt-in retries. `connect(retries=N, backoff=S)` /
+  `connect(url, { retries, backoff })` resend a `Busy` or `Unavailable`
+  refusal after the server's `Retry-After` (doubling from `backoff`); a
+  handler error, timeout or not-found is never resent. Off by default.
+- Python SDK: the async client now has every method of the sync one —
+  tenants, tokens, secrets, limits, blobs, `drain`, `for_tenant`, and
+  `workspace`/`out` on `call` and `run_script` — with the same names and
+  arguments; `zygo_sdk.aio` is reachable after `import zygo_sdk`.
+- Node SDK: `index.d.ts` now declares every method and option (`stream`,
+  `streamScript`, `cancel`, `drain`, `putBlob`/`blob`/`deleteBlob`,
+  `putDeps`/`deps`/`deleteDeps`; `key`, `signal`, `workspace`, `out`, `deps`,
+  `tenant`, `retries`, `backoff`), and a test fails when a declaration goes
+  missing.
 
 - Chapter 17: adding `zygo mcp` to Claude Code and Codex.
 - Chapter 11: Windows through WSL2 — systemd, cgroup v2 only, then the
@@ -75,6 +102,22 @@ break things and will say so here.
   and the crates current.
 
 ### Fixed
+
+- Python SDK: the README's async example imported `zygo.aio`, a module that
+  does not exist; it now imports `zygo_sdk`. Docstring cross-references named
+  `zygo.` instead of `zygo_sdk.`.
+- Node SDK: a `Retry-After: 0` header was read as 1 second, and streaming
+  calls ignored the header entirely.
+- The docs disagreed with themselves, again: warm-exec is 1.4 ms plus the
+  program's start everywhere (not 2 ms); the `default` seccomp profile is
+  ~215 names, of which 190 exist on aarch64; `vm` has a `scratch`-bounded
+  writable layer and costs about six times `ns`; gVisor runs rootless, with
+  advisory cgroups; bandwidth and disk I/O are the only limits without a
+  default; a re-warm is 150–185 ms, not half a second; `zygo up` never pulls,
+  so chapter 11 pulls first; the Landlock network rules are enforced in CI's
+  `landlock-network` job; the T3 row says what `vm` cannot do yet; `layer` is
+  defined in chapter 17 and the glossary; and "daemonless" says what the
+  supervisor is.
 
 - `system = [...]` builds failed with "Release file … is expired" once the
   package index an image shipped with passed its Valid-Until. Flattening an

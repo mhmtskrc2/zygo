@@ -7,7 +7,7 @@
 //! needs is prose about *why* `?out=1` exists, which no derive produces.
 //!
 //! What keeps a hand-written document from drifting is not discipline — it is
-//! [`tests::every_route_in_the_router_is_in_the_document`], which reads
+//! `tests::every_route_in_the_router_is_in_the_document`, which reads
 //! `api.rs`'s own source with `include_str!`, extracts every arm of the
 //! routing `match`, and fails if one is missing here. Adding a route without
 //! documenting it is a test failure rather than a thing somebody notices in
@@ -52,7 +52,8 @@ pub const ROUTES: &[Route] = &[
     Route {
         method: "get",
         path: "/metrics",
-        summary: "Prometheus text exposition.",
+        summary: "Prometheus text exposition. A tenant token sees its own functions' series; \
+                  the process-wide counters are everybody's.",
         who: "any",
         deploy: false,
     },
