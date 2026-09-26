@@ -88,9 +88,6 @@ libkrun = { git = "https://github.com/containers/libkrun.git", tag = "v1.19.4" }
 # * `rust.missing_docs` — about a quarter of the public items have no doc
 #   comment. Turning it on today would mean a few hundred "the name says it"
 #   lines; it goes on when the pass that writes real ones lands.
-# * `clippy.undocumented_unsafe_blocks` — 187 `unsafe` blocks lack a
-#   `// SAFETY:` comment. Same plan: a later pass adds them, and the lint
-#   then keeps them.
 # * `clippy.unwrap_used`, `expect_used` — `--all-targets` lints the tests,
 #   and a test that cannot `unwrap` is a worse test.
 # * `clippy.mem_forget` — `mem::forget` is used on purpose, where a `Drop`
@@ -113,6 +110,12 @@ unused_import_braces = "warn"
 dbg_macro = "warn"
 todo = "warn"
 unimplemented = "warn"
+# Every `unsafe` block and `unsafe impl` carries a `// SAFETY:` comment that
+# says which invariant makes it sound — which pointer is live, which
+# descriptor is owned, why a fork child may call it. Most of the sites are
+# Linux-only, so `make lint` on a Mac sees a fraction of them; CI's Linux
+# clippy job is the one that enforces this.
+undocumented_unsafe_blocks = "warn"
 
 [profile.release]
 lto = "thin"

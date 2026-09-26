@@ -1247,6 +1247,10 @@ mod tests {
     fn every_missing_secret_is_named_at_once_and_no_value_is_echoed() {
         // Serialised through an environment variable this test owns; the
         // names are chosen so no real shell would have them.
+        // SAFETY: `set_var` races only with a C `getenv` on another thread;
+        // Rust's own `std::env` readers take the same lock. Not verified in
+        // this pass: cargo runs tests on several threads, and no audit was made
+        // of libc calls in this suite that read the environment.
         unsafe { std::env::set_var("ZYGO_TEST_SECRET_PRESENT", "hunter2") };
         let err = secrets_from_env(&[
             "ZYGO_TEST_SECRET_PRESENT".into(),
@@ -1271,6 +1275,7 @@ mod tests {
 
         let values = secrets_from_env(&["ZYGO_TEST_SECRET_PRESENT".into()]).expect("present");
         assert_eq!(values["ZYGO_TEST_SECRET_PRESENT"], "hunter2");
+        // SAFETY: as above.
         unsafe { std::env::remove_var("ZYGO_TEST_SECRET_PRESENT") };
     }
 

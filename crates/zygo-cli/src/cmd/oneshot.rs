@@ -493,6 +493,10 @@ mod tests {
         assert!(!quick.timed_out, "a prompt child was called slow");
         assert_eq!(quick.exit_code, 0, "{quick:?}");
 
+        // SAFETY: `set_var` races only with a C `getenv` on another thread;
+        // Rust's own `std::env` readers take the same lock. Not verified in
+        // this pass: cargo runs tests on several threads, and no audit was made
+        // of libc calls in this suite that read the environment.
         unsafe { std::env::set_var("ZYGO_TEST_SLEEP", "30") };
         let slow = run(
             &exe,

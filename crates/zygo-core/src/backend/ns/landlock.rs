@@ -431,6 +431,9 @@ pub unsafe fn apply(ruleset: &Ruleset) -> Result<(), std::io::Error> {
         core::mem::size_of::<u64>()
     };
 
+    // SAFETY: `attr` is a live local of the kernel's layout (`repr(C)`, two
+    // `u64`s), and `attr_size` is either its full size or the one-field size an
+    // older ABI expects; the kernel reads no further.
     let ruleset_fd = unsafe {
         libc::syscall(
             SYS_LANDLOCK_CREATE_RULESET,
@@ -447,6 +450,8 @@ pub unsafe fn apply(ruleset: &Ruleset) -> Result<(), std::io::Error> {
     for rule in &ruleset.rules {
         // `O_PATH` opens the object without reading it, which is all a rule
         // needs and is permitted even where `open` for read would not be.
+        // SAFETY: `rule.path` is a NUL-terminated `CString` the ruleset owns;
+        // `open` only reads it.
         let fd = unsafe { libc::open(rule.path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
         if fd < 0 {
             // A path the image does not have needs no rule; skipping it is
@@ -457,13 +462,20 @@ pub unsafe fn apply(ruleset: &Ruleset) -> Result<(), std::io::Error> {
         // Only known once the path is open: the plan names targets, and a
         // bind mount's target is whatever its source is. A failed `fstat`
         // keeps the rights as they were, which is what happened before.
+        // SAFETY: all-zero bytes are a valid `stat`: plain data the kernel
+        // fills in.
         let mut st: libc::stat = unsafe { core::mem::zeroed() };
+        // SAFETY: `fd` was just opened here and `st` is a live local for the
+        // call.
         let is_dir = unsafe { libc::fstat(fd, &mut st) } != 0
             || (st.st_mode & libc::S_IFMT) == libc::S_IFDIR;
         let beneath = PathBeneathAttr {
             allowed_access: rights_for(rule.rights, is_dir),
             parent_fd: fd,
         };
+        // SAFETY: `beneath` is a live local of the kernel's packed layout
+        // (`repr(C, packed)`, 12 bytes), `ruleset_fd` was created above, and
+        // `fd` is open for the call.
         let rc = unsafe {
             libc::syscall(
                 SYS_LANDLOCK_ADD_RULE,
@@ -473,9 +485,13 @@ pub unsafe fn apply(ruleset: &Ruleset) -> Result<(), std::io::Error> {
                 0usize,
             )
         };
+        // SAFETY: `fd` is this function's own descriptor, and the kernel has
+        // taken its own reference for the rule.
         unsafe { libc::close(fd) };
         if rc != 0 {
             let err = std::io::Error::last_os_error();
+            // SAFETY: `ruleset_fd` was created by this function and is not used
+            // after the error.
             unsafe { libc::close(ruleset_fd) };
             return Err(err);
         }
@@ -486,6 +502,8 @@ pub unsafe fn apply(ruleset: &Ruleset) -> Result<(), std::io::Error> {
             allowed_access: rule.rights,
             port: u64::from(rule.port),
         };
+        // SAFETY: `attr` is a live local of the kernel's layout (`repr(C)`, two
+        // `u64`s) and `ruleset_fd` was created above.
         let rc = unsafe {
             libc::syscall(
                 SYS_LANDLOCK_ADD_RULE,
@@ -497,12 +515,18 @@ pub unsafe fn apply(ruleset: &Ruleset) -> Result<(), std::io::Error> {
         };
         if rc != 0 {
             let err = std::io::Error::last_os_error();
+            // SAFETY: `ruleset_fd` was created by this function and is not used
+            // after the error.
             unsafe { libc::close(ruleset_fd) };
             return Err(err);
         }
     }
 
+    // SAFETY: `landlock_restrict_self` takes the descriptor this function
+    // created and a flags word; it touches no memory.
     let rc = unsafe { libc::syscall(SYS_LANDLOCK_RESTRICT_SELF, ruleset_fd, 0usize) };
+    // SAFETY: `ruleset_fd` is this function's own descriptor and is not used
+    // again; the kernel keeps the ruleset.
     unsafe { libc::close(ruleset_fd) };
     if rc != 0 {
         return Err(std::io::Error::last_os_error());
@@ -682,6 +706,8 @@ mod tests {
         } else {
             8
         };
+        // SAFETY: `attr` is a live local of the kernel's layout and `size` is
+        // the one this ABI accepts.
         let ruleset = unsafe {
             libc::syscall(
                 SYS_LANDLOCK_CREATE_RULESET,
@@ -692,12 +718,15 @@ mod tests {
         };
         assert!(ruleset >= 0, "{}", std::io::Error::last_os_error());
         let path = CString::new(file.path().as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `path` is a NUL-terminated `CString` alive for the call.
         let fd = unsafe { libc::open(path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
         let add = |rights: u64| {
             let beneath = PathBeneathAttr {
                 allowed_access: rights,
                 parent_fd: fd,
             };
+            // SAFETY: `beneath` is a live local of the kernel's packed layout,
+            // and `ruleset` and `fd` are descriptors this test opened above.
             unsafe {
                 libc::syscall(
                     SYS_LANDLOCK_ADD_RULE,
@@ -719,6 +748,8 @@ mod tests {
             "{}",
             std::io::Error::last_os_error()
         );
+        // SAFETY: both descriptors were opened by this test and are not used
+        // again.
         unsafe {
             libc::close(fd);
             libc::close(ruleset as i32);

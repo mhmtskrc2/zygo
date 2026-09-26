@@ -27,10 +27,10 @@ pub struct Pty {
 
 /// Allocate a pty.
 pub fn open() -> std::io::Result<Pty> {
-    // SAFETY: both out-parameters are valid for the duration of the call, and
-    // the remaining three are the documented "use the defaults" nulls.
     let mut master: RawFd = -1;
     let mut slave: RawFd = -1;
+    // SAFETY: both out-parameters are live locals for the duration of the call,
+    // and the remaining three are the documented "use the defaults" nulls.
     let rc = unsafe {
         libc::openpty(
             &mut master,
@@ -47,9 +47,11 @@ pub fn open() -> std::io::Result<Pty> {
         return Err(std::io::Error::last_os_error());
     }
 
-    // SAFETY: `openpty` succeeded, so both are fresh owned descriptors.
     Ok(Pty {
+        // SAFETY: `openpty` succeeded, so this is a fresh descriptor nobody
+        // else holds.
         master: unsafe { OwnedFd::from_raw_fd(master) },
+        // SAFETY: as above.
         slave: unsafe { OwnedFd::from_raw_fd(slave) },
     })
 }
@@ -57,9 +59,12 @@ pub fn open() -> std::io::Result<Pty> {
 /// Copy the caller's terminal size onto the pty, so the sandbox sees the same
 /// geometry. Without this, full-screen programs draw at 80×24 regardless.
 pub fn copy_window_size(from: RawFd, to: RawFd) {
+    // SAFETY: all-zero bytes are a valid `winsize`: plain data the ioctl fills
+    // in.
     let mut size: libc::winsize = unsafe { core::mem::zeroed() };
     // SAFETY: `winsize` is the struct both ioctls expect.
     if unsafe { libc::ioctl(from, libc::TIOCGWINSZ, &mut size) } == 0 {
+        // SAFETY: `size` is a live local of the struct `TIOCSWINSZ` reads.
         unsafe { libc::ioctl(to, libc::TIOCSWINSZ, &size) };
     }
 }
@@ -78,17 +83,23 @@ pub struct RawMode {
 
 impl RawMode {
     pub fn enable(fd: RawFd) -> std::io::Result<Option<RawMode>> {
+        // SAFETY: `isatty` takes a descriptor and touches no memory.
         if unsafe { libc::isatty(fd) } != 1 {
             return Ok(None); // not a terminal: nothing to put into raw mode
         }
 
+        // SAFETY: all-zero bytes are a valid `termios`: plain data `tcgetattr`
+        // fills in.
         let mut original: libc::termios = unsafe { core::mem::zeroed() };
+        // SAFETY: `original` is a live local for the call.
         if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
 
         let mut raw = original;
+        // SAFETY: `raw` is a live local; `cfmakeraw` only rewrites its fields.
         unsafe { libc::cfmakeraw(&mut raw) };
+        // SAFETY: `raw` is a live local `tcsetattr` only reads.
         if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -102,6 +113,8 @@ impl RawMode {
 
 impl Drop for RawMode {
     fn drop(&mut self) {
+        // SAFETY: `original` was filled in by `tcgetattr` on this descriptor
+        // and is a live field for the call.
         unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.original) };
         forget(self.fd);
     }
@@ -176,6 +189,8 @@ pub fn relay(master: OwnedFd) -> std::thread::JoinHandle<()> {
 
         // Caller's input → sandbox. A separate thread because a blocking read
         // on stdin must not hold up output.
+        // SAFETY: `dup` returns a fresh descriptor nobody else holds, or -1,
+        // which `OwnedFd` treats as an error on use rather than as memory.
         let writer = unsafe { OwnedFd::from_raw_fd(libc::dup(master_fd)) };
         std::thread::spawn(move || {
             let mut input = std::io::stdin();
@@ -219,6 +234,7 @@ mod tests {
         let slave = pty.slave.as_raw_fd();
 
         assert_ne!(master, slave);
+        // SAFETY: `isatty` takes a descriptor and touches no memory.
         assert_eq!(unsafe { libc::isatty(slave) }, 1, "the slave must be a tty");
     }
 
@@ -248,11 +264,15 @@ mod tests {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
+        // SAFETY: `want` is a live local of the struct the ioctl reads.
         unsafe { libc::ioctl(a.slave.as_raw_fd(), libc::TIOCSWINSZ, &want) };
 
         copy_window_size(a.slave.as_raw_fd(), b.slave.as_raw_fd());
 
+        // SAFETY: all-zero bytes are a valid `winsize`: plain data the ioctl
+        // fills in.
         let mut got: libc::winsize = unsafe { core::mem::zeroed() };
+        // SAFETY: `got` is a live local for the call.
         unsafe { libc::ioctl(b.slave.as_raw_fd(), libc::TIOCGWINSZ, &mut got) };
         assert_eq!((got.ws_row, got.ws_col), (40, 132));
     }
@@ -275,7 +295,10 @@ mod tests {
     }
 
     fn lflags(fd: RawFd) -> libc::tcflag_t {
+        // SAFETY: all-zero bytes are a valid `termios`: plain data `tcgetattr`
+        // fills in.
         let mut t: libc::termios = unsafe { core::mem::zeroed() };
+        // SAFETY: `t` is a live local for the call.
         assert_eq!(unsafe { libc::tcgetattr(fd, &mut t) }, 0);
         t.c_lflag & MEANINGFUL
     }
@@ -347,9 +370,14 @@ mod tests {
 
         // Change it by hand; `restore_all` must now leave it alone, because
         // nothing in this process is holding it raw.
+        // SAFETY: all-zero bytes are a valid `termios`: plain data `tcgetattr`
+        // fills in.
         let mut raw: libc::termios = unsafe { core::mem::zeroed() };
+        // SAFETY: `raw` is a live local for the call.
         assert_eq!(unsafe { libc::tcgetattr(fd, &mut raw) }, 0);
+        // SAFETY: `raw` is a live local; `cfmakeraw` only rewrites its fields.
         unsafe { libc::cfmakeraw(&mut raw) };
+        // SAFETY: `raw` is a live local `tcsetattr` only reads.
         assert_eq!(unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) }, 0);
         let deliberate = lflags(fd);
 
@@ -379,14 +407,21 @@ mod tests {
 
         let second = open().expect("openpty");
         assert_eq!(
+            // SAFETY: both are descriptors this test owns; `stale`'s previous
+            // file is closed by the `dup2`, and `first` is not used again.
             unsafe { libc::dup2(second.master.as_raw_fd(), stale) },
             stale
         );
         let fd = second.slave.as_raw_fd();
 
+        // SAFETY: all-zero bytes are a valid `termios`: plain data `tcgetattr`
+        // fills in.
         let mut raw: libc::termios = unsafe { core::mem::zeroed() };
+        // SAFETY: `raw` is a live local for the call.
         assert_eq!(unsafe { libc::tcgetattr(fd, &mut raw) }, 0);
+        // SAFETY: `raw` is a live local; `cfmakeraw` only rewrites its fields.
         unsafe { libc::cfmakeraw(&mut raw) };
+        // SAFETY: `raw` is a live local `tcsetattr` only reads.
         assert_eq!(unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) }, 0);
         let deliberate = lflags(fd);
 
@@ -423,9 +458,12 @@ mod tests {
     #[test]
     fn a_pipe_is_not_put_into_raw_mode() {
         let mut fds = [0 as RawFd; 2];
+        // SAFETY: `pipe` writes two descriptors into a live two-element array.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
         let guard = RawMode::enable(fds[0]).unwrap();
         assert!(guard.is_none(), "a pipe has no terminal settings to change");
+        // SAFETY: both descriptors were made by the `pipe` above and are not
+        // used again.
         unsafe {
             libc::close(fds[0]);
             libc::close(fds[1]);

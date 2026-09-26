@@ -299,6 +299,7 @@ pub struct PreparedLaunch {
 // reads. The supervisor keeps one per warm-exec function and uses it from
 // whichever thread a request arrives on.
 unsafe impl Send for PreparedLaunch {}
+// SAFETY: as above: shared across threads, the struct is only ever read.
 unsafe impl Sync for PreparedLaunch {}
 
 /// One request's argv: the plan's, with something on the end.
@@ -325,6 +326,7 @@ impl RequestArgv<'_> {
 // SAFETY: as for `PreparedLaunch` — the pointers point into heap buffers this
 // struct and the plan it borrows own and never mutate after construction.
 unsafe impl Send for RequestArgv<'_> {}
+// SAFETY: as above: shared across threads, the struct is only ever read.
 unsafe impl Sync for RequestArgv<'_> {}
 
 impl PreparedLaunch {

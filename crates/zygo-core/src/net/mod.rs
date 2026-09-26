@@ -1027,6 +1027,10 @@ pub(crate) mod linux {
         }
         if pid == 0 {
             // The child. Any failure is an exit code; the parent reports it.
+            // SAFETY: the child side of the fork, as the comment above says:
+            // `setns`, `socket`, `bind`, `sendmsg` and `_exit` on descriptors
+            // and a `sockaddr` computed before the fork; it allocates nothing
+            // and never returns.
             unsafe {
                 if libc::setns(user, 0) != 0 || libc::setns(net, 0) != 0 {
                     libc::_exit(2);

@@ -46,11 +46,15 @@ const SYS_PIVOT_ROOT: libc::c_long = if cfg!(target_arch = "aarch64") {
 pub unsafe fn child_main(plan: &PreparedLaunch, ready_fd: c_int, err_fd: c_int) -> ! {
     // 0. Die with the parent — asked for first, before anything can happen
     //    that the parent's death should interrupt.
+    // SAFETY: `prctl` with constant arguments touches no memory and is
+    // async-signal-safe, which is all this side of the clone may call.
     unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) };
 
     // 1. Wait for the parent to write the id maps. Until they exist this
     //    process has no valid uid and cannot mount anything.
     let mut signal = [0u8; 1];
+    // SAFETY: `ready_fd` is owned by this child (the caller's contract) and the
+    // read lands in a one-byte local that outlives the call.
     let n = unsafe { libc::read(ready_fd, signal.as_mut_ptr() as *mut c_void, 1) };
     if n != 1 {
         fail(err_fd, Step::WaitForIdMaps);
@@ -72,13 +76,19 @@ pub unsafe fn child_main(plan: &PreparedLaunch, ready_fd: c_int, err_fd: c_int) 
         events: 0,
         revents: 0,
     };
+    // SAFETY: `pfd` is a live local for the whole call, and `poll` is
+    // async-signal-safe.
     if unsafe { libc::poll(&mut pfd, 1, 0) } > 0 && pfd.revents & libc::POLLHUP != 0 {
         fail_with(err_fd, Step::ParentDied, libc::ESRCH);
     }
+    // SAFETY: `ready_fd` is this child's own descriptor and is never used
+    // again.
     unsafe { libc::close(ready_fd) };
 
     // 2. The mount plan.
     for op in &plan.ops {
+        // SAFETY: `apply`'s contract is this function's: child side of the
+        // clone, `op` prepared before it, `err_fd` owned here.
         unsafe { apply(op, err_fd) };
     }
 
@@ -88,16 +98,22 @@ pub unsafe fn child_main(plan: &PreparedLaunch, ready_fd: c_int, err_fd: c_int) 
     //    the same point, so it can be detached immediately. The alternative
     //    needs a spare directory inside the image to hold the old root, which
     //    a read-only image may not have.
+    // SAFETY: `newroot` is a NUL-terminated `CString` the plan owns for as long
+    // as this child runs.
     if unsafe { libc::chdir(plan.newroot.as_ptr()) } != 0 {
         fail(err_fd, Step::PivotRoot);
     }
     let dot = c".".as_ptr();
+    // SAFETY: `pivot_root` by number; `dot` is a NUL-terminated literal the
+    // kernel only reads.
     if unsafe { libc::syscall(SYS_PIVOT_ROOT, dot, dot) } != 0 {
         fail(err_fd, Step::PivotRoot);
     }
+    // SAFETY: `umount2` reads the same literal and takes a constant flag.
     if unsafe { libc::umount2(dot, MNT_DETACH) } != 0 {
         fail(err_fd, Step::UnmountOldRoot);
     }
+    // SAFETY: `chdir` on a NUL-terminated literal.
     if unsafe { libc::chdir(c"/".as_ptr()) } != 0 {
         fail(err_fd, Step::PivotRoot);
     }
@@ -113,13 +129,20 @@ pub unsafe fn child_main(plan: &PreparedLaunch, ready_fd: c_int, err_fd: c_int) 
     //    to start this sandbox on the client's behalf, and collapsing them
     //    into one would send a program's stderr down its caller's stdout.
     if let Some(fds) = plan.stdio_streams {
+        // SAFETY: `adopt_streams`' contract holds: child side, three
+        // descriptors the plan says this child owns, all at 3 or above (checked
+        // by the supervisor before the plan was built).
         unsafe { adopt_streams(fds, err_fd) };
     } else if let Some(fd) = plan.stdio {
+        // SAFETY: `adopt_terminal`'s contract holds: child side, a descriptor
+        // the plan says this child owns.
         unsafe { adopt_terminal(fd, err_fd) };
     }
     //    And the caller's signal dispositions, when the program is being
     //    started for somebody else.
     if let Some(mask) = plan.ignored_signals {
+        // SAFETY: `signal` and `sigprocmask` are async-signal-safe, and this
+        // process has exactly one thread.
         unsafe { reset_signals(mask) };
     }
 
@@ -127,22 +150,31 @@ pub unsafe fn child_main(plan: &PreparedLaunch, ready_fd: c_int, err_fd: c_int) 
     //    name it. `execve` would otherwise close it: Rust marks sockets
     //    close-on-exec, and the whole point is for the agent to inherit it.
     if let Some(fd) = plan.agent_fd {
+        // SAFETY: `place_agent_socket`'s contract holds: child side, a
+        // descriptor the plan says this child owns.
         unsafe { place_agent_socket(fd, err_fd) };
     }
 
     // 6. Identity of the sandbox as seen from inside.
     let host = plan.hostname.as_bytes();
+    // SAFETY: `sethostname` reads exactly `host.len()` bytes of a string the
+    // plan owns for the life of this child.
     if unsafe { libc::sethostname(host.as_ptr() as *const c_char, host.len()) } != 0 {
         // A sandbox with the wrong hostname still runs correctly; not fatal.
     }
 
     if plan.bring_up_loopback {
+        // SAFETY: `bring_up_loopback`'s contract holds: child side, syscalls
+        // only.
         unsafe { bring_up_loopback(err_fd) };
     }
 
+    // SAFETY: `workdir` is a NUL-terminated `CString` the plan owns for the
+    // life of this child.
     if unsafe { libc::chdir(plan.workdir.as_ptr()) } != 0 {
         // The image may not have the configured working directory; `/` always
         // exists and is a better outcome than refusing to start.
+        // SAFETY: `chdir` on a NUL-terminated literal.
         if unsafe { libc::chdir(c"/".as_ptr()) } != 0 {
             fail(err_fd, Step::Chdir);
         }
@@ -155,16 +187,24 @@ pub unsafe fn child_main(plan: &PreparedLaunch, ready_fd: c_int, err_fd: c_int) 
     //     drop. See `hand_out_secrets_dir` for why a descriptor rather than a
     //     path.
     if let Some(sock) = plan.secrets_fd {
+        // SAFETY: `hand_out_secrets_dir`'s contract holds: child side, and
+        // `sock` is the plan's descriptor for this child.
         unsafe { hand_out_secrets_dir(sock, err_fd) };
     }
 
     // 7–10. Limits, privilege, Landlock and seccomp.
+    // SAFETY: `harden`'s contract is this function's: child side, plan prepared
+    // before the clone.
     unsafe { harden(plan, err_fd) };
 
     // 11. Hand the sandbox over — to the program, or to a loop that keeps it.
     if plan.hold {
+        // SAFETY: `hold`'s contract holds: child side, and it never returns.
         unsafe { hold(err_fd) }
     }
+    // SAFETY: `exec_or_fail`'s contract holds: `argv()` and the plan's `envp()`
+    // are NUL-terminated pointer arrays built before the clone and owned by the
+    // plan for as long as this child runs.
     unsafe { exec_or_fail(plan, plan.argv(), err_fd) }
 }
 
@@ -184,6 +224,8 @@ pub(super) unsafe fn harden(plan: &PreparedLaunch, err_fd: c_int) {
             rlim_cur: *value as libc::rlim_t,
             rlim_max: *value as libc::rlim_t,
         };
+        // SAFETY: `limit` is a live local and `setrlimit` only reads it;
+        // `resource` is one of the constants the plan was built from.
         if unsafe { libc::setrlimit(*resource as _, &limit) } != 0 {
             fail(err_fd, Step::SetRlimit);
         }
@@ -191,10 +233,13 @@ pub(super) unsafe fn harden(plan: &PreparedLaunch, err_fd: c_int) {
 
     // `no_new_privs` before dropping capabilities: it is what stops a setuid
     // binary inside the image from regaining any of them.
+    // SAFETY: `prctl` with constant arguments; touches no memory.
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
         fail(err_fd, Step::NoNewPrivs);
     }
 
+    // SAFETY: `drop_all_capabilities` is `prctl` and one `capset` on stack
+    // data, all async-signal-safe.
     if plan.drop_capabilities && unsafe { !drop_all_capabilities() } {
         fail(err_fd, Step::DropCapabilities);
     }
@@ -204,6 +249,9 @@ pub(super) unsafe fn harden(plan: &PreparedLaunch, err_fd: c_int) {
     // process is otherwise unconstrained. Both require `no_new_privs`, set
     // just above.
     if !plan.landlock.is_empty()
+        // SAFETY: `landlock::apply`'s contract holds: `no_new_privs` was set
+        // just above, the ruleset is plan data from before the clone, and it
+        // allocates nothing.
         && let Err(e) = unsafe { super::landlock::apply(&plan.landlock) }
     {
         fail_with(err_fd, Step::ApplyLandlock, e.raw_os_error().unwrap_or(0));
@@ -213,6 +261,8 @@ pub(super) unsafe fn harden(plan: &PreparedLaunch, err_fd: c_int) {
     // unprivileged caller) and after every other setup step, because the
     // filter denies most of what those steps needed.
     if !plan.seccomp.is_empty()
+        // SAFETY: `seccomp::install`'s contract holds: `no_new_privs` is set,
+        // `plan.seccomp` outlives the call, and it allocates nothing.
         && let Err(e) = unsafe { super::seccomp::install(&plan.seccomp, plan.seccomp_log) }
     {
         fail_with(err_fd, Step::InstallSeccomp, e.raw_os_error().unwrap_or(0));
@@ -236,6 +286,10 @@ pub(super) unsafe fn exec_or_fail(
     err_fd: c_int,
 ) -> ! {
     for candidate in &plan.program_candidates {
+        // SAFETY: `candidate` is a NUL-terminated `CString`, and `argv` and
+        // `envp()` are NUL-terminated pointer arrays the plan owns; a
+        // successful `execve` replaces this image, and a failed one leaves
+        // every pointer as it was for the next try.
         unsafe { libc::execve(candidate.as_ptr(), argv, plan.envp()) };
     }
     fail(err_fd, Step::Execve);
@@ -265,6 +319,11 @@ pub(super) unsafe fn exec_or_fail(
 /// Child side of the clone: nothing here allocates, and every call is
 /// async-signal-safe.
 unsafe fn hand_out_secrets_dir(sock: std::os::fd::RawFd, err_fd: c_int) {
+    // SAFETY: child side of the clone: `mkdir`, `open`, `close` and `sendmsg`
+    // are async-signal-safe and the path is a literal. `__errno_location` is
+    // this thread's own errno. `send_fd`'s contract holds (a forked child,
+    // stack only), and `sock` and `dir` are descriptors this child owns and
+    // closes exactly once.
     unsafe {
         let path = c"/run/secrets";
         // `EEXIST` is fine and expected on a rewarm into a reused tmpfs.
@@ -302,6 +361,8 @@ unsafe fn hand_out_secrets_dir(sock: std::os::fd::RawFd, err_fd: c_int) {
 /// # Safety
 /// Child side of the clone: nothing here may allocate.
 unsafe fn hold(err_fd: c_int) -> ! {
+    // SAFETY: child side of the clone: `prctl` with constants, `close` on the
+    // descriptor this child owns, and `close_from` is syscalls only.
     unsafe {
         libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
         libc::close(err_fd);
@@ -315,22 +376,32 @@ unsafe fn hold(err_fd: c_int) -> ! {
         // Blocks while there is an orphan to wait for; ECHILD when there is
         // none, in which case sleep and look again. A second of latency in
         // reaping a stray zombie is nothing, and it costs no CPU to wait.
+        // SAFETY: `status` is a live local; pid -1 waits for any child, which
+        // as pid 1 of the namespace is exactly what this init must reap.
         if unsafe { libc::waitpid(-1, &mut status, 0) } < 0 {
             let pause = libc::timespec {
                 tv_sec: 1,
                 tv_nsec: 0,
             };
+            // SAFETY: `pause` is a live local and a null remainder pointer is
+            // allowed.
             unsafe { libc::nanosleep(&pause, core::ptr::null_mut()) };
         }
     }
 }
 
 /// Apply one prepared mount.
+///
+/// # Safety
+/// Child side of the clone: nothing here may allocate. `op` is the plan's,
+/// prepared before the clone, and `err_fd` is this child's own descriptor.
 unsafe fn apply(op: &PreparedOp, err_fd: c_int) {
     let null = core::ptr::null::<c_char>();
 
     match op {
         PreparedOp::MakeRootPrivate => {
+            // SAFETY: `mount` reads NUL-terminated literals and the documented
+            // null arguments; the propagation flags take no data pointer.
             let rc = unsafe {
                 libc::mount(
                     null,
@@ -346,6 +417,8 @@ unsafe fn apply(op: &PreparedOp, err_fd: c_int) {
         }
 
         PreparedOp::Overlay { target, options } => {
+            // SAFETY: `target` and `options` are NUL-terminated `CString`s the
+            // plan owns for the life of this child; `mount` only reads them.
             let rc = unsafe {
                 libc::mount(
                     c"overlay".as_ptr(),
@@ -366,6 +439,8 @@ unsafe fn apply(op: &PreparedOp, err_fd: c_int) {
             readonly,
             submounts,
         } => {
+            // SAFETY: `source` and `target` are NUL-terminated `CString`s the
+            // plan owns; a bind takes no data pointer.
             let rc = unsafe {
                 libc::mount(
                     source.as_ptr(),
@@ -382,6 +457,8 @@ unsafe fn apply(op: &PreparedOp, err_fd: c_int) {
             // second, explicit step. Skipped only for a derived-layer build,
             // whose root is a private copy made to be written.
             if *readonly {
+                // SAFETY: `lock_bind`'s contract holds: child side, and
+                // `target` and `submounts` are the plan's `CString`s.
                 unsafe { lock_bind(target, true, submounts, err_fd, Step::MountRoot) };
             }
         }
@@ -394,7 +471,10 @@ unsafe fn apply(op: &PreparedOp, err_fd: c_int) {
             // A tmpfs mounted over `/dev` hides whatever the image had there,
             // including the `shm` and `pts` directories the later mounts need.
             // Recreate the mount point on the fresh, writable filesystem.
+            // SAFETY: `target` is a NUL-terminated `CString` the plan owns.
             unsafe { ensure_dir(target.as_ptr()) };
+            // SAFETY: `target` and `options` are NUL-terminated `CString`s the
+            // plan owns; `flags` is a plain integer.
             let rc = unsafe {
                 libc::mount(
                     c"tmpfs".as_ptr(),
@@ -422,7 +502,11 @@ unsafe fn apply(op: &PreparedOp, err_fd: c_int) {
             // exists nowhere until now. Harmless where it is already there,
             // and where the parent is read-only it fails and the mount below
             // reports the real problem.
+            // SAFETY: both are NUL-terminated `CString`s the plan owns, which
+            // is `ensure_mount_point`'s only requirement.
             unsafe { ensure_mount_point(source.as_ptr(), target.as_ptr()) };
+            // SAFETY: `source` and `target` are NUL-terminated `CString`s the
+            // plan owns; a bind takes no data pointer.
             let rc = unsafe {
                 libc::mount(
                     source.as_ptr(),
@@ -440,10 +524,14 @@ unsafe fn apply(op: &PreparedOp, err_fd: c_int) {
             } else {
                 Step::MountBind
             };
+            // SAFETY: `lock_bind`'s contract holds: child side, and `target`
+            // and `submounts` are the plan's `CString`s.
             unsafe { lock_bind(target, *readonly, submounts, err_fd, step) };
         }
 
         PreparedOp::Proc { target } => {
+            // SAFETY: `target` is a NUL-terminated `CString` the plan owns; the
+            // rest are literals and a null data pointer.
             let rc = unsafe {
                 libc::mount(
                     c"proc".as_ptr(),
@@ -459,6 +547,8 @@ unsafe fn apply(op: &PreparedOp, err_fd: c_int) {
         }
 
         PreparedOp::Sysfs { target } => {
+            // SAFETY: `target` is a NUL-terminated `CString` the plan owns; the
+            // rest are literals and a null data pointer.
             let rc = unsafe {
                 libc::mount(
                     c"sysfs".as_ptr(),
@@ -475,7 +565,10 @@ unsafe fn apply(op: &PreparedOp, err_fd: c_int) {
         }
 
         PreparedOp::DevPts { target, options } => {
+            // SAFETY: `target` is a NUL-terminated `CString` the plan owns.
             unsafe { ensure_dir(target.as_ptr()) };
+            // SAFETY: `target` and `options` are NUL-terminated `CString`s the
+            // plan owns; the type is a literal.
             let rc = unsafe {
                 libc::mount(
                     c"devpts".as_ptr(),
@@ -495,10 +588,16 @@ unsafe fn apply(op: &PreparedOp, err_fd: c_int) {
             // The target lives on the `/dev` tmpfs mounted a moment ago, so it
             // is writable: create an empty file to bind over. `mknod` is not
             // available to an unprivileged user namespace (PoC 6).
+            // SAFETY: `target` is a NUL-terminated `CString` the plan owns;
+            // `open` only reads it.
             let fd = unsafe { libc::open(target.as_ptr(), libc::O_CREAT | libc::O_WRONLY, 0o644) };
             if fd >= 0 {
+                // SAFETY: `fd` was just returned by `open` and nothing else
+                // holds it.
                 unsafe { libc::close(fd) };
             }
+            // SAFETY: `source` and `target` are NUL-terminated `CString`s the
+            // plan owns; a bind takes no data pointer.
             let rc = unsafe {
                 libc::mount(
                     source.as_ptr(),
@@ -514,7 +613,11 @@ unsafe fn apply(op: &PreparedOp, err_fd: c_int) {
         }
 
         PreparedOp::Mask { target } => {
+            // SAFETY: all-zero bytes are a valid `stat`: it is plain data the
+            // kernel fills in.
             let mut st: libc::stat = unsafe { core::mem::zeroed() };
+            // SAFETY: `target` is a NUL-terminated `CString` the plan owns and
+            // `st` is a live local for the call.
             if unsafe { libc::stat(target.as_ptr(), &mut st) } != 0 {
                 // Kernels differ in which of these exist; a path that is not
                 // there needs no masking.
@@ -522,6 +625,8 @@ unsafe fn apply(op: &PreparedOp, err_fd: c_int) {
             }
             let rc = if st.st_mode & libc::S_IFMT == libc::S_IFDIR {
                 // An empty read-only tmpfs hides a directory's contents.
+                // SAFETY: `target` is a NUL-terminated `CString` the plan owns;
+                // the rest are literals, including the options string.
                 unsafe {
                     libc::mount(
                         c"tmpfs".as_ptr(),
@@ -532,6 +637,8 @@ unsafe fn apply(op: &PreparedOp, err_fd: c_int) {
                     )
                 }
             } else {
+                // SAFETY: `target` is a NUL-terminated `CString` the plan owns;
+                // the source is a literal and a bind takes no data pointer.
                 unsafe {
                     libc::mount(
                         c"/dev/null".as_ptr(),
@@ -548,12 +655,18 @@ unsafe fn apply(op: &PreparedOp, err_fd: c_int) {
         }
 
         PreparedOp::RemountReadOnly { target } => {
+            // SAFETY: all-zero bytes are a valid `stat`: it is plain data the
+            // kernel fills in.
             let mut st: libc::stat = unsafe { core::mem::zeroed() };
+            // SAFETY: `target` is a NUL-terminated `CString` the plan owns and
+            // `st` is a live local for the call.
             if unsafe { libc::stat(target.as_ptr(), &mut st) } != 0 {
                 return;
             }
             // Bind it to itself first: a path that is not already a mount point
             // cannot be remounted.
+            // SAFETY: `target` is a NUL-terminated `CString` the plan owns; a
+            // bind to itself takes no data pointer.
             unsafe {
                 libc::mount(
                     target.as_ptr(),
@@ -563,6 +676,8 @@ unsafe fn apply(op: &PreparedOp, err_fd: c_int) {
                     core::ptr::null(),
                 )
             };
+            // SAFETY: `target` is a NUL-terminated `CString` the plan owns; a
+            // remount takes null source, type and data.
             let rc = unsafe {
                 libc::mount(
                     null,
@@ -618,6 +733,9 @@ unsafe fn lock_bind(
         propagation: 0,
         userns_fd: 0,
     };
+    // SAFETY: `attr` is a live local of the kernel's `struct mount_attr` layout
+    // (`repr(C)`, four `u64`s), the size passed is its own, and `target` is a
+    // NUL-terminated `CString` the plan owns.
     let rc = unsafe {
         libc::syscall(
             SYS_MOUNT_SETATTR,
@@ -639,8 +757,11 @@ unsafe fn lock_bind(
     } else {
         LOCKED_REMOUNT
     };
+    // SAFETY: `remount_keeping_locks`' contract holds: child side, and `target`
+    // is a NUL-terminated `CString` alive for the call.
     unsafe { remount_keeping_locks(target.as_ptr(), flags, true, err_fd, step) };
     for sub in submounts {
+        // SAFETY: as above, for each submount `CString` the plan owns.
         unsafe { remount_keeping_locks(sub.as_ptr(), flags, false, err_fd, step) };
     }
 }
@@ -667,7 +788,11 @@ unsafe fn remount_keeping_locks(
     // the one `statfs` syscall, with no allocation.)
     const KEEP: [(u64, u64); 4] = [(8, 8), (1024, 1024), (2048, 2048), (4096, 1 << 21)];
 
+    // SAFETY: all-zero bytes are a valid `statvfs`: plain data the kernel fills
+    // in.
     let mut st: libc::statvfs = unsafe { core::mem::zeroed() };
+    // SAFETY: `path` is NUL-terminated (every caller passes a `CString`'s
+    // pointer) and `st` is a live local for the call.
     if unsafe { libc::statvfs(path, &mut st) } != 0 {
         if must_exist {
             fail_at(err_fd, step, path);
@@ -681,6 +806,8 @@ unsafe fn remount_keeping_locks(
         }
     }
     let null = core::ptr::null::<c_char>();
+    // SAFETY: `path` is NUL-terminated (the callers pass a `CString`'s
+    // pointer); a remount takes null source, type and data.
     let rc = unsafe {
         libc::mount(
             null,
@@ -699,17 +826,27 @@ const TIOCSCTTY: u32 = 0x540E;
 
 /// Move the agent's socket to [`crate::pool::AGENT_FD`] and let it survive
 /// `execve`.
+///
+/// # Safety
+/// Child side of the clone: nothing here may allocate. `fd` is a descriptor
+/// this child owns.
 unsafe fn place_agent_socket(fd: c_int, err_fd: c_int) {
     const TARGET: c_int = crate::pool::AGENT_FD;
 
+    // SAFETY: `fd` is a descriptor this child owns and `TARGET` is a fixed
+    // number; `dup2` touches no memory.
     if fd != TARGET && unsafe { libc::dup2(fd, TARGET) } < 0 {
         fail(err_fd, Step::PlaceAgentSocket);
     }
     if fd != TARGET {
+        // SAFETY: `fd` is this child's own descriptor, already copied to
+        // `TARGET`, and is not used again.
         unsafe { libc::close(fd) };
     }
     // Clearing FD_CLOEXEC is the point: without it `execve` closes the socket
     // and the agent starts with nothing to talk to.
+    // SAFETY: `fcntl` on the descriptor just placed at `TARGET`; touches no
+    // memory.
     if unsafe { libc::fcntl(TARGET, libc::F_SETFD, 0) } < 0 {
         fail(err_fd, Step::PlaceAgentSocket);
     }
@@ -741,23 +878,37 @@ unsafe fn place_agent_socket(fd: c_int, err_fd: c_int) {
 /// supervisor checks that before building the plan, because this function
 /// may not: it runs between `clone3` and `execve`, where nothing may
 /// allocate or fail with a message.
+///
+/// # Safety
+/// Child side of the clone: nothing here may allocate. The three descriptors
+/// are this child's own, each at 3 or above.
 unsafe fn adopt_streams(fds: [c_int; 3], err_fd: c_int) {
+    // SAFETY: `setsid` takes no arguments and touches no memory.
     if unsafe { libc::setsid() } < 0 {
         fail(err_fd, Step::AdoptTerminal);
     }
+    // SAFETY: `ioctl` with an integer argument on a descriptor this child owns;
+    // it reads no memory.
     if unsafe { libc::ioctl(fds[0], TIOCSCTTY as _, 0) } != 0
         && !matches!(errno(), libc::ENOTTY | libc::EPERM)
     {
         fail(err_fd, Step::AdoptTerminal);
     }
     for (target, source) in fds.iter().enumerate() {
+        // SAFETY: `dup2` between descriptors this child owns; touches no
+        // memory. The sources are at 3 or above, so no target overwrites an
+        // unread source (see above).
         if unsafe { libc::dup2(*source, target as c_int) } < 0 {
             fail(err_fd, Step::AdoptTerminal);
         }
     }
 }
 
+/// # Safety
+/// Child side of the clone: nothing here may allocate. `fd` is a descriptor
+/// this child owns.
 unsafe fn adopt_terminal(fd: c_int, err_fd: c_int) {
+    // SAFETY: `setsid` takes no arguments and touches no memory.
     if unsafe { libc::setsid() } < 0 {
         fail(err_fd, Step::AdoptTerminal);
     }
@@ -765,15 +916,21 @@ unsafe fn adopt_terminal(fd: c_int, err_fd: c_int) {
     // is what the venv builder hands over to capture `pip` — is simply used as
     // stdio: `TIOCSCTTY` says ENOTTY, and that is the one refusal that means
     // "not applicable" rather than "failed".
+    // SAFETY: `ioctl` with an integer argument on a descriptor this child owns;
+    // it reads no memory.
     if unsafe { libc::ioctl(fd, TIOCSCTTY as _, 0) } != 0 && errno() != libc::ENOTTY {
         fail(err_fd, Step::AdoptTerminal);
     }
     for target in 0..3 {
+        // SAFETY: `dup2` from a descriptor this child owns onto 0, 1 and 2;
+        // touches no memory.
         if unsafe { libc::dup2(fd, target) } < 0 {
             fail(err_fd, Step::AdoptTerminal);
         }
     }
     if fd > 2 {
+        // SAFETY: `fd` is this child's own descriptor and has been copied to 0,
+        // 1 and 2; it is not used again.
         unsafe { libc::close(fd) };
     }
 }
@@ -790,6 +947,11 @@ unsafe fn adopt_terminal(fd: c_int, err_fd: c_int) {
 /// stays blocked. `SIGKILL` and `SIGSTOP` cannot be set and are skipped, and
 /// the two real-time signals libc keeps for itself refuse, which is nothing
 /// to reset either.
+///
+/// # Safety
+/// Child side of the clone: nothing here may allocate, and the process has
+/// exactly one thread, which is what makes `signal` and `sigprocmask` safe
+/// to call.
 unsafe fn reset_signals(mask: u64) {
     for signal in 1..=64 {
         if signal == libc::SIGKILL || signal == libc::SIGSTOP {
@@ -800,9 +962,16 @@ unsafe fn reset_signals(mask: u64) {
         } else {
             libc::SIG_DFL
         };
+        // SAFETY: `signal` with a valid signal number and one of the two
+        // standard dispositions; async-signal-safe, and this process has one
+        // thread.
         unsafe { libc::signal(signal, disposition) };
     }
+    // SAFETY: all-zero bytes are a valid `sigset_t`, and `sigemptyset`
+    // initialises it properly below anyway.
     let mut none: libc::sigset_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `none` is a live local; a null old-set pointer is allowed; both
+    // calls are async-signal-safe.
     unsafe {
         libc::sigemptyset(&mut none);
         libc::sigprocmask(libc::SIG_SETMASK, &none, std::ptr::null_mut());
@@ -819,26 +988,45 @@ unsafe fn reset_signals(mask: u64) {
 /// already exists or the parent is read-only; the mount reports what matters.
 ///
 /// No allocation: the path is copied into a stack buffer and cut at each `/`.
+///
+/// # Safety
+/// Child side of the clone: nothing here may allocate. Both pointers are
+/// NUL-terminated strings alive for the call.
 unsafe fn ensure_mount_point(source: *const c_char, target: *const c_char) {
+    // SAFETY: `target` is NUL-terminated: every caller passes a `CString`'s
+    // pointer.
     let len = unsafe { libc::strlen(target) };
     let mut buf = [0u8; 4096];
     if len == 0 || len >= buf.len() {
+        // SAFETY: `target` is NUL-terminated, which is `ensure_dir`'s only
+        // requirement.
         unsafe { ensure_dir(target) };
         return;
     }
+    // SAFETY: `strlen` found `len` readable bytes at `target`, `len <
+    // buf.len()` was checked just above, and a stack buffer cannot overlap the
+    // plan's heap string.
     unsafe { core::ptr::copy_nonoverlapping(target.cast::<u8>(), buf.as_mut_ptr(), len) };
     buf[len] = 0;
     for i in 1..len {
         if buf[i] == b'/' {
             buf[i] = 0;
+            // SAFETY: `buf` was NUL-terminated at index `i` a moment ago, so
+            // `mkdir` reads a valid C string.
             unsafe { libc::mkdir(buf.as_ptr() as *const c_char, 0o755) };
             buf[i] = b'/';
         }
     }
+    // SAFETY: all-zero bytes are a valid `stat`: plain data the kernel fills
+    // in.
     let mut st: libc::stat = unsafe { core::mem::zeroed() };
     let is_file =
+        // SAFETY: `source` is NUL-terminated (a `CString`'s pointer) and `st`
+        // is a live local for the call.
         unsafe { libc::stat(source, &mut st) } == 0 && (st.st_mode & libc::S_IFMT) != libc::S_IFDIR;
     if is_file {
+        // SAFETY: `target` is NUL-terminated (a `CString`'s pointer); `open`
+        // only reads it.
         let fd = unsafe {
             libc::open(
                 target,
@@ -847,9 +1035,13 @@ unsafe fn ensure_mount_point(source: *const c_char, target: *const c_char) {
             )
         };
         if fd >= 0 {
+            // SAFETY: `fd` was just returned by `open` and nothing else holds
+            // it.
             unsafe { libc::close(fd) };
         }
     } else {
+        // SAFETY: `target` is NUL-terminated, which is `ensure_dir`'s only
+        // requirement.
         unsafe { ensure_dir(target) };
     }
 }
@@ -859,7 +1051,12 @@ unsafe fn ensure_mount_point(source: *const c_char, target: *const c_char) {
 /// Only useful where the parent is writable — a fresh tmpfs. On the read-only
 /// root it fails harmlessly, because the image store already put the directory
 /// there.
+///
+/// # Safety
+/// `path` is a NUL-terminated string alive for the call.
 unsafe fn ensure_dir(path: *const c_char) {
+    // SAFETY: `path` is NUL-terminated: every caller passes a `CString`'s
+    // pointer or a buffer it terminated itself.
     unsafe { libc::mkdir(path, 0o755) };
 }
 
@@ -883,25 +1080,41 @@ const IFF_UP: libc::c_short = 1;
 /// A fresh netns has a loopback device but it is down, so even a sandbox with
 /// `network = "none"` cannot talk to itself — which breaks anything using a
 /// local socket, including the warm-execution protocol.
+///
+/// # Safety
+/// Child side of the clone: nothing here may allocate, and `err_fd` is this
+/// child's own descriptor.
 unsafe fn bring_up_loopback(err_fd: c_int) {
+    // SAFETY: `socket` takes integers only; touches no memory.
     let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
     if sock < 0 {
         fail(err_fd, Step::BringUpLoopback);
     }
 
+    // SAFETY: all-zero bytes are a valid `IfReq`: plain data with the kernel's
+    // layout (checked by `ifreq_matches_the_kernel_layout`).
     let mut req: IfReq = unsafe { core::mem::zeroed() };
     req.name[0] = b'l' as c_char;
     req.name[1] = b'o' as c_char;
 
+    // SAFETY: `req` is a live local of the layout the ioctl expects, and `sock`
+    // is a descriptor this function just opened.
     if unsafe { libc::ioctl(sock, SIOCGIFFLAGS as _, &mut req) } != 0 {
+        // SAFETY: `sock` is this function's own descriptor and is not used
+        // after the failure report.
         unsafe { libc::close(sock) };
         fail(err_fd, Step::BringUpLoopback);
     }
     req.flags |= IFF_UP;
+    // SAFETY: `req` is a live local of the layout the ioctl expects;
+    // `SIOCSIFFLAGS` only reads it.
     if unsafe { libc::ioctl(sock, SIOCSIFFLAGS as _, &req) } != 0 {
+        // SAFETY: `sock` is this function's own descriptor and is not used
+        // after the failure report.
         unsafe { libc::close(sock) };
         fail(err_fd, Step::BringUpLoopback);
     }
+    // SAFETY: `sock` is this function's own descriptor and is not used again.
     unsafe { libc::close(sock) };
 }
 
@@ -935,8 +1148,14 @@ struct CapData {
 /// A tenant that looks like root inside the sandbox — uid 0 mapped to an
 /// unprivileged host uid — must hold no capability at all, or "root inside"
 /// starts meaning something.
+///
+/// # Safety
+/// Child side of the clone: nothing here may allocate. Must run after
+/// `no_new_privs` is set and before `execve`, or a dropped capability could
+/// come back.
 unsafe fn drop_all_capabilities() -> bool {
     // Ambient first: a capability left there would be re-raised on execve.
+    // SAFETY: `prctl` with constant arguments; touches no memory.
     unsafe {
         libc::prctl(
             libc::PR_CAP_AMBIENT,
@@ -949,6 +1168,7 @@ unsafe fn drop_all_capabilities() -> bool {
 
     for cap in 0..=CAP_LAST_CAP_GUESS {
         // EINVAL simply means this kernel has no such capability.
+        // SAFETY: `prctl` with constant arguments; touches no memory.
         unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) };
     }
 
@@ -957,6 +1177,9 @@ unsafe fn drop_all_capabilities() -> bool {
         pid: 0,
     };
     let data = [CapData::default(); 2];
+    // SAFETY: `header` and `data` are live locals with the kernel's layouts
+    // (checked by `capability_structs_match_the_kernel_layout`), and version 3
+    // wants exactly the two `CapData` passed.
     unsafe { libc::syscall(SYS_CAPSET, &header, data.as_ptr()) == 0 }
 }
 
@@ -980,6 +1203,9 @@ pub(super) fn fail_at(err_fd: c_int, step: Step, path: *const c_char) -> ! {
     let mut payload = [0u8; 8];
     payload[..4].copy_from_slice(&(step as u32).to_ne_bytes());
     payload[4..].copy_from_slice(&errno.to_ne_bytes());
+    // SAFETY: `path` is NUL-terminated (every caller passes a `CString`'s
+    // pointer), `payload` is a live local, and `write` only reads the bytes it
+    // is given; `_exit` never returns.
     unsafe {
         let len = libc::strlen(path).min(4000);
         libc::write(err_fd, payload.as_ptr() as *const c_void, payload.len());
@@ -996,6 +1222,8 @@ fn fail_with(err_fd: c_int, step: Step, errno: c_int) -> ! {
     let mut payload = [0u8; 8];
     payload[..4].copy_from_slice(&(step as u32).to_ne_bytes());
     payload[4..].copy_from_slice(&errno.to_ne_bytes());
+    // SAFETY: `payload` is a live local and `write` only reads it; `_exit`
+    // never returns.
     unsafe {
         libc::write(err_fd, payload.as_ptr() as *const c_void, payload.len());
         libc::_exit(EXIT_LAUNCH_FAILED)

@@ -276,6 +276,8 @@ unsafe fn helper_main(
 ) -> ! {
     // Die with the supervisor, so a request cannot outlive the thing that is
     // enforcing its deadline.
+    // SAFETY: `prctl` with constant arguments; async-signal-safe and touches no
+    // memory.
     unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) };
 
     // Descriptor hygiene, and it is not optional. `fork` copied the
@@ -347,6 +349,9 @@ unsafe fn helper_main(
             child::fail(parked[ERR], Step::Setns);
         }
     }
+    // SAFETY: `close_from`'s contract holds: child side of the fork, syscalls
+    // only. Everything at `FIRST + count` and above is a copy this helper does
+    // not need.
     unsafe { close_from(FIRST + count as c_int) };
 
     let user = FIRST;
@@ -384,6 +389,8 @@ unsafe fn helper_main(
         (ipc, libc::CLONE_NEWIPC),
         (uts, libc::CLONE_NEWUTS),
     ] {
+        // SAFETY: `setns` takes a descriptor this helper renumbered a moment
+        // ago and a constant; it touches no memory.
         if unsafe { libc::setns(fd, kind) } != 0 {
             child::fail(ends.err_w, Step::Setns);
         }
@@ -395,10 +402,16 @@ unsafe fn helper_main(
     //
     // SAFETY: single-threaded here; the request does only syscalls.
     let (request, placed) = match into {
+        // SAFETY: this helper is a single-threaded fork of the supervisor and
+        // the request it forks runs only syscalls.
         -1 => (unsafe { libc::fork() }, false),
+        // SAFETY: `clone3_into`'s fork-like contract holds for the same reason;
+        // `dir` is the cgroup descriptor renumbered above.
         dir => match unsafe { super::clone::clone3_into(0, Some(dir)) } {
             Ok(super::clone::CloneResult::Child) => (0, true),
             Ok(super::clone::CloneResult::Parent { child }) => (child as libc::pid_t, true),
+            // SAFETY: as for the plain `fork` above; the refusal left nothing
+            // behind.
             Err(_) => (unsafe { libc::fork() }, false),
         },
     };
@@ -406,15 +419,22 @@ unsafe fn helper_main(
         child::fail(ends.err_w, Step::Setns);
     }
     if request == 0 {
+        // SAFETY: `request_main`'s contract is this function's: child side of a
+        // fork, plan and argv built before it, descriptors renumbered by this
+        // helper. It never returns.
         unsafe { request_main(plan, argv, cgroup, mnt, ends) }
     }
     if into >= 0 {
+        // SAFETY: `into` is this helper's own copy of the cgroup descriptor and
+        // is not used again.
         unsafe { libc::close(into) };
     }
 
     // Only the status pipe stays open here. Closing `err_w` matters: the
     // request's copy closes at `execve`, and the parent takes end of file on
     // that pipe as "it worked" — which never arrives while this copy is open.
+    // SAFETY: each is a descriptor this helper owns, at the number it put it;
+    // closing the copies here leaves the request's own untouched.
     unsafe {
         libc::close(ends.err_w);
         libc::close(ends.go_r);
@@ -437,10 +457,12 @@ unsafe fn helper_main(
     // SAFETY: waiting for our own child.
     while unsafe { libc::waitpid(request, &mut status, 0) } < 0 {
         if child::errno() != libc::EINTR {
+            // SAFETY: `_exit` touches no memory and never returns.
             unsafe { libc::_exit(1) };
         }
     }
     write_all_raw(ends.status_w, &status.to_ne_bytes());
+    // SAFETY: `_exit` touches no memory and never returns.
     unsafe { libc::_exit(0) }
 }
 
@@ -459,6 +481,8 @@ unsafe fn request_main(
     mnt: c_int,
     ends: Ends,
 ) -> ! {
+    // SAFETY: `status_w` is the helper's pipe end at the number the helper put
+    // it; the request does not report status, the helper does.
     unsafe {
         libc::close(ends.status_w);
     }
@@ -467,12 +491,16 @@ unsafe fn request_main(
     // between the fork and this line sends nothing; the request then either
     // never gets `GO` and exits below, or runs to its deadline, which the
     // supervisor enforces by host pid, not through the helper.
+    // SAFETY: `prctl` with constant arguments; async-signal-safe and touches no
+    // memory.
     unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) };
 
     // The sandbox's cgroup namespace, entered here rather than in the helper
     // so the helper could create this process inside its cgroup. It changes
     // only what `/proc/self/cgroup` shows; the process is already where it
     // belongs, or about to be moved there by the supervisor.
+    // SAFETY: `cgroup` is the namespace descriptor the helper renumbered for
+    // this request; `setns` takes it and a constant.
     if unsafe { libc::setns(cgroup, libc::CLONE_NEWCGROUP) } != 0 {
         child::fail(ends.err_w, Step::Setns);
     }
@@ -481,19 +509,28 @@ unsafe fn request_main(
     // every allocation would be billed to the tenant's cgroup as a whole
     // rather than to this request.
     let mut byte = [0u8; 1];
+    // SAFETY: `go_r` is a descriptor this request owns and `byte` is a live
+    // one-byte local.
     if unsafe { libc::read(ends.go_r, byte.as_mut_ptr() as *mut c_void, 1) } != 1 {
         // The supervisor gave up on us (a cgroup it could not create, say).
+        // SAFETY: `_exit` touches no memory and never returns.
         unsafe { libc::_exit(127) }
     }
+    // SAFETY: `go_r` is this request's own descriptor and is not used again.
     unsafe { libc::close(ends.go_r) };
 
     // Now the filesystem: the pivoted root the init built. Needs
     // `CAP_SYS_ADMIN` in the sandbox's user namespace, which the helper's
     // `setns(user)` granted and this fork inherited.
+    // SAFETY: `mnt` is the namespace descriptor the helper renumbered for this
+    // request; `setns` takes it and a constant.
     if unsafe { libc::setns(mnt, libc::CLONE_NEWNS) } != 0 {
         child::fail(ends.err_w, Step::EnterMountNamespace);
     }
+    // SAFETY: `workdir` is a NUL-terminated `CString` the plan owns for the
+    // life of this request.
     if unsafe { libc::chdir(plan.workdir.as_ptr()) } != 0
+        // SAFETY: `chdir` on a NUL-terminated literal.
         && unsafe { libc::chdir(c"/".as_ptr()) } != 0
     {
         child::fail(ends.err_w, Step::Chdir);
@@ -503,6 +540,8 @@ unsafe fn request_main(
     // standard descriptors clears close-on-exec on the copies, which is the
     // only reason these three survive `execve` when every other pipe does not.
     for (from, to) in [(ends.stdin_r, 0), (ends.stdout_w, 1), (ends.stderr_w, 2)] {
+        // SAFETY: `dup2` between descriptors this request owns; it touches no
+        // memory.
         if unsafe { libc::dup2(from, to) } < 0 {
             child::fail(ends.err_w, Step::WireStdio);
         }
@@ -510,7 +549,12 @@ unsafe fn request_main(
 
     // Exactly what the init went through, so a request is never less
     // constrained than the sandbox it is in.
+    // SAFETY: `harden`'s contract holds: child side of a fork, plan built
+    // before it, `err_w` owned here.
     unsafe { child::harden(plan, ends.err_w) };
+    // SAFETY: `exec_or_fail`'s contract holds: `argv` and the plan's `envp()`
+    // are NUL-terminated pointer arrays built before the fork and alive until
+    // `execve` replaces this image.
     unsafe { child::exec_or_fail(plan, argv, ends.err_w) }
 }
 

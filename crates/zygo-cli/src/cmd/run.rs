@@ -517,6 +517,8 @@ fn ignored_signals() -> u64 {
     for signal in 1..=64 {
         // SAFETY: a query, with a null new action; `action` is a live local.
         let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: `sigaction` with a valid signal number, a null new action and
+        // a live local to fill in; it changes nothing.
         let queried = unsafe { libc::sigaction(signal, std::ptr::null(), &mut action) } == 0;
         if queried && action.sa_sigaction == libc::SIG_IGN {
             mask |= 1u64 << (signal - 1);

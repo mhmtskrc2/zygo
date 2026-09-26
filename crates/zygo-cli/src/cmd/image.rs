@@ -532,6 +532,8 @@ fn abandoned_roots(tmp: &std::path::Path) -> Vec<std::path::PathBuf> {
 #[cfg(unix)]
 fn is_running(pid: i32) -> bool {
     // A pid that is not ours answers `EPERM`, which still means it is there.
+    // SAFETY: `kill` with signal 0 delivers nothing and touches no memory; any
+    // pid is sound to pass.
     unsafe {
         libc::kill(pid, 0) == 0
             || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)

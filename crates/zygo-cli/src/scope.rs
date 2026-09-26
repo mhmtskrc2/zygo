@@ -300,11 +300,16 @@ mod tests {
     fn a_process_already_in_a_scope_is_left_alone() {
         // Safe: this test runs in its own process and sets the variable the
         // function reads, which nothing else in the suite looks at.
+        // SAFETY: `set_var` races only with a C `getenv` on another thread;
+        // Rust's own `std::env` readers take the same lock. Not verified in
+        // this pass: cargo runs tests on several threads, and no audit was made
+        // of libc calls in this suite that read the environment.
         unsafe { std::env::set_var(MARKER, "1") };
         let cli = Cli::try_parse_from(["zygo", "run", "alpine:3", "true"]).expect("parse");
         // Returns rather than replacing this process, which is the assertion:
         // reaching the next line at all is the pass.
         ensure_delegated(&cli);
+        // SAFETY: as above.
         unsafe { std::env::remove_var(MARKER) };
     }
 }

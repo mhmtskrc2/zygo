@@ -890,6 +890,10 @@ mod probe {
             return Primitive::NoUserns("could not fork".into());
         }
         if pid == 0 {
+            // SAFETY: the child side of the fork: `unshare`, `write`, `read`,
+            // `fork`, `waitpid`, `mount` and `_exit` are all async-signal-safe,
+            // every buffer is a local, the paths are literals, and the
+            // descriptors are the pipes this function made. It never returns.
             unsafe {
                 libc::close(up_read);
                 libc::close(down_write);
@@ -959,11 +963,15 @@ mod probe {
             }
         }
 
+        // SAFETY: the four descriptors are the pipes this function made, and
+        // nothing uses them after this.
         let close_all = || unsafe {
             for fd in [up_read, up_write, down_read, down_write] {
                 libc::close(fd);
             }
         };
+        // SAFETY: `pid` is the child this function forked and has not reaped;
+        // `status` is a live local.
         let reap = || unsafe {
             libc::kill(pid, libc::SIGKILL);
             let mut status = 0;
@@ -1251,6 +1259,7 @@ mod probe {
     }
 
     fn subuid() -> Check {
+        // SAFETY: `getuid` cannot fail and has no preconditions.
         let uid = unsafe { libc::getuid() };
         if uid == 0 {
             return Check::ok("subuid/subgid", "running as root");

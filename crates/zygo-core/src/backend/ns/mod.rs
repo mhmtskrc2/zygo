@@ -232,6 +232,8 @@ impl NsSandbox {
     /// forwarded from the CLI; the kernel tears down the whole namespace when
     /// its init dies.
     pub fn signal(&self, signal: i32) -> Result<()> {
+        // SAFETY: `kill` touches no memory; the pid is the init this launcher
+        // created and has not reaped.
         let rc = unsafe { libc::kill(self.pid as libc::pid_t, signal) };
         if rc != 0 {
             return Err(Error::primitive(
@@ -560,7 +562,9 @@ pub fn launch(config: &SandboxConfig, hierarchy: Option<&cgroup::Hierarchy>) -> 
     })?;
 
     let namespaces = NamespaceSet::for_network(config.network);
+    // SAFETY: `getuid` cannot fail and has no preconditions.
     let outer_uid = unsafe { libc::getuid() };
+    // SAFETY: `getgid` cannot fail and has no preconditions.
     let outer_gid = unsafe { libc::getgid() };
     // Captured *before* the clone: inside a user namespace with no map yet,
     // `getuid()` returns the overflow uid and mapping that is rejected. PoC 1
@@ -623,6 +627,8 @@ pub fn launch(config: &SandboxConfig, hierarchy: Option<&cgroup::Hierarchy>) -> 
     // and both pipe ends are owned here.
     let result = match &cgroup_dir {
         Some(dir) => {
+            // SAFETY: as above; `dir` is a descriptor this function opened and
+            // holds for the call.
             match unsafe { clone::clone3_into(namespaces.clone_flags(), Some(dir.as_raw_fd())) } {
                 Ok(r) => {
                     placed = true;
@@ -666,6 +672,9 @@ pub fn launch(config: &SandboxConfig, hierarchy: Option<&cgroup::Hierarchy>) -> 
             if let Some((ours, _)) = secrets_pair {
                 drop(ours);
             }
+            // SAFETY: `child_main`'s contract holds: this is the child of the
+            // clone, `plan` was prepared before it, and both pipe ends are this
+            // child's own. It never returns.
             unsafe { child::child_main(&plan, ready_read.as_raw_fd(), err_write.as_raw_fd()) }
         }
 
@@ -907,7 +916,9 @@ fn write_id_maps(pid: u32, uid_map: &str, gid_map: &str) -> Result<()> {
     // Which line that is depends on the sandbox user — see `identity_line`.
     let (uid_line, gid_line) = if multi_line {
         (
+            // SAFETY: `getuid` cannot fail and has no preconditions.
             idmap::identity_line(uid_map, unsafe { libc::getuid() }),
+            // SAFETY: `getgid` cannot fail and has no preconditions.
             idmap::identity_line(gid_map, unsafe { libc::getgid() }),
         )
     } else {
@@ -974,6 +985,7 @@ fn pipe_cloexec() -> Result<(OwnedFd, OwnedFd)> {
 fn write_all(fd: i32, buf: &[u8]) -> std::io::Result<()> {
     let mut written = 0;
     while written < buf.len() {
+        // SAFETY: `buf` is live for the call and `write` only reads it.
         let n = unsafe {
             libc::write(
                 fd,

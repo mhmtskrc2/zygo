@@ -524,7 +524,9 @@ fn scratch_root(image: &Path, scratch_bytes: u64) -> std::result::Result<PathBuf
         ));
     }
 
+    // SAFETY: `getuid` cannot fail and has no preconditions.
     let uid = unsafe { libc::getuid() };
+    // SAFETY: `getgid` cannot fail and has no preconditions.
     let gid = unsafe { libc::getgid() };
     // SAFETY: a plain syscall; the process is single-threaded here (a fresh
     // fork), which is what `CLONE_NEWUSER` requires.
@@ -546,6 +548,8 @@ fn scratch_root(image: &Path, scratch_bytes: u64) -> std::result::Result<PathBuf
     // copy of the parent's, and on a shared-subtree host a mount would be
     // propagated out of it. Everything below is private.
     let root_c = CString::new("/").expect("no NUL");
+    // SAFETY: `root_c` is a NUL-terminated `CString` alive for the call; a
+    // propagation change takes null source, type and data.
     if unsafe {
         libc::mount(
             std::ptr::null(),
@@ -574,6 +578,8 @@ fn scratch_root(image: &Path, scratch_bytes: u64) -> std::result::Result<PathBuf
     let base_c = CString::new(base.to_string_lossy().as_bytes()).expect("no NUL");
     let tmpfs_c = CString::new("tmpfs").expect("no NUL");
     let size_c = CString::new(format!("size={scratch_bytes},mode=0700")).expect("no NUL");
+    // SAFETY: `tmpfs_c`, `base_c` and `size_c` are NUL-terminated `CString`s
+    // alive for the call; `mount` only reads them.
     if unsafe {
         libc::mount(
             tmpfs_c.as_ptr(),
@@ -606,6 +612,8 @@ fn scratch_root(image: &Path, scratch_bytes: u64) -> std::result::Result<PathBuf
         work.display()
     );
     let opts_c = CString::new(opts).expect("no NUL");
+    // SAFETY: `overlay_c`, `merged_c` and `opts_c` are NUL-terminated
+    // `CString`s alive for the call; `mount` only reads them.
     if unsafe {
         libc::mount(
             overlay_c.as_ptr(),

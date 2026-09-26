@@ -1013,6 +1013,9 @@ pub unsafe fn install(prog: &[SockFilter], log_denials: bool) -> Result<(), std:
         len: prog.len() as u16,
         filter: prog.as_ptr(),
     };
+    // SAFETY: `fprog` is a live local of the kernel's `sock_fprog` layout whose
+    // pointer is `prog`, which the caller keeps alive for the call; the kernel
+    // copies the filter and keeps no reference.
     let apply = |flags: libc::c_uint| unsafe {
         libc::syscall(
             SYS_SECCOMP,

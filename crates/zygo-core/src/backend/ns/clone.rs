@@ -115,6 +115,13 @@ pub unsafe fn clone3_into(
     }
 }
 
+/// The non-Linux stand-in for [`clone3_into`], so the callers compile
+/// everywhere: it always fails with `Unsupported`.
+///
+/// # Safety
+///
+/// Nothing unsafe happens here; the signature matches the Linux one, and
+/// so does its contract.
 #[cfg(not(target_os = "linux"))]
 pub unsafe fn clone3_into(
     _flags: u64,
@@ -126,6 +133,13 @@ pub unsafe fn clone3_into(
     ))
 }
 
+/// The non-Linux stand-in for [`clone3`], so the callers compile
+/// everywhere: it always fails with `Unsupported`.
+///
+/// # Safety
+///
+/// Nothing unsafe happens here; the signature matches the Linux one, and
+/// so does its contract.
 #[cfg(not(target_os = "linux"))]
 pub unsafe fn clone3(_flags: u64) -> io::Result<CloneResult> {
     Err(io::Error::new(
@@ -144,6 +158,8 @@ pub fn is_available() -> bool {
     // An intentionally invalid size: the kernel validates the size before it
     // does anything else, so this returns EINVAL when clone3 exists and
     // ENOSYS when it does not. Nothing is cloned either way.
+    // SAFETY: a null pointer with size 0 is rejected by the kernel before it
+    // reads anything, so no process is created and no memory is touched.
     let rc = unsafe { libc::syscall(SYS_CLONE3, core::ptr::null::<CloneArgs>(), 0usize) };
     debug_assert_eq!(rc, -1, "the probe must never actually clone");
     io::Error::last_os_error().raw_os_error() != Some(libc::ENOSYS)

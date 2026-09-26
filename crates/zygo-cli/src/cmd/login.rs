@@ -138,6 +138,7 @@ pub(super) fn prompt_password(registry: &str, prompt: &str) -> anyhow::Result<St
 
     // SAFETY: `termios` is written by `tcgetattr` before it is read.
     let mut original: libc::termios = unsafe { core::mem::zeroed() };
+    // SAFETY: `original` is a live local for the call.
     if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
         return Err(std::io::Error::last_os_error()).context("could not read the terminal mode");
     }

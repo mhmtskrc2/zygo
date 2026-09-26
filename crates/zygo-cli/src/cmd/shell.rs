@@ -187,6 +187,9 @@ unsafe fn drop_capabilities() {
         inheritable: u32,
     }
 
+    // SAFETY: `prctl` with constant arguments touches no memory, and `capset`
+    // reads two live locals with the kernel's layouts (the same structs as the
+    // launcher's, whose sizes its tests check).
     unsafe {
         libc::prctl(
             libc::PR_CAP_AMBIENT,

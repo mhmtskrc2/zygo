@@ -33,6 +33,8 @@ use cli::{Cli, Command};
 /// Called before any thread exists, which is the only requirement.
 #[cfg(unix)]
 fn die_quietly_on_a_closed_pipe() {
+    // SAFETY: `signal` with a valid number and the default disposition, called
+    // from `main` before any thread exists.
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
