@@ -150,10 +150,20 @@ impl Client {
     /// the same as none, which is what this used to have.
     pub fn budget(request: &Request) -> Duration {
         match request {
-            Request::Serve { .. } => SERVE_TIMEOUT,
+            // Each of these warms a zygote before it answers: `ServeRuntime`
+            // warms `min_warm` of them, and `Warm` and `Shell` rewarm a
+            // function that went cold or lost its agent. That is the same work
+            // `Serve` does, so it gets the same budget.
+            Request::Serve { .. }
+            | Request::ServeRuntime { .. }
+            | Request::Warm { .. }
+            | Request::Shell { .. } => SERVE_TIMEOUT,
             // The supervisor owns the deadline and then has to answer, so the
-            // client waits for the deadline *and* the reply.
-            Request::Exec { timeout_ms, .. } => {
+            // client waits for the deadline *and* the reply. A pooled script
+            // carries a deadline exactly as a function's request does; giving
+            // it the thirty-second control budget cut off every pooled request
+            // allowed longer than that, and blamed a healthy supervisor.
+            Request::Exec { timeout_ms, .. } | Request::ExecScript { timeout_ms, .. } => {
                 Duration::from_millis(*timeout_ms).saturating_add(REPLY_GRACE)
             }
             // `RUN` is never sent through `send`: it is answered twice and
@@ -626,6 +636,49 @@ mod tests {
             workspace: None,
         });
         assert_eq!(exec, Duration::from_secs(5) + REPLY_GRACE);
+
+        // So does a script run in a pool, and past the control budget: a
+        // pooled request allowed a minute used to be abandoned at thirty
+        // seconds with "the supervisor did not answer".
+        let script = Client::budget(&Request::ExecScript {
+            runtime: "py313".into(),
+            script: crate::protocol::Script::inline("def handler(e):\n    return e\n"),
+            event: serde_json::Value::Null,
+            timeout_ms: 60_000,
+            tenant: None,
+            key: None,
+            stream: false,
+            workspace: None,
+        });
+        assert_eq!(script, Duration::from_secs(60) + REPLY_GRACE);
+        assert!(script > CONTROL_TIMEOUT);
+
+        // Warming a pool, or rewarming a function, is the work `serve` does.
+        assert_eq!(
+            Client::budget(&Request::ServeRuntime {
+                name: "py313".into(),
+                spec: None,
+                layer: Box::default(),
+                base_dir: "/tmp".into(),
+                allow_host_net: false,
+                allow_private_net: false,
+                allow_unlimited: false,
+                tenant: None,
+                deps: None,
+            }),
+            SERVE_TIMEOUT
+        );
+        assert_eq!(
+            Client::budget(&Request::Warm {
+                name: "x".into(),
+                tenant: None
+            }),
+            SERVE_TIMEOUT
+        );
+        assert_eq!(
+            Client::budget(&Request::Shell { name: "x".into() }),
+            SERVE_TIMEOUT
+        );
 
         // Everything else reads state the supervisor already has.
         assert_eq!(Client::budget(&Request::List), CONTROL_TIMEOUT);

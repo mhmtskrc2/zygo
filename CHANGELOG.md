@@ -69,6 +69,15 @@ break things and will say so here.
   request once more on a fresh connection when a reused one turns out to be
   closed before any of the answer arrived. Seen as about one call in a
   hundred failing under an n8n task runner.
+- **Runtime pools:** a pooled script is waited for until its own deadline,
+  as a function's request is. The client gave `POST /runtimes/<name>/call`
+  and `zygo exec --runtime` the thirty-second budget meant for `ps` and
+  `stop`, so every pooled request allowed longer than 30 s failed there with
+  "the supervisor did not answer running a script within 30s" and advice to
+  restart a supervisor that was fine. A script that really overruns is still
+  killed at its deadline and reported as timed out (exit 137, HTTP 408).
+  Serving a pool, `POST /fn/<name>/warm` and `zygo shell`, which warm a
+  zygote before answering, now get the budget `serve` has.
 
 ## [0.1.3] — 2026-09-26
 
