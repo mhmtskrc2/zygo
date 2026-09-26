@@ -30,6 +30,7 @@ make test           # Rust, agent and SDK suites
 make lint           # rustfmt, clippy with warnings as errors, rustdoc with warnings as errors, and the book's links
 make check-linux    # type-check the Linux-only code from a non-Linux host
 make test-linux     # the full suite inside a Linux container
+make lint-linux     # clippy against the Linux-only code, where most unsafe lives
 ```
 
 The lint policy is the `[workspace.lints]` table in `Cargo.toml`; a lint goes

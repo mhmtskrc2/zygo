@@ -1,4 +1,4 @@
-.PHONY: help build test test-rust test-agent test-sdk test-sdk-python test-sdk-node \
+.PHONY: help build test test-rust test-agent test-sdk test-sdk-python test-sdk-node lint-linux \
         verify-mcp check check-linux test-linux \
         verify-linux verify-supervisor-linux escape-linux dist-linux \
         fuzz-linux gvisor-linux verify-login-linux verify-shim verify-deps-linux \
@@ -28,6 +28,7 @@ help:
 	@echo "conformance  run the agent protocol suite against both reference agents"
 	@echo "check-linux  type-check the Linux-only code from a non-Linux host"
 	@echo "test-linux   run the full suite inside a Linux container"
+	@echo "lint-linux   clippy against the Linux-only code, inside a container"
 	@echo "verify-linux run the ns launcher isolation checks against a real kernel"
 	@echo "verify-supervisor-linux  139 end-to-end supervisor lifecycle checks"
 	@echo "repro-blue-green-linux   the one open supervisor question, five times"
@@ -250,6 +251,17 @@ test-linux:
 		-e CARGO_TARGET_DIR=/tmp/target \
 		rust:1.90 \
 		sh -c "cargo test --workspace && python3 -m unittest discover -s agents/python"
+
+# clippy against the Linux-only code — the `ns` backend, the launcher, the
+# network — which a Mac never compiles. Most `unsafe` sites live there, so
+# this is where `undocumented_unsafe_blocks` is really enforced; CI's Linux
+# job runs the same command. The image has no clippy, so it is added first.
+lint-linux:
+	docker run --rm \
+		-v "$(PWD):/src" -w /src \
+		-e CARGO_TARGET_DIR=/tmp/target \
+		rust:1.90 \
+		sh -c "rustup component add clippy >/dev/null && cargo clippy --workspace --all-targets -- -D warnings"
 
 # The `ns` launcher can only be exercised on Linux. Runs the isolation and
 # limit checks against a real kernel.

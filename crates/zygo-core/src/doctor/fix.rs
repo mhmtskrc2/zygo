@@ -306,7 +306,7 @@ fn delegation_fix() -> Fix {
         what: "delegate cgroup controllers to your user session".into(),
         why: "without a cgroup it can own, a sandbox has no memory limit, no pid \
               limit and no CPU quota. Zygo refuses to start one rather than run it \
-              unlimited (requirement N4)."
+              unlimited: every limit is on by default."
             .into(),
         cost: None,
         commands: vec![
