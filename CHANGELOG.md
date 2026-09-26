@@ -42,7 +42,9 @@ break things and will say so here.
 
 - CI builds with the `rust-version` the manifest declares and treats a broken
   rustdoc link as an error; `make lint` does the same. The lint policy is
-  written down in `Cargo.toml`'s `[workspace.lints]`.
+  written down in `Cargo.toml`'s `[workspace.lints]`. Every `unsafe` block
+  and `unsafe impl` carries a `// SAFETY:` comment naming the invariant it
+  relies on, and clippy refuses one without.
 
 - `zygo doctor --fix` on Ubuntu 24.04 installs an AppArmor profile that
   lets the `zygo` binary alone use user namespaces, instead of turning
