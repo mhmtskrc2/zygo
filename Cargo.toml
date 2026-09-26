@@ -46,7 +46,7 @@ bytes = "1"
 futures-util = "0.3"
 tar = "0.4"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-ruzstd = "0.7"
+ruzstd = "0.9"
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 clap_complete = "4"
 anyhow = "1"
