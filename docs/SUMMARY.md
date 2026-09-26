@@ -56,4 +56,5 @@ is the project README.
   - [ADR 0003 — No Deno or Bun agent](book/adr/0003-no-deno-or-bun-agent.md)
   - [ADR 0004 — A supervisor upgrade re-warms](book/adr/0004-no-supervisor-reexec.md)
   - [ADR 0005 — One warm zygote per script version](book/adr/0005-one-warm-zygote-per-script-version.md)
+  - [ADR 0006 — The memory limit is each request's](book/adr/0006-memory-limit-per-request.md)
 - [Glossary](book/glossary.md)

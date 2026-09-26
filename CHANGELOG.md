@@ -19,6 +19,17 @@ break things and will say so here.
 
 ### Fixed
 
+- **Warm functions and runtime pools:** a request that goes over `mem` is
+  now killed alone. The limit and the group kill used to sit on the
+  function's cgroup, one budget for the zygote and every request at once, so
+  one request allocating past it took the zygote, the Node agent's parked
+  workers and every request in flight beside it — in a runtime pool, other
+  tenants' — down in one event, and the pool rewarmed. `memory.max` and
+  `memory.oom.group` are now written on each request's own cgroup and on the
+  zygote's leaf; the function keeps `pids.max` and `cpu.max`. A function may
+  therefore use `mem` once per concurrent request plus once for its warm
+  process (chapters 3, 13, 20; ADR 0006). `make verify-oom-linux` is the
+  check.
 - **SDKs:** a call on a pooled connection that `zygo api` had closed while it
   sat idle no longer fails with "the API closed the connection without
   answering". The API hangs up after 30 s idle; all three clients (Python

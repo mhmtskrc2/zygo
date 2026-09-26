@@ -327,9 +327,9 @@ pub(super) fn admit(
     per_request: bool,
     id: &str,
     host_pid: u32,
-    narrower: Option<&crate::sandbox::limits::Limits>,
+    limits: &crate::sandbox::limits::Limits,
 ) -> Option<PathBuf> {
-    let dir = request_cgroup(generation, per_request, id, narrower)?;
+    let dir = request_cgroup(generation, per_request, id, limits)?;
     let _ = crate::cgroup::attach(&dir, host_pid);
     Some(dir)
 }
@@ -342,7 +342,7 @@ pub(super) fn request_cgroup(
     generation: Option<&std::path::Path>,
     per_request: bool,
     id: &str,
-    narrower: Option<&crate::sandbox::limits::Limits>,
+    limits: &crate::sandbox::limits::Limits,
 ) -> Option<PathBuf> {
     if !per_request {
         return None;
@@ -351,18 +351,20 @@ pub(super) fn request_cgroup(
     if std::fs::create_dir(&dir).is_err() {
         return None;
     }
-    // A tenant's own limits, written on *this request's* cgroup before the
-    // child is let go. Cgroups nest, so a narrower number here binds whatever
-    // the function above was declared with — and a wider one would not,
-    // which is why `TenantLimits::narrow` can only produce a smaller value.
+    // This request's memory limit, written on *its* cgroup before the child
+    // is let go: `mem` bounds one request, and `memory.oom.group` makes a
+    // limit hit kill this process tree and nothing beside it — not the
+    // zygote, not the requests in flight next to it, which in a runtime pool
+    // are other tenants'. `limits` is the function's own, or a tenant's
+    // narrower set: cgroups nest, so a smaller number here binds whatever
+    // the function was declared with, and a wider one would not, which is
+    // why `TenantLimits::narrow` can only produce a smaller value.
     //
     // Best effort, like the attach below: a limit that could not be written
-    // leaves the request under the function's own, which is the promise the
-    // operator already made. Failing the request instead would turn a tenant's
-    // *tightening* into an outage.
-    if let Some(limits) = narrower {
-        let _ = crate::cgroup::apply(&dir, &limits.cgroup_writes());
-    }
+    // leaves the request under the tenant's budget, which still bounds it.
+    // Failing the request instead would turn a tenant's *tightening* into an
+    // outage.
+    let _ = crate::cgroup::apply(&dir, &limits.leaf_writes());
     Some(dir)
 }
 

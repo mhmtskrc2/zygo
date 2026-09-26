@@ -15,6 +15,8 @@ use crate::spec::{Bytes, Cpu, Duration};
 #[derive(Debug, Clone, PartialEq)]
 pub struct Limits {
     /// `memory.max` — hard limit; exceeding it OOM-kills this cgroup only.
+    /// Written on each request's own cgroup and on the zygote's, never on
+    /// the function they share: see [`Limits::leaf_writes`].
     pub mem: Bytes,
     /// `memory.high` — throttle and reclaim before killing.
     pub mem_high: Bytes,
@@ -60,12 +62,32 @@ pub struct CgroupWrite {
 }
 
 impl Limits {
-    /// The cgroup v2 files to write, in the order they must be written.
+    /// Every cgroup v2 file, for one cgroup that holds the whole sandbox — a
+    /// one-shot with nothing beside it, or a description of the limits (`zygo
+    /// run --explain`). A warm function is two kinds of cgroup, and gets
+    /// [`function_writes`](Self::function_writes) on the one its sandboxes
+    /// share and [`leaf_writes`](Self::leaf_writes) on each process tree.
+    pub fn cgroup_writes(&self) -> Vec<CgroupWrite> {
+        let mut w = self.leaf_writes();
+        w.extend(self.shared_writes());
+        w
+    }
+
+    /// The files for a cgroup that holds **one process tree**: a request's,
+    /// or the zygote's. The memory limit and the whole-tree kill.
+    ///
+    /// Memory is bounded here and not on the function above, so that `mem`
+    /// means one request. With `memory.max` and `memory.oom.group` on the
+    /// function, one request allocating past the limit was killed together
+    /// with the zygote, its parked workers and every request in flight
+    /// beside it — in a runtime pool, other tenants' requests. Found with
+    /// three sleeping requests and one 2 GB allocation in one pool: all four
+    /// died, and the pool rewarmed.
     ///
     /// `memory.max` comes before `memory.high` deliberately: writing a `high`
     /// above the current `max` is rejected on some kernels, and the reverse
     /// order is always accepted.
-    pub fn cgroup_writes(&self) -> Vec<CgroupWrite> {
+    pub fn leaf_writes(&self) -> Vec<CgroupWrite> {
         let mut w = vec![CgroupWrite {
             file: "memory.max",
             value: self.mem.get().to_string(),
@@ -99,6 +121,48 @@ impl Limits {
                 file: "memory.oom.group",
                 value: u8::from(self.oom_group).to_string(),
             },
+        ]);
+        w.retain(|e| !e.value.is_empty());
+        w
+    }
+
+    /// The files for the cgroup a function's generations, zygote and
+    /// requests all sit under: the process count and the CPU share, which are
+    /// one budget for the whole function, and **no memory ceiling** —
+    /// `memory.max` is opened to `max` and the group kill switched off, so a
+    /// function directory left by an earlier Zygo does not keep the shared
+    /// limit it used to carry. Memory is bounded one level down, per leaf.
+    /// What a whole function may use is therefore at most
+    /// `(concurrency + 1) × mem` per sandbox; the tenant's budget above
+    /// bounds the sum.
+    pub fn function_writes(&self) -> Vec<CgroupWrite> {
+        let mut w = vec![
+            CgroupWrite {
+                file: "memory.max",
+                value: "max".to_string(),
+            },
+            CgroupWrite {
+                file: "memory.oom.group",
+                value: "0".to_string(),
+            },
+            // The swap ceiling stays shared: it is zero by default, and what it
+            // protects is the host's swap, not one request's share of it.
+            CgroupWrite {
+                file: "memory.swap.max",
+                value: self.swap.get().to_string(),
+            },
+        ];
+        w.extend(self.shared_writes());
+        w
+    }
+
+    /// The knobs that are one budget for a function rather than per process
+    /// tree.
+    fn shared_writes(&self) -> Vec<CgroupWrite> {
+        // `io.max` is per-device and needs a `major:minor`, which only the
+        // launcher knows. Emitted separately by `io_max_for_device`.
+        let _ = (&self.io_read, &self.io_write);
+        vec![
             CgroupWrite {
                 file: "pids.max",
                 value: self.pids.to_string(),
@@ -111,13 +175,7 @@ impl Limits {
                 file: "cpu.weight",
                 value: "100".to_string(),
             },
-        ]);
-
-        // `io.max` is per-device and needs a `major:minor`, which only the
-        // launcher knows. Emitted separately by `io_max_for_device`.
-        let _ = (&self.io_read, &self.io_write);
-        w.retain(|e| !e.value.is_empty());
-        w
+        ]
     }
 
     /// `io.max` line for a specific block device, or `None` when no I/O limit
@@ -251,6 +309,39 @@ mod tests {
         // hard limit has to be written first.
         let pos = |f: &str| w.iter().position(|e| e.file == f).unwrap();
         assert!(pos("memory.max") < pos("memory.high"));
+    }
+
+    /// The memory limit is a leaf's, the process and CPU budget the
+    /// function's, and the two sets do not overlap on memory: a function
+    /// with `memory.max` of its own is the shared budget this replaced.
+    #[test]
+    fn memory_is_bounded_per_leaf_and_the_function_has_no_ceiling() {
+        let leaf = limits().leaf_writes();
+        let leaf_files: Vec<&str> = leaf.iter().map(|e| e.file).collect();
+        assert!(leaf_files.contains(&"memory.max"));
+        assert!(leaf_files.contains(&"memory.oom.group"));
+        assert!(!leaf_files.contains(&"pids.max"), "{leaf_files:?}");
+        assert!(!leaf_files.contains(&"cpu.max"), "{leaf_files:?}");
+
+        let function = limits().function_writes();
+        let get = |f: &str| &function.iter().find(|e| e.file == f).unwrap().value;
+        assert_eq!(
+            get("memory.max"),
+            "max",
+            "a function-level ceiling is the shared budget"
+        );
+        assert_eq!(
+            get("memory.oom.group"),
+            "0",
+            "a kill at the function level takes every request"
+        );
+        assert_eq!(get("pids.max"), "64");
+        assert_eq!(get("cpu.max"), "50000 100000");
+        assert_eq!(get("memory.swap.max"), "0");
+        assert!(
+            !function.iter().any(|e| e.file == "memory.high"),
+            "memory.high on the function would throttle every request for one"
+        );
     }
 
     #[test]

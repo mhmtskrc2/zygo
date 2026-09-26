@@ -1,6 +1,6 @@
 .PHONY: help build test test-rust test-agent test-sdk test-sdk-python test-sdk-node lint-linux \
         verify-mcp check check-linux test-linux \
-        verify-linux verify-supervisor-linux escape-linux dist-linux \
+        verify-linux verify-supervisor-linux verify-oom-linux escape-linux dist-linux \
         fuzz-linux gvisor-linux verify-login-linux verify-shim verify-deps-linux \
         repro-blue-green-linux bench-record verify-api-linux verify-plugin-host verify-plugin-host-node vm-build vm-probe vm-kernel \
         verify-vm-pi use-cases-linux vm-use-cases-linux \
@@ -31,6 +31,7 @@ help:
 	@echo "lint-linux   clippy against the Linux-only code, inside a container"
 	@echo "verify-linux run the ns launcher isolation checks against a real kernel"
 	@echo "verify-supervisor-linux  139 end-to-end supervisor lifecycle checks"
+	@echo "verify-oom-linux  one request over its memory limit dies alone in a pool"
 	@echo "repro-blue-green-linux   the one open supervisor question, five times"
 	@echo "escape-linux attempt every known escape vector against a real kernel"
 	@echo "landlock-net-linux  Landlock's bind/connect rules, on a 6.7+ kernel"
@@ -290,6 +291,11 @@ verify-seccomp-profiles-linux: tests/linux/bin/zygo-linux-musl
 # Separate from verify-linux because it is the only suite where the client
 # process exits between steps, which is what exposes failures that live in the
 # supervisor's threading rather than in the sandbox.
+verify-oom-linux: tests/linux/bin/zygo-linux-musl
+	docker run --rm --privileged -v "$(PWD):/src:ro" \
+		python:3.12-slim \
+		sh /src/tests/linux/verify_oom_containment.sh
+
 verify-supervisor-linux: tests/linux/bin/zygo-linux-musl
 	docker run --rm --privileged -v "$(PWD):/src:ro" \
 		python:3.12-slim \

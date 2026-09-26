@@ -110,4 +110,4 @@ project.
 
 ---
 
-← [ADR 0004 — A supervisor upgrade re-warms](0004-no-supervisor-reexec.md) · [Contents](../README.md) · **Next: [Glossary](../glossary.md) →**
+← [ADR 0004 — A supervisor upgrade re-warms](0004-no-supervisor-reexec.md) · [Contents](../README.md) · **Next: [ADR 0006 — The memory limit is each request's](0006-memory-limit-per-request.md) →**

@@ -278,6 +278,20 @@ That is the trade Zygo exists to make. A long-running worker is fast but leaks
 state from one request to the next. A container per request is clean but costs
 hundreds of milliseconds. A fork is both fast and clean.
 
+## What `mem` bounds in a warm function
+
+`mem` is **one request's** limit. Each request runs in a cgroup of its own
+with `memory.max = mem`, and the warm process (the agent, and for Node the
+workers it keeps loaded) sits in a leaf of its own with the same limit
+([chapter 3](03-cgroups.md#the-tree-as-files)). A request that allocates
+past `mem` is killed by the kernel, together with everything it started and
+nothing else: the requests running beside it finish, and the zygote is still
+warm for the next one. So a function with `concurrency = 4` and
+`mem = "256M"` may use up to five times `mem` at once, one share for the warm
+process and one per request; the tenant's budget above bounds the sum.
+`make verify-oom-linux` runs three sleeping requests beside one that
+allocates 2 GB, for both agents, and checks that only the one dies.
+
 ```text
   long-running worker          container per request         fork per request (Zygo)
   ───────────────────          ─────────────────────         ───────────────────────

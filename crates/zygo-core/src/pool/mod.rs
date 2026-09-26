@@ -608,6 +608,7 @@ impl Pool {
             generation_cgroup: generation,
             per_request_cgroup: self.config.per_request_cgroup,
             timeout: f.limits.timeout.get(),
+            limits: f.limits.clone(),
             secrets: Mutex::new(Secrets::default()),
             scripts: Mutex::new(Scripts::default()),
             script_dir: script_dir.to_path_buf(),

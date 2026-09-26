@@ -399,7 +399,7 @@ fn start_vm(config: &SandboxConfig, kernel: &Path) -> Result<Box<dyn Sandbox>> {
             );
             let function = cgroup::Hierarchy::function_name(&config.id.name, config.own_limits);
             h.create_function(&config.id.tenant, &function, &limits)?;
-            Some(h.create_generation(&config.id.tenant, &function)?)
+            Some(h.create_generation(&config.id.tenant, &function, &limits)?)
         }
         None => None,
     };

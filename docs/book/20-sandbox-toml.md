@@ -133,7 +133,7 @@ These are enforced for every request. None can be switched off, except
 
 | Field | Type | Default | Enforced by | Rules |
 |---|---|---|---|---|
-| `mem` | bytes | `256M` | `memory.max`; `memory.high` at 90%; no swap | At least `8M`. The whole request's process tree is killed together. |
+| `mem` | bytes | `256M` | `memory.max` on each request's own cgroup, and on the warm process's; `memory.high` at 90%; no swap | At least `8M`. Bounds one request: its whole process tree is killed together, and nothing beside it. A warm function may use `mem` once for its zygote plus once per concurrent request. |
 | `cpu` | cores | `1.0` | `cpu.max`, over a 100 ms period | Above zero. A request that spins is slowed, not the host. |
 | `pids` | integer | `64` | `pids.max` | Not zero. The fork-bomb limit. |
 | `timeout` | duration | `30s` | the supervisor, with `cgroup.kill` | Not zero unless `--allow-unlimited`. The request exits 137. |

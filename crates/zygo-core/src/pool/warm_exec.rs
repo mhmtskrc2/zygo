@@ -69,6 +69,9 @@ pub struct WarmExec {
     pub(super) generation_cgroup: Option<PathBuf>,
     pub(super) per_request_cgroup: bool,
     pub(super) timeout: std::time::Duration,
+    /// The function's limits; each request's cgroup gets the memory limit
+    /// from here.
+    pub(super) limits: crate::sandbox::limits::Limits,
     pub(super) secrets: Mutex<Secrets>,
     /// Scripts written into the sandbox for the requests running them. As on
     /// [`WarmFn`](super::WarmFn), and for a pool of these it is the only way
@@ -263,13 +266,14 @@ impl WarmExec {
 
         // The request's cgroup exists before the request does, so the request
         // can be created inside it rather than moved there (see
-        // `enter::enter_with`). A warm-exec function is one tenant's and its
-        // limits were set at warm time; there is nothing per-request to narrow.
+        // `enter::enter_with`). A warm-exec function is one tenant's, so
+        // there is nothing per-request to narrow: every request gets the
+        // function's own memory limit.
         let request_cgroup = request_cgroup(
             self.generation_cgroup.as_deref(),
             self.per_request_cgroup,
             &id,
-            None,
+            &self.limits,
         );
         let request_cgroup_dir = request_cgroup
             .as_deref()

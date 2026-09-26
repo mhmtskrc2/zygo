@@ -574,10 +574,11 @@ pub fn launch(config: &SandboxConfig, hierarchy: Option<&cgroup::Hierarchy>) -> 
     let uid_map = idmap::render_id_map(&idmap::id_map(config.uid, outer_uid, sub));
     let gid_map = idmap::render_id_map(&idmap::id_map(config.gid, outer_gid, sub));
 
-    // The function carries the limits and outlives this sandbox; the
-    // generation is what this one launch attaches to, kills and removes, so
-    // retiring it cannot reach a replacement started under the same name. The
-    // tenant above groups everything one customer runs.
+    // The function carries the process and CPU budget and outlives this
+    // sandbox; the generation is what this one launch attaches to, kills and
+    // removes, so retiring it cannot reach a replacement started under the
+    // same name; its zygote leaf carries the memory limit, as every request
+    // does. The tenant above groups everything one customer runs.
     let generation = match hierarchy {
         Some(h) => {
             // Builds `zygo.slice/{system,tenants}` and moves this process into
@@ -586,7 +587,7 @@ pub fn launch(config: &SandboxConfig, hierarchy: Option<&cgroup::Hierarchy>) -> 
             h.ensure(cgroup::Hierarchy::host_ram())?;
             let function = cgroup::Hierarchy::function_name(&config.id.name, config.own_limits);
             h.create_function(&config.id.tenant, &function, &config.limits)?;
-            Some(h.create_generation(&config.id.tenant, &function)?)
+            Some(h.create_generation(&config.id.tenant, &function, &config.limits)?)
         }
         None => None,
     };

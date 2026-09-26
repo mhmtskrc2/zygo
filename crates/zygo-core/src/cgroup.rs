@@ -6,21 +6,26 @@
 //! ├── system/                     supervisor, image GC   memory.min = 512M
 //! └── tenants/                    memory.max = tenant budget
 //!     ├── acme/                   one tenant: a customer of the embedder
-//!     │   ├── resize/             one function or pool  memory.max, pids.max, cpu.max
+//!     │   ├── resize/             one function or pool  pids.max, cpu.max
 //!     │   │   └── g4242-1/        one generation of the sandbox
-//!     │   │       ├── zygote
-//!     │   │       ├── req-01f3…
-//!     │   │       └── req-01f4…
+//!     │   │       ├── zygote      memory.max = mem, oom.group
+//!     │   │       ├── req-01f3…   memory.max = mem, oom.group
+//!     │   │       └── req-01f4…   memory.max = mem, oom.group
 //!     │   └── thumbnail/
 //!     └── default/                everything served without a tenant
 //! ```
 //!
 //! Three levels, and each answers a different question. The **tenant** is who
 //! the work is for — a customer of whoever embedded Zygo — and is where a
-//! per-tenant budget goes. The **function** carries the limits a request is
-//! actually held to and outlives any one sandbox. A **generation** is what one
-//! sandbox — its zygote and its requests — lives in and is torn down with, so
-//! replacing or rewarming a function takes only the sandbox being replaced.
+//! per-tenant budget goes. The **function** carries the process and CPU
+//! budget every request shares and outlives any one sandbox. A **generation**
+//! is what one sandbox — its zygote and its requests — lives in and is torn
+//! down with, so replacing or rewarming a function takes only the sandbox
+//! being replaced. Memory is bounded on the **leaves**: the zygote and each
+//! request carry `mem` of their own, with `memory.oom.group` so a limit hit
+//! kills that one process tree and nothing beside it. On the function it was
+//! one budget for the zygote and every request at once, and a single request
+//! over it took every other request in the pool down with it.
 //!
 //! The tenant level was added when tenants became first-class.
 //! Before that, `tenants/<name>` *was* the function, which is why the word
@@ -156,7 +161,7 @@ impl Hierarchy {
     }
 
     /// `zygo.slice/tenants/<tenant>/<name>` — one function or pool, where the
-    /// limits a request is held to are written.
+    /// process and CPU budget its requests share is written.
     pub fn function(&self, tenant: &str, name: &str) -> PathBuf {
         self.tenant(tenant).join(sanitise(name))
     }
@@ -356,27 +361,32 @@ impl Hierarchy {
             });
         }
 
-        apply(&dir, &limits.cgroup_writes())?;
+        apply(&dir, &limits.function_writes())?;
         Ok(dir)
     }
 
     /// Create a generation under an existing function, with the leaf the
-    /// sandbox's process will live in. Limits stay on the function so they
-    /// cover every generation, the zygote and every per-request child.
-    pub fn create_generation(&self, tenant: &str, name: &str) -> Result<PathBuf> {
+    /// sandbox's process will live in. The process and CPU budget stays on
+    /// the function, covering every generation; the memory limit is written
+    /// on the zygote leaf, as it is on every request, so the zygote is bounded
+    /// on its own and a request over its limit cannot reach it.
+    pub fn create_generation(&self, tenant: &str, name: &str, limits: &Limits) -> Result<PathBuf> {
         let dir = self.generation(tenant, name);
         create(&dir)?;
         enable_controllers(&dir, CONTROLLERS)?;
-        create(&Self::zygote(&dir))?;
+        let zygote = Self::zygote(&dir);
+        create(&zygote)?;
+        apply(&zygote, &limits.leaf_writes())?;
         Ok(dir)
     }
 
-    /// Create a per-request cgroup. Limits are inherited from the function;
-    /// only
-    /// the wall-clock kill switch is per request.
-    pub fn create_request(generation: &Path, request_id: &str) -> Result<PathBuf> {
+    /// Create a per-request cgroup with the request's own memory limit. The
+    /// process and CPU budget is inherited from the function; the wall-clock
+    /// kill switch and the memory limit are per request.
+    pub fn create_request(generation: &Path, request_id: &str, limits: &Limits) -> Result<PathBuf> {
         let dir = Self::request(generation, request_id);
         create(&dir)?;
+        apply(&dir, &limits.leaf_writes())?;
         Ok(dir)
     }
 
@@ -1160,6 +1170,19 @@ mod tests {
         assert_eq!(budget, expected.get().to_string());
     }
 
+    /// Delete the regular files under `dir`, leaving the directories: what a
+    /// fake cgroup tree needs before `rmdir`, which on cgroupfs never sees a
+    /// control file in its way.
+    fn strip_control_files(dir: &Path) {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            if entry.file_type().unwrap().is_dir() {
+                strip_control_files(&entry.path());
+            } else {
+                std::fs::remove_file(entry.path()).unwrap();
+            }
+        }
+    }
+
     /// Stand in for a delegated hierarchy: on a real cgroupfs the kernel
     /// creates the limit files when a controller is enabled.
     fn fake_delegation(dir: &Path) {
@@ -1171,7 +1194,7 @@ mod tests {
     }
 
     #[test]
-    fn creating_a_tenant_writes_every_limit() {
+    fn creating_a_function_writes_the_shared_budget_and_no_memory_ceiling() {
         let tmp = tempfile::tempdir().unwrap();
         let h = Hierarchy::new(tmp.path().join("zygo.slice"));
         h.ensure(Bytes(8 * (1 << 30))).unwrap();
@@ -1180,11 +1203,53 @@ mod tests {
         let dir = h.create_function("acme", "resize", &limits()).unwrap();
 
         let read = |f: &str| std::fs::read_to_string(dir.join(f)).unwrap();
-        assert_eq!(read("memory.max"), (256 * (1 << 20)).to_string());
+        assert_eq!(
+            read("memory.max"),
+            "max",
+            "the function is not one memory budget"
+        );
+        assert_eq!(
+            read("memory.oom.group"),
+            "0",
+            "a kill here would take every request"
+        );
         assert_eq!(read("memory.swap.max"), "0");
-        assert_eq!(read("memory.oom.group"), "1");
         assert_eq!(read("pids.max"), "64");
         assert_eq!(read("cpu.max"), "50000 100000");
+    }
+
+    /// `mem` is each process tree's own: the zygote's leaf and every request
+    /// carry it, with the group kill, so a request over its limit dies alone.
+    #[test]
+    fn the_zygote_and_each_request_carry_the_memory_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let h = Hierarchy::new(tmp.path().join("zygo.slice"));
+        h.ensure(Bytes(8 * (1 << 30))).unwrap();
+        fake_delegation(&h.function("acme", "resize"));
+        h.create_function("acme", "resize", &limits()).unwrap();
+
+        let generation = h.create_generation("acme", "resize", &limits()).unwrap();
+        let request = Hierarchy::create_request(&generation, "00000001", &limits()).unwrap();
+
+        for leaf in [Hierarchy::zygote(&generation), request] {
+            let read = |f: &str| std::fs::read_to_string(leaf.join(f)).unwrap();
+            assert_eq!(
+                read("memory.max"),
+                (256 * (1 << 20)).to_string(),
+                "{}",
+                leaf.display()
+            );
+            assert_eq!(read("memory.oom.group"), "1", "{}", leaf.display());
+            assert_eq!(read("memory.swap.max"), "0", "{}", leaf.display());
+            assert!(
+                !leaf.join("pids.max").exists(),
+                "the process budget is the function's"
+            );
+        }
+        assert!(
+            !generation.join("memory.max").exists(),
+            "the generation carries nothing; its leaves do"
+        );
     }
 
     /// Replacing a function must not let the old sandbox's teardown reach the
@@ -1198,18 +1263,22 @@ mod tests {
         fake_delegation(&h.function("acme", "resize"));
         h.create_function("acme", "resize", &limits()).unwrap();
 
-        let old = h.create_generation("acme", "resize").unwrap();
-        let new = h.create_generation("acme", "resize").unwrap();
+        let old = h.create_generation("acme", "resize", &limits()).unwrap();
+        let new = h.create_generation("acme", "resize", &limits()).unwrap();
         assert_ne!(old, new);
         assert!(Hierarchy::zygote(&old).is_dir());
         assert!(Hierarchy::zygote(&new).is_dir());
 
+        // On cgroupfs the control files go with the directory; on a temporary
+        // directory the limit files written on the zygote leaf are real, and
+        // `rmdir` would refuse. Take them away, as the kernel would.
+        strip_control_files(&old);
         Hierarchy::remove(&old).unwrap();
         assert!(!old.exists());
         assert!(Hierarchy::zygote(&new).is_dir(), "the replacement survived");
         assert!(
-            h.function("acme", "resize").join("memory.max").exists(),
-            "limits stay on the tenant"
+            h.function("acme", "resize").join("pids.max").exists(),
+            "the shared budget stays on the function"
         );
     }
 

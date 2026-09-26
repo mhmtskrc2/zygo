@@ -31,14 +31,19 @@ group can never use more than its parent allows, whatever its own files say.
                 ├── system/                     the supervisor, protected
                 └── tenants/
                     └── acme/                   one customer's budget
-                        └── resize/             one function: memory.max, cpu.max, pids.max
+                        └── resize/             one function: cpu.max, pids.max
                             └── g4242-1/        one warm sandbox
-                                ├── zygote      the warm process
-                                ├── req-01f3…   one request ─┐ each request has its own
-                                └── req-01f4…   one request ─┘ group, so it can be killed alone
+                                ├── zygote      the warm process: memory.max = mem
+                                ├── req-01f3…   one request ─┐ each has its own group and
+                                └── req-01f4…   one request ─┘ its own memory.max = mem
 ```
 
 This is Zygo's real tree; `crates/zygo-core/src/cgroup.rs` describes each level.
+The memory limit is on the leaves on purpose. The function's group holds the
+warm process and every request at once, so a `memory.max` there would be one
+budget for all of them, and a single request going over it would take the
+others with it. On its own group, a request that goes over `mem` is killed
+alone, and the warm process and the requests beside it go on.
 
 ## Controllers
 

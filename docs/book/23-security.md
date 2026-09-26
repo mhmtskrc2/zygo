@@ -191,7 +191,7 @@ syscall named in the tables below is refused.
 | Vector | Control | Status |
 |---|---|---|
 | Seeing or signalling host processes | separate pid namespace; only the sandbox's own processes are visible | **attempted** |
-| Resource exhaustion | mandatory cgroup limits; `pids.max` always set; `memory.oom.group` | **attempted** separately by `make verify-linux` (the fork bomb is cut off at `pids.max`; the memory hog is OOM-killed inside its own cgroup and the host loses 0 MB) |
+| Resource exhaustion | mandatory cgroup limits; `pids.max` always set; `memory.max` and `memory.oom.group` on each request's own cgroup | **attempted** separately by `make verify-linux` (the fork bomb is cut off at `pids.max`; the memory hog is OOM-killed inside its own cgroup and the host loses 0 MB) and `make verify-oom-linux` (in a warm function, the hog dies and the three requests beside it, and the zygote, do not) |
 | Zygote contamination | the zygote never handles a request itself; every request is a fresh process that ends in `_exit` | by construction |
 | A file left in the temp folder for the next request (or tenant) | each request's `TMPDIR` is its own folder under `/work`, which cannot be listed, removed when the request ends; a literal `/tmp/...` path is still shared by the sandbox | **attempted** (case 18, in a runtime pool) |
 

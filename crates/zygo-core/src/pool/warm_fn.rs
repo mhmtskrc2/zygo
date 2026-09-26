@@ -434,7 +434,7 @@ impl WarmFn {
             self.per_request_cgroup,
             &id,
             host_pid,
-            narrowed.as_ref(),
+            narrowed.as_ref().unwrap_or(&self.limits),
         );
         request.running_at(request_cgroup.as_deref(), host_pid);
         let _secrets = match self.place_secrets(secrets) {

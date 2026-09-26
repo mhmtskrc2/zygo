@@ -83,4 +83,4 @@ One line each. The chapter in brackets explains the term in full; the numbers fo
 
 ---
 
-← [ADR 0005 — One warm zygote per script version](adr/0005-one-warm-zygote-per-script-version.md) · [Contents](README.md)
+← [ADR 0006 — The memory limit is each request's](adr/0006-memory-limit-per-request.md) · [Contents](README.md)

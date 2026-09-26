@@ -4,10 +4,10 @@ Some choices in Zygo look strange until you know the reason: why the `vm`
 backend has no warm functions, why there is no Deno agent, why an upgrade
 throws the warm sandboxes away. Each of these was written down as an
 *Architecture Decision Record* (ADR): a short, dated note of a question, the
-answer, and what would change the answer. This chapter explains the five ADRs
+answer, and what would change the answer. This chapter explains the six ADRs
 in plain words; each section links to the full record in [adr/](adr/).
 
-## The five decisions at a glance
+## The six decisions at a glance
 
 | ADR | The question | The answer, in one line |
 |---|---|---|
@@ -16,16 +16,18 @@ in plain words; each section links to the full record in [adr/](adr/).
 | [0003](adr/0003-no-deno-or-bun-agent.md) | Should there be Deno and Bun agents? | No, until an embedder asks with a measurement. |
 | [0004](adr/0004-no-supervisor-reexec.md) | Can an upgrade keep the warm sandboxes? | No. An upgrade drains, restarts and re-warms. |
 | [0005](adr/0005-one-warm-zygote-per-script-version.md) | One warm zygote per script version? What evicts it? | Yes for heavy scripts, a runtime pool for light ones; timeouts evict. |
+| [0006](adr/0006-memory-limit-per-request.md) | What does `mem` bound in a warm function? | One request, on its own cgroup — never the function as a whole. |
 
 ```text
-  how the five decisions depend on each other
+  how the six decisions depend on each other
   ─────────────────────────────────────────────────────────────────
    0001  the product is the warm path, for an embedder
      │
      ├──► 0002  keep one warm path (ns), do not build three
      ├──► 0003  keep the agent list small enough to test fully
      ├──► 0004  restarts re-warm; keep one copy of the state
-     └──► 0005  how a real embedder should use warm paths
+     ├──► 0005  how a real embedder should use warm paths
+     └──► 0006  one tenant's request cannot take the others down
   ─────────────────────────────────────────────────────────────────
 ```
 
