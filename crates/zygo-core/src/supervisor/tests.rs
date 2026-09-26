@@ -1257,7 +1257,7 @@ fn with_secret_key(dir: &tempfile::TempDir) -> Supervisor {
     let key =
         crate::secrets::SecretKey::parse(&crate::secrets::SecretKey::generate().expect("keygen"))
             .expect("parse");
-    supervisor.secret_key = Some(key);
+    supervisor.secret_key = Some(std::sync::Arc::new(key));
     supervisor
 }
 

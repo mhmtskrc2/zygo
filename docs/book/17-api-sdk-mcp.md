@@ -163,7 +163,7 @@ rights. Bodies are JSON unless marked raw; the limit is 16 MiB.
 | `POST /deps` | any | Build a dependency set from lock files: `{image, files}`. 202 while building. |
 | `GET /deps`, `GET /deps/{id}` | any | Their state, and the build log. |
 | `DELETE /deps/{id}` | deploy | Remove one no pool uses. |
-| `POST /tenants` · `GET /tenants` | op | Create or list tenants. |
+| `POST /tenants` · `GET /tenants` | op | Create or list tenants. `400` on a host whose user has no subordinate uid range, unless the supervisor runs with `ZYGO_ALLOW_SHARED_UID=1` ([chapter 23](23-security.md#hardening-your-deployment)). |
 | `GET /tenants/{id}` | that tenant, or op | One tenant: scripts, limits. |
 | `DELETE /tenants/{id}` | deploy | Remove it, its scripts and its functions. |
 | `PATCH /tenants/{id}/limits` | deploy | Narrow its limits: `mem`, `cpu`, `pids`, `timeout`, `scratch`, `network`, `allow`. |

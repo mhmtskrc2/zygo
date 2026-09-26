@@ -2750,4 +2750,5 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "zeroize",
 ]

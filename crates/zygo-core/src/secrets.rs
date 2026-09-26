@@ -48,6 +48,7 @@ use std::path::PathBuf;
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+use zeroize::Zeroizing;
 
 use crate::error::{Error, IoContext, Result};
 use crate::paths::Paths;
@@ -66,8 +67,11 @@ pub const KEY_FILE_ENV: &str = "ZYGO_SECRETS_KEY_FILE";
 pub const MAX_SECRET_BYTES: usize = 64 * 1024;
 
 /// A key, kept out of `Debug` and wiped when it goes.
-#[derive(Clone)]
-pub struct SecretKey(Key);
+///
+/// Not `Clone`: one copy of the key in this process's heap, zeroed when it
+/// is dropped, is the promise; a copy that could be made anywhere would be
+/// one nobody wipes. The supervisor shares it through an `Arc`.
+pub struct SecretKey(Zeroizing<[u8; 32]>);
 
 impl std::fmt::Debug for SecretKey {
     /// Never the bytes. A key in a log line is a key that has been published.
@@ -106,15 +110,20 @@ impl SecretKey {
     /// One message for every way of getting it wrong, because they are all the
     /// same mistake from the operator's side: what they have is not a key.
     pub fn parse(text: &str) -> Result<SecretKey> {
-        let bytes = if text.len() == 64 && text.bytes().all(|b| b.is_ascii_hexdigit()) {
-            hex::decode(text).ok()
-        } else {
-            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, text).ok()
-        };
+        // The decoded bytes are the key too, so they are wiped as well.
+        let bytes: Option<Zeroizing<Vec<u8>>> =
+            if text.len() == 64 && text.bytes().all(|b| b.is_ascii_hexdigit()) {
+                hex::decode(text).ok()
+            } else {
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, text).ok()
+            }
+            .map(Zeroizing::new);
         match bytes {
-            Some(bytes) if bytes.len() == 32 => Ok(SecretKey(
-                Key::try_from(&bytes[..]).expect("checked to be 32 bytes"),
-            )),
+            Some(bytes) if bytes.len() == 32 => {
+                let mut key = Zeroizing::new([0u8; 32]);
+                key.copy_from_slice(&bytes);
+                Ok(SecretKey(key))
+            }
             _ => Err(bad(
                 "a key is 32 bytes, as 64 hex characters or base64, and this is not. \
                  `zygo secrets keygen` prints one. A passphrase is not a key: \
@@ -136,7 +145,10 @@ impl SecretKey {
     }
 
     fn cipher(&self) -> ChaCha20Poly1305 {
-        ChaCha20Poly1305::new(&self.0)
+        // The cipher keeps its own copy of the key and wipes it on drop
+        // (`chacha20poly1305`'s `zeroize` feature). The 32 bytes it is built
+        // from here live on the stack for the length of this call.
+        ChaCha20Poly1305::new(&Key::from(*self.0))
     }
 }
 
@@ -151,11 +163,11 @@ struct Sealed {
 /// The secrets on this host.
 pub struct SecretStore {
     dir: PathBuf,
-    key: SecretKey,
+    key: std::sync::Arc<SecretKey>,
 }
 
 impl SecretStore {
-    pub fn new(paths: &Paths, key: SecretKey) -> SecretStore {
+    pub fn new(paths: &Paths, key: std::sync::Arc<SecretKey>) -> SecretStore {
         SecretStore {
             dir: paths.secrets(),
             key,
@@ -388,7 +400,7 @@ mod tests {
     fn store() -> (tempfile::TempDir, SecretStore) {
         let root = tempfile::tempdir().expect("a temp dir");
         let key = SecretKey::parse(&SecretKey::generate().expect("keygen")).expect("parse");
-        let store = SecretStore::new(&Paths::rooted(root.path()), key);
+        let store = SecretStore::new(&Paths::rooted(root.path()), key.into());
         (root, store)
     }
 
@@ -448,12 +460,12 @@ mod tests {
         let root = tempfile::tempdir().expect("tempdir");
         let paths = Paths::rooted(root.path());
         let first = SecretKey::parse(&SecretKey::generate().expect("keygen")).expect("parse");
-        SecretStore::new(&paths, first)
+        SecretStore::new(&paths, first.into())
             .put("acme", "K", "value")
             .expect("put");
 
         let other = SecretKey::parse(&SecretKey::generate().expect("keygen")).expect("parse");
-        let err = SecretStore::new(&paths, other)
+        let err = SecretStore::new(&paths, other.into())
             .values("acme")
             .expect_err("a different key");
         assert!(format!("{err}").contains("will not decrypt"), "{err}");
@@ -465,7 +477,7 @@ mod tests {
         let root = tempfile::tempdir().expect("tempdir");
         let paths = Paths::rooted(root.path());
         let key = SecretKey::parse(&SecretKey::generate().expect("keygen")).expect("parse");
-        let secrets = SecretStore::new(&paths, key);
+        let secrets = SecretStore::new(&paths, key.into());
         secrets.put("acme", "K", "acme's value").expect("put");
         secrets
             .put("globex", "OTHER", "globex's value")

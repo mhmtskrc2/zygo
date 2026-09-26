@@ -102,7 +102,7 @@ pub struct Supervisor {
     /// running supervisor would mean half the store readable and half not, and
     /// nothing would say which half. `None` is a host with no secrets, which
     /// is a working host — see [`Supervisor::secret_store`].
-    secret_key: Option<crate::secrets::SecretKey>,
+    secret_key: Option<Arc<crate::secrets::SecretKey>>,
     /// Rewarm history per name. See [`Backoff`] for why it is not in `Entry`.
     rewarms: Mutex<BTreeMap<String, Backoff>>,
     /// One lock per function name, held for the length of a rewarm.
@@ -172,7 +172,8 @@ impl Supervisor {
             // here, rather than at the first request that needed it: an
             // operator who typo'd the variable must not get a host that
             // quietly behaves as though they had set nothing.
-            secret_key: crate::secrets::SecretKey::from_env(|k| std::env::var(k).ok())?,
+            secret_key: crate::secrets::SecretKey::from_env(|k| std::env::var(k).ok())?
+                .map(Arc::new),
             cold: Mutex::new(BTreeMap::new()),
             rewarms: Mutex::new(BTreeMap::new()),
             warming: Mutex::new(BTreeMap::new()),

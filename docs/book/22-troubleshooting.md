@@ -116,6 +116,24 @@ The exit code is **1**, not 125. The host is fine and the input is wrong, so a
 CI job that retries on another machine would fail there too. 125 is kept for a
 build that could not *start*.
 
+### "this host has no subordinate uid range for the user running Zygo"
+
+`POST /tenants` (or `client.create_tenant`) was refused. Without a range in
+`/etc/subuid` and `/etc/subgid`, every sandbox maps to your one host uid, so
+two tenants' sandboxes are the same user to the kernel and the wall between
+their files is only what the mounts and Landlock add. `zygo doctor` reports
+it as `subuid/subgid … degraded` and prints the fix, which is `uidmap` and a
+line per user:
+
+```bash
+sudo apt install uidmap
+sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $USER
+zygo supervisor stop            # the next command starts a new one
+```
+
+To run multi-tenant without that anyway — a test host, say — start the
+supervisor with `ZYGO_ALLOW_SHARED_UID=1`.
+
 ## AppArmor and user namespaces
 
 *AppArmor* is a set of rules, loaded by the system's administrator, that the

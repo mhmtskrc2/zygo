@@ -11,9 +11,56 @@
 
 use super::{ControlError, Response, Supervisor};
 
+/// Set to `1` to register tenants on a host whose user has no subordinate
+/// uid range, where every tenant's sandbox runs as the same host uid.
+pub const ALLOW_SHARED_UID_ENV: &str = "ZYGO_ALLOW_SHARED_UID";
+
+/// Whether this host can give each tenant a host uid of its own.
+///
+/// Without a subordinate range, every sandbox maps to the caller's one uid,
+/// and the wall between two tenants' files is only what the mounts and
+/// Landlock add. That is a fine single-tenant host and a degraded
+/// multi-tenant one, which is why it is refused at the moment a host becomes
+/// multi-tenant — a second tenant — rather than at every launch. The
+/// operator who accepts it says so once, in the environment.
+///
+/// Answered as `true` off Linux: the shim forwards to a VM whose own
+/// supervisor makes this decision, and the unit tests are about the
+/// supervisor, not about the developer machine's `/etc/subuid`.
+fn uid_separation_or_allowed() -> bool {
+    if cfg!(test) || std::env::var_os(ALLOW_SHARED_UID_ENV).is_some_and(|v| v == "1") {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        crate::backend::ns::idmap::subuid_range_for_current_user().is_some()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
+}
+
 impl Supervisor {
     /// Register a tenant, or find the one already registered.
+    ///
+    /// A tenant is what makes a host multi-tenant, so this is where the host
+    /// is asked whether it can keep tenants apart — a subordinate uid range,
+    /// or the operator's `ZYGO_ALLOW_SHARED_UID=1`.
     pub fn create_tenant(&self, id: &str) -> std::result::Result<Response, Response> {
+        if !uid_separation_or_allowed() {
+            return Err(Response::error(
+                ControlError::BadSpec,
+                format!(
+                    "this host has no subordinate uid range for the user running Zygo, so \
+                     every tenant's sandbox would run as the same host uid and one tenant \
+                     could reach another's files. Install `uidmap` and give this user a \
+                     range in /etc/subuid and /etc/subgid (`zygo doctor` says how), or set \
+                     {ALLOW_SHARED_UID_ENV}=1 on the supervisor to run multi-tenant \
+                     without uid separation anyway"
+                ),
+            ));
+        }
         let (tenant, existed) = crate::tenants::Tenants::new(&self.paths)
             .create(id)
             .map_err(|e| Response::error(ControlError::BadSpec, e))?;
@@ -255,8 +302,8 @@ impl Supervisor {
     /// ceremony for a risk that is not there.
     pub fn secret_store(&self) -> Option<crate::secrets::SecretStore> {
         self.secret_key
-            .clone()
-            .map(|key| crate::secrets::SecretStore::new(&self.paths, key))
+            .as_ref()
+            .map(|key| crate::secrets::SecretStore::new(&self.paths, std::sync::Arc::clone(key)))
     }
 
     /// The store, or the error a caller gets when there is no key.

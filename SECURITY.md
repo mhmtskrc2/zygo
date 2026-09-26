@@ -93,4 +93,5 @@ range is missing, each of which weakens a boundary.
 * Bind the HTTP API to loopback or a unix socket. It refuses to start
   unauthenticated on a reachable address, but the default is worth keeping.
 * Install `uidmap` so tenants get distinct subordinate uid ranges rather than
-  sharing one identity map.
+  sharing one identity map. A host without one refuses to register a tenant
+  unless the supervisor runs with `ZYGO_ALLOW_SHARED_UID=1`.
