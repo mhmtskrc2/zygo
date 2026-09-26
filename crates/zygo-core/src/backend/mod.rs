@@ -45,7 +45,7 @@ pub trait Sandbox: Send + Sync {
     /// afterwards, because the cgroup directory is removed as part of reaping
     /// and the counters go with it — a caller that read them after `wait`
     /// found an empty directory and reported zero, which reads exactly like
-    /// "it was not killed". Found by `poc/verify_api.sh` against a real
+    /// "it was not killed". Found by `tests/linux/verify_api.sh` against a real
     /// kernel.
     fn outcome(&self) -> SandboxOutcome {
         SandboxOutcome::default()

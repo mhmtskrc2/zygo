@@ -2578,7 +2578,7 @@ async fn one_shot(api: &Arc<Api>, body: &[u8]) -> Result<Response<ApiBody>, Http
     // whole reason those fields exist; answering 408 for a sandbox that hit
     // the `timeout` its caller asked for made the SDK raise instead of
     // returning the result, which contradicts "a non-zero exit is not an
-    // exception". Found by `poc/verify_api.sh` against a real kernel.
+    // exception". Found by `tests/linux/verify_api.sh` against a real kernel.
     //
     // 408 is kept for the one case it fits: this API's own outer bound fired,
     // the child was killed, and what it would have said is unknown. That is

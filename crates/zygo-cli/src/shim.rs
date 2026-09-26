@@ -734,7 +734,7 @@ pub fn host_checks(
         None => Check::degraded(
             "linux build",
             "none on this Mac; the VM keeps whatever it already has",
-            "in a checkout: make guest-build (no Docker) or make poc/zygo-linux-musl; otherwise set ZYGO_LINUX_BIN",
+            "in a checkout: make guest-build (no Docker) or make tests/linux/bin/zygo-linux-musl; otherwise set ZYGO_LINUX_BIN",
         ),
     });
     checks.push(match vm {
@@ -1317,7 +1317,7 @@ fn ensure_guest_binary(limactl: &Path, paths: &zygo_core::paths::Paths) -> anyho
             "the VM has no Linux build of Zygo to run, and there is none on \
              this Mac to put there\n  \
              → in a checkout: make guest-build (compiled in the VM, no Docker) \
-             or make poc/zygo-linux-musl\n  \
+             or make tests/linux/bin/zygo-linux-musl\n  \
              → otherwise: set ZYGO_LINUX_BIN to a Linux `zygo` for this \
              machine's architecture"
         );
@@ -1427,7 +1427,7 @@ fn linux_binary() -> Option<PathBuf> {
     });
     let checkout = PathBuf::from(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../poc/zygo-linux-musl"
+        "/../../tests/linux/bin/zygo-linux-musl"
     ));
     [named, installed, Some(checkout)]
         .into_iter()
@@ -1836,7 +1836,7 @@ mod tests {
     /// The retry decision, against a stand-in for `limactl`: SSH's line
     /// and exit 255 together mean the guest ran nothing; either alone does
     /// not. A real refusal needs a VM and a burst wide enough to hit its
-    /// session cap, which `poc/verify_shim_concurrency.sh` attempts; this
+    /// session cap, which `tests/linux/verify_shim_concurrency.sh` attempts; this
     /// is the decision itself, on the bytes SSH actually prints.
     #[cfg(target_os = "macos")]
     #[test]

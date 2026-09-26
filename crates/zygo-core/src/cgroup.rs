@@ -941,7 +941,7 @@ mod tests {
     // The removal itself is not unit tested: `rmdir` on a real cgroup succeeds
     // with its control files in place, and on an ordinary filesystem it does
     // not, so a temporary directory cannot stand in for one. That half is
-    // covered end to end in `poc/verify_supervisor.sh`, against a real kernel.
+    // covered end to end in `tests/linux/verify_supervisor.sh`, against a real kernel.
 
     /// A fake cgroup with the given pids in its `cgroup.procs`.
     fn fake_cgroup(dir: &Path, pids: &str) {

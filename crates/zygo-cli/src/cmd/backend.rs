@@ -170,7 +170,7 @@ fn install_vm(cli: &Cli) -> anyhow::Result<u8> {
         "there is no published guest kernel to download: libkrunfw ships source, \
          not an image\n  \
          → build one with `make vm-kernel`, then copy it in:\n     \
-         install -Dm644 poc/vm-out/Image {}\n  \
+         install -Dm644 tests/linux/bin/vm-out/Image {}\n  \
          → `zygo doctor` reports it once it is there",
         destination.display()
     )
