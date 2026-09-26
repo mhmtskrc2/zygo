@@ -117,6 +117,23 @@ alike. The ones a first pull request most often trips on:
 By sending a pull request you agree that your contribution is licensed under
 the [Apache License 2.0](LICENSE), the same as the rest of the project.
 
+## Cutting a release
+
+A release is one tag; the workflow in `.github/workflows/release.yml` builds
+and publishes everything from it — binaries, the image, the crates, the
+Homebrew formula and the two `zygo-sdk` packages. It refuses a tag whose
+version differs from any manifest, so the version is written in one step:
+
+```bash
+make bump VERSION=0.1.4      # Cargo.toml, both SDK manifests, spec/openapi.json, chapter 17
+```
+
+Then turn *Unreleased* in [CHANGELOG.md](CHANGELOG.md) into the version's
+section, run `make test && make lint`, commit as `Release 0.1.4`, and push
+the commit and the tag `v0.1.4`. A `workflow_dispatch` of the same workflow
+rehearses all of it and uploads nothing. If one publish step fails, fix its
+cause and re-run the failed jobs; a version that is already up is left alone.
+
 ## Maintainers
 
 Zygo has one maintainer, named in [`.github/CODEOWNERS`](.github/CODEOWNERS).

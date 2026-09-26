@@ -6,7 +6,7 @@
         verify-vm-pi use-cases-linux vm-use-cases-linux \
         syscall-tables conformance conformance-node conformance-node-seccomp \
         examples-go-linux oci-image verify-oci \
-        seccomp-matrix-linux landlock-net-linux bench bench-embed bench-density fmt lint clean
+        seccomp-matrix-linux landlock-net-linux bench bench-embed bench-density fmt lint clean bump
 
 help:
 	@echo "build        build the zygo binary"
@@ -38,6 +38,7 @@ help:
 	@echo "fuzz-linux   sweep every syscall number against all three seccomp profiles"
 	@echo "gvisor-linux the gvisor backend against a real runsc, compared with ns"
 	@echo "bench        reproduce every published number on this host"
+	@echo "bump VERSION=x.y.z  write a release version everywhere, spec/openapi.json included"
 	@echo "bench-embed  the warm fork against a container, one import-heavy script"
 	@echo "bench-density  what one more warm script costs this host"
 	@echo "bench-record  make bench, kept as JSON in bench/results/"
@@ -533,6 +534,9 @@ dist-linux:
 
 fmt:
 	cargo fmt --all
+
+bump:
+	sh tools/bump_version.sh "$(VERSION)"
 
 lint:
 	cargo fmt --all -- --check
