@@ -5,7 +5,7 @@
 # Three things, each of which was a session to diagnose from the outside and
 # is a few seconds to check from here:
 #
-#   1. Z-1: `shutil.copy2` across a mount boundary works under every profile.
+#   1. `shutil.copy2` across a mount boundary works under every profile.
 #      `copy2` calls `listxattr`, which the allowlist did not name, so it
 #      answered `EPERM` — reported by Python as `[Errno 1] Operation not
 #      permitted` on a file that plainly exists. `pip install --target` is a

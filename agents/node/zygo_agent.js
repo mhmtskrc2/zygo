@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // SPDX-License-Identifier: Apache-2.0
-// zygo-agent — the reference runtime agent for Node (design doc §3.4.1).
+// zygo-agent — the reference runtime agent for Node (`spec/protocol.md`).
 //
 // Node has no `fork()` in the Unix sense. `child_process.fork` starts a whole
 // new process, and starting one costs tens of milliseconds — which is the cost
@@ -48,7 +48,7 @@ const AGENT_FD = 3;
 /// Must match `zygo_core::protocol::frame`.
 const MAX_FRAME_BYTES = 32 * 1024 * 1024;
 
-/// Per-request stdout/stderr capture, truncated past this (design doc §3.12).
+/// Per-request stdout/stderr capture, truncated past this.
 const RING_BUFFER_BYTES = 256 * 1024;
 
 /// Workers kept loaded and parked.
@@ -744,7 +744,8 @@ function worker(argv) {
     } catch (e) {
       reply = { type: 'result', ok: false, error: (e && e.stack) || String(e) };
       // Nothing of the script has run: the supervisor and this worker disagree
-      // about what the request is, which §2 makes an `ERROR` rather than a
+      // about what the request is, which `spec/protocol.md` §2 makes an
+      // `ERROR` rather than a
       // result, so that a caller can tell "your code threw" from "your code
       // was not what was asked for".
       if (e instanceof ScriptDigestMismatch) {
@@ -857,7 +858,7 @@ class Agent {
     // `close`, not `exit`, for the request's answer. `exit` fires when the
     // process ends, and the worker's stdout and stderr can still have
     // buffered data arriving after it — a handler whose last line raced the
-    // exit had that line dropped, intermittently (B-26). `close` fires once
+    // exit had that line dropped, intermittently. `close` fires once
     // every stdio stream is done.
     child.on('close', (code, signal) => {
       if (w.request) this._finish(w, code, signal);
@@ -917,7 +918,8 @@ class Agent {
     }
     const result = w.result;
     // A worker that refused the request answers `ERROR`, not `DONE`: it is the
-    // answer to this `EXEC` either way (§3.5), and a request that was refused
+    // answer to this `EXEC` either way (`spec/protocol.md` §3.5), and a
+    // request that was refused
     // produced no result to report.
     if (result && result.refused) {
       this._error(id, result.refused.code, result.refused.message);
@@ -1075,7 +1077,7 @@ const HEARTBEAT_MS = 2_000;
 ///
 /// Node reports the *name*; this used to assume `SIGKILL` and answer 137
 /// whatever had happened, so a handler killed by SIGSEGV and one killed by its
-/// deadline were indistinguishable (B-26).
+/// deadline were indistinguishable.
 function signalNumber(signal) {
   return (signal && os.constants.signals[signal]) || 9;
 }

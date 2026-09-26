@@ -3,8 +3,8 @@
 //!
 //! Everything below the network was already covered by unit tests; what was
 //! not covered at all was the client's behaviour when a registry answers
-//! *differently from what was asked* — and that is where the code review
-//! found B-05: a pinned digest was never compared with what arrived, so
+//! *differently from what was asked* — and that is where the bug was: a
+//! pinned digest was never compared with what arrived, so
 //! `zygo pull python@sha256:<X>` accepted any self-consistent manifest a
 //! registry chose to serve.
 //!
@@ -306,7 +306,7 @@ fn an_honest_registry_is_pulled_from() {
 
 /// A registry that serves a manifest other than the one asked for is refused.
 ///
-/// This is B-05. The client never compared `reference.digest` with what
+/// The client never compared `reference.digest` with what
 /// arrived, so a pinned pull — the whole mechanism `zygo.lock` rests on —
 /// accepted a substitution silently.
 #[test]

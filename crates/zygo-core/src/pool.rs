@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The warm pool — `Pool`, `WarmFn` (design doc §3.2, ADR-008).
+//! The warm pool — `Pool`, `WarmFn`.
 //!
 //! This is the product. Everything before it exists to get here: a sandbox that
 //! is already built when the request arrives, so serving one costs a `fork()`
 //! and a cgroup rather than a container.
 //!
-//! The library is the API and the CLI is a client of it (ADR-008), so a platform
+//! The library is the API and the CLI is a client of it (the API is the surface,
+//! not the CLI: `docs/book/adr/0001-embedded-runtime.md`), so a platform
 //! embeds this type directly rather than shelling out. `Pool` owns the warm
 //! sandboxes; `WarmFn` is one function's handle.
 //!
@@ -51,7 +52,7 @@ use crate::spec::ResolvedFn;
 
 /// The reference Python agent, carried inside the binary.
 ///
-/// Requirement N6 is a single static binary with no runtime dependencies, so
+/// Zygo ships as a single static binary with no runtime dependencies, so
 /// the agent cannot be a file the user is expected to have. It is written into
 /// the data directory on first use and bind-mounted into the sandbox.
 ///
@@ -159,7 +160,7 @@ impl BuiltinAgent {
 #[derive(Debug, Clone, Default)]
 pub struct PoolConfig {
     pub paths: Paths,
-    /// Give each request its own cgroup (design doc open question A2).
+    /// Give each request its own cgroup.
     ///
     /// Bought for `cgroup.kill`, which tears down a timed-out request's whole
     /// tree in one write. On by default, and the default is **settled**.
@@ -879,7 +880,7 @@ impl Pool {
         // `crate::bytecode`: the slim images ship no `.pyc`.
         let entry = crate::bytecode::ensure(&store, &entry)?.image;
 
-        // Which of the two warm modes this is (design doc §3.4). A runtime
+        // Which of the two warm modes this is. A runtime
         // means an agent in the box that forks per request; none means
         // warm-exec — the sandbox is held and each request is a fresh process
         // running `cmd` with the event on stdin.
@@ -1445,8 +1446,8 @@ pub struct WarmFn {
     /// The function's own wall-clock budget, from its resolved spec.
     ///
     /// This is the limit; a caller's timeout only decides how long *it* waits.
-    /// Requirement N4 makes the spec's limits mandatory, so a client asking for
-    /// longer cannot get it.
+    /// The spec's limits are mandatory, so a client asking for longer cannot
+    /// get it.
     timeout: std::time::Duration,
     /// Everything this function was declared with, kept whole.
     ///
@@ -1680,8 +1681,8 @@ impl WarmFn {
 
     /// Serve one request and report where its time went.
     ///
-    /// The three phases are the ones the design document asks for in its
-    /// observability section: fork, cgroup setup, and the handler itself.
+    /// The three phases are the ones worth telling apart: fork, cgroup setup,
+    /// and the handler itself.
     /// Having them per request is also the only way to localise a tail — three
     /// plausible explanations for one were wrong before these existed.
     pub fn call_timed(
@@ -1863,7 +1864,7 @@ impl WarmFn {
         // the child into its own cgroup, and signalling it if there is no
         // cgroup to kill.
         //
-        // B-12: this used to be resolved inside `admit`, which returned `None`
+        // This used to be resolved inside `admit`, which returned `None`
         // when the translation failed — and `None` is also what it returns
         // when per-request cgroups are simply off. The two were
         // indistinguishable, so a child whose pid could not be translated got
@@ -1933,7 +1934,7 @@ impl WarmFn {
         // stop them is trusting the blast radius to contain itself.
         //
         // The function's own limit wins over the caller's: asking for longer
-        // than the spec allows is asking past a mandatory limit (N4).
+        // than the spec allows is asking past a mandatory limit.
         // A tenant's own timeout narrows this too: a cgroup cannot enforce a
         // wall clock, so the supervisor's deadline is where that key lands.
         let ceiling = narrowed
@@ -2153,7 +2154,7 @@ impl WarmFn {
 
     /// Freeze the tenant so it stops costing CPU while keeping its memory.
     ///
-    /// This is the middle tier of the design's memory tiering (§3.9, F12): a
+    /// This is the middle tier of the idle policy: a
     /// zygote nobody has called for `idle_timeout` keeps its resident pages —
     /// which is the whole asset, since they are what makes the next request
     /// cost a `fork()` — but stops being schedulable. Waking it is one write,
@@ -2480,8 +2481,8 @@ impl Drop for SecretsLease<'_> {
 /// process inside ever receives a value: not the agent (it is not in `EXEC`,
 /// not in the zygote's memory, not on the connection), and not a warm-exec
 /// request's environment. Only the process that runs the handler can read the
-/// file, and only while a request is in flight — the design's "delivered as a
-/// file, to the child only" (§3.10), enforced by *where* the write happens
+/// file, and only while a request is in flight — "delivered as a file, to the
+/// child only", enforced by *where* the write happens
 /// rather than by asking anything inside to be careful.
 ///
 /// `via_pid` is whichever process in the sandbox the supervisor may look
@@ -2573,7 +2574,7 @@ fn write_secrets(secrets: &mut Secrets, at: SecretsAt<'_>) -> Result<()> {
 
     // The directory is recorded **before** the files are written, so a write
     // that fails half way leaves something `unlink_all` can clean. It was set
-    // afterwards until the code review (B-01): the second of three
+    // afterwards until this was found: the second of three
     // writes failing left the first file on the tmpfs at mode 0400, `dir` was
     // `None` so nothing removed it, and every later request on that function
     // failed with EACCES trying to create a file that was already there.
@@ -2618,7 +2619,8 @@ fn secrets_dir(init_pid: u32) -> PathBuf {
 /// afterwards, if one was created.
 ///
 /// `host_pid` must be a pid in *this* process's namespace — translated first on
-/// the agent path (§2.2b), native on the warm-exec path. Failing to move it is
+/// the agent path (`FORKED`'s pid is in the sandbox's pid namespace, see
+/// `spec/protocol.md`), native on the warm-exec path. Failing to move it is
 /// not worth failing the request over: the process is still inside the
 /// sandbox's generation under the *tenant* cgroup, so the tenant's limits
 /// still apply; what is lost is only the per-request accounting and
@@ -2689,7 +2691,7 @@ fn kill_request(request_cgroup: Option<&std::path::Path>, host_pid: u32) {
     unsafe { libc::kill(host_pid as libc::pid_t, libc::SIGKILL) };
 }
 
-/// Where secret files live inside the sandbox (design doc §3.10).
+/// Where secret files live inside the sandbox.
 pub const SECRETS_DIR_IN_SANDBOX: &str = "/run/secrets";
 
 /// Where a request's own script lands inside the sandbox (protocol 1.1).
@@ -3000,7 +3002,7 @@ fn write_request_file_at(
     // partially written set left by an earlier failure, and opening one of
     // those with `O_TRUNC` fails with EACCES because the file is 0400 and the
     // supervisor is not root. Removing first means the mode of whatever was
-    // there cannot decide whether this request works (B-01).
+    // there cannot decide whether this request works.
     let _ = rustix::fs::unlinkat(dir, name, rustix::fs::AtFlags::empty());
     let fd = rustix::fs::openat(
         dir,
@@ -3017,14 +3019,14 @@ fn write_request_file_at(
 
 /// A warm-exec function: a held sandbox, and a fresh process per request.
 ///
-/// The other half of the design's warm model (§3.4, layer 1), for everything
+/// The other half of the warm model, for everything
 /// that is not an interpreter worth keeping warm: a Go or Rust binary starts
 /// in a millisecond, so there is nothing to amortise and no agent to write.
 /// The sandbox — namespaces, mounts, cgroup, hardening — is what is kept.
 ///
 /// A request costs a fork of the supervisor, six `setns` calls, a second fork,
-/// the hardening steps, and an `execve`: the design's "1–3 ms plus the
-/// program's own start-up". The event goes in on stdin, the result comes out
+/// the hardening steps, and an `execve`: 1–3 ms plus the program's own
+/// start-up. The event goes in on stdin, the result comes out
 /// on stdout as JSON, and stderr is captured separately.
 #[cfg(target_os = "linux")]
 pub struct WarmExec {
@@ -3194,7 +3196,7 @@ impl WarmExec {
         self.call_script_timed(event, None, timeout, None)
     }
 
-    /// The same, for a request that brought its own script (todo 3.4).
+    /// The same, for a request that brought its own script.
     ///
     /// The **warm-exec pool** shape: one held sandbox running a program the
     /// operator named — `sh`, a static binary — and each request's script
@@ -3362,7 +3364,7 @@ impl WarmExec {
         }
 
         // Everything the request says, with the deadline enforced while it
-        // is said. The function's own limit wins over the caller's (N4).
+        // is said. The function's own limit wins over the caller's.
         let budget = timeout.min(self.timeout);
         let deadline = budget.saturating_sub(admitted - started);
         let collected = collect_request(&entered, deadline, || {
@@ -3513,7 +3515,7 @@ fn collect_request(
 /// The request's wait status from the helper, or `None` if the helper never
 /// reported one *within `grace`*.
 ///
-/// The bound is the whole point (B-13). This read used to block for ever, and
+/// The bound is the whole point. This read used to block for ever, and
 /// it runs immediately after `collect_request` has already given up waiting
 /// for the request — so the one case it is reached in is the case where
 /// something is wrong, and it answered that by hanging the caller instead of
@@ -3605,7 +3607,7 @@ fn into_outcome(
     let stdout = String::from_utf8_lossy(&c.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&c.stderr).into_owned();
 
-    // The contract (§3.4): stdout is the JSON result. A program that printed
+    // The contract: stdout is the JSON result. A program that printed
     // something else has not failed to run, so its exit code stands — but its
     // answer cannot be handed on as a result, and saying so is more useful
     // than a mangled one.
@@ -3929,7 +3931,7 @@ impl Function {
                 secrets,
             ),
             // A warm-exec pool takes a script as the last word of its
-            // command line (todo 3.4); a warm-exec *function* has an `entry`
+            // command line; a warm-exec *function* has an `entry`
             // of its own and is not asked for one. Either way there is no
             // agent here, so `sink`, `workspace` and `tenant_limits` have
             // nowhere to go — see the note on `Function::call_full`.
@@ -4238,7 +4240,7 @@ pub fn agent_mounts(
     mounts
 }
 
-/// Which warm mode a function uses (design doc §3.4).
+/// Which warm mode a function uses.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     /// An agent in the box gives each request its own process.
@@ -4611,7 +4613,7 @@ mod tests {
     ///
     /// The file is `0400` and the supervisor is not root, so opening it with
     /// `O_TRUNC` fails with EACCES — and every later request on that function
-    /// failed with it, for ever (B-01). Attempted with a real `0400` file
+    /// failed with it, for ever. Attempted with a real `0400` file
     /// rather than asserted about the flags, because the flags are not what
     /// broke: the mode of a file nobody expected to be there was.
     #[cfg(unix)]
@@ -4632,7 +4634,7 @@ mod tests {
     /// A write that fails part way through leaves nothing behind.
     ///
     /// `write_secrets` records the directory *before* it writes, so the
-    /// cleanup has somewhere to aim; it recorded it afterwards until B-01, and
+    /// cleanup has somewhere to aim; it used to record it afterwards, and
     /// `unlink_all` then saw `dir == None` and removed nothing. The failure is
     /// provoked with a name that cannot be created.
     #[cfg(unix)]
@@ -4803,7 +4805,8 @@ mod tests {
     #[test]
     fn a_process_in_the_host_namespace_translates_to_itself() {
         // The identity case, which is also the one that made this bug invisible
-        // for so long: in PoC 3 the agent was a plain host subprocess, so the
+        // for so long: in `crates/zygo-core/examples/poc3_warm_path.rs` the
+        // agent was a plain host subprocess, so the
         // pid it reported happened to be correct.
         let me = std::process::id();
         assert_eq!(innermost_ns_pid(me), Some(me));
@@ -5390,8 +5393,8 @@ mod tests {
 
     #[test]
     fn per_request_cgroups_are_on_by_default() {
-        // Measured at 97 µs of a 1.9 ms request; the design's open question A2
-        // resolves in favour of keeping them.
+        // Measured at 97 µs of a 1.9 ms request, which is cheap enough to keep
+        // them on.
         assert!(PoolConfig::new(Paths::rooted("/x")).per_request_cgroup);
     }
 

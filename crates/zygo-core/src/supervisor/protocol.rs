@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The control protocol: CLI ↔ supervisor (design doc §3.4).
+//! The control protocol: CLI ↔ supervisor.
 //!
 //! Deliberately **not** the agent wire protocol. The agent runs tenant code, so
 //! it must never be able to say "stop that other function" or "serve this spec";
@@ -350,7 +350,7 @@ pub enum Request {
     /// was the one that wrote it.
     ///
     /// The script is not run, and naming it does not make it runnable: a
-    /// request has to name a function or (from Phase 1.2) a runtime as well.
+    /// request has to name a function or a runtime as well.
     PutScript {
         source: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -778,7 +778,7 @@ pub enum Response {
 
     /// The tenant is at its concurrency limit and its queue is full.
     ///
-    /// The design document's `429`: a distinct response rather than an error,
+    /// The API's `429`: a distinct response rather than an error,
     /// because the caller's correct reaction is to retry rather than to give up,
     /// and a platform routing to a second machine needs to tell the two apart.
     Busy {

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """A plugin host, built on the Zygo API alone.
 
-The exit criterion for the embedder API (roadmap 2.12), and it is written as a
+The exit criterion for the embedder API (Phase 2 of ROADMAP.md), and it is written as a
 program rather than a checklist because the question it answers is not "does
 each route work" — the suites answer that — but **can somebody build the thing
 the API is for without reaching past it**. No `sandbox.toml`, no file on the

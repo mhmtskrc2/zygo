@@ -121,7 +121,7 @@ fi
 
 say ""
 say "a shell script in a warm-exec pool"
-# The other warm-exec shape (todo 3.4): `cmd` and no agent, with each
+# The other warm-exec shape: `cmd` and no agent, with each
 # request's script written into the sandbox and named on the command line.
 # The point of the check is that a pool needs no agent at all — `sh` has no
 # protocol and nothing to warm.

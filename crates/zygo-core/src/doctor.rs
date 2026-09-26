@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Environment probing behind `zygo doctor` (design doc §4.1).
+//! Environment probing behind `zygo doctor`.
 //!
 //! The output is the honest answer to "will this host actually enforce what
-//! Zygo promises?". Risk R2 is that a rootless host without cgroup delegation
-//! silently applies no limits at all; requirement N4 says that must never be a
-//! silent condition, so this module exists to make it loud, with the one-line
-//! fix printed next to it.
+//! Zygo promises?". The risk is that a rootless host without cgroup delegation
+//! silently applies no limits at all; limits are mandatory, so that must never
+//! be a silent condition, and this module exists to make it loud, with the
+//! one-line fix printed next to it.
 //!
 //! The probes are thin; the interesting logic — kernel version comparison,
 //! Landlock ABI to feature mapping, overall verdict — is pure and tested.
@@ -194,9 +194,9 @@ impl fmt::Display for KernelVersion {
 pub const MIN_KERNEL: (u32, u32) = (5, 3);
 /// Below this, overlayfs is unavailable inside a user namespace and the image
 /// store has to flatten layers instead — slower and heavier on disk, but
-/// correct (design doc appendix C, risk R3).
+/// correct.
 pub const OVERLAY_KERNEL: (u32, u32) = (5, 11);
-/// Above this everything in appendix C is present: Landlock networking,
+/// Above this every optional kernel feature is present: Landlock networking,
 /// `cgroup.kill`, `memory.peak`.
 pub const RECOMMENDED_KERNEL: (u32, u32) = (6, 1);
 /// From this release, moving a process into a cgroup waits for an RCU grace
@@ -340,7 +340,7 @@ fn civil_from_unix(secs: i64) -> (i32, u32, u32) {
     (year, month, day)
 }
 
-/// What a given Landlock ABI level can restrict (design doc appendix C).
+/// What a given Landlock ABI level can restrict.
 pub fn landlock_features(abi: u32) -> &'static str {
     match abi {
         0 => "unavailable",
@@ -1112,9 +1112,9 @@ mod probe {
                 ),
             );
         }
-        // Attempted, not read: see `cgroup::probe_delegation`. This is the R2
-        // case — without a cgroup it can own, a sandbox has no limits and must
-        // not start at all.
+        // Attempted, not read: see `cgroup::probe_delegation`. Without a
+        // cgroup it can own, a sandbox has no limits and must not start at
+        // all.
         match cgroup::probe_delegation(&own) {
             Ok(have) => Check::ok("cgroup v2", format!("delegated ({})", have.join(" "))),
             // This cgroup will not take a child, which is the normal state of
@@ -1166,7 +1166,8 @@ mod probe {
     /// Unprivileged overlayfs landed in 5.11. Before that, `/proc/filesystems`
     /// still lists `overlay` and a privileged mount still succeeds, so reading
     /// that file alone reports support that a rootless sandbox does not have.
-    /// PoC 6 measured exactly this divergence on 5.10.
+    /// `tests/poc/poc6_overlayfs_userns.sh` measured exactly this divergence
+    /// on 5.10.
     fn overlayfs() -> Check {
         let present = std::fs::read_to_string("/proc/filesystems")
             .map(|s| s.contains("overlay"))
@@ -1283,7 +1284,7 @@ mod probe {
         if has_range {
             // A range is only usable through the setuid helpers; without them
             // the launcher falls back to mapping the caller's single uid, and
-            // the uid-level separation between tenants (§3.10) is lost.
+            // the uid-level separation between tenants is lost.
             let helpers = ["newuidmap", "newgidmap"].iter().all(|h| {
                 std::env::var_os("PATH")
                     .is_some_and(|paths| std::env::split_paths(&paths).any(|d| d.join(h).is_file()))
@@ -1392,7 +1393,7 @@ mod probe {
     /// A line of its own rather than folded into `kvm`, because the two fail
     /// for opposite reasons and have opposite remedies: a host without KVM
     /// cannot run the backend at all, and a host with KVM and no kernel is one
-    /// command away. Folding them together sent people to the wrong one (D8).
+    /// command away. Folding them together sent people to the wrong one.
     fn guest_kernel(paths: &crate::Paths) -> Check {
         let image = paths.krun().join(crate::backend::vm::KERNEL_FILE);
         if image.is_file() {
@@ -1530,7 +1531,8 @@ mod tests {
         assert!(!v50.at_least(MIN_KERNEL.0, MIN_KERNEL.1));
         assert!(v510.at_least(MIN_KERNEL.0, MIN_KERNEL.1));
 
-        // 5.10 runs, but without unprivileged overlayfs (PoC 6 measured this).
+        // 5.10 runs, but without unprivileged overlayfs
+        // (`tests/poc/poc6_overlayfs_userns.sh` measured this).
         assert!(!v510.at_least(OVERLAY_KERNEL.0, OVERLAY_KERNEL.1));
         assert!(v515.at_least(OVERLAY_KERNEL.0, OVERLAY_KERNEL.1));
 
@@ -1760,7 +1762,8 @@ mod tests {
             "and the vm backend is not built, which is the other half"
         );
 
-        // Missing cgroup delegation disqualifies `ns` entirely (requirement N4).
+        // Missing cgroup delegation disqualifies `ns` entirely: limits are
+        // mandatory.
         let r = report(vec![
             ("kernel", Status::Ok),
             ("user namespaces", Status::Ok),

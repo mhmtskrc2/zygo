@@ -13,7 +13,7 @@
 //! private, writable copy of the image, and what the install changed becomes
 //! the layer.
 //!
-//! **Copy and diff, not overlayfs.** The design says `upperdir`. An
+//! **Copy and diff, not overlayfs.** An overlay `upperdir` was the plan. An
 //! unprivileged overlay mount needs kernel 5.11 and is refused on the host this
 //! was first verified on (5.10); and even where it works, turning overlay
 //! whiteouts — character devices and `trusted.*` xattrs — into OCI ones needs
@@ -24,7 +24,7 @@
 //!
 //! **Host networking**, as for the venv cache and for the same narrow reason:
 //! the operation is installing distribution packages the user named, once,
-//! before any tenant code runs. The design's package-repository allowlist
+//! before any tenant code runs. A package-repository allowlist
 //! belongs to `egress` networking, which does not exist yet; until it does this
 //! is the same grant `pip` gets.
 //!

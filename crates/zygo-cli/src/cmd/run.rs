@@ -23,9 +23,9 @@ pub fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<u8> {
     let result = run_in_phases(cli, args, &phase);
 
     // A sandbox that never started is not a program that failed, and the
-    // exit status cannot say which (the first adoption report, §8: it had to
-    // classify a start failure by matching on the error's text, and
-    // reported it as the tenant's fault meanwhile). The outcome file can:
+    // exit status cannot say which (the first real consumer had to classify
+    // a start failure by matching on the error's text, and reported it as
+    // the tenant's fault meanwhile). The outcome file can:
     // written here too, with `started: false` and the phase that failed,
     // so a caller reports "unavailable" rather than "harness" without
     // reading stderr. Best effort — the error is the answer, and a file
@@ -243,8 +243,8 @@ fn run_in_phases(cli: &Cli, args: &RunArgs, phase: &std::cell::Cell<Phase>) -> a
     // written two ways: an OCI bundle's `root.path` is a single directory, and
     // `krun_set_root` takes a single directory. There is nowhere for a stack
     // of lowerdirs to go. gVisor's Sentry keeps an overlay of its own above it,
-    // and a guest kernel can build one inside itself if M3 needs the layers
-    // back.
+    // and a guest kernel can build one inside itself if the layers are ever
+    // needed back.
     let host = zygo_core::doctor::cached(store.paths());
     let overlay_supported = !matches!(
         resolved.isolation,

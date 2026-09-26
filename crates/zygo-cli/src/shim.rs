@@ -20,8 +20,8 @@
 //! forwarding it would silently run against a directory that is not the one
 //! the user is looking at.
 //!
-//! The provider is Lima, driven through `limactl`. The design allows for a
-//! Virtualization.framework helper instead; Lima is what a `brew install` can
+//! The provider is Lima, driven through `limactl`. A Virtualization.framework
+//! helper could replace it; Lima is what a `brew install` can
 //! rely on today, it gives virtiofs mounts
 //! and a working init without a signed helper binary, and everything above
 //! this line is provider-independent.
@@ -470,7 +470,7 @@ pub fn install_args() -> Vec<OsString> {
 /// host, so `limactl delete zygo` used to leave it behind: the VM was gone,
 /// its copy of the binary with it, and the next command read the stale stamp,
 /// concluded the binary was installed and failed inside the new VM with
-/// "zygo: not found" (B-27). Mixing in something that changes when the
+/// "zygo: not found". Mixing in something that changes when the
 /// instance is recreated makes a deleted VM look exactly like a changed
 /// binary, which is a case this already handles.
 pub fn build_stamp(len: u64, modified_secs: u64, instance: u64) -> String {
@@ -536,7 +536,7 @@ where
 /// The same, with variables to set inside the VM.
 ///
 /// `limactl shell` runs the command with the *guest's* environment, so
-/// everything the caller's shell had was dropped at the boundary (B-28):
+/// everything the caller's shell had was dropped at the boundary:
 /// `ZYGO_API_TOKEN` never reached `zygo api`, `ZYGO_LOG=debug` turned nothing
 /// on, and a secret named by `secrets = [...]` — which is read from the shell
 /// that runs `up` — arrived empty, so the command failed on a Mac and worked
@@ -1080,7 +1080,7 @@ fn run_forwarded(
     // Ctrl-C reaches `limactl` anyway, because it goes to the whole foreground
     // process group. A `kill` by pid does not: it arrives here, this process
     // ends, and `limactl` — and the sandbox behind it — carries on with
-    // nobody left to wait for it (B-28). So the pid is published and the two
+    // nobody left to wait for it. So the pid is published and the two
     // signals a person actually sends are forwarded.
     FORWARDED_CHILD.store(child.id() as i32, std::sync::atomic::Ordering::SeqCst);
     install_signal_relay();
@@ -2291,7 +2291,7 @@ mod tests {
     /// A VM that was deleted and recreated needs the binary put back, even
     /// though the binary on the host has not moved.
     ///
-    /// B-27: the stamp lived on the host and described only the file, so
+    /// The stamp lived on the host and described only the file, so
     /// `limactl delete zygo` left it behind claiming an installation that had
     /// gone with the VM. The next command forwarded into a VM with no `zygo`
     /// in it.
@@ -2307,7 +2307,7 @@ mod tests {
 
     /// The environment the caller had is carried into the VM.
     ///
-    /// B-28: `limactl shell` runs with the *guest's* environment, so a secret
+    /// `limactl shell` runs with the *guest's* environment, so a secret
     /// or a token from the user's shell arrived empty and the command failed
     /// on a Mac while working on Linux.
     #[test]

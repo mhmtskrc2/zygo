@@ -8,7 +8,7 @@
 #
 # It also refuses to let a run start on top of somebody else's: another
 # session's `zygo` on the same machine shares the data directory, the cgroup
-# tree and the port, and risk V9 is that the two blame each other. Pass
+# tree and the port, and the risk is that the two blame each other. Pass
 # `--force` when the processes are yours.
 #
 # Run:  sh tests/linux/pi_env.sh [--force]
@@ -106,7 +106,7 @@ say ""
 
 # --- what the host side still provides --------------------------------------
 #
-# The VMM runs inside the `ns` backend's cgroups and network namespace (D2),
+# The VMM runs inside the `ns` backend's cgroups and network namespace,
 # so everything `ns` needs is still needed.
 
 say "the host side the VMM lives in"

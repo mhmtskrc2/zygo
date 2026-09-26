@@ -127,7 +127,8 @@ class AgentHarness:
         """The same, for a request whose answer may be an `ERROR`.
 
         A child that refuses the request — a script whose digest does not match
-        — answers `ERROR` rather than `DONE` (§2), so a caller checking that
+        — answers `ERROR` rather than `DONE` (`spec/protocol.md` §2), so a
+        caller checking that
         has to be able to see it.
         """
         exec_message = {
@@ -707,7 +708,7 @@ class FixtureTests(unittest.TestCase):
 
 
 class ConcurrencyTests(unittest.TestCase):
-    """Several requests in flight at once (design doc §3.3).
+    """Several requests in flight at once.
 
     The agent used to handle one `EXEC` to completion before reading the next,
     and that was measured to be the ceiling on throughput: with the CPU quota
@@ -871,7 +872,7 @@ class InheritedSocketTests(unittest.TestCase):
 
 
 class ForkFallbackTests(unittest.TestCase):
-    """Risk R1: a handler that starts threads at import time cannot be forked."""
+    """A handler that starts threads at import time cannot be forked."""
 
     def test_threaded_handlers_fall_back_to_spawning(self):
         h = AgentHarness(
@@ -939,7 +940,7 @@ class ForkFallbackTests(unittest.TestCase):
         self.assertIn("falling back to spawn", stderr)
 
     def test_the_spawn_fallback_answers_everything_while_it_waits_for_go(self):
-        """B-09: the fallback took the next frame and demanded it be `GO`.
+        """The fallback took the next frame and demanded it be `GO`.
 
         Anything else — a second `EXEC`, a `PING`, a `GO` for another request
         — killed the worker and answered nothing at all, so the supervisor

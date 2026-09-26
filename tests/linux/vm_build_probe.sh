@@ -90,8 +90,8 @@ if grep -q 'krunfw' Makefile 2>/dev/null; then
 fi
 
 head2 "does krun_set_kernel exist in this version?"
-# D8 rests on it: it is what keeps the GPL kernel out of an Apache-2.0 binary
-# and the 15 MB budget intact.
+# The downloaded-kernel decision rests on it: it is what keeps the GPL kernel
+# out of an Apache-2.0 binary and the 15 MB budget intact.
 if grep -rn 'krun_set_kernel' include/ src/ 2>/dev/null | head -5 | sed 's/^/  /'; then
     note "krun_set_kernel is present, so the kernel can be a downloaded artefact (D8)"
 else

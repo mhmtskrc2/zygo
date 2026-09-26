@@ -151,7 +151,7 @@ pub(super) fn prompt_password(registry: &str, prompt: &str) -> anyhow::Result<St
 
     // `ISIG` stays on, so Ctrl-C at the prompt is how you cancel it — and it
     // killed the process with echo still off, leaving the shell typing
-    // invisibly (B-08, the code review). This handler puts the echo back and
+    // invisibly. This handler puts the echo back and
     // then lets the signal do what it was going to do.
     let restore = EchoRestored { fd };
     install_echo_handler(fd);

@@ -3,8 +3,8 @@
 //!
 //! Every variant carries enough context to print an actionable message: which
 //! primitive failed, what was attempted, and — where one exists — the doc
-//! anchor explaining how to fix the environment. Phase 1 requires that no
-//! failing kernel primitive surfaces as a bare `errno`.
+//! anchor explaining how to fix the environment. The rule is that no failing
+//! kernel primitive surfaces as a bare `errno`.
 
 use std::path::PathBuf;
 
@@ -46,7 +46,7 @@ pub enum Error {
     /// A dependency build ran and failed: `pip` could not resolve a
     /// requirement, `apt` could not find a package.
     ///
-    /// Its own variant because of the exit code (E-02). These used to be
+    /// Its own variant because of the exit code. These used to be
     /// `BackendUnavailable`, which is exit **125** — "this host cannot run
     /// sandboxes". A CI job reading that code is told to try another machine,
     /// when what actually happened is that a line in `requirements.txt` names
@@ -71,7 +71,7 @@ pub enum Error {
 
     /// An I/O failure with no path attached.
     ///
-    /// Deliberately **not** `#[from]` (E-03). With the conversion derived, a
+    /// Deliberately **not** `#[from]`. With the conversion derived, a
     /// bare `?` on any `io::Result` compiled and produced "No such file or
     /// directory" with nothing to say which file — in a mount plan with
     /// thirty entries, that is not a diagnosis. Without it the compiler asks

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! `clone3` (design doc §3.3 step 1).
+//! `clone3`: the first step of building a sandbox.
 //!
 //! `clone3` rather than `unshare` for a reason the first measurements made
 //! concrete: `unshare(CLONE_NEWPID)` does *not* move the caller into the new

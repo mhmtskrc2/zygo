@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `zygo shell <name>` — a shell inside a warm sandbox, for debugging.
 //!
-//! The design calls this "a debug fork; it does not touch the zygote"
-//! (§4.3), and that is exactly what it is: the sandbox's *namespaces* are
+//! This is "a debug fork; it does not touch the zygote", and that is
+//! exactly what it is: the sandbox's *namespaces* are
 //! entered by a fresh process, so the warm agent keeps its memory, its request
 //! counters and its place in the idle policy. Nothing about the function
 //! changes because you looked at it.

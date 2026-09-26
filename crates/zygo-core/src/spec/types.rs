@@ -344,7 +344,7 @@ macro_rules! str_enum {
 }
 
 str_enum! {
-    /// Where the isolation boundary is drawn (design doc §3.9).
+    /// Where the isolation boundary is drawn.
     Isolation {
         Ns => "ns",
         Gvisor => "gvisor",
@@ -355,7 +355,7 @@ str_enum! {
 }
 
 str_enum! {
-    /// Network policy (design doc §3.8). `Host` additionally requires
+    /// Network policy. `Host` additionally requires
     /// `--allow-host-net`, since it removes the network boundary entirely.
     ///
     /// `bridge` is accepted as a spelling of `full`: it is the word every
@@ -375,7 +375,7 @@ str_enum! {
 }
 
 str_enum! {
-    /// seccomp profile (design doc appendix B).
+    /// seccomp profile (`docs/book/24-seccomp-profiles.md`).
     SeccompProfile {
         Permissive => "permissive",
         Default => "default",
@@ -396,7 +396,7 @@ str_enum! {
 }
 
 /// Warm-process strategy. Absent means warm-exec: no agent, the sandbox spawns
-/// `cmd` per request (design doc §3.4, layer 1).
+/// `cmd` per request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Runtime {
     /// Built-in agent shipped with Zygo.
@@ -639,7 +639,7 @@ impl Cidr {
 
 /// The addresses that stay denied in every namespaced network mode.
 ///
-/// One definition, because there were three and they disagreed (B-18). The
+/// One definition, because there were three and they disagreed. The
 /// spec's validator had no carrier-grade NAT range and no unspecified
 /// address; the resolver had both; the nftables set had CGNAT. So
 /// `allow = ["100.64.0.1:443"]` passed validation, told the user nothing, and
@@ -729,7 +729,7 @@ impl FromStr for AllowRule {
         // looks: the address is full of colons, so "split on the last one"
         // turns `2001:db8::1` into the host `2001:db8:` on **port 1** — a rule
         // that parses, reports nothing, and permits something nobody asked
-        // for (B-17). Brackets are the standard way to say which colons belong
+        // for. Brackets are the standard way to say which colons belong
         // to the address, and a bare literal is recognised as one.
         let (host_part, port) = if let Some(rest) = t.strip_prefix('[') {
             let (inside, after) = rest.split_once(']').ok_or_else(|| {
@@ -931,7 +931,7 @@ mod tests {
     ///
     /// `2001:db8::1` used to parse as the host `2001:db8:` on port 1: it
     /// looked accepted, matched nothing anyone meant, and opened port 1 on a
-    /// prefix instead (B-17).
+    /// prefix instead.
     #[test]
     fn an_ipv6_literal_in_allow_keeps_all_of_its_colons() {
         let bare: AllowRule = "2001:db8::1".parse().expect("a bare v6 literal");

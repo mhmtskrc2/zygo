@@ -56,7 +56,7 @@ impl Platform {
         Platform {
             architecture,
             // Images are always Linux: even the `vm` backend boots a Linux
-            // guest, and macOS runs Zygo inside a Linux VM (design doc §3.11).
+            // guest, and macOS runs Zygo inside a Linux VM.
             os: "linux".to_string(),
             variant: None,
         }

@@ -133,7 +133,7 @@ pub fn parse_subid(content: &str, user: &str, uid: u32) -> Vec<SubIdRange> {
 /// rest of the range maps into the subordinate block. That gives a sandbox that
 /// believes it is root (uid 0 inside) while being an unprivileged, *distinct*
 /// uid on the host — which is what keeps one tenant from touching another's
-/// files (design doc §3.10, "seeing another tenant").
+/// files (the "seeing another tenant" threat in `docs/book/23-security.md`).
 ///
 /// With no subordinate range, the map degenerates to a single identity entry:
 /// the sandbox works, but every tenant shares one host uid, so uid-level
@@ -201,7 +201,7 @@ pub fn identity_line(map: &str, outside: u32) -> String {
 /// Read the subordinate range configured for the current user.
 ///
 /// Without one, every tenant maps to the same host uid and the uid-level
-/// separation between tenants described in design doc §3.10 is lost; the
+/// separation between tenants is lost; the
 /// sandbox still runs, and `zygo doctor` reports the degradation.
 pub fn subuid_range_for_current_user() -> Option<SubIdRange> {
     // SAFETY: getuid cannot fail and has no preconditions.

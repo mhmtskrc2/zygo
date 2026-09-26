@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `zygo agent test <binary> [args…]` — the protocol conformance suite.
 //!
-//! The design's claim is that the warm protocol is language independent
-//! (ADR-009): anything that speaks it gets limits, timeouts, idle tiering and
+//! The claim is that the warm protocol is language independent: anything
+//! that speaks it gets limits, timeouts, idle tiering and
 //! metrics for free. A claim like that is worth exactly as much as the tool
 //! that checks it, so this is that tool — the same checks `spec/protocol.md`
 //! §3 lists, run against a real process.
@@ -884,7 +884,8 @@ const SCRIPT_MARK: &str = "the-request";
 ///
 /// * the script ran — the agent implements 1.1;
 /// * the agent's own handler ran instead — it ignored a field it does not
-///   know, which is exactly what §5 tells it to do, and it serves functions
+///   know, which is exactly what `spec/protocol.md` §5 tells it to do, and
+///   it serves functions
 ///   only;
 /// * the request failed — also fine, as long as it *answered*: an agent may
 ///   refuse what it cannot do, and silence is the only wrong answer.
@@ -939,7 +940,8 @@ fn script_in_exec_check(agent: &mut Agent, script: Option<&Path>) -> anyhow::Res
     // And the rule that makes `path` safe to use: a sandbox has one uid, so
     // the child can replace the file it is about to load. The digest arrives
     // on the supervisor's connection, where it cannot. An agent that runs the
-    // script anyway has no defence against that swap (§3.8).
+    // script anyway has no defence against that swap (`spec/protocol.md`
+    // §3.8).
     let mut tampered = inline.clone();
     tampered.digest = Some(zygo_core::scripts::ScriptDigest::of("not this script").to_string());
     let refused = matches!(
@@ -1373,7 +1375,8 @@ fn heartbeat_check(agent: &mut Agent) -> anyhow::Result<Outcome> {
 /// arrive while it is still sleeping.
 ///
 /// Skipped rather than failed when no chunk arrives at all: `stream` is an
-/// optional field, and §5 says an agent ignores fields it does not know.
+/// optional field, and `spec/protocol.md` §5 says an agent ignores fields it
+/// does not know.
 fn stream_check(agent: &mut Agent) -> anyhow::Result<Outcome> {
     let id = "c10";
     let early = "first";

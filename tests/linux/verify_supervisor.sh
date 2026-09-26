@@ -206,7 +206,7 @@ else
 fi
 
 # Past the queue the answer must be a distinguishable `BUSY`, not a hang and
-# not a generic failure: requirement N4's limits are only useful if the caller
+# not a generic failure: mandatory limits are only useful if the caller
 # is told which one it hit. `--concurrency 1` with a two-second handler makes
 # the queue overflow rather than drain.
 printf 'import time\n\n\ndef handler(event):\n    time.sleep(2)\n    return {"slept": True}\n' > slower.py
@@ -372,7 +372,7 @@ fi
 
 say ""
 say "secrets"
-# Delivered as a file to the child only (design doc §3.10). Three things have
+# Delivered as a file to the child only. Three things have
 # to be true, and each is checked by looking rather than trusting: the handler
 # can read it, it is gone once no request is running, and the agent's own
 # process never has it.
@@ -535,7 +535,7 @@ case "$out" in
     *) bad "secret in warm-exec: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-140)" ;;
 esac
 
-# What a request costs, end to end through the CLI: the design says 1–3 ms of
+# What a request costs, end to end through the CLI: the budget is 1–3 ms of
 # overhead plus the program. `sh -c cat` is about as small as a program gets.
 started=$(date +%s%N)
 for _ in 1 2 3 4 5 6 7 8 9 10; do "$ZYGO" exec echo '{}' >/dev/null 2>&1; done
@@ -905,7 +905,7 @@ fi
 
 say ""
 say "protocol conformance"
-# The design claims the warm protocol is language independent. That is worth
+# The claim is that the warm protocol is language independent. That is worth
 # what its smallest implementation proves, so the suite runs against the
 # reference Python agent *and* against a complete agent written in POSIX sh —
 # which shares no code with Zygo at all.
@@ -1517,7 +1517,7 @@ say ""
 say "deadlines"
 
 # The limit is the function's own `timeout`, not whatever the client asked to
-# wait for: N4 makes the spec's limits mandatory, so a client cannot buy more
+# wait for: the spec's limits are mandatory, so a client cannot buy more
 # time by asking for it. `zygo exec` waits 60 s by default, so a run that ends
 # near 2 s is the function's budget being enforced and one near 60 s is not.
 if served spin spin.py --name spin --timeout 2s; then
@@ -1996,7 +1996,7 @@ esac
 # not a reason to leave the project down.
 # `failed` carries a reason per function, not just a name: `up --json` used to
 # print one document per failure *and* a summary, and two of its failure paths
-# printed nothing at all in JSON mode, so the reason was lost (E-14). One
+# printed nothing at all in JSON mode, so the reason was lost. One
 # document now, and the entry says why.
 out=$("$ZYGO" --json up 2>/dev/null | tr -d '\n ')
 case "$out" in

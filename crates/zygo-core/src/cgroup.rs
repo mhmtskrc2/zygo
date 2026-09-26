@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The two-level cgroup v2 hierarchy (design doc §3.6).
+//! The two-level cgroup v2 hierarchy.
 //!
 //! ```text
 //! zygo.slice/                     memory.max = host RAM − reserve
@@ -22,7 +22,7 @@
 //! sandbox — its zygote and its requests — lives in and is torn down with, so
 //! replacing or rewarming a function takes only the sandbox being replaced.
 //!
-//! The tenant level was added when tenants became first-class (roadmap 2.1).
+//! The tenant level was added when tenants became first-class.
 //! Before that, `tenants/<name>` *was* the function, which is why the word
 //! turns up in this file meaning two things in two different releases; the
 //! directory keeps its name because the level it names is now the tenant.
@@ -203,7 +203,7 @@ impl Hierarchy {
     ///
     /// Not the generation cgroup itself: that one parents the per-request
     /// cgroups, and cgroup v2 forbids a cgroup from holding processes while
-    /// delegating to children. The design's own diagram (§3.6) shows this —
+    /// delegating to children. The diagram at the top of this module shows this —
     /// `zygote` alongside `req-…` — and writing a pid one level up returns
     /// EBUSY.
     pub fn zygote(generation: &Path) -> PathBuf {
@@ -212,8 +212,7 @@ impl Hierarchy {
 
     /// Per-request cgroup, under the generation the request was forked in. A
     /// directory per request costs a `mkdir` and three small writes (~50 µs),
-    /// and buys `cgroup.kill`: one write tears down the whole tree on timeout
-    /// (open question A2 in the design doc).
+    /// and buys `cgroup.kill`: one write tears down the whole tree on timeout.
     pub fn request(generation: &Path, request_id: &str) -> PathBuf {
         generation.join(format!("req-{}", sanitise(request_id)))
     }
@@ -221,13 +220,13 @@ impl Hierarchy {
     /// Create the top-level layout and its budgets. Idempotent.
     ///
     /// The first thing this does is move the calling process into
-    /// `zygo.slice/system`, which is where the design says the supervisor
-    /// belongs (§3.6) — and which is also what makes the rest possible.
+    /// `zygo.slice/system`, which is where the supervisor belongs — and which
+    /// is also what makes the rest possible.
     /// cgroup v2 forbids a cgroup from holding processes *and* delegating
     /// controllers to its children, so as long as Zygo's own process sits in
     /// `zygo.slice`'s parent, that parent can never enable the controllers the
-    /// tenants below need (PoC 2 found this one level down; it applies at every
-    /// level).
+    /// tenants below need (`tests/poc/poc2_cgroup_limits.sh` found this one
+    /// level down; it applies at every level).
     pub fn ensure(&self, host_ram: Bytes) -> Result<()> {
         let total = Bytes(host_ram.get().saturating_sub(SYSTEM_RESERVE.get()));
         let tenant_budget = total.scaled(TENANT_BUDGET_FRACTION);
@@ -279,7 +278,7 @@ impl Hierarchy {
 
         // The reservation and the aggregate budget are protections, not
         // correctness requirements: without them a tenant is still bounded by
-        // its own limits, which is what requirement N4 actually demands. They
+        // its own limits, which is what "limits are mandatory" actually demands. They
         // are also the first things to be unavailable on a host that has not
         // delegated the memory controller, and failing here would turn a
         // degraded setup into a refusal to start. `create_tenant` is where the
@@ -319,19 +318,19 @@ impl Hierarchy {
     /// Fails rather than silently running without limits. A cgroup whose
     /// controllers were never delegated looks perfectly normal — the directory
     /// exists, `mkdir` succeeded — but `memory.max` is simply absent and every
-    /// write to it is ignored. That is risk R2, and requirement N4 says a
-    /// sandbox must never start in that state.
+    /// write to it is ignored. Limits are mandatory, so a sandbox must never
+    /// start in that state.
     ///
     /// The tenant level above gets no limits of its own here. It is a grouping
     /// — everything one customer runs, in one place, killable in one write —
     /// and what bounds a request is the function's own limits below it. A
-    /// per-tenant ceiling is roadmap 2.8 and goes on this same directory.
+    /// per-tenant ceiling is not built yet; it would go on this same directory.
     pub fn create_function(&self, tenant: &str, name: &str, limits: &Limits) -> Result<PathBuf> {
         let dir = self.function(tenant, name);
 
         // Controllers have to be enabled at *every* level between the root and
         // the leaf; enabling them only at the top leaves the grandchild without
-        // a single limit file (PoC 2).
+        // a single limit file (`tests/poc/poc2_cgroup_limits.sh` found this).
         create(&self.tenants())?;
         enable_controllers(&self.root, CONTROLLERS)?;
         enable_controllers(&self.tenants(), CONTROLLERS)?;
@@ -578,7 +577,8 @@ pub fn apply(dir: &Path, writes: &[CgroupWrite]) -> Result<()> {
 ///
 /// A rootless setup needs `Delegate=cpu cpuset io memory pids` on
 /// `user@.service`; without it the limits silently do nothing, which is
-/// requirement N4's failure mode and why `zygo doctor` checks it (risk R2).
+/// the failure mode "limits are mandatory" forbids, and why `zygo doctor`
+/// checks it.
 pub fn available_controllers(dir: &Path) -> Vec<String> {
     std::fs::read_to_string(dir.join("cgroup.controllers"))
         .map(|s| s.split_whitespace().map(str::to_string).collect())
@@ -698,8 +698,8 @@ pub fn missing_controllers(dir: &Path) -> Vec<&'static str> {
 /// dutifully lists everything `user.slice` delegated — and which still refuses
 /// `mkdir`, because the scope itself is not delegated and systemd owns the
 /// directory. `zygo doctor` reported `cgroup v2 … ok` on exactly such a host
-/// while `zygo run` failed on the very next line. That is requirement N4's
-/// failure mode wearing the opposite mask: not a silent lack of limits, but a
+/// while `zygo run` failed on the very next line. That is the silent-no-limits
+/// failure wearing the opposite mask: not a silent lack of limits, but a
 /// confident promise of them.
 ///
 /// So this does the first thing [`Hierarchy::ensure`] does — create a child —
@@ -810,7 +810,7 @@ fn join_system(system: &Path) -> Result<()> {
 /// for its children at the same time ("no internal processes"). Anything
 /// already sitting in Zygo's slice therefore has to move aside before
 /// `subtree_control` can be written — and `system/` is exactly where the
-/// design says the supervisor belongs anyway (PoC 2).
+/// supervisor belongs anyway (`tests/poc/poc2_cgroup_limits.sh` found this).
 fn vacate(from: &Path, into: &Path) -> Result<()> {
     let procs = match std::fs::read_to_string(from.join("cgroup.procs")) {
         Ok(text) => text,
@@ -1213,9 +1213,9 @@ mod tests {
         );
     }
 
-    /// Requirement N4: a sandbox must never start with limits that are not
-    /// actually enforced. Without delegation the directory exists and `mkdir`
-    /// succeeds, but no limit file does — which is risk R2's exact shape.
+    /// A sandbox must never start with limits that are not actually
+    /// enforced. Without delegation the directory exists and `mkdir`
+    /// succeeds, but no limit file does — exactly that shape.
     #[test]
     fn a_tenant_without_delegated_controllers_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1343,7 +1343,7 @@ mod tests {
     #[test]
     fn missing_controllers_are_detected() {
         let tmp = tempfile::tempdir().unwrap();
-        // No file at all: everything is missing (risk R2).
+        // No file at all: everything is missing.
         assert_eq!(missing_controllers(tmp.path()), REQUIRED_CONTROLLERS);
 
         std::fs::write(

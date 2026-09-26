@@ -2,7 +2,8 @@
 //! OCI images: references, the content-addressed store, and the Distribution
 //! client that fills it.
 //!
-//! Zygo never builds images (ADR-004). It consumes what `docker build`,
+//! Zygo never builds images (rule P4 in `docs/book/08-principles.md`). It
+//! consumes what `docker build`,
 //! `buildah` or any registry produces, because compatibility is adoption
 //! (principle P4).
 
@@ -160,7 +161,7 @@ impl ImageError {
 ///
 /// One place, because the spelling is load-bearing: `Store::parse_digest`
 /// compares lower-case hex, and a second implementation that produced upper
-/// case would write a blob nothing could ever find (R-06, E-11).
+/// case would write a blob nothing could ever find.
 pub fn digest_of(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     format!("sha256:{}", hex::encode(Sha256::digest(bytes)))

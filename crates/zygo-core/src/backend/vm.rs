@@ -13,14 +13,14 @@
 //! `krun_start_enter` never returns, so the fork before it is to this backend
 //! what `clone3` is to `ns`: the moment the sandbox stops being this process.
 //! `VmSandbox` is then the same three things `NsSandbox` is — a pid, a state
-//! and a cgroup — where the pid is the VMM's (D1).
+//! and a cgroup — where the pid is the VMM's.
 //!
 //! The VMM lives in the `ns` backend's own cgroup tree, so `memory.max`,
 //! `pids.max`, `cpu.max`, `freeze` and `cgroup.kill` all apply to it
-//! unchanged, and freezing a tenant freezes the whole guest (D2). What they
+//! unchanged, and freezing a tenant freezes the whole guest. What they
 //! bound is the VMM's own footprint, which is the guest's RAM plus its
 //! overhead; the guest's own limits are a second fence inside it, and that is
-//! M2's work.
+//! not built yet.
 //!
 //! # What it refuses, by name
 //!
@@ -42,8 +42,8 @@ use crate::spec::Network;
 ///
 /// A downloaded artefact and not a linked one, for two reasons that happen to
 /// have the same answer: the kernel is GPL and this binary is Apache-2.0, and
-/// it is ten to twenty megabytes against a fifteen megabyte budget. Requirement
-/// D8; `krun_set_kernel` is what makes it possible, and it is present in the
+/// it is ten to twenty megabytes against a fifteen megabyte budget.
+/// `krun_set_kernel` is what makes it possible, and it is present in the
 /// pinned libkrun.
 pub const KERNEL_FILE: &str = "Image";
 
@@ -108,7 +108,7 @@ fn kernel_format(kernel: &Path) -> std::result::Result<u32, String> {
 ///
 /// A kernel, its page tables and the virtio queues are not the tenant's
 /// memory, and charging them to `mem` would mean a function given 128 MB had
-/// rather less than that. Provisional until M2 measures it on the Pi; the
+/// rather less than that. Provisional until it is measured on the Pi; the
 /// number is here rather than scattered so that the measurement has one place
 /// to land.
 pub const GUEST_KERNEL_ALLOWANCE_MIB: u32 = 128;
@@ -117,7 +117,8 @@ pub const GUEST_KERNEL_ALLOWANCE_MIB: u32 = 128;
 ///
 /// The VMM maps the guest's memory and keeps its own; a `memory.max` set to
 /// exactly the guest's RAM kills the VMM as the guest fills up, which reads
-/// as a crash rather than as the guest's own out-of-memory. Provisional, M2.
+/// as a crash rather than as the guest's own out-of-memory. Provisional, not
+/// yet measured.
 pub const VMM_OVERHEAD_MIB: u32 = 64;
 
 /// Whether a virtual machine monitor is linked into this binary.
@@ -336,7 +337,7 @@ mod ffi {
             initramfs: *const c_char,
             cmdline: *const c_char,
         ) -> i32;
-        /// M3: `/run/secrets` as a per-sandbox tag (D6).
+        /// `/run/secrets` as a per-sandbox tag.
         pub fn krun_add_virtiofs(ctx: u32, tag: *const c_char, path: *const c_char) -> i32;
         pub fn krun_set_workdir(ctx: u32, workdir_path: *const c_char) -> i32;
         pub fn krun_set_exec(
@@ -346,14 +347,14 @@ mod ffi {
             envp: *const *const c_char,
         ) -> i32;
         pub fn krun_set_env(ctx: u32, envp: *const *const c_char) -> i32;
-        /// M2: the rlimits the `ns` child applies, applied in the guest.
+        /// The rlimits the `ns` child applies, applied in the guest.
         pub fn krun_set_rlimits(ctx: u32, rlimits: *const *const c_char) -> i32;
-        /// M3: the agent's socket on port 3, and `RequestControl` on port 4
-        /// (D5) — the two that let a warm function work at all.
+        /// The agent's socket on port 3, and `RequestControl` on port 4 —
+        /// the two that let a warm function work at all.
         pub fn krun_add_vsock_port(ctx: u32, port: u32, filepath: *const c_char) -> i32;
-        /// M5: `--tty` and the guest's own console.
+        /// `--tty` and the guest's own console.
         pub fn krun_set_console_output(ctx: u32, filepath: *const c_char) -> i32;
-        /// M2: the uid inside the guest, which is not the host's.
+        /// The uid inside the guest, which is not the host's.
         pub fn krun_setuid(ctx: u32, uid: c_int) -> i32;
         pub fn krun_start_enter(ctx: u32) -> i32;
     }
@@ -369,8 +370,8 @@ fn start_vm(config: &SandboxConfig, kernel: &Path) -> Result<Box<dyn Sandbox>> {
 
     // `krun_set_root` takes one directory, so the rootfs has to be flat. The
     // store already keys a flattened rootfs on its layers, and `gvisor` needs
-    // the same thing for the same reason (D3). If PoC 8 says virtiofs makes
-    // imports slow, M3 replaces this with a tag per layer and a guest overlay.
+    // the same thing for the same reason. If virtiofs turns out to make
+    // imports slow, a tag per layer and a guest overlay would replace this.
     let rootfs =
         crate::backend::gvisor::flat_rootfs(config).ok_or_else(|| Error::BackendUnavailable {
             backend: "vm",
@@ -383,7 +384,7 @@ fn start_vm(config: &SandboxConfig, kernel: &Path) -> Result<Box<dyn Sandbox>> {
         })?;
 
     // The same two-level hierarchy every other backend builds: the VMM goes in
-    // it, and everything the guest costs the host is charged there (D2).
+    // it, and everything the guest costs the host is charged there.
     let hierarchy = cgroup::Hierarchy::discover().ok();
     let generation = match hierarchy.as_ref() {
         Some(h) => {
@@ -406,7 +407,7 @@ fn start_vm(config: &SandboxConfig, kernel: &Path) -> Result<Box<dyn Sandbox>> {
     // A pipe the child can report a pre-`krun_start_enter` failure on. Without
     // it, a child that dies while setting the VMM up is a bare exit code: the
     // library's own errors are negative return values, and nobody is reading
-    // them (V7).
+    // them.
     let (err_read, err_write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)
         .map_err(|e| Error::primitive("pipe", "internal vm launcher error", e.into()))?;
 
@@ -863,7 +864,7 @@ pub struct VmSandbox {
     cgroup_dir: Option<PathBuf>,
     /// Wall-clock budget, enforced by [`VmSandbox::wait`] on the monitor.
     ///
-    /// The guest gets its own, tighter one in M2; this is the backstop a
+    /// The guest is meant to get its own, tighter one; this is the backstop a
     /// wedged guest cannot defeat, because it is the host killing the process
     /// that *is* the virtual machine.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]

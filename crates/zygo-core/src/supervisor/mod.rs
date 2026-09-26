@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The supervisor: the process that owns the warm pool between commands.
 //!
-//! Zygo is daemonless (P5, ADR-005). That is a statement about *whose* process
+//! Zygo is daemonless (rule P5 in `docs/book/08-principles.md`). That is a
+//! statement about *whose* process
 //! this is, not about whether one exists: a warm sandbox is warm because
 //! something holds it open, and that something runs in the user's own session,
 //! needs no root, and is not a system service. `zygo serve` starts one if there
@@ -12,10 +13,10 @@
 //!   zygo exec ──unix socket──► supervisor ──agent socket──► zygote ──fork──► request
 //! ```
 //!
-//! One RPC boundary on the request path, which is the whole point of ADR-005:
+//! One RPC boundary on the request path, which is the whole point of that rule:
 //! Docker's client → daemon → containerd → shim chain is deliberately absent.
 //!
-//! Recovery is by rewarming, not by state repair (design doc §3.4). If the
+//! Recovery is by rewarming, not by state repair. If the
 //! supervisor is restarted, its functions are gone and the next `serve` pays
 //! the warm-up again — a few hundred milliseconds, against the standing risk of
 //! reattaching to sandboxes whose state nobody can vouch for.
@@ -88,7 +89,7 @@ impl Launcher {
                     // life, and every warm-up and every `ns` request runs on
                     // it. A panic in one of them used to end the loop, after
                     // which every later job sat in the channel unanswered and
-                    // the supervisor looked hung rather than broken (E-01).
+                    // the supervisor looked hung rather than broken.
                     //
                     // The panic is still a bug and still prints; `run`'s
                     // caller sees the dropped result channel and reports it.
@@ -141,8 +142,8 @@ fn launcher_gone() -> Error {
 
 /// How soon after a crash the first rewarm may be attempted.
 ///
-/// Immediately: the design document's acceptance criterion is that a function is
-/// back within 500 ms of its agent dying, and a warm-up is ~300 ms, so there is
+/// Immediately: the target is that a function is back within 500 ms of its
+/// agent dying, and a warm-up is ~300 ms, so there is
 /// no room for a delay before the first try. The backoff exists for the case
 /// this cannot fix — a handler that crashes the interpreter on import — where
 /// retrying in a tight loop would turn one broken function into a busy host.
@@ -320,7 +321,7 @@ pub struct Supervisor {
     /// Without it, N requests that all find the same crashed function all
     /// rewarm it: N sandboxes built, N of them registered in turn, and N−1
     /// thrown away — on a function that crashes under load, which is when the
-    /// host can least afford it (B-10). The first request through builds the
+    /// host can least afford it. The first request through builds the
     /// replacement; the rest wait on this and then find it already in the
     /// registry.
     ///
@@ -623,13 +624,13 @@ impl Supervisor {
 
     /// Bring a crashed function back, respecting its backoff.
     ///
-    /// Recovery is by rewarming rather than repair (§3.4): a sandbox whose agent
+    /// Recovery is by rewarming rather than repair: a sandbox whose agent
     /// died has no state worth recovering, and the spec that built it is still
     /// in the registry. The backoff is what stops a function that cannot start
     /// at all — a handler that segfaults on import — from becoming a rewarm loop
     /// that costs more than the function ever would.
     fn rewarm(&self, name: &str, broken: &Arc<Entry>) -> std::result::Result<Arc<Entry>, Response> {
-        // One rewarm at a time per function (B-10). Everything below — the
+        // One rewarm at a time per function. Everything below — the
         // backoff, the warm-up, the registration — runs under this, so the
         // second request to arrive waits here rather than building a second
         // sandbox for the same crash.
@@ -690,7 +691,7 @@ impl Supervisor {
         }
     }
 
-    /// Apply the idle policy once (design doc F12, §3.9).
+    /// Apply the idle policy once.
     ///
     /// Two tiers, both driven by how long it has been since a request finished:
     /// past `idle_timeout` a function is frozen, which keeps the resident pages
@@ -961,7 +962,7 @@ impl Supervisor {
         // plus that. This is the whole reason pausing is a tier of its own
         // rather than going straight to cold.
         //
-        // **After** the permit, and that ordering is the fix for B-11. It used
+        // **After** the permit, and that ordering is the fix. It used
         // to happen before, in the caller, where `in_flight` was still zero —
         // so `tier_idle` could read the gate, see nothing in flight, and
         // freeze the function in the window between the thaw and the permit.
@@ -1716,7 +1717,7 @@ impl Supervisor {
     /// Forget a script.
     ///
     /// Nothing checks whether anything still refers to it, because until
-    /// tenants exist (Phase 2) nothing *can* refer to it durably: a request
+    /// tenants exist nothing *can* refer to it durably: a request
     /// already in flight has the bytes, and a caller that removes a script it
     /// is about to run has made that call fail on purpose.
     pub fn delete_script(&self, digest: &str) -> std::result::Result<Response, Response> {
@@ -2839,8 +2840,8 @@ fn reject_foreign_peer(stream: &UnixStream) -> Option<Response> {
 /// be read at all, and the honest reading of that is "this connection's owner
 /// is unknown" — which, for a check whose failure mode is arbitrary code
 /// execution as this user, has to be a refusal. It read as `None` meaning
-/// *allowed* until the code review (B-02), because the syscall and the
-/// policy shared one `?`.
+/// *allowed* until this was found, because the syscall and the policy shared
+/// one `?`.
 fn peer_verdict(ours: u32, peer: Option<u32>) -> Option<Response> {
     match peer {
         None => Some(Response::error(
@@ -3104,7 +3105,7 @@ mod tests {
 
     #[test]
     fn the_first_rewarm_after_a_crash_is_immediate() {
-        // The design document's acceptance criterion is "back within 500 ms",
+        // The target is "back within 500 ms",
         // and a warm-up is ~300 ms. Any delay before the first attempt spends
         // budget that is not there.
         assert_eq!(Backoff::delay(0), Duration::ZERO);
@@ -4524,7 +4525,7 @@ mod tests {
     /// The syscall is the input to this decision, so the decision is what is
     /// tested; a socket on which `SO_PEERCRED` genuinely fails cannot be
     /// conjured from inside a process that owns both ends. The bug this pins
-    /// (B-02) was that the syscall and the policy shared one `?`, so "could
+    /// was that the syscall and the policy shared one `?`, so "could
     /// not read the credentials" and "the credentials are ours" returned the
     /// same answer: allowed.
     #[test]

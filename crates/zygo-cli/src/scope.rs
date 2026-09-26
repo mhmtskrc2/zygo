@@ -298,8 +298,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_process_already_in_a_scope_is_left_alone() {
-        // Safe: this test runs in its own process and sets the variable the
-        // function reads, which nothing else in the suite looks at.
+        // This test sets the variable the function reads, which nothing else
+        // in the suite looks at — but not in its own process: cargo runs the
+        // tests of one binary as threads of one process.
         // SAFETY: `set_var` races only with a C `getenv` on another thread;
         // Rust's own `std::env` readers take the same lock. Not verified in
         // this pass: cargo runs tests on several threads, and no audit was made

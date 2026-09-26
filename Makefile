@@ -397,7 +397,7 @@ use-cases-linux: tests/linux/bin/zygo-linux-musl
 		apt-get -qq install -y passt nftables file >/dev/null 2>&1; \
 		sh /src/tests/linux/use_cases.sh' 
 
-# Known escape vectors (design doc §3.10), each actually attempted.
+# Known escape vectors (docs/book/23-security.md), each actually attempted.
 escape-linux: tests/linux/bin/zygo-linux-musl
 	docker run --rm --privileged -v "$(PWD):/src:ro" \
 		-e ZYGO_DATA_HOME=/tmp/zdata python:3.12-slim \

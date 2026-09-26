@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Command-line surface (design doc §4.3).
+//! Command-line surface (`docs/book/19-commands.md`).
 //!
-//! The CLI is a thin client over `zygo-core` (ADR-008), so this module is
+//! The CLI is a thin client over `zygo-core` (the API is the surface, not the
+//! CLI: `docs/book/adr/0001-embedded-runtime.md`), so this module is
 //! almost entirely declaration: parse, build a [`Layer`] of overrides, hand it
 //! to the library.
 
@@ -497,11 +498,11 @@ pub enum BenchCommand {
     Cold {
         #[arg(long, default_value_t = 50)]
         n: u32,
-        /// Image to start. The default is what requirement N2 is written about.
+        /// Image to start. The default is what the cold budget is written about.
         #[arg(long, default_value = "python:3.12-slim")]
         image: String,
         /// Command to run. Defaults to starting the interpreter and exiting,
-        /// because N2's budget includes the interpreter.
+        /// because the cold budget includes the interpreter.
         #[arg(long, num_args = 1.., value_delimiter = ' ')]
         command: Option<Vec<String>>,
     },
@@ -525,8 +526,7 @@ pub enum BenchCommand {
     Load {
         #[arg(long, default_value_t = 10)]
         seconds: u32,
-        /// Clients calling at once. The design document's acceptance criterion
-        /// is >= 600 requests/s at 4.
+        /// Clients calling at once. The target is >= 600 requests/s at 4.
         #[arg(long, default_value_t = 4)]
         concurrency: u32,
         /// CPU quota for the tenant, in cores.
@@ -538,7 +538,7 @@ pub enum BenchCommand {
 /// `-f/--file`, on the commands that read a spec.
 ///
 /// Not a global flag: `zygo logs -f` means *follow*, and both spellings are in
-/// the design doc's CLI reference. Scoping the flag keeps both.
+/// `docs/book/19-commands.md`. Scoping the flag keeps both.
 #[derive(Debug, Args, Default, Clone)]
 pub struct SpecFileArgs {
     /// Spec file to read. Defaults to `sandbox.toml`, searched upwards.
@@ -1380,7 +1380,7 @@ mod tests {
     }
 
     /// `-f` means *file* on spec-reading commands and *follow* on `logs`; both
-    /// are in the design doc's CLI reference, so both must work.
+    /// are in `docs/book/19-commands.md`, so both must work.
     #[test]
     fn dash_f_means_file_or_follow_depending_on_the_command() {
         let cli = Cli::try_parse_from(["zygo", "spec", "-f", "other.toml", "validate"]).unwrap();

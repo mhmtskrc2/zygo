@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! seccomp-bpf filters (design doc appendix B).
+//! seccomp-bpf filters (`docs/book/24-seccomp-profiles.md`).
 //!
 //! The filter is an **allowlist**: anything not named returns `EPERM`. That
 //! direction matters — a denylist silently gains a hole every time the kernel
@@ -11,9 +11,9 @@
 //! *installed* in the child. Everything after `clone3` has to be
 //! allocation-free, and generating BPF is not.
 //!
-//! The three profiles come from appendix B. `default` is the one PoC 5
-//! validated against numpy, pandas, Pillow, pydantic and requests — the same
-//! syscall set, expressed here rather than as a Docker profile.
+//! `default` is the profile `tests/poc/poc5_seccomp_packages.py` validated
+//! against numpy, pandas, Pillow, pydantic and requests — the same syscall
+//! set, expressed here rather than as a Docker profile.
 
 use super::syscalls;
 use crate::spec::SeccompProfile;
@@ -258,12 +258,13 @@ impl Assembler {
 
 /// Syscalls every profile allows.
 ///
-/// This is PoC 5's validated set: the five reference packages exercise their
+/// This is the set `tests/poc/poc5_seccomp_packages.py` validated: the five
+/// reference packages exercise their
 /// real code paths — numpy's BLAS threads, Pillow's codecs, pandas' file I/O,
 /// pydantic's Rust core, requests' TLS setup — under exactly these.
 ///
-/// Plus the whole extended-attribute family, which PoC 5 did not reach and
-/// the first real consumer did (the first adoption report, Z-1). Only
+/// Plus the whole extended-attribute family, which that check did not reach
+/// and the first real consumer did. Only
 /// `getxattr` and `lgetxattr` were here; `listxattr` was not, so it answered
 /// `EPERM` — which `shutil.copy2` reports as `[Errno 1] Operation not
 /// permitted` naming a file that plainly exists, and `pip install --target`
@@ -527,7 +528,7 @@ pub const BASE_ALLOWLIST: &[&str] = &[
 /// suite runs every appendix-B vector against all three profiles now, and
 /// found them reachable under this one; the comment above claimed they were
 /// what Docker allows, and Docker removed io_uring from its default profile
-/// in 20.10.18 (moby#43991) for the same reason appendix B excludes it — it
+/// in 20.10.18 (moby#43991) for the same reason it is excluded here — it
 /// is a large, fast-moving kernel surface reachable with no capability at
 /// all. `userfaultfd` was wider here than in Docker, which grants it only
 /// with `CAP_SYS_PTRACE`; a Zygo sandbox holds no capabilities, so "as Docker
@@ -593,7 +594,7 @@ pub const STRICT_REMOVED: &[&str] = &[
 /// program, so a profile without it produces a sandbox that cannot start at all
 /// — which is exactly what happened the first time this was run.
 ///
-/// Design doc §3.4.1 puts this tightening where it belongs: the agent's child,
+/// This tightening goes where it belongs: the agent's child,
 /// which is already running the interpreter and never needs to exec again.
 /// [`child_program`] turns it into a filter; the supervisor hands that to the
 /// agent in `ZYGO_CHILD_SECCOMP`, and the agent installs it after `fork()` and
@@ -679,7 +680,7 @@ pub fn encode(prog: &[SockFilter]) -> Vec<u8> {
 /// filter that denied every `fork`.
 pub const SPECIAL_CASED: &[&str] = &["clone"];
 
-/// Syscalls that must never be reachable (design doc appendix B).
+/// Syscalls that must never be reachable.
 ///
 /// Nothing in `default` or `strict` grants these — they are simply absent from
 /// both allowlists. The constant exists so a test can assert that, rather than
@@ -1085,7 +1086,7 @@ mod tests {
         assert!(default < permissive, "{default} !< {permissive}");
     }
 
-    /// Appendix B's exclusions are the point of the whole profile. If one of
+    /// The excluded syscalls are the point of the whole profile. If one of
     /// them ever appears in an allowlist, the sandbox has a hole that reading
     /// 190 names would not reveal.
     /// What `permissive` is allowed to grant from [`NEVER_ALLOWED`], exactly.
@@ -1093,7 +1094,7 @@ mod tests {
     /// Not "some of them": the list. `io_uring_setup`, `io_uring_enter`,
     /// `io_uring_register` and `userfaultfd` were in `PERMISSIVE_EXTRA` and
     /// are not in this set, which is what the escape suite found when it
-    /// started running appendix B's vectors against all three profiles.
+    /// started running the escape vectors against all three profiles.
     const PERMISSIVE_MAY_GRANT: &[&str] = &[
         "ptrace",
         "setns",
@@ -1176,7 +1177,7 @@ mod tests {
 
     /// The launcher installs its filter immediately before `execve`. A profile
     /// that denies it produces a sandbox that cannot start — the tightening
-    /// belongs in the agent's already-running child (design doc §3.4.1).
+    /// belongs in the agent's already-running child.
     #[test]
     fn no_profile_denies_the_exec_that_starts_the_sandbox() {
         for profile in [
@@ -1439,7 +1440,7 @@ mod tests {
             );
         }
 
-        /// Z-1 from the first adoption report: `listxattr` answered `EPERM`,
+        /// Found by the first real consumer: `listxattr` answered `EPERM`,
         /// which `shutil.copy2` reports as `[Errno 1] Operation not permitted`
         /// on a file that plainly exists — and `pip install --target` is a
         /// `copy2` per file. Every spelling of every operation on an extended
@@ -1674,7 +1675,7 @@ mod tests {
             }
         }
 
-        /// The tightening the design puts in the agent's child, run rather
+        /// The tightening that goes in the agent's child, run rather
         /// than inspected: a program is refused, a process is refused, a
         /// thread is not — and the profiles that do not tighten hand back
         /// nothing at all rather than an empty filter.

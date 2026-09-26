@@ -6,9 +6,9 @@ members = ["crates/zygo-core", "crates/zygo-cli"]
 version = "0.1.1"
 edition = "2024"
 # 1.88, not 1.85: let-chains (`if let .. && ..`) are used throughout and were
-# stabilised in 1.88. The declared floor was false until the 2026-09-21 review
-# (C-01) — `cargo check` on the machine that wrote it passed because that
-# machine was newer, which is how an MSRV drifts.
+# stabilised in 1.88. The declared floor was wrong until a machine with an
+# older toolchain tried to build it — `cargo check` on the machine that wrote
+# it passed because that machine was newer, which is how an MSRV drifts.
 rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/mhmtskrc2/zygo"
@@ -25,7 +25,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 sha2 = "0.10"
 hex = "0.4"
-# Secrets at rest (roadmap 2.7). RustCrypto, pure Rust, and the same family as
+# Secrets at rest. RustCrypto, pure Rust, and the same family as
 # `sha2` above — a cipher is the one thing this project will not write itself,
 # and a C dependency would complicate the static musl build the distribution
 # rests on. `zeroize` so a key does not outlive its use in this process's heap.

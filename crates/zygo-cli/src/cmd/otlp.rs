@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! OTLP metrics export from `zygo api` (design doc §3.12).
+//! OTLP metrics export from `zygo api`.
 //!
 //! OTLP/HTTP with the protocol's JSON encoding, pushed to a collector on an
 //! interval. JSON rather than protobuf because the protocol defines both as
@@ -10,7 +10,7 @@
 //!
 //! What is exported is exactly what `/metrics` exposes, from the same
 //! snapshot, so the two views cannot disagree. Metrics only: the request
-//! spans the design also names need a trace context on the request path,
+//! spans that would go with them need a trace context on the request path,
 //! which is a protocol change and is not made here.
 
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -443,7 +443,7 @@ def main() -> int:
 
         # --- a warm-exec pool --------------------------------------------------
         #
-        # The other pool shape (todo 3.4). No agent and no protocol: the
+        # The other pool shape. No agent and no protocol: the
         # sandbox is held, the script is written into it, and each request is
         # `cmd` plus that path with the event on stdin. For a runtime that
         # starts in under a millisecond there is nothing for an agent to

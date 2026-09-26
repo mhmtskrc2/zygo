@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Landlock filesystem and network restriction (design doc §3.3 step 6, §3.8).
+//! Landlock filesystem and network restriction.
 //!
 //! Landlock is *defence in depth*, not the boundary. The boundary is the mount
 //! namespace: a sandbox cannot name a path that was never mounted into it.

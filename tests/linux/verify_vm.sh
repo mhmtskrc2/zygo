@@ -1,6 +1,7 @@
 #!/bin/sh
 # SPDX-License-Identifier: Apache-2.0
-# The `vm` backend against a real KVM, compared with `ns` (requirement N8).
+# The `vm` backend against a real KVM, compared with `ns`: the same spec must
+# mean the same thing on every backend.
 #
 # Shaped like `verify_gvisor.sh`: the `ns` baseline first, then the same probes
 # on `vm`, then the things that must differ, then every refusal by name.
@@ -229,7 +230,7 @@ if [ -n "$vm_uname" ]; then
         *) bad "the second guest did not answer: $again" ;;
     esac
 
-    # The claim from §2 of the plan: a guest can offer controls the host lacks.
+    # The claim: a guest can offer controls the host lacks.
     out=$(zygo run --quiet --isolation vm --timeout "${BOOT_S}s" "$IMAGE" \
         /bin/sh -c 'ls /sys/kernel/security/ 2>/dev/null | tr "\n" " "; echo; ls /sys/fs/cgroup/cgroup.kill >/dev/null 2>&1 && echo cgroup-kill-yes || echo cgroup-kill-no' 2>/dev/null)
     say "  note  inside the guest: $(printf '%s' "$out" | tr '\n' ' ')"

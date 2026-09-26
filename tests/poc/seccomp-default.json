@@ -1,6 +1,6 @@
 {
   "_comment": [
-    "PoC 5 — Zygo's proposed `default` seccomp allowlist (design doc appendix B).",
+    "PoC 5 — Zygo's proposed `default` seccomp allowlist (the `default` profile, docs/book/24-seccomp-profiles.md).",
     "",
     "Written as a Docker seccomp profile so it can be tested against real",
     "packages without writing BPF by hand: Docker drives libseccomp with the",

@@ -1,6 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: Apache-2.0
-# The container image, built and run for real (todo 4.2).
+# The container image, built and run for real.
 #
 # What this checks is the image rather than Zygo: that the binary in it is the
 # one that was built, that it starts as a non-root user, that `/healthz`

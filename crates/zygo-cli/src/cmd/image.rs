@@ -266,7 +266,7 @@ fn prune(cli: &Cli, opts: &PruneOptions) -> anyhow::Result<u8> {
 /// `image rm` prunes what the removed images kept alive, and in JSON mode it
 /// used to print its own `{"removed": …}` document and then let `prune` print
 /// a second one — two JSON values on one stream, which `json.load` rejects
-/// (E-14). Passing a slot here lets the caller fold both into one document.
+/// Passing a slot here lets the caller fold both into one document.
 fn prune_with(
     cli: &Cli,
     opts: &PruneOptions,

@@ -84,7 +84,7 @@ impl RegistryClient {
             // otherwise hang `pull` — and therefore `run` and `serve` — for
             // ever, with no output and nothing to interrupt in a supervisor.
             // Per-read rather than per-request, so a genuinely large layer on
-            // a slow link still completes (S-02).
+            // a slow link still completes.
             .connect_timeout(CONNECT_TIMEOUT)
             .read_timeout(READ_TIMEOUT)
             .build()
@@ -232,7 +232,7 @@ impl RegistryClient {
         // What was actually served. Computed every time, and then compared
         // against everything that claimed to know it.
         //
-        // Until the code review (B-05) the header was taken as the
+        // Until this was found the header was taken as the
         // answer when present and the body hashed only when it was absent —
         // and neither was ever compared with `reference.digest`. So
         // `zygo pull python@sha256:<X>` accepted any self-consistent manifest

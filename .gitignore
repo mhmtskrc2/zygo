@@ -33,7 +33,7 @@ __pycache__/
 # against — but it is still a build artefact.
 /packaging/oci/zygo
 
-# Development material: the roadmap, the design document, the review reports
+# Development material: planning notes, design notes and review reports
 # and the test plans. Useful to whoever is building Zygo and noise to whoever
 # is using it, so it lives here rather than in `docs/`, which is for readers.
 /mhmt/

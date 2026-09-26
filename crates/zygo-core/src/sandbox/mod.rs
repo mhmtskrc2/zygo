@@ -3,8 +3,8 @@
 //!
 //! Everything here is pure data: the mount plan, the limit set and the identity
 //! of the sandbox. A backend consumes this and draws the isolation boundary
-//! wherever it draws it — namespaces, gVisor's Sentry, or a VM. Requirement N8
-//! ("behavioural equivalence across backends") is much easier to hold when the
+//! wherever it draws it — namespaces, gVisor's Sentry, or a VM. Behavioural
+//! equivalence across backends is much easier to hold when the
 //! backends share the description rather than each deriving their own.
 
 pub mod limits;
@@ -99,7 +99,7 @@ pub struct SandboxConfig {
     pub agent_fd: Option<std::os::fd::RawFd>,
     /// Build the sandbox and then *hold* it instead of running `argv`.
     ///
-    /// Warm-exec (design doc §3.4, layer 1): the namespaces, mounts, cgroup
+    /// Warm-exec: the namespaces, mounts, cgroup
     /// and hardening are set up once and kept; each request is a fresh process
     /// entered into them by the supervisor. The init process stays as Zygo's
     /// own code — a reaping loop, never `execve` — so nothing from the image
@@ -139,7 +139,7 @@ impl SandboxConfig {
     ///
     /// The same literal was written out in several test modules; a field added
     /// to `SandboxConfig` had to be added to every one of them before anything
-    /// compiled (T-07 in the code review). Here it is written once, and
+    /// compiled. Here it is written once, and
     /// a test that cares about one field changes that field.
     #[doc(hidden)]
     pub fn for_tests() -> SandboxConfig {
@@ -183,7 +183,7 @@ impl SandboxConfig {
 /// front of exactly this.
 pub const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
-/// The state machine a warm sandbox moves through (design doc appendix A).
+/// The state machine a warm sandbox moves through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SandboxState {

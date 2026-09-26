@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The dependency cache (design doc §3.7, todo 2.7).
+//! The dependency cache.
 //!
 //! `requirements.txt` → `cache/venvs/<hash>/`, built once and bound read-only
 //! at `/venv` in every sandbox that lists the same file against the same image.
@@ -11,9 +11,9 @@
 //! where the code will run is also what makes the cache key honest: the same
 //! requirements against a different image are a different venv.
 //!
-//! The design says "an embedded `uv`". That was not done: `uv` is ~30 MB, and
-//! requirement N6 caps the whole binary at 15 MB. The image's `pip` is slower
-//! and already there.
+//! An embedded `uv` was considered and not done: `uv` is ~30 MB, and the
+//! whole static binary is budgeted at 15 MB. The image's `pip` is slower and
+//! already there.
 //!
 //! The build sandbox is given **host networking**. This is the one place Zygo
 //! grants it without `--allow-host-net`, and it is justified narrowly: the

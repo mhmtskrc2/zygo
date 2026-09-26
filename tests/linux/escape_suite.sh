@@ -1,6 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: Apache-2.0
-# Escape suite for the `ns` backend (design doc §3.10).
+# Escape suite for the `ns` backend (`docs/book/23-security.md`).
 #
 # Each case is an actual attempt to get out, not an inspection of settings: a
 # test that only reads a flag passes on a kernel that ignores the flag.
@@ -505,8 +505,8 @@ rm -rf "$FCAP"
 
 # --- 14. the host's filesystem ----------------------------------------------
 #
-# `/work` used to be on this list and is not any more. Phase 2.6 mounted a
-# tmpfs there for per-request workspaces, so the path now exists in every
+# `/work` used to be on this list and is not any more. Per-request workspaces
+# mount a tmpfs there, so the path now exists in every
 # sandbox and this case began reporting an escape on a directory Zygo itself
 # had created. Existence is the wrong question for it; 14b asks the right one.
 
@@ -574,7 +574,7 @@ print(','.join(reachable) if reachable else 'none')")
 # A warm-exec request is forked inside the held sandbox and its helper
 # renumbers thirteen descriptors — seven namespace descriptors among them —
 # before `execve`. `F_DUPFD` and `dup2` both *clear* close-on-exec, so until
-# the code review (B-03) every one of them was inherited by the tenant
+# this was found every one of them was inherited by the tenant
 # program: the namespace descriptors it would need to `setns` back out, and a
 # second copy of the helper's error pipe.
 #

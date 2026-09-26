@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
-//! `zygo api` — the HTTP front door (design doc §4.6, requirement F9).
+//! `zygo api` — the HTTP front door (`docs/book/17-api-sdk-mcp.md`).
 //!
 //! A client of the supervisor, not a second copy of it. Every route here turns
 //! into one control request over the unix socket, which is the same boundary
-//! the CLI crosses; ADR-005's "one RPC boundary on the request path" holds
+//! the CLI crosses; "one RPC boundary on the request path" holds
 //! because HTTP → supervisor replaces CLI → supervisor rather than adding to
 //! it. The supervisor stays the only process that owns sandboxes, and this one
 //! can be restarted, moved to a unix socket, or fronted by something else
 //! without a warm function noticing.
 //!
-//! Security posture (§3.10): bearer auth by default, `127.0.0.1` by default,
+//! Security posture: bearer auth by default, `127.0.0.1` by default,
 //! and an unauthenticated listener is refused on anything but a unix socket or
 //! a loopback address. The token comes from `ZYGO_API_TOKEN` and nowhere else —
 //! never a flag, because flags are in `ps`.
@@ -96,7 +96,7 @@ pub const API_VERSION: u32 = 1;
 ///
 /// Without a cap, a 16 MB body of `[null,null,…]` is about a million elements,
 /// and the batch handler opened a supervisor connection and spawned a task for
-/// each (S-06). The supervisor serves every connection on a thread, so the
+/// each. The supervisor serves every connection on a thread, so the
 /// cost of that request was paid by the host rather than by the caller.
 const MAX_BATCH: usize = 1024;
 
@@ -111,7 +111,7 @@ const BATCH_IN_FLIGHT: usize = 16;
 /// Idle control connections kept for reuse.
 ///
 /// Each one pins a thread in the supervisor, so the pool that only ever grew
-/// (S-07) turned a burst of concurrent requests into a permanent thread count.
+/// turned a burst of concurrent requests into a permanent thread count.
 /// Above this, a finished connection is closed instead of kept.
 const MAX_IDLE_CLIENTS: usize = 32;
 
@@ -119,8 +119,7 @@ const MAX_IDLE_CLIENTS: usize = 32;
 ///
 /// The function's own `timeout` is the real limit and the supervisor enforces
 /// it; this header only says how long the caller will wait. Unbounded, it is a
-/// way to hold a connection and a supervisor thread for as long as you like
-/// (S-08).
+/// way to hold a connection and a supervisor thread for as long as you like.
 ///
 /// A day rather than the hour it was. An embedder's long jobs — a render, a
 /// migration, a model run — are hours, and an hour was a ceiling they hit for
@@ -133,8 +132,8 @@ const MAX_TIMEOUT_MS: u64 = 24 * 3_600_000;
 
 /// How long a connection has to send its request headers.
 ///
-/// hyper only honours this when the builder has a timer, and it had none
-/// (S-09) — so a connection that opened and sent one byte was held for ever.
+/// hyper only honours this when the builder has a timer, and it had none —
+/// so a connection that opened and sent one byte was held for ever.
 const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How long a one-shot `POST /run` may hold the connection beyond the
@@ -527,7 +526,7 @@ where
         let result = http1::Builder::new()
             // Without a timer hyper accepts `header_read_timeout` and then
             // silently does nothing with it, so a connection that sends one
-            // byte and stops is held for ever (S-09).
+            // byte and stops is held for ever.
             .timer(hyper_util::rt::TokioTimer::new())
             .header_read_timeout(HEADER_READ_TIMEOUT)
             .serve_connection(io, service)
@@ -549,7 +548,7 @@ async fn handle(req: Request<Incoming>, api: Arc<Api>) -> Result<Response<ApiBod
     };
     // Counted once, from the status that was actually sent. Counting in the
     // `Err` arm *and* here meant every 500 produced by a refused request was
-    // two errors, so the rate on a dashboard was twice the truth (B-30).
+    // two errors, so the rate on a dashboard was twice the truth.
     if response.status().is_server_error() {
         api.errors.fetch_add(1, Ordering::Relaxed);
     }
@@ -1131,7 +1130,7 @@ fn timeout_header(req: &Request<Incoming>) -> Result<u64, HttpError> {
 /// The headers alone, so this is reachable from a test.
 ///
 /// `Request<Incoming>` cannot be built outside a server, which is why the
-/// ceiling below went untested until there was a ceiling to test (S-08).
+/// ceiling below went untested until there was a ceiling to test.
 fn timeout_header_from(headers: &hyper::HeaderMap) -> Result<u64, HttpError> {
     match headers.get("x-zygo-timeout-ms") {
         None => Ok(DEFAULT_TIMEOUT_MS),
@@ -1209,7 +1208,7 @@ where
         if result.is_ok() {
             // Above the ceiling the connection is dropped rather than kept:
             // each idle one pins a supervisor thread, so a pool that only grew
-            // made a momentary burst permanent (S-07).
+            // made a momentary burst permanent.
             let mut idle = api.clients.lock().expect("clients");
             if idle.len() < MAX_IDLE_CLIENTS {
                 idle.push(client);
@@ -1365,7 +1364,7 @@ async fn batch(
     }
 
     // One caller asking for a thousand things must not take a thousand
-    // supervisor connections ahead of every other caller (S-06). The
+    // supervisor connections ahead of every other caller. The
     // per-function concurrency limit still bounds the sandbox work behind
     // this; the semaphore bounds the plumbing in front of it.
     let permits = Arc::new(tokio::sync::Semaphore::new(BATCH_IN_FLIGHT));
@@ -1432,7 +1431,7 @@ where
         // A panicking element is reported as that element's failure. It used
         // to `expect`, which took down the whole batch — and with it the
         // answers to every element that had already succeeded, which is the
-        // one thing a batch exists to prevent (S-06).
+        // one thing a batch exists to prevent.
         out.push(h.await.unwrap_or_else(|e| {
             tracing::error!("a batch element panicked: {e}");
             serde_json::json!({
@@ -2719,7 +2718,7 @@ fn render_metrics(snapshot: &super::otlp::Snapshot, tenant: Option<&str>) -> Str
     out
 }
 
-/// Map a control reply to an HTTP status and JSON body (§4.6).
+/// Map a control reply to an HTTP status and JSON body.
 /// Count a finished request, if that is what this reply is.
 ///
 /// Called at the four places something is *run* — a function, a pool, a batch
@@ -2893,7 +2892,7 @@ fn reply_to_response(reply: Reply) -> Response<ApiBody> {
     response
 }
 
-/// The design document's `POST /fn/<name>` answers: 200 with the result and
+/// `POST /fn/<name>`'s answers: 200 with the result and
 /// metrics; 408 when the deadline killed it; 500 when the handler raised.
 fn outcome_to_json(outcome: Outcome) -> (StatusCode, serde_json::Value) {
     let metrics = serde_json::json!({
@@ -3015,7 +3014,7 @@ mod tests {
 
     #[test]
     fn the_status_codes_are_the_design_documents() {
-        // §4.6: 200, 408, 429, 500 — and each distinguishable from the body.
+        // 200, 408, 429, 500 — and each distinguishable from the body.
         let (s, body) = outcome_to_json(outcome(None, false));
         assert_eq!(s, StatusCode::OK);
         assert_eq!(body["result"]["ok"], true);
@@ -3400,7 +3399,7 @@ mod tests {
     /// larger the caller makes it.
     #[test]
     fn a_caller_cannot_ask_for_an_unbounded_amount_of_work() {
-        // S-08: the wait a caller may ask for. Refused rather than clamped —
+        // The wait a caller may ask for. Refused rather than clamped —
         // a caller given an hour when it asked for a day would report the
         // wrong thing when the wait ended.
         let over = Request::builder()
@@ -3438,7 +3437,7 @@ mod tests {
             2500
         );
 
-        // S-06 and S-07: the two ceilings that bound supervisor connections.
+        // The two ceilings that bound supervisor connections.
         // Checked as relationships rather than as literals, because what
         // matters is that a batch cannot out-compete the pool in front of it —
         // and at compile time, since both are constants.

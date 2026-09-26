@@ -1,6 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: Apache-2.0
-# Requirement N6: one static binary, no runtime dependencies, small enough to
+# The distribution rule: one static binary, no runtime dependencies, small enough to
 # `curl | sh`.
 #
 # The budget lives here rather than in three copies — `make dist-linux`, the
@@ -37,7 +37,7 @@ echo "size: $((SIZE / 1048576)) MB ($SIZE bytes), budget ${BUDGET_MB} MB"
 
 FAIL=0
 
-# `static-pie linked` and `statically linked` are both static: what N6 asks is
+# `static-pie linked` and `statically linked` are both static: what matters is
 # whether there is a dynamic interpreter to satisfy at run time, and neither
 # has one. x86_64 musl produces the PIE form and aarch64 does not, so matching
 # only the second phrase fails on the architecture it was not written on.

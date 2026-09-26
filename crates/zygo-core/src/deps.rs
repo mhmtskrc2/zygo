@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Dependency sets built from files that arrived over the API (todo 3.3).
+//! Dependency sets built from files that arrived over the API.
 //!
 //! [`crate::venv`] builds a venv from a `requirements.txt` **on this host**,
 //! named by a spec file the operator wrote. That is the right shape for

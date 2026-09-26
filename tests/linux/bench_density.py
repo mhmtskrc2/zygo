@@ -21,7 +21,8 @@ Every script here is *distinct* — a different constant in the source — so th
 supervisor cannot dedupe them, and every one shares an image and a dependency
 set, which is the shape an embedder has.
 
-And then the same question of the shape Phase 1 built to answer it. With
+And then the same question of the shape Phase 1 of ROADMAP.md built to
+answer it. With
 `--pool` every script runs in **one runtime pool** instead of getting a zygote
 of its own, and the two numbers become:
 
@@ -32,7 +33,7 @@ of its own, and the two numbers become:
   p50 / p99         what a call costs once every script has been run once,
                     measured over the API an embedder actually uses
 
-The roadmap's exit criterion for Phase 1 is that pair: p99 under 5 ms with a
+ROADMAP.md's exit criterion for Phase 1 is that pair: p99 under 5 ms with a
 flat slope, at a thousand distinct scripts.
 
 Usage:

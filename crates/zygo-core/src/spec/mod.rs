@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The `sandbox.toml` surface (design doc §4.4) and the layering rules that
+//! The `sandbox.toml` surface (`docs/book/20-sandbox-toml.md`) and the layering rules that
 //! turn it into a runnable description.
 //!
 //! Precedence, highest first: **CLI flags → `[fn.<name>]` → `[defaults]` →
@@ -76,7 +76,7 @@ pub struct Layer {
     pub workdir: Option<PathBuf>,
     pub user: Option<String>,
 
-    // --- derived system layer (design doc §3.7) ---------------------------
+    // --- derived system layer ---------------------------------------------
     pub system: Option<Vec<String>>,
     pub nix: Option<Vec<String>>,
 
@@ -84,7 +84,7 @@ pub struct Layer {
     pub isolation: Option<Isolation>,
     pub seccomp: Option<SeccompProfile>,
 
-    // --- limits (design doc §3.5) -----------------------------------------
+    // --- limits -----------------------------------------------------------
     pub mem: Option<Bytes>,
     pub cpu: Option<Cpu>,
     pub pids: Option<u32>,
@@ -99,7 +99,7 @@ pub struct Layer {
     /// unlimited, with a warning.
     pub bandwidth: Option<Bytes>,
 
-    // --- network (design doc §3.8) ----------------------------------------
+    // --- network ----------------------------------------------------------
     pub network: Option<Network>,
     pub allow: Option<Vec<AllowRule>>,
 
@@ -124,7 +124,7 @@ pub struct Layer {
     pub max_warm: Option<u32>,
 }
 
-/// `[api]` block: the local HTTP/Unix endpoint (design doc §4.6).
+/// `[api]` block: the local HTTP/Unix endpoint.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ApiSpec {
@@ -459,7 +459,7 @@ listen = "127.0.0.1:7700"
 auth   = "bearer"
 "#;
 
-    /// The design doc's example must parse verbatim — it is the contract.
+    /// The reference example must parse verbatim — it is the contract.
     #[test]
     fn design_doc_example_parses() {
         let spec = Spec::parse(DOC_EXAMPLE, None).expect("doc example should parse");

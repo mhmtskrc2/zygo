@@ -2,8 +2,8 @@
 //! `zygo serve`, `exec`, `ps`, `stop`, and the supervisor process behind them.
 //!
 //! Every command here is the same shape: connect to the supervisor, send one
-//! request, print the answer. That thinness is ADR-008 — the library is the
-//! product, and a platform embedding `zygo_core` gets the same behaviour
+//! request, print the answer. That thinness is deliberate — the library is
+//! the product, and a platform embedding `zygo_core` gets the same behaviour
 //! without a CLI in the way.
 
 use std::sync::Arc;
@@ -399,7 +399,7 @@ pub fn up(cli: &Cli, file: Option<&std::path::Path>, relock: bool) -> anyhow::Re
     // `up --json` used to write one document per failure from inside this
     // loop and then a summary document at the end, so its output was several
     // JSON values concatenated — which `json.load` rejects and `jq` only
-    // accepts with `-s` (E-14). Two of the failure branches printed nothing
+    // accepts with `-s`. Two of the failure branches printed nothing
     // at all in JSON mode, so the reason was simply lost. One document, with
     // every failure and why, is what a caller can actually read.
     let mut failed: Vec<serde_json::Value> = Vec::new();

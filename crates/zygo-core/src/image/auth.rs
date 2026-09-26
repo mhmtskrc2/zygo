@@ -20,7 +20,7 @@ use super::ImageError;
 /// below that hold the same secret in other shapes. A derived one puts the
 /// password into any `{:?}` — a `tracing` field, an `anyhow` context, a test
 /// assertion message — and a credential that reaches a log has to be rotated.
-/// The the code review (S-01) found four such derives.
+/// Four such derives were found and removed.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Credential {
     pub username: String,

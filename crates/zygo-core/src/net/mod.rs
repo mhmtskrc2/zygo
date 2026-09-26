@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Sandbox networking (design doc §3.8): `none`, `egress`, `full`, `host`.
+//! Sandbox networking: `none`, `egress`, `full`, `host`.
 //!
 //! `none` is the default and needs nothing — the sandbox gets an empty network
 //! namespace with a loopback interface, which the launcher brings up itself.
@@ -12,8 +12,8 @@
 //!   namespace and the host, in userspace, as the ordinary user. It copies the
 //!   host's addresses and routes into the namespace, so the sandbox sees a
 //!   plausible network rather than a translated one. The root-only
-//!   alternative in the design — a veth pair — is not reachable rootless,
-//!   which is P5.
+//!   alternative — a veth pair — is not reachable rootless, and no root is
+//!   rule P5 in `docs/book/08-principles.md`.
 //! * **`nft`** installs the allowlist *inside* the sandbox's network
 //!   namespace. Zygo has no capabilities on the host, but it created the
 //!   sandbox's user namespace, so entering that namespace grants a full
@@ -129,7 +129,7 @@ pub fn needs_configuration(network: Network) -> bool {
 }
 
 /// Blocks that reach the host and its neighbours. Rejected before any allow
-/// rule unless `--allow-private-net` was given (design doc §3.10).
+/// rule unless `--allow-private-net` was given.
 ///
 /// Multicast, `0.0.0.0/8` and the reserved `240.0.0.0/4` (broadcast included)
 /// as well: none of them is "the internet", and under `full` an open
@@ -672,8 +672,8 @@ pub(crate) mod linux {
             // is a trap.
             .arg("--runas")
             .arg(format!("{uid}:{gid}"))
-            // No inbound forwarding at all: the design gives `egress` and
-            // `full` egress only, and a listening port would be reachable
+            // No inbound forwarding at all: `egress` and `full` are egress
+            // only, and a listening port would be reachable
             // from the host.
             .args(["--tcp-ports", "none"])
             .args(["--udp-ports", "none"])
@@ -1131,7 +1131,7 @@ pub(crate) mod linux {
             // close-on-exec from the moment it exists. Without it the
             // sandbox's `/run/secrets` directory descriptor was inherited by
             // every later `Command` the supervisor spawned — `pasta`, `nft`,
-            // `newuidmap`, a re-exec of itself (S-04, the code review). The
+            // `newuidmap`, a re-exec of itself. The
             // flag has to be set here rather than afterwards: between
             // `recvmsg` and an `fcntl` there is a window in which another
             // thread can fork.
@@ -1292,7 +1292,7 @@ mod tests {
     /// The ruleset's blocks and the one `is_private_addr` answers for are the
     /// same set, checked address by address rather than by reading both lists.
     ///
-    /// They were not (B-18): the spec's validator had no carrier-grade NAT
+    /// They were not: the spec's validator had no carrier-grade NAT
     /// range, so `allow = ["100.64.0.1:443"]` was accepted, said nothing, and
     /// was then dropped by nftables. A rule that looks accepted and is dead is
     /// worse than one that is refused.

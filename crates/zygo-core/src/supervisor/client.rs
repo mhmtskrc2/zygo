@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The CLI's side of the control socket, including starting a supervisor.
 //!
-//! `zygo serve` is expected to work on a machine where nothing is running yet
-//! (design doc §4.2), so the client starts a supervisor when it cannot find
+//! `zygo serve` is expected to work on a machine where nothing is running yet,
+//! so the client starts a supervisor when it cannot find
 //! one. That is the only place in Zygo that spawns a background process, and it
 //! is written to fail loudly: a `serve` that silently did nothing because the
 //! supervisor died at startup is the worst possible outcome, so the client

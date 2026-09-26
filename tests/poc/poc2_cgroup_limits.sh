@@ -261,7 +261,7 @@ say ""
 
 # --- kernel features the design depends on ----------------------------------
 
-say "kernel features (design doc appendix C)"
+say "kernel features (what the kernel offers)"
 probe="$ROOT/probe"
 mkdir -p "$probe" 2>/dev/null
 for f in cgroup.kill memory.peak cgroup.freeze memory.oom.group; do

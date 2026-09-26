@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The mount plan (design doc §3.3, step 2).
+//! The mount plan.
 //!
 //! The plan is computed as pure data and only then applied, for three reasons:
 //! it can be unit tested on a non-Linux host, it can be printed by
@@ -18,7 +18,7 @@ pub enum RootfsView {
     /// Ordered top layer first, which is the order overlayfs expects.
     Overlay { lower: Vec<PathBuf> },
     /// Flattened single directory, bound read-only. The fallback for kernels
-    /// that refuse overlayfs inside a user namespace (design doc R3).
+    /// that refuse overlayfs inside a user namespace (before 5.11).
     Flat { dir: PathBuf },
 }
 
@@ -82,13 +82,13 @@ pub struct MountPlan {
     pub ops: Vec<MountOp>,
 }
 
-/// Device nodes present in every sandbox (design doc §3.3: "minimal static
-/// set"). The real `/dev` is never bound.
+/// Device nodes present in every sandbox: a minimal static set. The real
+/// `/dev` is never bound.
 pub const DEV_NODES: &[&str] = &["null", "zero", "full", "random", "urandom", "tty"];
 
 /// Paths under `/proc` and `/sys` that leak host state or allow host
-/// modification. Bind-mounted over, following Docker's default set plus the
-/// entries listed in design doc §3.3.
+/// modification. Bind-mounted over, following Docker's default set plus a few
+/// more.
 pub const MASKED_PATHS: &[&str] = &[
     "/proc/acpi",
     "/proc/asound",
@@ -141,7 +141,7 @@ pub struct MountPoint {
 /// Exported because the spec's validator has to refuse the same set: it used
 /// to carry its own shorter list — `/`, `/proc`, `/sys`, `/dev` — so a mount
 /// onto `/tmp` or `/run` was accepted by the validator and then silently
-/// mounted over by the launcher (B-19). One list, in the module that does the
+/// mounted over by the launcher. One list, in the module that does the
 /// mounting.
 pub const MANAGED_TARGETS: &[&str] = &[
     "/proc",

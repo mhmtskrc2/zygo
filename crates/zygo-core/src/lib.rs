@@ -2,8 +2,9 @@
 //! # zygo-core
 //!
 //! Core library behind the `zygo` CLI, the Python/TypeScript bindings and any
-//! platform embedding Zygo directly (see ADR-008: the library is the product,
-//! the CLI is a thin client over it).
+//! platform embedding Zygo directly. The library is the product and the CLI
+//! is a thin client over it (`docs/book/adr/0001-embedded-runtime.md`: the
+//! API is the surface, not the CLI).
 //!
 //! The crate is organised around the lifecycle of a sandbox:
 //!

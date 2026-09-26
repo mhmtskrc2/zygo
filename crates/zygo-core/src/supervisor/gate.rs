@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Per-tenant admission control: `concurrency`, a bounded queue, and the `429`.
 //!
-//! Requirement N4 makes limits mandatory, and a limit nobody is told about is a
+//! Limits are mandatory, and a limit nobody is told about is a
 //! hang. So a tenant at its ceiling gets one of two answers and never a third:
 //! wait briefly in a bounded queue, or be turned away immediately with enough
-//! numbers to decide what to do next (design doc §7.5: the platform queues or
-//! routes to another machine).
+//! numbers to decide what to do next (the platform queues or routes to another
+//! machine).
 //!
 //! Unbounded queueing is the failure this exists to prevent. A queue with no
 //! limit converts "too much load" into "every request times out and the

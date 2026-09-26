@@ -12,7 +12,7 @@
 # has what a Zygo sandbox needs *inside* the guest: cgroups with the pids
 # controller, seccomp, Landlock, overlayfs, nftables, virtiofs and vsock.
 # Anything missing is a custom kernel build, which is a week and needs disk, so
-# it is found out here rather than in M2.
+# it is found out here rather than while building the guest side.
 #
 # Run:  make vm-kernel
 set -eu
@@ -105,8 +105,8 @@ echo "  $OUT/Image  $(stat -c %s "$OUT/Image") bytes"
 echo "  sha256:$sha"
 
 # What the guest will and will not be able to do. Every one of these is
-# something `guest-init` needs in M2, so a missing line is a milestone that
-# cannot land rather than a surprise inside a sandbox.
+# something `guest-init` will need, so a missing line is work that cannot
+# land rather than a surprise inside a sandbox.
 echo ""
 echo "config, for the controls a Zygo guest needs:"
 config=$(find /build/libkrunfw -name '.config' | head -1)

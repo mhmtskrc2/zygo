@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! On-disk layout (design doc §3.13).
+//! On-disk layout.
 //!
 //! ```text
 //! $XDG_DATA_HOME/zygo/

@@ -1,6 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: Apache-2.0
-# The embedder API's exit criterion (roadmap 2.12), run for real.
+# The embedder API's exit criterion (Phase 2 of `ROADMAP.md`), run for real.
 #
 # A plugin host built on the HTTP API alone: no `sandbox.toml`, no file written
 # on the Zygo host, no shelling out to `zygo`. If it needed one of those, the
@@ -17,7 +17,7 @@ set -u
 SRC=${SRC:-/src}
 ZYGO=${ZYGO:-$SRC/tests/linux/bin/zygo-linux-musl}
 IMAGE=${IMAGE:-python:3.12-slim}
-# Phase 3's exit criterion adds the second language: one Python plugin and one
+# Phase 3 of `ROADMAP.md` adds the second language: one Python plugin and one
 # JavaScript plugin, through the same API and under the same customer's limits.
 NODE_IMAGE=${NODE_IMAGE:-node:22-slim}
 

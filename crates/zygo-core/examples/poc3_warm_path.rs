@@ -142,7 +142,7 @@ impl Args {
             warmup: value("--warmup")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(500),
-            // A per-request cgroup is the design's default (open question A2);
+            // A per-request cgroup is the default;
             // `--no-cgroup` isolates how much of the budget it costs.
             cgroup: !argv.iter().any(|a| a == "--no-cgroup"),
             agent: value("--agent")

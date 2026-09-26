@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `zygo` — the CLI.
 //!
-//! A thin client over `zygo-core` (ADR-008). Everything interesting lives in
+//! A thin client over `zygo-core`. Everything interesting lives in
 //! the library; this crate parses arguments, prints tables and maps errors onto
 //! exit codes.
 
@@ -79,7 +79,7 @@ fn main() -> std::process::ExitCode {
             // 137 for a deadline.
             //
             // Searched through the whole chain, not just the outermost error
-            // (B-29). `downcast_ref` looks only at the top, so any
+            // `downcast_ref` looks only at the top, so any
             // `.context("…")` on the way up — and the CLI adds them freely —
             // turned a spec error into a bare 1. A script checking for 2 saw
             // it only when nobody had added context, which is the worst kind
@@ -110,8 +110,7 @@ fn run(cli: &Cli) -> anyhow::Result<u8> {
             Ok(0)
         }
 
-        // Phase 2 onwards. Each says which phase it belongs to rather than
-        // failing as an unknown command, so `--help` stays honest.
+        // The warm-path commands: everything that needs a supervisor.
         Command::Serve(args) => cmd::supervisor::serve(cli, args),
         Command::Exec(args) => cmd::supervisor::exec(cli, args),
         Command::Ps => cmd::supervisor::ps(cli),
@@ -183,7 +182,7 @@ fn init_tracing(verbose: u8, json: bool, keep_time: bool) {
 mod tests {
     /// The library's exit code survives a `.context()` on the way up.
     ///
-    /// B-29: the mapping used `downcast_ref` on the outermost error, so any
+    /// The mapping used `downcast_ref` on the outermost error, so any
     /// context added between the library and `main` replaced 2 or 125 with a
     /// bare 1 — and the CLI adds context on most paths.
     #[test]

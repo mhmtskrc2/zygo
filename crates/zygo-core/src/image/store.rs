@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The content-addressed image store (design doc §3.7).
+//! The content-addressed image store.
 //!
 //! Blobs land under `images/blobs/sha256/<digest>`, verified on the way in.
 //! Layers are unpacked once into `images/layers/<digest>/` and shared by every
@@ -107,8 +107,8 @@ impl Store {
         }
         // Lower case only. `write_blob` compares against a freshly computed
         // digest, which `digest_of` renders in lower case, so an upper-case
-        // reference named a blob that could be written and never verified
-        // (E-11, the code review). Refusing it here says so once, where the
+        // reference named a blob that could be written and never verified.
+        // Refusing it here says so once, where the
         // reference was written.
         if hex.chars().any(|c| c.is_ascii_uppercase()) {
             return Err(ImageError::digest(
@@ -144,7 +144,7 @@ impl Store {
         // Unique per *attempt*, not per process. The name used to be
         // `blob-{hex}-{pid}`, which two threads of one process pulling the
         // same blob share — so they wrote into the same file, and whichever
-        // renamed second published a mixture of the two (B-20). A counter
+        // renamed second published a mixture of the two. A counter
         // makes every attempt its own file at no cost.
         static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let attempt = ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -156,7 +156,7 @@ impl Store {
         // And the file is removed on every way out but the successful one.
         // Before, only the digest-mismatch branch cleaned up, so a read error,
         // a full disk or a dropped connection each left a part-written blob in
-        // `tmp/` for ever (B-21).
+        // `tmp/` for ever.
         let _cleanup = TempFile(&tmp_path);
 
         let mut hasher = Sha256::new();
@@ -477,7 +477,7 @@ impl Store {
     ///
     /// "No file yet" and "the file is corrupt" both used to answer with an
     /// empty list, and the next `put` then wrote that empty list back: one bad
-    /// parse and the store forgot every image it had, silently (B-22). They
+    /// parse and the store forgot every image it had, silently. They
     /// are different situations and only the first is ordinary.
     ///
     /// A corrupt index is moved aside rather than deleted, so it can be looked
@@ -818,8 +818,7 @@ fn link_or_copy(source: &Path, dest: &Path) -> Result<()> {
     }
     // `symlink_metadata`, and a removal that does not follow a link: a
     // dangling symlink at `dest` does not "exist", so `copy` created the
-    // link's *target* — on the host, if the link pointed outside the layer
-    // (B-04).
+    // link's *target* — on the host, if the link pointed outside the layer.
     remove_whatever_is_there(dest)?;
     match std::fs::hard_link(source, dest) {
         Ok(()) => Ok(()),
@@ -888,7 +887,7 @@ pub(crate) fn is_internal_entry(name: &std::ffi::OsStr) -> bool {
 /// not a refinement: the unpack path was hardened against hostile tars
 /// (`safe_join`, `ensure_real_directory`) and this one was not, so a lower
 /// layer could plant `etc` as a symlink to `/etc` and an upper layer's
-/// `etc/passwd` would be created **on the host** (B-04, the code review).
+/// `etc/passwd` would be created **on the host**.
 /// `create_dir_all` follows a symlink, and `Path::exists` is false for a
 /// dangling one — so both branches wrote through it.
 /// Give `path` the access and modification times in `md`, without following
@@ -997,7 +996,7 @@ fn remove_whatever_is_there(path: &Path) -> Result<()> {
 ///
 /// A `?` is an early return, and an early return between "create the temp
 /// file" and "rename it" used to leave that file behind. There were four such
-/// returns and one of them cleaned up (B-21). A guard cannot miss a path the
+/// returns and one of them cleaned up. A guard cannot miss a path the
 /// way a list of cleanup calls can.
 struct TempFile<'a>(&'a std::path::Path);
 
@@ -1358,7 +1357,7 @@ mod tests {
     /// The same escape as above, on the *flatten* path.
     ///
     /// The unpack path has been hardened since the first pass; the flatten path
-    /// had not (B-04). A lower layer plants a directory name as a symlink
+    /// had not. A lower layer plants a directory name as a symlink
     /// pointing outside the store, and an upper layer then writes a file under
     /// that name — `create_dir_all` follows the link and the file lands on the
     /// host.
@@ -1407,7 +1406,7 @@ mod tests {
     ///
     /// `Path::exists` is false for a dangling link, which is why both the
     /// copy branch and the hard-link branch skipped their removal and created
-    /// the link's target instead (B-04).
+    /// the link's target instead.
     #[cfg(unix)]
     #[test]
     fn a_dangling_symlink_in_the_destination_is_replaced() {

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Isolation backends: where the boundary is drawn (design doc §3.9).
+//! Isolation backends: where the boundary is drawn.
 //!
 //! `ns`, `gvisor` and `vm` all consume the same [`SandboxConfig`] and speak the
-//! same warm-execution protocol. Requirement N8 is that the same spec and the
+//! same warm-execution protocol. The rule is that the same spec and the
 //! same test suite pass on all three — the trait exists to make that structural
 //! rather than aspirational.
 
@@ -211,7 +211,7 @@ pub fn for_isolation(isolation: Isolation, paths: &crate::Paths) -> Result<Box<d
     }
 }
 
-/// Placeholder for a backend that exists in the design but cannot exist in
+/// Placeholder for a backend that exists on other platforms but cannot exist in
 /// this binary — a Linux-only backend compiled for something else. It reports
 /// *why* rather than being silently missing, so the flag gives a straight
 /// answer instead of an unknown-backend error.

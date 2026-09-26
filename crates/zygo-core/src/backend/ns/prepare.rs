@@ -222,7 +222,7 @@ pub enum PreparedOp {
         options: CString,
     },
     /// Bind the host's device node; `mknod` is unavailable to an unprivileged
-    /// user namespace (confirmed by PoC 6).
+    /// user namespace (`tests/poc/poc6_overlayfs_userns.sh` confirms it).
     DevNode {
         source: CString,
         target: CString,
@@ -364,7 +364,7 @@ impl std::fmt::Debug for PreparedLaunch {
 }
 
 // Mount flags. Spelled out rather than pulled from `libc` so the plan reads
-// like the design document.
+// like a description of the sandbox rather than a list of constants.
 const MS_RDONLY: u64 = 1;
 const MS_NOSUID: u64 = 2;
 const MS_NODEV: u64 = 4;

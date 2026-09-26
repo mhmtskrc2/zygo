@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `zygo bench` — measure the warm path against the real pool.
 //!
-//! PoC 3 measured p50 1887 µs against a 2000 µs budget: **6% of headroom**. The
+//! `crates/zygo-core/examples/poc3_warm_path.rs` measured p50 1887 µs against a
+//! 2000 µs budget: **6% of headroom**. The
 //! supervisor's queue, timers and metrics all land on this path, so
 //! a number that is only ever measured by hand will be spent without anyone
 //! noticing. This runs the same measurement against `zygo_core::pool`, which is
@@ -16,7 +17,7 @@ use zygo_core::spec::{Layer, ResolveOptions, Spec};
 use crate::cli::{BenchCommand, Cli};
 use crate::output::{self, Style};
 
-/// The budgets from the design document, §5.
+/// The warm-path budgets: p50 under 2 ms, p99 under 10 ms.
 const WARM_P50_BUDGET_US: f64 = 2_000.0;
 const WARM_P99_BUDGET_US: f64 = 10_000.0;
 
@@ -317,7 +318,7 @@ mod published {
     /// Warm-exec: a fresh process entered into a held sandbox.
     pub const EXEC_P50_MS: f64 = 1.40;
     /// A runtime pool, a different script with every request, at the same
-    /// rate. The roadmap's exit criterion for Phase 1 is the p99 under 5 ms.
+    /// rate. `ROADMAP.md`'s exit criterion for Phase 1 is the p99 under 5 ms.
     pub const POOL_P50_MS: f64 = 1.91;
     pub const POOL_P99_MS: f64 = 11.36;
     /// What `zygo serve` costs once, for a Python handler with no imports, as
@@ -910,7 +911,7 @@ fn virtualisation() -> Option<String> {
     read_first_line("/sys/class/dmi/id/product_name")
 }
 
-/// Requirement N2: a cold `run` with the image already in the store.
+/// The cold budget: a `run` with the image already in the store.
 const COLD_BUDGET_MS: f64 = 50.0;
 
 /// The acceptance criterion for throughput.
@@ -918,9 +919,9 @@ const LOAD_TARGET_PER_SECOND: f64 = 600.0;
 
 /// `zygo bench cold` — build a sandbox, run a program, tear it down.
 ///
-/// This is requirement N2, and the default command is the one N2 is written
+/// This is the cold budget, and the default command is the one it is written
 /// about: starting a Python interpreter and exiting. The image must already be
-/// in the store, because N2 is explicitly about the cached case — pulling is a
+/// in the store, because the budget is for the cached case — pulling is a
 /// network measurement and belongs nowhere near this number.
 fn cold(
     cli: &Cli,
@@ -1308,7 +1309,7 @@ struct Report {
     quota: Option<CpuAccounting>,
     /// The p50 budget this run is judged against: the agent's or warm-exec's.
     p50_budget: f64,
-    /// The tail's budget. A pool's is the roadmap's 5 ms rather than the warm
+    /// The tail's budget. A pool's is `ROADMAP.md`'s 5 ms rather than the warm
     /// path's 10 ms, because that is the number Phase 1's exit is written in.
     p99_budget: f64,
     label: &'static str,
@@ -1621,8 +1622,8 @@ fn print_floor(style: &Style, floor: &[f64], report: &Report) {
 /// The share of the p99 spent creating and joining the request's own cgroup.
 ///
 /// `admit` and `release` are the per-request cgroup and nothing else, so when
-/// they own the tail the number above is about open question A2 rather than
-/// about the warm path. Returned as a fraction of the total p99.
+/// they own the tail the number above is about the per-request cgroup rather
+/// than about the warm path. Returned as a fraction of the total p99.
 fn cgroup_share_of_p99(phases: &[zygo_core::pool::CallTiming]) -> Option<f64> {
     if phases.is_empty() {
         return None;
@@ -1644,7 +1645,8 @@ fn cgroup_share_of_p99(phases: &[zygo_core::pool::CallTiming]) -> Option<f64> {
 /// The same duty as the CPU-quota note: a reader must not conclude from a
 /// failed budget that the runtime is slow, when what they measured is a
 /// decision that is still open. `bench warm` on a default configuration is
-/// the command the README points newcomers at, and until A2 is settled it
+/// the command the README points newcomers at, and while the per-request
+/// cgroup's cost is still an open question it
 /// prints `p99 FAIL` — so it has to say what the number is about, and how to
 /// take the measurement without it.
 fn print_cgroup_note(phases: &[zygo_core::pool::CallTiming], report: &Report, style: &Style) {
@@ -1797,7 +1799,7 @@ mod tests {
 
     #[test]
     fn the_budget_is_the_design_documents() {
-        // §5: p50 < 2 ms, p99 < 10 ms.
+        // p50 < 2 ms, p99 < 10 ms.
         assert_eq!(WARM_P50_BUDGET_US, 2_000.0);
         assert_eq!(WARM_P99_BUDGET_US, 10_000.0);
     }
@@ -1816,7 +1818,7 @@ mod tests {
         assert!(!report(&tailed).within_budget(), "p99 was ignored");
     }
 
-    /// Phase 0 measured 6%. If a change eats into that, the number should say
+    /// The first measurement was 6%. If a change eats into that, the number should say
     /// so rather than the run merely still passing.
     #[test]
     fn headroom_is_reported_as_a_percentage_of_the_budget() {

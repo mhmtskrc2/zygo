@@ -59,7 +59,7 @@ say ""
 # --- test 2: writable overlay, needed for the derived system layer ----------
 
 say "test 2 — writable overlay (upperdir) inside unshare -Urm"
-say "  used when building a derived apt/nix layer (design doc §3.7)"
+say "  used when building a derived apt/nix layer (docs/book/15-images-and-dependencies.md)"
 if unshare -Urm sh -c "
     mount -t overlay overlay \
         -o lowerdir=$WORK/lower1,upperdir=$WORK/upper,workdir=$WORK/work \

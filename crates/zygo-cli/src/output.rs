@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Terminal output helpers.
 //!
-//! Two rules, both from the design doc's DX goals: every failure names the
+//! Two rules: every failure names the
 //! primitive that failed and how to fix it, and every command can produce JSON
 //! so a platform can consume it.
 

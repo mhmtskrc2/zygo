@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""zygo-agent — the reference runtime agent (design doc §3.4.1).
+"""zygo-agent — the reference runtime agent (``spec/protocol.md``).
 
 Loads a handler once, then serves each request from a ``fork()`` of the warmed
 interpreter. The child starts with copy-on-write memory, so there is nothing to
@@ -58,7 +58,7 @@ PROTOCOL_VERSION = 1
 HEADER = struct.Struct(">I")
 MAX_FRAME_BYTES = 32 * 1024 * 1024
 
-# Per-request stdout/stderr capture, truncated past this (design doc §3.12).
+# Per-request stdout/stderr capture, truncated past this.
 RING_BUFFER_BYTES = 256 * 1024
 
 # How often the agent says a request in flight is still alive (proto 1.4).
@@ -336,8 +336,8 @@ def has_extra_threads() -> bool:
     survive.
 
     ``fork()`` in a threaded process only carries the calling thread across, so
-    a lock another thread held stays locked forever in the child. That is risk
-    R1; the caller falls back to spawning instead of forking.
+    a lock another thread held stays locked forever in the child. That is the
+    fork-safety risk; the caller falls back to spawning instead of forking.
 
     Python threads are not the only kind. ``import duckdb`` starts four native
     ones, which ``threading`` cannot see: forked anyway, a child died in glibc
@@ -623,7 +623,8 @@ def run_request(
 
     except ScriptDigestMismatch as exc:
         # Not a failed handler — nothing of the script has run. The supervisor
-        # and this child disagree about what the request is, which §2 makes an
+        # and this child disagree about what the request is, which
+        # `spec/protocol.md` §2 makes an
         # `ERROR` so that a caller can tell "your code raised" from "your code
         # was not what was asked for".
         refused = str(exc)
@@ -1181,7 +1182,8 @@ class Agent:
                 self._unreaped.append((request.pid, request.tmpdir))
 
         # An `ERROR` from the child goes up as an `ERROR`: it is the answer to
-        # this `EXEC` either way (§3.5), and a request that was refused is not
+        # this `EXEC` either way (`spec/protocol.md` §3.5), and a request that
+        # was refused is not
         # a request that produced a result.
         if result.get("type") != "ERROR":
             result["type"] = "DONE"
@@ -1196,7 +1198,7 @@ class Agent:
         A handler that returns more than the frame limit allows used to raise
         out of the serve loop and take the agent with it: one oversize return
         value, and every later request to that function failed until it was
-        rewarmed (B-24). The request is the thing that failed, not the agent,
+        rewarmed. The request is the thing that failed, not the agent,
         so it is reported as a failed request and the loop carries on.
 
         The replacement is built from scratch rather than by trimming the
@@ -1312,7 +1314,7 @@ class Agent:
         self._wire.send({"type": "FORKED", "id": request_id, "pid": pid})
 
     def _exec_spawned(self, request: dict) -> None:
-        """Fallback for handlers that cannot be forked (risk R1).
+        """Fallback for handlers that cannot be forked.
 
         A fresh interpreter per request, imports and all, instead of a 1-2 ms
         fork — but it cannot deadlock on a lock some import-time thread was

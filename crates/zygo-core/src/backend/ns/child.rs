@@ -587,7 +587,8 @@ unsafe fn apply(op: &PreparedOp, err_fd: c_int) {
         PreparedOp::DevNode { source, target } => {
             // The target lives on the `/dev` tmpfs mounted a moment ago, so it
             // is writable: create an empty file to bind over. `mknod` is not
-            // available to an unprivileged user namespace (PoC 6).
+            // available to an unprivileged user namespace
+            // (`tests/poc/poc6_overlayfs_userns.sh`).
             // SAFETY: `target` is a NUL-terminated `CString` the plan owns;
             // `open` only reads it.
             let fd = unsafe { libc::open(target.as_ptr(), libc::O_CREAT | libc::O_WRONLY, 0o644) };
@@ -1143,7 +1144,7 @@ struct CapData {
 }
 
 /// Empty every capability set: bounding, ambient, effective, permitted and
-/// inheritable (design doc §3.3 step 5).
+/// inheritable.
 ///
 /// A tenant that looks like root inside the sandbox — uid 0 mapped to an
 /// unprivileged host uid — must hold no capability at all, or "root inside"

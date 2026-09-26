@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The `ns` backend: namespaces + cgroups + seccomp + Landlock
-//! (design doc §3.3).
+//! (`docs/book/06-how-zygo-works.md`).
 //!
 //! This is the backend the efficiency argument rests on: a sandbox is an
-//! ordinary process the kernel has been told to constrain (principle P1), built
+//! ordinary process the kernel has been told to constrain (rule P1 in
+//! `docs/book/08-principles.md`), built
 //! with no daemon, no RPC and no mount orchestration on the request path.
 //!
 //! The launch is split across three modules because the middle of it runs under
@@ -319,7 +320,7 @@ impl NsSandbox {
     /// been killed. `wait()` used to route the no-timeout case through that
     /// one, which waits ten seconds, **sends a SIGKILL halfway through**, and
     /// then gives up: a healthy program asked to run without a limit was
-    /// killed after five seconds (B-14). Nothing else read `--allow-unlimited`
+    /// killed after five seconds. Nothing else read `--allow-unlimited`
     /// and then imposed a limit.
     fn reap_until_it_exits(&mut self) -> Result<i32> {
         if let Some(code) = self.exit_code {
@@ -567,8 +568,8 @@ pub fn launch(config: &SandboxConfig, hierarchy: Option<&cgroup::Hierarchy>) -> 
     // SAFETY: `getgid` cannot fail and has no preconditions.
     let outer_gid = unsafe { libc::getgid() };
     // Captured *before* the clone: inside a user namespace with no map yet,
-    // `getuid()` returns the overflow uid and mapping that is rejected. PoC 1
-    // found this the hard way.
+    // `getuid()` returns the overflow uid and mapping that is rejected.
+    // `tests/poc/poc1_namespace_setup.py` found this the hard way.
     let sub = idmap::subuid_range_for_current_user();
     let uid_map = idmap::render_id_map(&idmap::id_map(config.uid, outer_uid, sub));
     let gid_map = idmap::render_id_map(&idmap::id_map(config.gid, outer_gid, sub));
@@ -594,7 +595,7 @@ pub fn launch(config: &SandboxConfig, hierarchy: Option<&cgroup::Hierarchy>) -> 
     // spawns of `newuidmap`, `nft` and the long-lived `pasta` below, and a
     // `pasta` holding the write end means the parent never sees end of file
     // on it — quite apart from handing an unrelated process a descriptor into
-    // this launch (S-03, the code review). The child gets its copy through
+    // this launch. The child gets its copy through
     // `clone`, which does not exec, so the flag costs it nothing.
     let (ready_read, ready_write) = pipe_cloexec()?;
     let (err_read, err_write) = pipe_cloexec()?;
@@ -771,7 +772,7 @@ pub fn launch(config: &SandboxConfig, hierarchy: Option<&cgroup::Hierarchy>) -> 
             // reported why it could not start". `reap` only *waits* for it,
             // so a child that is wedged — which is exactly the first case —
             // was waited on rather than killed, and on the second the child
-            // was mid-failure and might still be running (B-15). `kill` ends
+            // was mid-failure and might still be running. `kill` ends
             // the process tree and then reaps, which is what a failed start
             // owes the host.
             let payload = match read_to_end_within(err_read, START_TIMEOUT) {

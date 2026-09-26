@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The `gvisor` backend: the same sandbox, drawn by `runsc` (design doc §3.9).
+//! The `gvisor` backend: the same sandbox, drawn by `runsc`.
 //!
 //! `ns` builds the sandbox itself; this hands the same [`MountPlan`](crate::sandbox::mount::MountPlan) to gVisor
 //! as an OCI bundle and lets its Sentry — a userspace kernel — serve the
 //! tenant's syscalls. The boundary moves from "the host kernel, narrowed by
-//! seccomp" to "a Go program that implements Linux", which is why the design
-//! offers it for hosts that have no KVM and do not want to trust `ns` alone.
+//! seccomp" to "a Go program that implements Linux", which is why it is
+//! offered for hosts that have no KVM and do not want to trust `ns` alone.
 //!
 //! The translation is [`crate::oci`], which is pure and tested everywhere.
 //! What is here is only the process handling: write a bundle, run `runsc`,

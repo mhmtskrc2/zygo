@@ -6,7 +6,7 @@ The design claims a namespace set, a mount plan and a `pivot_root` cost 1–3 ms
 and that the expensive parts of `docker run` are orchestration rather than
 isolation. This measures the isolation half directly.
 
-Each iteration performs, in a forked child, the sequence from design doc §3.3:
+Each iteration performs, in a forked child, the sequence of docs/book/06-how-zygo-works.md:
 
     unshare(USER|NS|NET|IPC|UTS|CGROUP)   →  new namespaces
     write uid_map / gid_map               →  identity inside them
@@ -110,7 +110,7 @@ def step(name: str) -> None:
 
 
 def setup_once(rootfs: str, phases: dict[str, float], with_netns: bool = True) -> None:
-    """The sequence from design doc §3.3, timed phase by phase."""
+    """The one-shot sequence of docs/book/06-how-zygo-works.md, timed phase by phase."""
     # Capture the identity *before* unsharing. Inside a fresh user namespace
     # with no map yet, getuid() returns the overflow uid (65534), and writing
     # that into uid_map is rejected: a process may only map the uid it actually

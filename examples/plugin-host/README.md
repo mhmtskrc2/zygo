@@ -48,7 +48,7 @@ thousand plugins do not mean ten thousand warm processes.
 records which one it belongs to, because a digest names bytes and Zygo has no
 opinion about what they are written in. Onboarding, tokens, secrets, limits,
 streaming, cancelling and offboarding are untouched by the addition — which is
-the claim Phase 3 exits on, and `demo.py` checks it by holding the *same*
+the claim Phase 2 of `ROADMAP.md` exits on, and `demo.py` checks it by holding the *same*
 customer's Python and JavaScript plugins to the *same* 64 MiB.
 
 **A token is the whole of a customer's authority.** `onboard` returns one, and

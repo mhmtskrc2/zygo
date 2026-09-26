@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The mount plan, rendered as an OCI runtime `config.json` (design doc §3.9).
+//! The mount plan, rendered as an OCI runtime `config.json`.
 //!
 //! The `ns` backend *executes* a [`MountPlan`](crate::sandbox::mount::MountPlan); `gvisor` hands the same plan to
 //! `runsc`, which executes it on the other side of a process boundary. That is
 //! the whole reason the plan is pure data (see [`crate::sandbox::mount`]): two
 //! backends that each derived their own idea of what a sandbox looks like would
-//! drift, and requirement N8 says the same spec must mean the same thing on
+//! drift, and the rule is that the same spec must mean the same thing on
 //! every backend.
 //!
 //! What is *not* translated, and why, is as much of the contract as what is:
@@ -138,7 +138,7 @@ fn process(sandbox: &SandboxConfig, options: &BundleOptions<'_>) -> Value {
 /// start. An OCI runtime instead *creates* the directory, and a read-only
 /// root makes that fail — so `zygo run --isolation gvisor alpine:3 echo hi`
 /// died with "failed to create process working directory" where `ns` had run
-/// it. Requirement N8 is that the same spec means the same thing on every
+/// it. The rule is that the same spec means the same thing on every
 /// backend, so the fallback is applied here rather than left to the runtime.
 ///
 /// A directory counts as existing if the image has it, or if something is
@@ -702,7 +702,7 @@ mod tests {
     /// What the first real `runsc` run failed on after the namespace fix:
     /// `alpine:3` has no `/app`, an OCI runtime tries to *create* the working
     /// directory, and the root is read-only. `ns` falls back to `/` and runs,
-    /// so this must too (requirement N8).
+    /// so this must too: the same spec means the same thing on every backend.
     #[test]
     fn a_working_directory_the_image_lacks_falls_back_to_the_root() {
         let tmp = tempfile::tempdir().expect("tempdir");

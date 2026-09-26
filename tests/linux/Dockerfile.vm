@@ -1,7 +1,7 @@
 # Build environment for the `vm` backend .
 #
-# The question this image exists to answer is **V1**: does libkrun build and
-# link against musl? Everything about the plan's distribution story hangs on
+# The question this image exists to answer: does libkrun build and
+# link against musl? Everything about how Zygo is distributed hangs on
 # it — `dist-linux` ships one static binary under 15 MB, and if libkrun needs
 # glibc then the vm-capable build is a separate target and the README has to
 # say so rather than pretending.

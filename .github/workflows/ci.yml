@@ -20,7 +20,7 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
-# Least privilege by default (S-13). Without this the token is whatever the
+# Least privilege by default. Without this the token is whatever the
 # repository's default is, which for many repositories is write — handed to
 # every third-party action in every job. A job that needs more asks for it.
 permissions:

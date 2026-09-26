@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Entering a held sandbox to run one request (warm-exec, design doc §3.4).
+//! Entering a held sandbox to run one request (warm-exec).
 //!
 //! The sandbox was built once and its init is holding it. A request is a
 //! fresh process that has to end up *inside* — same namespaces, same
@@ -20,7 +20,7 @@
 //!   namespace. Entering `pid` affects *children*, so the request is born
 //!   inside it — and because the helper is still in the host's pid namespace,
 //!   the pid `fork()` returns is the host pid. No translation, unlike the
-//!   agent path (§2.2b).
+//!   agent path, where `FORKED` carries a pid from inside the sandbox.
 //! - The request enters the mount namespace itself, after `GO`. Entering it
 //!   in the helper would take the helper's view of the host away before it
 //!   has reported anything.
@@ -39,7 +39,8 @@
 //! Why this is allowed rootless: `setns` into a user namespace needs
 //! `CAP_SYS_ADMIN` in it, and a process in the parent namespace with the
 //! creator's uid has every capability there. The supervisor created it; the
-//! helper is its fork. PoC 9's third row measured exactly this case.
+//! helper is its fork. `tests/poc/poc9_netns_pool.py` measured exactly this
+//! case (its third row).
 //!
 //! Everything between `fork` and `execve` is async-signal-safe: the parent is
 //! multi-threaded, and a child that allocates can deadlock on a lock some
@@ -133,8 +134,8 @@ pub fn enter_with(
     // flag: the request `dup2`s the three it keeps onto 0, 1 and 2 (which
     // clears the flag on those three, as it must) and the rest vanish at
     // `execve` without anyone having to remember them. The renumbering used
-    // `F_DUPFD`/`dup2`, which clear the flag, so until B-03 the rest did not
-    // vanish at all — see the comment there.
+    // `F_DUPFD`/`dup2`, which clear the flag, so the rest did not vanish at
+    // all — see the comment there.
     let (go_r, go_w) = pipe_cloexec()?;
     let (stdin_r, stdin_w) = pipe_cloexec()?;
     let (stdout_r, stdout_w) = pipe_cloexec()?;
@@ -325,7 +326,7 @@ unsafe fn helper_main(
         // namespace descriptors, second copies of its own stdio, and the
         // helper's error pipe. `setns` is denied by the seccomp filter, so it
         // was a leak rather than an escape, but the comment at the top of this
-        // function promised the opposite (B-03, the code review).
+        // function promised the opposite.
         //
         // SAFETY: `fcntl` with F_DUPFD_CLOEXEC on a descriptor we hold.
         parked[i] = unsafe { libc::fcntl(*fd, libc::F_DUPFD_CLOEXEC, PARKED) };

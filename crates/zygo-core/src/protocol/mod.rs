@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The warm execution wire protocol (design doc §3.4).
+//! The warm execution wire protocol (`spec/protocol.md`).
 //!
-//! Deliberately small and language independent (ADR-009). Anything that speaks
+//! Deliberately small and language independent. Anything that speaks
 //! it — the built-in Python agent, a Node agent, thirty lines of bash — gets
 //! limits, timeouts, tiering, metrics and `vm` transport for free.
 //!

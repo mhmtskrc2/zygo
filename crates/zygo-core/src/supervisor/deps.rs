@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Dependency sets over the control protocol (todo 3.3).
+//! Dependency sets over the control protocol.
 //!
 //! [`crate::deps`] knows how to build one; this is when. Three rules, and all
 //! three are about the request path:

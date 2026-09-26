@@ -11,9 +11,8 @@
 //! the "must never panic" hole today.
 
 // Gated because `image::auth` is: a build without the registry client has no
-// credential store to sweep, and `cargo test --no-default-features` failed to
-// compile here until the code review (T-04) — so the feature-off build
-// was never tested at all.
+// credential store to sweep, and `cargo test --no-default-features` used to
+// fail to compile here — so the feature-off build was never tested at all.
 #[cfg(feature = "registry")]
 use zygo_core::image::auth::CredentialStore;
 use zygo_core::image::media::{Index, Manifest};
@@ -484,7 +483,7 @@ fn dns_queries_from_a_sandbox_never_panic_and_always_answer_with_a_valid_packet(
 
     // A name with more addresses than one packet holds. The header used to
     // promise every one of them while the body stopped at the limit, which is
-    // a malformed answer and reads to a resolver as a failed lookup (B-16).
+    // a malformed answer and reads to a resolver as a failed lookup.
     let many_v4: Vec<IpAddr> = (0..80)
         .map(|i| IpAddr::V4(Ipv4Addr::new(203, 0, 113, i as u8)))
         .collect();

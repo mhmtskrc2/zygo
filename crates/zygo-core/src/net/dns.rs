@@ -3,7 +3,7 @@
 //!
 //! An allowlist by *name* cannot be enforced by a packet filter, which only
 //! ever sees addresses — and the addresses behind `api.example.com` are the
-//! service's to change, not ours to know in advance. The design's answer is to
+//! service's to change, not ours to know in advance. The answer is to
 //! make the sandbox's resolver the thing that decides: every query passes
 //! through here, a name the allowlist does not cover does not resolve, and a
 //! name it does cover is resolved on the host and its addresses are added to
@@ -135,8 +135,7 @@ pub fn response(query: &Query, rcode: Rcode, addrs: &[IpAddr]) -> Vec<u8> {
     // ANCOUNT used to be `answers.len()` while the loop below stopped at the
     // packet limit, so a name with enough addresses produced a header
     // promising records that were not there — a malformed answer that a
-    // resolver reports as a failed lookup rather than a short one
-    // (B-16, the code review).
+    // resolver reports as a failed lookup rather than a short one.
     //
     // The truncation bit is deliberately *not* set. It tells a client to retry
     // over TCP, and this resolver listens on UDP only (see `serve`), so a
@@ -273,7 +272,7 @@ pub fn answer(
 
 /// The same ranges the ruleset rejects and the spec's validator refuses.
 ///
-/// One definition, in `spec::types`, because three copies disagreed (B-18).
+/// One definition, in `spec::types`, because three copies disagreed.
 pub fn is_private(addr: IpAddr) -> bool {
     crate::spec::types::is_private_addr(addr)
 }

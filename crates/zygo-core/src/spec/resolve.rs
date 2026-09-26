@@ -16,7 +16,7 @@ use super::types::*;
 use super::{Layer, Spec, SpecError};
 use crate::sandbox::limits::Limits;
 
-/// Built-in defaults (design doc §3.5). The bottom layer of the merge stack.
+/// Built-in defaults. The bottom layer of the merge stack.
 pub fn defaults() -> Layer {
     Layer {
         isolation: Some(Isolation::Ns),
@@ -420,8 +420,8 @@ fn resolve_layer(
     // into a path. `cgroup::sanitise` exists for exactly this reason and only
     // the cgroup hierarchy goes through it: `Paths::tenant_data`,
     // `Paths::agent_sock` and the pasta pid file all join the name raw, and
-    // `[fn."../x"]` is legal TOML while `--name` is free text (B-07,
-    // the code review). One check here covers every entry point, because
+    // `[fn."../x"]` is legal TOML while `--name` is free text. One check
+    // here covers every entry point, because
     // every one of them resolves before it builds a path.
     if !is_fn_name(name) {
         return Err(SpecError::invalid_with(
@@ -436,7 +436,7 @@ fn resolve_layer(
     let entry = l.entry.map(|e| absolutise(base_dir, &e));
 
     // `runtime` is explicit, else inferred from the entry extension, else
-    // absent — which means warm-exec (design doc §3.4 layer 1).
+    // absent — which means warm-exec.
     let runtime = match (&l.runtime, &entry) {
         (Some(r), _) => Some(r.clone()),
         (None, Some(e)) => {
@@ -574,7 +574,7 @@ fn resolve_layer(
     // conflict the user had not caused and could not see, and the fix was to
     // pass a second flag they had no reason to know about.
     let scratch = l.scratch.unwrap_or_else(|| default_scratch(mem));
-    // tmpfs pages are billed to the memory cgroup (design doc §3.5), so a
+    // tmpfs pages are billed to the memory cgroup, so a
     // scratch area at or above the memory limit is a self-inflicted OOM.
     // Reachable only when `scratch` was asked for: the derived default is
     // half of `mem` and cannot collide with it.
@@ -660,7 +660,7 @@ fn resolve_layer(
     }
 
     if l.io_read.is_none() && l.io_write.is_none() && !opts.one_shot {
-        // Design doc §3.5 marks disk I/O as "unlimited (warning)". It is about
+        // Disk I/O is "unlimited, with a warning" by design. It is about
         // fairness between tenants, so it is pointless for a one-shot run.
         warnings.push(format!(
             "{}: no disk I/O limit; one tenant can saturate the device for the others",
@@ -905,7 +905,7 @@ fn normalise(p: &Path) -> PathBuf {
 /// The path is compared after [`normalise`], because the check is about a
 /// place and not about a spelling: `/proc/`, `//proc` and `/proc/../proc` all
 /// name the directory the launcher mounts, and a check on the raw string
-/// waved each of them through (B-19).
+/// waved each of them through.
 ///
 /// The set is the launcher's own [`MANAGED_TARGETS`] plus the root. It used to
 /// be a shorter list written out here, missing `/tmp` and `/run` — both of
@@ -950,7 +950,7 @@ mod tests {
     /// A mount target is refused for the place it names, not the way it is
     /// spelled — and the set of refused places is the launcher's own.
     ///
-    /// Both halves were wrong (B-19): the check ran on the raw string, so
+    /// Both halves were wrong: the check ran on the raw string, so
     /// `/proc/` and `/proc/../proc` passed it, and the list left out `/tmp`
     /// and `/run`, which the launcher mounts over. A spec naming either was
     /// accepted and then quietly overridden.
@@ -1688,7 +1688,7 @@ mem = "1G"
     /// and a cgroup directory, so it is validated before any of them is built.
     ///
     /// `cgroup::sanitise` existed for this and covered only the cgroup; the
-    /// other three joined the raw name (B-07). `[fn."../x"]` is legal TOML and
+    /// other three joined the raw name. `[fn."../x"]` is legal TOML and
     /// `--name` is free text, so the check belongs where every path agrees to
     /// start: resolution.
     #[test]

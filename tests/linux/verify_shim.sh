@@ -202,7 +202,7 @@ case $out in
     *) bad "exec did not round-trip the event: $out" ;;
 esac
 
-# The design's number for a second command is 100 ms. Measured with the VM
+# The budget for a second command is 100 ms. Measured with the VM
 # already up, which is what the number is about — and reported either way,
 # because a latency check that only prints when it wins is not a measurement.
 started=$(now_ms)

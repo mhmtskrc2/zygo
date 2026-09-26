@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Resource limits and their translation to kernel knobs (design doc §3.5).
+//! Resource limits and their translation to kernel knobs.
 //!
 //! The struct is platform independent and so is [`Limits::cgroup_writes`]; the
 //! `ns` backend just writes what it is handed. That keeps the interesting part
@@ -177,7 +177,7 @@ pub enum RlimitKind {
 ///
 /// One definition rather than the same literal in five modules: every one of
 /// them was a copy, and a field added to `Limits` had to be added to all five
-/// before anything compiled again (T-07 in the code review). It is
+/// before anything compiled again. It is
 /// `cfg(test)`-free on purpose so the backends' own test modules can reach it
 /// across crate-internal boundaries.
 #[doc(hidden)]

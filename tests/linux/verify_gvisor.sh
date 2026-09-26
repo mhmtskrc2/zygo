@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # The `gvisor` backend against a real `runsc`.
 #
-# Requirement N8 is that the same spec means the same thing on every backend.
+# The rule is that the same spec means the same thing on every backend.
 # The only way to check that is to run the same command on two of them and
 # compare, which is what the last section here does — the rest establishes
 # that the backend works at all, and that the things it cannot do are refused
