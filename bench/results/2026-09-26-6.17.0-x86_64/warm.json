@@ -1,0 +1,22 @@
+{
+  "budget": {
+    "p50_us": 2000.0,
+    "p99_us": 10000.0
+  },
+  "cpu": null,
+  "headroom_p50_percent": 25.6383,
+  "imports_ms": 0.867654999979095,
+  "max_us": 2619.4339999999997,
+  "mean_us": 1484.1389723333305,
+  "p50_us": 1487.234,
+  "p90_us": 1592.3254,
+  "p999_us": 1905.1971630000048,
+  "p99_measured": true,
+  "p99_us": 1714.0643599999999,
+  "pass": true,
+  "requests": 3000,
+  "requests_per_second": 250.0473635757002,
+  "rss_kb": 20596,
+  "runtime": "python/3.12.14",
+  "warm_ms": 51.141095
+}

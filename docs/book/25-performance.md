@@ -100,9 +100,27 @@ second.
 virtual machine on a laptop with two virtual CPUs, not a server. A real
 server is usually faster; the numbers here are careful, not flattering.
 
-**No number here is from an x86_64 machine.** All three hosts are aarch64
-(64-bit ARM). The CI workflow builds and tests on x86_64 runners, and the
-syscall tables are generated for x86_64, but nothing was timed there.
+**Only one record is from an x86_64 machine, and it is a shared one.** All
+three hosts above are aarch64 (64-bit ARM). The `bench` workflow records
+the same suite on GitHub's x86_64 and arm64 runners — 4 vCPU of an AMD EPYC
+9V45, 16 GB, Linux 6.17, on Azure — and the first record, from 26 September
+2026, is in [`bench/results/`](../../bench/results/2026-09-26-6.17.0-x86_64).
+It is a shared virtual machine, and `zygo bench all` says so in its verdict
+("the host was throttled or busy"), so it is a cross-check, not a
+publication:
+
+| x86_64 runner, 26 September 2026 | measured | the Lima VM's number |
+|---|---|---|
+| a warm request, usually | 1.47 ms | 1.44 ms |
+| a warm request, 1 in 100 | 1.97 ms | 10.5 ms |
+| a pooled script, usually | 2.11 ms | 1.91 ms |
+| `zygo run`, usually | 17.9 ms | 12.3 ms |
+| throughput at concurrency 4 | 790 requests/s | 1,108 requests/s |
+
+The medians agree with the Lima VM's within a third; the one-in-a-hundred
+tail is five times shorter, which is what a 6.17 kernel with `favordynmods`
+looks like ([below](#why-1-in-100-is-slow-on-newer-kernels)). The arm64
+runner, the same day, gave 1.52 / 1.78 ms for the warm path.
 
 Reproduce any of the numbers:
 

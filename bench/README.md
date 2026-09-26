@@ -29,3 +29,5 @@ benchmark in chapter 25.
 |---|---|---|
 | [2026-09-25-6.8.0-aarch64](results/2026-09-25-6.8.0-aarch64) | Lima VM on an M1 Max, 2 vCPU, 4 GB, Ubuntu 24.04 | in a privileged container; cgroup2 without `favordynmods`, so the 99th percentiles miss their budget, as chapter 25 explains |
 | [2026-09-25-5.10.104-aarch64](results/2026-09-25-5.10.104-aarch64) | Docker Desktop's VM on the same Mac | a 5.10 kernel: no slow tail, but a slower cold start; within budget |
+| [2026-09-26-6.17.0-x86_64](results/2026-09-26-6.17.0-x86_64) | GitHub `ubuntu-24.04` runner: 4 vCPU of an AMD EPYC 9V45, 16 GB, Azure, Linux 6.17 | **the first x86_64 record.** A shared runner, so the verdict is "not a verdict: the host was throttled or busy"; the medians are close to the Lima VM's and the 99th percentiles far under it |
+| [2026-09-26-6.17.0-aarch64](results/2026-09-26-6.17.0-aarch64) | GitHub `ubuntu-24.04-arm` runner: 4 vCPU, 16 GB, Azure, Linux 6.17 | the same run on the arm runner, for the pair |
