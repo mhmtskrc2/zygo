@@ -221,7 +221,7 @@ impl WarmExec {
     /// fallback shape puts the bytes on the wire.
     ///
     /// `secrets` is a pool request's own values, or `None` for a function's;
-    /// see [`place_secrets`].
+    /// see `place_secrets` in `pool/secrets.rs`.
     pub fn call_script_timed(
         &self,
         event: serde_json::Value,

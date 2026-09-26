@@ -252,8 +252,8 @@ test-linux:
 		rust:1.90 \
 		sh -c "cargo test --workspace && python3 -m unittest discover -s agents/python"
 
-# clippy against the Linux-only code — the `ns` backend, the launcher, the
-# network — which a Mac never compiles. Most `unsafe` sites live there, so
+# clippy and rustdoc against the Linux-only code — the `ns` backend, the
+# launcher, the network — which a Mac never compiles. Most `unsafe` sites live there, so
 # this is where `undocumented_unsafe_blocks` is really enforced; CI's Linux
 # job runs the same command. The image has no clippy, so it is added first.
 lint-linux:
@@ -261,7 +261,9 @@ lint-linux:
 		-v "$(PWD):/src" -w /src \
 		-e CARGO_TARGET_DIR=/tmp/target \
 		rust:1.90 \
-		sh -c "rustup component add clippy >/dev/null && cargo clippy --workspace --all-targets -- -D warnings"
+		sh -c "rustup component add clippy >/dev/null && \
+		cargo clippy --workspace --all-targets -- -D warnings && \
+		RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps"
 
 # The `ns` launcher can only be exercised on Linux. Runs the isolation and
 # limit checks against a real kernel.

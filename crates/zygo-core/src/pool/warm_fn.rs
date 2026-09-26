@@ -129,7 +129,8 @@ pub struct WarmFn {
     /// file the other just deleted.
     pub(super) secrets: Mutex<Secrets>,
     /// Scripts written into the sandbox for the requests running them, and how
-    /// many requests each still has. See [`Scripts`] and [`place_script`].
+    /// many requests each still has. See [`Scripts`] and `place_script` in
+    /// `pool/scripts.rs`.
     pub(super) scripts: Mutex<Scripts>,
     /// The host side of `/run/script`: this sandbox's alone, removed with it.
     pub(super) script_dir: PathBuf,
