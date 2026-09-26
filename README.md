@@ -125,4 +125,4 @@ is `ns`-only by decision ([ADR 0002](docs/book/adr/0002-warm-paths-stay-on-ns.md
 
 ---
 
-**Next: [The Zygo booklet](docs/book/README.md) →**
+**Next: [The Zygo book](https://mhmtskrc2.github.io/zygo/book/) →** · [in the repository](docs/book/README.md)
