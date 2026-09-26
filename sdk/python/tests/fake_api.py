@@ -41,6 +41,14 @@ class Recorder:
         # Close each connection after answering, without saying so — what a
         # server that drops idle keep-alive connections looks like to a client.
         self.hang_up = False
+        # Close a connection without answering when it is asked a *second*
+        # request — the server having hung up on a pooled connection at the
+        # moment the client reused it, in its most abrupt form. A fresh
+        # connection's first request is answered as usual.
+        self.drop_reused = False
+        # Close every connection without answering. What a client on a fresh
+        # connection meets when the server is broken.
+        self.drop = False
         self.lock = threading.Lock()
 
     def answer(
@@ -100,6 +108,13 @@ def _handler(recorder: Recorder):
             pass
 
         def _serve(self, method: str) -> None:
+            served = getattr(self, "_served", 0)
+            self._served = served + 1
+            if recorder.drop or (recorder.drop_reused and served):
+                # Not recorded: the request was never answered, and a test
+                # counts the requests that were.
+                self.close_connection = True
+                return
             length = int(self.headers.get("content-length", 0) or 0)
             raw = self.rfile.read(length) if length else b""
             # Not every body is JSON: `PUT /scripts` sends the script as

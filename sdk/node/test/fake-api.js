@@ -22,8 +22,30 @@ export class FakeApi {
     this.connections = 0;
     this.answers = new Map();
     this.delay = 0;
-
+    // Close each connection after answering, without saying so — what a
+    // server that drops idle keep-alive connections looks like to a client.
+    this.hangUp = false;
+    // Close a connection without answering when it is asked a *second*
+    // request — the server having hung up on a pooled connection at the
+    // moment the client reused it, in its most abrupt form. A fresh
+    // connection's first request is answered as usual.
+    this.dropReused = false;
+    // Close every connection without answering: a broken server, as met on a
+    // fresh connection.
+    this.drop = false;
+    // Node's own server would close an idle connection after five seconds
+    // and say so in a `Keep-Alive` header, which the client's agent honours.
+    // `zygo api` says nothing, so this server says nothing either, and a
+    // test that wants a connection closed closes it itself.
     this.server = http.createServer(async (request, response) => {
+      const served = request.socket.zygoServed ?? 0;
+      request.socket.zygoServed = served + 1;
+      if (this.drop || (this.dropReused && served)) {
+        // Not recorded: the request was never answered, and a test counts
+        // the requests that were.
+        request.socket.destroy();
+        return;
+      }
       const chunks = [];
       for await (const chunk of request) chunks.push(chunk);
       const raw = Buffer.concat(chunks).toString('utf8');
@@ -65,8 +87,15 @@ export class FakeApi {
       if (retryAfter === undefined && answer.body?.code === 'deps_building') retryAfter = 5;
       if (retryAfter !== undefined) headers['retry-after'] = String(retryAfter);
       response.writeHead(answer.status, headers);
-      response.end(payload);
+      response.end(payload, () => {
+        // Once the answer is handed to the kernel: closed both ways, as
+        // hyper does. A half-close (`socket.end()`) would still read and
+        // answer a request the client sent in the meantime, and that request
+        // would then run twice — the one thing a retry must never do.
+        if (this.hangUp) request.socket.destroy();
+      });
     });
+    this.server.keepAliveTimeout = 0;
     this.server.on('connection', () => {
       this.connections += 1;
     });

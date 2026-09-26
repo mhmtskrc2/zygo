@@ -9,6 +9,7 @@
  */
 
 import assert from 'node:assert/strict';
+import http from 'node:http';
 import test from 'node:test';
 
 import { FakeApi } from './fake-api.js';
@@ -238,6 +239,88 @@ test('connections are reused between calls', async () => {
     for (let i = 0; i < 5; i += 1) await client.call('f', {});
     assert.equal(api.connections, 1);
   } finally {
+    client.close();
+    await api.close();
+  }
+});
+
+test('a connection the server closed is replaced, not reported', async () => {
+  // The server hangs up after answering, without saying so — what `zygo api`
+  // does to a connection idle for 30 s. The agent usually notices the close
+  // before the next call and opens a new socket; when it does not, the call
+  // meets a reset with nothing answered and goes once more on a fresh one.
+  for (const unix of [false, true]) {
+    const api = await FakeApi.start({ unix });
+    api.answer('POST', '/fn/f', 200, OK_RESULT);
+    api.hangUp = true;
+    const client = connect(api.url, { token: null });
+    try {
+      for (let i = 0; i < 3; i += 1) await client.call('f', {});
+      assert.equal(api.requests.length, 3, `unix=${unix}`);
+    } finally {
+      client.close();
+      await api.close();
+    }
+  }
+});
+
+test('a reused connection the server drops is sent again, once', async () => {
+  // The server closes a pooled connection the moment it is reused, without
+  // answering. Every call after the first meets that, goes once more on a
+  // fresh connection, and is answered there: three calls, three answers,
+  // three connections.
+  const api = await FakeApi.start();
+  api.answer('POST', '/fn/f', 200, OK_RESULT);
+  api.dropReused = true;
+  const client = connect(api.url, { token: null });
+  try {
+    for (let i = 0; i < 3; i += 1) await client.call('f', {});
+    assert.equal(api.requests.length, 3);
+    assert.equal(api.connections, 3);
+  } finally {
+    client.close();
+    await api.close();
+  }
+});
+
+test('a fresh connection that fails is reported, not retried', async () => {
+  // Only a reused socket earns a second attempt. A new one the server drops
+  // is a broken server, and one connection is all it gets.
+  const api = await FakeApi.start();
+  api.answer('POST', '/fn/f', 200, OK_RESULT);
+  api.drop = true;
+  const client = connect(api.url, { token: null });
+  try {
+    await assert.rejects(client.call('f', {}), TransportError);
+    assert.equal(api.connections, 1);
+  } finally {
+    client.close();
+    await api.close();
+  }
+});
+
+test('a pooled connection is dropped before the server would close it', async () => {
+  // `zygo api` hangs up on a connection idle for 30 s. The agent's `timeout`
+  // is what drops a free socket before that; it must stay under the server's
+  // figure, and it must not touch a socket with a request in flight. The
+  // second half is checked with a short-fused agent through the internal seam.
+  const api = await FakeApi.start();
+  api.answer('POST', '/fn/f', 200, OK_RESULT);
+  const client = connect(api.url, { token: null });
+  const quick = connect(api.url, { token: null, agent: new http.Agent({ keepAlive: true, timeout: 100 }) });
+  try {
+    assert.ok(client._agent.options.timeout <= 25_000, 'the idle limit is not under the server\'s 30 s');
+
+    await quick.call('f', {});
+    await new Promise((r) => setTimeout(r, 300));
+    await quick.call('f', {});
+    assert.equal(api.connections, 2, 'the idle socket was reused past the limit');
+
+    api.delay = 300;
+    await quick.call('f', {}); // longer than the idle limit, and still answered
+    assert.equal(api.connections, 2, 'a socket with a request in flight was cut');
+  } finally {
+    quick.close();
     client.close();
     await api.close();
   }

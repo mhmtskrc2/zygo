@@ -48,6 +48,13 @@ from ._models import (
 #: order, and an answer past it is a bug rather than a large result.
 MAX_BODY = 64 * 1024 * 1024
 
+# How long a pooled connection may sit unused before the client drops it
+# rather than reuse it, in seconds. `zygo api` closes a connection that has
+# waited 30 s for its next request (hyper's header read timeout), so a pooled
+# connection older than that is one the server has already hung up on. Ten
+# seconds under it, so a slow network or a busy loop cannot close the gap.
+POOL_IDLE_LIMIT = 20.0
+
 
 class _UnixConnection(http.client.HTTPConnection):
     """``HTTPConnection`` over a unix socket.
@@ -113,7 +120,7 @@ class Client:
         self.timeout = timeout
         self.retries = max(0, int(retries))
         self.backoff = max(0.0, float(backoff))
-        self._idle: List[http.client.HTTPConnection] = []
+        self._idle: List[tuple[http.client.HTTPConnection, float]] = []
         self._lock = threading.Lock()
         self._closed = False
         #: Set by :meth:`for_tenant`; sent as ``X-Zygo-Tenant`` on every call.
@@ -126,11 +133,8 @@ class Client:
         with self._lock:
             self._closed = True
             idle, self._idle = self._idle, []
-        for connection in idle:
-            try:
-                connection.close()
-            except Exception:  # noqa: BLE001 - closing must not raise
-                pass
+        for connection, _ in idle:
+            _discard(connection)
 
     def __enter__(self) -> "Client":
         return self
@@ -848,18 +852,21 @@ class Client:
         connection, reused = self._take()
         try:
             try:
-                connection.request(method, path, body=payload, headers=sent)
-            except (BrokenPipeError, ConnectionResetError):
-                # A kept-alive connection the server had already closed. The
-                # request never went out, so sending it again on a fresh
-                # connection cannot run it twice. Only once, and only for a
-                # reused one: a new connection that fails is a real failure.
+                response = _send(connection, method, path, payload, sent)
+            except _ConnectionLost as lost:
+                # A pooled connection the server had closed while it waited.
+                # Nothing of an answer arrived, so the request did not run,
+                # and sending it again on a fresh connection cannot run it
+                # twice. Once, and only for a reused connection: a new one
+                # that fails is a real failure, reported as such.
                 if not reused:
-                    raise
+                    raise lost.cause
                 _discard(connection)
                 connection = self._open()
-                connection.request(method, path, body=payload, headers=sent)
-            response = connection.getresponse()
+                try:
+                    response = _send(connection, method, path, payload, sent)
+                except _ConnectionLost as lost_again:
+                    raise lost_again.cause
             raw = response.read(MAX_BODY)
             status = response.status
             retry_after = _retry_after(response.getheader("retry-after"))
@@ -882,10 +889,26 @@ class Client:
         return _decode(status, raw, retry_after)
 
     def _take(self) -> tuple[http.client.HTTPConnection, bool]:
-        """A connection, and whether it has been used before."""
+        """A connection, and whether it has been used before.
+
+        The most recently returned connection first, so the pool's youngest
+        connections stay in use and its oldest go stale and are dropped. One
+        that has waited longer than :data:`POOL_IDLE_LIMIT` is closed here
+        rather than handed out: the server has hung up on it, or is about to.
+        """
+        stale: List[http.client.HTTPConnection] = []
+        taken: Optional[http.client.HTTPConnection] = None
         with self._lock:
-            if self._idle:
-                return self._idle.pop(), True
+            while self._idle:
+                connection, since = self._idle.pop()
+                if time.monotonic() - since <= POOL_IDLE_LIMIT:
+                    taken = connection
+                    break
+                stale.append(connection)
+        for connection in stale:
+            _discard(connection)
+        if taken is not None:
+            return taken, True
         return self._open(), False
 
     def _give_back(self, connection: http.client.HTTPConnection) -> None:
@@ -893,7 +916,7 @@ class Client:
             if self._closed:
                 _discard(connection)
                 return
-            self._idle.append(connection)
+            self._idle.append((connection, time.monotonic()))
 
     def _open(self) -> http.client.HTTPConnection:
         endpoint = self.endpoint
@@ -952,6 +975,43 @@ def connect(
 #
 # Used by the asynchronous client too, so the two cannot disagree about what a
 # status code means or how a batch element is read.
+
+
+class _ConnectionLost(Exception):
+    """The connection failed before a byte of the answer arrived.
+
+    Raised by :func:`_send` and caught by the exchange, which decides whether
+    to try once more; ``cause`` is the error to report if it does not.
+    """
+
+    def __init__(self, cause: BaseException) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
+
+
+def _send(
+    connection: http.client.HTTPConnection,
+    method: str,
+    path: str,
+    payload: Optional[bytes],
+    sent: Dict[str, str],
+) -> "http.client.HTTPResponse":
+    """Send one request and read the status line and headers of its answer.
+
+    Three failures mean the connection was gone before anything came back,
+    and all three are what a kept-alive connection the server has closed
+    looks like: the write fails with a broken pipe or a reset, or it goes
+    through and the read meets end-of-file where the status line should be —
+    ``RemoteDisconnected``, which :mod:`http.client` raises only when it has
+    read nothing at all. The server closes an idle connection cleanly, so the
+    last is the usual one. Anything that fails after a byte of the answer has
+    arrived is not this and propagates as itself.
+    """
+    try:
+        connection.request(method, path, body=payload, headers=sent)
+        return connection.getresponse()
+    except (http.client.RemoteDisconnected, BrokenPipeError, ConnectionResetError) as e:
+        raise _ConnectionLost(e) from e
 
 
 def _discard(connection: http.client.HTTPConnection) -> None:

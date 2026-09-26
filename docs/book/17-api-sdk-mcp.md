@@ -451,6 +451,15 @@ A unix socket still needs the token, unless the API was started with
 threads or tasks. That matters: one connection would line concurrent callers
 up behind a single socket, and the warm path is measured in milliseconds.
 
+The API hangs up on a connection that has waited 30 seconds for its next
+request. A pooled connection older than 20 seconds is therefore dropped, not
+reused; and if a reused one turns out to be closed — the send fails, or the
+socket ends where the status line should begin — the request goes once more
+on a fresh connection. That is safe because nothing came back, so the
+request never ran. A connection that fails after the first byte of an
+answer, or a new connection that fails at all, is reported as a
+`TransportError`, never retried.
+
 ### Retries
 
 Both clients can resend a refused request. `retries` (default 0) is how many

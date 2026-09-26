@@ -19,6 +19,7 @@ import asyncio
 import base64
 import json
 import os
+import time
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 from ._endpoint import Endpoint, resolve
@@ -39,6 +40,8 @@ from ._models import (
 )
 from ._sync import (
     MAX_BODY,
+    POOL_IDLE_LIMIT,
+    _ConnectionLost,
     _batch_element,
     _body,
     _decode,
@@ -80,7 +83,7 @@ class AsyncClient:
         self.timeout = timeout
         self.retries = max(0, int(retries))
         self.backoff = max(0.0, float(backoff))
-        self._idle: List[_Connection] = []
+        self._idle: List[Tuple[_Connection, float]] = []
         self._lock = asyncio.Lock()
         self._closed = False
         #: Set by :meth:`for_tenant`; sent as ``X-Zygo-Tenant`` on every call.
@@ -92,7 +95,7 @@ class AsyncClient:
         async with self._lock:
             self._closed = True
             idle, self._idle = self._idle, []
-        for _, writer in idle:
+        for (_, writer), _ in idle:
             await _shut(writer)
 
     async def __aenter__(self) -> "AsyncClient":
@@ -606,13 +609,45 @@ class AsyncClient:
 
     async def _exchange(self, method: str, path: str, message: bytes) -> Any:
         """One request and its answer, on a pooled connection."""
-        reader, writer = await self._take()
+        connection, reused = await self._take()
         try:
-            writer.write(message)
-            await writer.drain()
-            status, response_headers, raw = await asyncio.wait_for(
-                _read_response(reader), timeout=self.timeout
-            )
+            return await self._exchange_on(connection, method, path, message)
+        except _ConnectionLost as lost:
+            # A pooled connection the server had closed while it waited.
+            # Nothing of an answer arrived, so the request did not run, and
+            # sending it again on a fresh connection cannot run it twice.
+            # Once, and only for a reused connection: a new one that fails is
+            # a real failure, reported as such.
+            if not reused:
+                raise _transport_error(method, path, self.endpoint, lost.cause) from lost.cause
+        try:
+            return await self._exchange_on(await self._open(), method, path, message)
+        except _ConnectionLost as lost:
+            raise _transport_error(method, path, self.endpoint, lost.cause) from lost.cause
+
+    async def _exchange_on(
+        self, connection: _Connection, method: str, path: str, message: bytes
+    ) -> Any:
+        """The exchange itself, on this connection.
+
+        Raises :class:`_ConnectionLost` if the connection failed before a
+        byte of the answer arrived — the write, or end-of-file or a reset
+        where the status line should be — and :class:`TransportError` for
+        anything after that.
+        """
+        reader, writer = connection
+        try:
+            try:
+                writer.write(message)
+                await writer.drain()
+            except OSError as e:
+                raise _ConnectionLost(e) from e
+            try:
+                status, response_headers, raw = await asyncio.wait_for(
+                    _read_response(reader), timeout=self.timeout
+                )
+            except _NoAnswer as e:
+                raise _ConnectionLost(e) from e
         except asyncio.CancelledError:
             # The exchange is half-finished: the request went out and the
             # answer is still coming. The connection can neither be reused —
@@ -622,9 +657,12 @@ class AsyncClient:
             # thing to do. Close it and let the cancel propagate.
             await _shut(writer)
             raise
+        except _ConnectionLost:
+            await _shut(writer)
+            raise
         except (OSError, asyncio.IncompleteReadError, asyncio.TimeoutError, ValueError) as e:
             await _shut(writer)
-            raise TransportError(f"{method} {path} failed against {self.endpoint}: {e}") from e
+            raise _transport_error(method, path, self.endpoint, e) from e
 
         # Only a connection that completed an exchange cleanly goes back: one
         # that raised may be mid-message, and the next request must not inherit
@@ -636,18 +674,36 @@ class AsyncClient:
 
         return _decode(status, raw, _retry_after(response_headers.get("retry-after")))
 
-    async def _take(self) -> _Connection:
+    async def _take(self) -> Tuple[_Connection, bool]:
+        """A connection, and whether it has been used before.
+
+        The most recently returned connection first, so the pool's youngest
+        connections stay in use and its oldest go stale and are dropped. One
+        that has waited longer than :data:`~zygo_sdk._sync.POOL_IDLE_LIMIT`
+        is closed here rather than handed out: the server has hung up on it,
+        or is about to.
+        """
+        stale: List[_Connection] = []
+        taken: Optional[_Connection] = None
         async with self._lock:
-            if self._idle:
-                return self._idle.pop()
-        return await self._open()
+            while self._idle:
+                connection, since = self._idle.pop()
+                if time.monotonic() - since <= POOL_IDLE_LIMIT:
+                    taken = connection
+                    break
+                stale.append(connection)
+        for _, writer in stale:
+            await _shut(writer)
+        if taken is not None:
+            return taken, True
+        return await self._open(), False
 
     async def _give_back(self, connection: _Connection) -> None:
         async with self._lock:
             if self._closed:
                 await _shut(connection[1])
                 return
-            self._idle.append(connection)
+            self._idle.append((connection, time.monotonic()))
 
     async def _open(self) -> _Connection:
         endpoint = self.endpoint
@@ -724,9 +780,16 @@ async def _read_head(reader: asyncio.StreamReader) -> Tuple[int, Dict[str, str]]
     to wait for: the point is to look at the status, decide, and then read the
     body a piece at a time.
     """
-    status_line = await reader.readline()
+    # End-of-file here, or a reset, is the whole answer failing to arrive.
+    # The server closes an idle connection cleanly, so end-of-file is the
+    # usual shape; a reset is what the kernel answers a write on a socket the
+    # peer has closed with, and nothing has been read by then either.
+    try:
+        status_line = await reader.readline()
+    except (ConnectionResetError, BrokenPipeError) as e:
+        raise _NoAnswer("the API closed the connection without answering") from e
     if not status_line:
-        raise TransportError("the API closed the connection without answering")
+        raise _NoAnswer("the API closed the connection without answering")
     parts = status_line.decode("latin-1").split(None, 2)
     if len(parts) < 2 or not parts[0].startswith("HTTP/"):
         raise TransportError(f"not an HTTP answer: {status_line!r}")
@@ -824,6 +887,19 @@ async def _read_chunked(reader: asyncio.StreamReader) -> bytes:
         if len(body) > MAX_BODY:
             raise TransportError("the API answered with more than this client's limit")
         await reader.readexactly(2)
+
+
+class _NoAnswer(TransportError):
+    """The connection ended before the status line.
+
+    A :class:`TransportError` like any other to a caller — a stream, which
+    holds its own connection, reports it as one — but distinguishable by the
+    pooled exchange, which may send the request once more.
+    """
+
+
+def _transport_error(method: str, path: str, endpoint: Endpoint, cause: BaseException) -> TransportError:
+    return TransportError(f"{method} {path} failed against {endpoint}: {cause}")
 
 
 async def _shut(writer: asyncio.StreamWriter) -> None:

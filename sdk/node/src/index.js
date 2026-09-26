@@ -71,6 +71,15 @@ export {
  */
 const MAX_BODY = 64 * 1024 * 1024;
 
+// How long a pooled connection may sit unused before the agent drops it
+// rather than reuse it. `zygo api` closes a connection that has waited 30 s
+// for its next request (hyper's header read timeout), so a pooled connection
+// older than that is one the server has already hung up on. Ten seconds under
+// it, so a slow network or a busy loop cannot close the gap. The agent applies
+// this to a socket only while it is free: on reuse the request's own
+// `timeout` takes over.
+const POOL_IDLE_MS = 20_000;
+
 /**
  * A connection to a Zygo API.
  *
@@ -111,7 +120,8 @@ export class Client {
     // `agent` is how `forTenant` shares this pool rather than opening a
     // second one. Undocumented on purpose: it is an internal seam, not a
     // knob, and passing a foreign agent here is a way to lose keep-alive.
-    this._agent = options.agent ?? new transport.Agent({ keepAlive: true, maxSockets: 64 });
+    this._agent =
+      options.agent ?? new transport.Agent({ keepAlive: true, maxSockets: 64, timeout: POOL_IDLE_MS });
   }
 
   /** Close every pooled connection. Calling it twice is harmless. */
@@ -852,13 +862,22 @@ export class Client {
     return Math.max(Number(error.retryAfter) || 0, this.backoff * 2 ** attempt);
   }
 
-  /** One request and its answer, on a pooled connection. */
-  #exchange(method, path, payload, sent) {
+  /**
+   * One request and its answer, on a pooled connection.
+   *
+   * A pooled connection may be one the server closed while it waited. If
+   * that shows before a byte of the answer arrives — the write fails, or the
+   * socket hangs up where the status line should be — the request did not
+   * run, so it goes once more on a fresh connection. Once, and only for a
+   * reused socket: a new one that fails is a real failure, reported as such.
+   * `fresh` is that second attempt.
+   */
+  #exchange(method, path, payload, sent, fresh = false) {
     const options = {
       method,
       path,
       headers: sent,
-      agent: this._agent,
+      agent: fresh ? false : this._agent,
       timeout: this.timeout,
     };
     if (this.endpoint.isUnix) {
@@ -869,7 +888,9 @@ export class Client {
     }
 
     return new Promise((resolvePromise, reject) => {
+      let answered = false;
       const request = this._transport.request(options, (response) => {
+        answered = true;
         const chunks = [];
         let size = 0;
         response.on('data', (chunk) => {
@@ -899,6 +920,14 @@ export class Client {
         reject(new TransportError(`${method} ${path} got no answer within ${this.timeout} ms`));
       });
       request.on('error', (e) => {
+        // `reusedSocket` is Node's own word for a socket from the pool; a
+        // reset or a broken pipe on one, with nothing answered, is the
+        // server having closed it. Node recommends exactly this retry.
+        const lost = e.code === 'ECONNRESET' || e.code === 'EPIPE';
+        if (lost && request.reusedSocket && !answered && !fresh) {
+          resolvePromise(this.#exchange(method, path, payload, sent, true));
+          return;
+        }
         const hint =
           e.code === 'ECONNREFUSED' || e.code === 'ENOENT'
             ? '\n  -> nothing is listening there; start one with `zygo api`'

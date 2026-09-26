@@ -7,6 +7,16 @@ break things and will say so here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **SDKs:** a call on a pooled connection that `zygo api` had closed while it
+  sat idle no longer fails with "the API closed the connection without
+  answering". The API hangs up after 30 s idle; all three clients (Python
+  sync and async, Node) now drop a pooled connection after 20 s, and send a
+  request once more on a fresh connection when a reused one turns out to be
+  closed before any of the answer arrived. Seen as about one call in a
+  hundred failing under an n8n task runner.
+
 ## [0.1.3] — 2026-09-26
 
 The code is v0.1.2's. That release's upload to npm failed after PyPI had

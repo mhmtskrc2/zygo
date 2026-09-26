@@ -231,6 +231,73 @@ class TransportTests(unittest.TestCase):
                     client.call("f", {})
             self.assertEqual(len(api.requests), 3)
 
+    def test_a_closed_connection_is_replaced_over_tcp_too(self) -> None:
+        # Over TCP the send goes through — the kernel takes the bytes — and it
+        # is the read that meets end-of-file where the status line should be.
+        # That is what `zygo api` closing an idle connection looks like, and
+        # it used to surface as "closed the connection without answering".
+        with FakeApi() as api:
+            api.answer("POST", "/fn/f", 200, OK_RESULT)
+            api.recorder.hang_up = True
+            with zygo.connect(api.url) as client:
+                for _ in range(3):
+                    client.call("f", {})
+            self.assertEqual(len(api.requests), 3)
+
+    def test_a_reused_connection_the_server_drops_is_sent_again_once(self) -> None:
+        # The server closes a pooled connection the moment it is reused,
+        # without answering. Every call after the first meets that, goes once
+        # more on a fresh connection, and is answered there: three calls,
+        # three answers, three connections.
+        with FakeApi() as api:
+            api.answer("POST", "/fn/f", 200, OK_RESULT)
+            api.recorder.drop_reused = True
+            with zygo.connect(api.url) as client:
+                for _ in range(3):
+                    client.call("f", {})
+            self.assertEqual(len(api.requests), 3)
+            self.assertEqual(api.connections, 3)
+
+    def test_a_fresh_connection_that_fails_is_reported_not_retried(self) -> None:
+        # Only a reused connection earns a second attempt. A new one that the
+        # server drops is a broken server, and one connection is all it gets.
+        with FakeApi() as api:
+            api.answer("POST", "/fn/f", 200, OK_RESULT)
+            api.recorder.drop = True
+            with zygo.connect(api.url) as client:
+                with self.assertRaises(zygo.TransportError):
+                    client.call("f", {})
+            self.assertEqual(api.connections, 1)
+
+    def test_a_connection_idle_past_the_limit_is_not_reused(self) -> None:
+        # The server hangs up on a connection idle for 30 s. The pool drops
+        # one before that rather than find out on the next request. The wait
+        # is simulated by backdating the pooled connection's timestamp.
+        with FakeApi() as api:
+            api.answer("POST", "/fn/f", 200, OK_RESULT)
+            with zygo.connect(api.url) as client:
+                client.call("f", {})
+                connection, since = client._idle[0]
+                client._idle[0] = (connection, since - zygo._sync.POOL_IDLE_LIMIT - 1)
+                client.call("f", {})
+                self.assertEqual(api.connections, 2)
+                client.call("f", {})
+                self.assertEqual(api.connections, 2, "the fresh connection was pooled")
+
+    def test_the_idle_limit_is_under_the_servers(self) -> None:
+        # The number the limit is measured against is in the server's source.
+        # A margin, not equality: the client's clock starts when the answer is
+        # read, the server's when it finishes writing it.
+        listen = Path(__file__).resolve().parents[3] / "crates/zygo-cli/src/cmd/api/listen.rs"
+        if not listen.exists():
+            self.skipTest("not in the repository")
+        import re
+
+        found = re.search(r"HEADER_READ_TIMEOUT[^;]*from_secs\((\d+)\)", listen.read_text())
+        assert found is not None, "the server's header read timeout moved"
+        server = float(found.group(1))
+        self.assertLessEqual(zygo._sync.POOL_IDLE_LIMIT, server - 5)
+
     def test_concurrent_callers_are_concurrent_at_the_socket(self) -> None:
         # A single pooled connection would serialise these, and the elapsed
         # time is the only thing that can tell the difference. Eight calls
@@ -914,6 +981,62 @@ class AsyncTests(unittest.TestCase):
             self.assertEqual(api.requests[0]["headers"].get("x-zygo-tenant"), "acme")
             self.assertEqual(api.requests[0]["headers"]["authorization"], "Bearer op")
             self.assertNotIn("x-zygo-tenant", api.requests[1]["headers"])
+
+        asyncio.run(exercise())
+
+    def test_a_connection_the_server_closed_is_replaced_not_reported(self) -> None:
+        # The same three shapes as for the synchronous client: the server
+        # hangs up after answering (end-of-file on the next status line),
+        # drops a reused connection outright, or drops a fresh one.
+        async def exercise() -> None:
+            for unix in (False, True):
+                with FakeApi(unix=unix) as api:
+                    api.answer("POST", "/fn/f", 200, OK_RESULT)
+                    api.recorder.hang_up = True
+                    async with zygo.aio.connect(api.url) as client:
+                        for _ in range(3):
+                            await client.call("f", {})
+                    self.assertEqual(len(api.requests), 3, f"unix={unix}")
+
+        asyncio.run(exercise())
+
+    def test_a_reused_connection_the_server_drops_is_sent_again_once(self) -> None:
+        async def exercise() -> None:
+            with FakeApi() as api:
+                api.answer("POST", "/fn/f", 200, OK_RESULT)
+                api.recorder.drop_reused = True
+                async with zygo.aio.connect(api.url) as client:
+                    for _ in range(3):
+                        await client.call("f", {})
+                self.assertEqual(len(api.requests), 3)
+                self.assertEqual(api.connections, 3)
+
+        asyncio.run(exercise())
+
+    def test_a_fresh_connection_that_fails_is_reported_not_retried(self) -> None:
+        async def exercise() -> None:
+            with FakeApi() as api:
+                api.answer("POST", "/fn/f", 200, OK_RESULT)
+                api.recorder.drop = True
+                async with zygo.aio.connect(api.url) as client:
+                    with self.assertRaises(zygo.TransportError):
+                        await client.call("f", {})
+                self.assertEqual(api.connections, 1)
+
+        asyncio.run(exercise())
+
+    def test_a_connection_idle_past_the_limit_is_not_reused(self) -> None:
+        async def exercise() -> None:
+            with FakeApi() as api:
+                api.answer("POST", "/fn/f", 200, OK_RESULT)
+                async with zygo.aio.connect(api.url) as client:
+                    await client.call("f", {})
+                    connection, since = client._idle[0]
+                    client._idle[0] = (connection, since - zygo._sync.POOL_IDLE_LIMIT - 1)
+                    await client.call("f", {})
+                    self.assertEqual(api.connections, 2)
+                    await client.call("f", {})
+                    self.assertEqual(api.connections, 2, "the fresh connection was pooled")
 
         asyncio.run(exercise())
 
