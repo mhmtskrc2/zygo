@@ -118,7 +118,8 @@ zygo run --mem 128M --timeout 10s python:3.12-slim python3 -c 'print("hello")'
   process per request in a held sandbox (about 1.4 ms), or an agent of your own
   against [the protocol](spec/protocol.md).
 - **For programs:** an HTTP API, dependency-free Python and Node clients
-  (`zygo-sdk`), and an MCP server. [Chapter 17](docs/book/17-api-sdk-mcp.md)
+  (`zygo-sdk`), an Elixir client (`zygo_sdk`), and an MCP server.
+  [Chapter 17](docs/book/17-api-sdk-mcp.md)
 - **For a multi-tenant product:** tenants with their own tokens and budgets,
   a script or a whole workspace (a tar) sent with each request, streamed
   output, and cancellation — all over the API.

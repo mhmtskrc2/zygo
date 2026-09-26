@@ -391,7 +391,7 @@ cat /tmp/why.json
 `timed_out` comes from the launcher. `oom_killed` comes from the kernel's own
 counter. Over the HTTP API the same three fields are in the answer to
 `POST /run`, and the SDKs expose them as `timed_out` / `timedOut` and
-`oom_killed` / `oomKilled`.
+`oom_killed` / `oomKilled` (Elixir uses the Python names).
 
 ### The sandbox never started, and it looks like the program failed
 
@@ -418,9 +418,9 @@ raise `concurrency` if the function can really take more. Over the API it is
 HTTP 429. `zygo exec` exits **75**, which is the same answer in the form a
 shell understands.
 
-The SDKs raise this as its own type, `Busy`, so a caller can tell it apart from
-a handler that failed. A handler that raised will raise again; a `Busy` will
-not.
+The SDKs raise this as its own type, `Busy` (in Elixir, a `Zygo.Error` with
+`kind: :busy`), so a caller can tell it apart from a handler that failed. A
+handler that raised will raise again; a `Busy` will not.
 
 ### Exit 4: no such function
 

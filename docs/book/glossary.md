@@ -31,6 +31,7 @@ One line each. The chapter in brackets explains the term in full; the numbers fo
 | **favordynmods** | A cgroup2 mount option that makes moving a process between cgroups cheap, at a small cost to every fork and exit; `zygo doctor --fix` can turn it on. [22, 25] |
 | **fork** | Making a copy of the calling process. [1] |
 | **gVisor** | A kernel written in Go that runs in user space and answers a sandbox's syscalls. [10] |
+| **Hex** | The package registry for Elixir and Erlang, as PyPI is for Python; the Elixir client is `zygo_sdk` there. [17] |
 | **image** | A file system stored as layers, plus a little metadata; the OCI standard defines it. [5] |
 | **jail** | FreeBSD's kernel object that confines a group of processes. [9] |
 | **KVM** | The Linux feature that lets it run virtual machines using the CPU's hardware support. [10] |

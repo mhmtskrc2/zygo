@@ -630,7 +630,7 @@ socket or a loopback address such as `127.0.0.1`.
 | `429` | This tenant's queue is full. The `Retry-After` header says when to try again. |
 
 [Chapter 17](17-api-sdk-mcp.md) has every route, status code and header, and
-the Python and Node clients.
+the Python, Node and Elixir clients.
 
 ## Sending metrics to OpenTelemetry
 

@@ -26,6 +26,15 @@ break things and will say so here.
   and every pool — and every later request is refused. Chapter 16 now has a
   unit file with `OOMPolicy=continue` and `Delegate=yes`, and chapter 22 the
   journal lines this looks like.
+- An Elixir client, `zygo_sdk` on Hex, in `sdk/elixir`. Every route the
+  Python and Node clients call, as `Zygo.call/4` and the rest: each returns
+  `{:ok, value}` or `{:error, %Zygo.Error{}}` and has a `!` twin, and one
+  error module with a `kind` (`:busy`, `:handler`, `:timeout` …) stands in
+  for the other clients' eleven classes. Pooled keep-alive connections over
+  TCP or a unix socket, the same retries of a refused request, NDJSON
+  streaming as a lazy `Stream`, and a named pool to put under a supervisor.
+  Two dependencies, Mint and NimblePool; Elixir 1.18 or newer. ADR 0007
+  says why it lives in this repository.
 
 ### Fixed
 

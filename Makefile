@@ -1,4 +1,4 @@
-.PHONY: help build test test-rust test-agent test-sdk test-sdk-python test-sdk-node lint-linux \
+.PHONY: help build test test-rust test-agent test-sdk test-sdk-python test-sdk-node test-sdk-elixir lint-linux \
         verify-mcp check check-linux test-linux \
         verify-linux verify-supervisor-linux verify-oom-linux escape-linux dist-linux \
         fuzz-linux gvisor-linux verify-login-linux verify-shim verify-deps-linux \
@@ -11,7 +11,7 @@
 help:
 	@echo "build        build the zygo binary"
 	@echo "test         run every test suite"
-	@echo "test-sdk     the Python and Node clients, against a stand-in API"
+	@echo "test-sdk     the Python, Node and Elixir clients, against a stand-in API"
 	@echo "verify-mcp   drive the MCP server over a pipe, as an agent host does"
 	@echo "verify-api-linux  the HTTP API end to end, through the Python client"
 	@echo "verify-plugin-host  a plugin host on the API alone — the embedder exit criterion"
@@ -69,16 +69,31 @@ test-agent:
 	python3 -W error::ResourceWarning -m unittest discover -s agents/python
 	node --test 'agents/node/*.test.js'
 
-# The two clients. Neither needs Linux, a kernel or a sandbox: what is under
+# The three clients. None needs Linux, a kernel or a sandbox: what is under
 # test is the client — the transport, the error mapping, the connection pool.
 # A test that needs a real sandbox belongs in the Rust suites.
-test-sdk: test-sdk-python test-sdk-node
+test-sdk: test-sdk-python test-sdk-node test-sdk-elixir
 
 test-sdk-python:
 	cd sdk/python && python3 -W error::ResourceWarning -m unittest discover -s tests
 
 test-sdk-node:
 	cd sdk/node && node --test 'test/*.test.js'
+
+# Formatted and warning-free as well as passing, as CI checks it: `mix
+# compile` alone would let a warning through that the release build refuses.
+# Without Elixir on the machine this says it skipped, loudly, rather than
+# failing `make test` for a contributor who never touches the SDK; CI has a
+# job that installs Elixir and runs it.
+test-sdk-elixir:
+	@if ! command -v mix >/dev/null; then \
+		echo "test-sdk-elixir: SKIPPED, no \`mix\` on PATH (the suite needs Elixir 1.18+)"; \
+	else \
+		cd sdk/elixir && mix deps.get --only test >/dev/null && \
+		MIX_ENV=test mix format --check-formatted && \
+		MIX_ENV=test mix compile --warnings-as-errors && \
+		mix test; \
+	fi
 
 # `zygo mcp` driven over a pipe, the way an agent host drives it: a real
 # handshake, a real tool list, and a tool call that really runs a sandbox.
@@ -549,10 +564,10 @@ lint:
 	cargo clippy --workspace --all-targets -- -D warnings
 	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 	python3 docs/nav.py --check
-	@for f in LICENSE NOTICE; do for d in sdk/python sdk/node; do \
+	@for f in LICENSE NOTICE; do for d in sdk/python sdk/node sdk/elixir; do \
 		cmp -s $$f $$d/$$f || { echo "$$d/$$f differs from $$f"; exit 1; }; \
 	done; done
-	@missing=$$(git ls-files '*.rs' '*.py' '*.sh' '*.js' '*.mjs' '*.ts' '*.c' '*.go' \
+	@missing=$$(git ls-files '*.rs' '*.py' '*.sh' '*.js' '*.mjs' '*.ts' '*.c' '*.go' '*.ex' '*.exs' \
 		| xargs grep -L 'SPDX-License-Identifier: Apache-2.0'); \
 	if [ -n "$$missing" ]; then \
 		echo "no SPDX-License-Identifier line in:"; echo "$$missing"; exit 1; \

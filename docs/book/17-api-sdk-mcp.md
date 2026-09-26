@@ -1,12 +1,12 @@
 # 17. The HTTP API, the SDKs and MCP
 
 The CLI is one way in. Programs use the HTTP API — directly, or through the
-Python and Node clients — and agent hosts use the MCP server. All of them end
-at the same supervisor, the long-lived Zygo process that owns the warm
-sandboxes.
+Python, Node and Elixir clients — and agent hosts use the MCP server. All of
+them end at the same supervisor, the long-lived Zygo process that owns the
+warm sandboxes.
 
 ```text
-  your program ──▶ Python / Node SDK ──┐
+  your program ──▶ Python/Node/Elixir ─┐
   curl ────────────────────────────────┤  HTTP  ┌──────────┐ unix socket ┌────────────┐
                                        └───────▶│ zygo api │────────────▶│            │
                                                 └──────────┘             │            │
@@ -17,7 +17,7 @@ sandboxes.
 ```
 
 This chapter has three parts. First the HTTP API itself: how to start it,
-who may call what, the routes and the answers. Then the two SDKs, and the
+who may call what, the routes and the answers. Then the three SDKs, and the
 features they reach: tenants, secrets, files, streaming, cancelling, runtime
 pools and dependency sets. Last, the MCP server for agent hosts.
 
@@ -278,12 +278,14 @@ OTLP push and the usage webhook are where per-tenant numbers live.
 
 ## Part two: the SDKs
 
-There are two clients, Python and Node, over the HTTP API. Both have **no
-dependencies**: the standard library has an HTTP client in each language, and
-a unix socket is a few lines on top of it. An SDK for a runtime whose point is
-a small, auditable boundary should not arrive with a dependency tree of its
-own. Neither is a second implementation of Zygo, and nothing in either client
-can widen a sandbox.
+There are three clients over the HTTP API: Python, Node and Elixir. Python
+and Node have **no dependencies**: the standard library has an HTTP client in
+each language, and a unix socket is a few lines on top of it. Erlang's HTTP
+client keeps its connections to itself, so the Elixir client has two small
+dependencies instead (see [The Elixir client](#the-elixir-client)). An SDK for
+a runtime whose point is a small, auditable boundary should not arrive with a
+dependency tree of its own. None is a second implementation of Zygo, and
+nothing in any client can widen a sandbox.
 
 ```text
   your process ──HTTP──▶ zygo api ──control socket──▶ supervisor ──▶ warm sandboxes
@@ -377,55 +379,129 @@ reads the declaration file against the module as it runs — every export,
 every `Client` method, every option a call reads — so a method added without
 a declaration fails the suite rather than shipping untyped.
 
+## The Elixir client
+
+```elixir
+# mix.exs
+{:zygo_sdk, "~> 0.1"}
+```
+
+Elixir 1.18 or newer, for the JSON module in the standard library. The same
+methods as Python, with the same snake_case names, as functions in the `Zygo`
+module that take the client first. Every one returns `{:ok, value}` or
+`{:error, %Zygo.Error{}}`, and has a `!` twin that returns the value or
+raises. Durations — `timeout:`, `backoff:`, `retry_after` — are milliseconds,
+as is usual in Elixir.
+
+```elixir
+client = Zygo.connect()                                  # ZYGO_API_URL, ZYGO_API_TOKEN
+{:ok, out} = Zygo.call(client, "resize", %{"url" => "…"}, timeout: 5_000)
+IO.inspect({out.result, out.stdout, out.metrics.wall_ms})
+```
+
+There is no `fn(name)` handle: `fn` is a keyword in Elixir, and
+`&Zygo.call(client, "resize", &1)` is the same thing in one line.
+
+### Processes, and the pool
+
+The client is a plain struct, so any process may use it. Its connections live
+in a pool process, which `Zygo.connect/2` starts linked to the caller. A
+client that should live as long as your application goes under your own
+supervisor instead, and is fetched by name:
+
+```elixir
+children = [{Zygo, name: MyApp.Zygo, url: "unix:///run/zygo/api.sock", retries: 3}]
+Zygo.functions!(Zygo.client(MyApp.Zygo))
+```
+
+```text
+  caller process ──checkout──▶ ┌── Zygo pool ─────────────┐
+    (sends, reads the answer)  │ idle connection  ·  12 s │
+  ◀──────────────connection─── │ idle connection  ·   3 s │
+  caller process ──checkin───▶ │ (up to pool_size: 32)    │
+                               └──────────────────────────┘
+```
+
+A caller borrows one connection for one request and gives it back. The socket
+moves with it, so a caller that crashes mid-request takes its socket down
+rather than leaving a half-read answer in the pool. More callers than
+`pool_size` wait for a connection to come free. The pool is
+[NimblePool](https://hex.pm/packages/nimble_pool), and the connections are
+[Mint](https://hex.pm/packages/mint), which is HTTP as a data structure
+rather than a process and opens a unix socket. Those two are the package's
+only dependencies.
+
+### Errors, and streams
+
+The other clients raise one class per kind of failure. The Elixir client
+has one exception, `Zygo.Error`, and its `kind` field says which failure it
+was: `:busy`, `:handler`, `:timeout` and so on (see [Errors in the
+clients](#errors-in-the-clients)). A `case` on the kind is how a caller
+branches:
+
+```elixir
+case Zygo.call(client, "resize", event) do
+  {:ok, out} -> out.result
+  {:error, %Zygo.Error{kind: :busy, retry_after: ms}} -> {:later, ms}
+  {:error, %Zygo.Error{kind: :handler, stderr: stderr}} -> {:bug, stderr}
+end
+```
+
+`Zygo.stream/4` returns a lazy `Stream`, and nothing is sent until it is read.
+Its items are `{:stdout, text}`, `{:stderr, text}` and `{:progress, text}`,
+then one last item: `{:result, %Zygo.Result{}}`, or `{:error, %Zygo.Error{}}`.
+A refusal before anything ran is that error alone. `Zygo.stream!/4` raises the
+error instead, after the output before it.
+
 ## What the clients can do
 
 **Who** is the token the call is made with: a *tenant* token is one
 customer's, an *operator* token is the host's. **Deploy** marks the calls that
 need deploy rights (see [The deploy gate](#the-deploy-gate)).
 
-| | Python | Node | Who | Deploy |
-|---|---|---|---|---|
-| Call a warm function | `client.call(name, event)` | `client.call(name, event)` | either | no |
-| A callable for one function | `client.fn(name)` | `client.fn(name)` | either | no |
-| Several events at once | `client.batch(name, events)` | `client.batch(name, events)` | either | no |
-| List functions | `client.functions()` | `client.functions()` | either | no |
-| Counters | `client.stats(name)` | `client.stats(name)` | either | no |
-| Warm one now | `client.warm(name)` | `client.warm(name)` | either | no |
-| Recent log | `client.logs(name)` | `client.logs(name)` | either | no |
-| Version | `client.version()` | `client.version()` | either | no |
-| Health | `client.health()` | `client.health()` | anyone | no |
-| Drain the host | `client.drain(grace)` | `client.drain(grace)` | operator | **yes** |
-| Register a script | `client.put_script(source)` | `client.putScript(source)` | either | no |
-| Build a dependency set | `client.put_deps(image, files)` | `client.putDeps(image, files)` | either | no |
-| How a build went | `client.deps(id)` | `client.deps(id)` | own, or operator | no |
-| Stop a running request | `client.cancel(id)` | `client.cancel(id)` | own, or operator | no |
-| Limit a tenant | `client.set_limits(id, **keys)` | `client.setLimits(id, keys)` | operator | **yes** |
-| A tenant's secret names | `client.secrets(id)` | `client.secrets(id)` | own, or operator | no |
-| Set one | `client.put_secret(id, name, v)` | `client.putSecret(id, name, v)` | operator | **yes** |
-| Forget one | `client.delete_secret(id, name)` | `client.deleteSecret(id, name)` | operator | **yes** |
-| Store a blob | `client.put_blob(tar)` | `client.putBlob(tar)` | either | no |
-| Look one up | `client.blob(digest)` | `client.blob(digest)` | either | no |
-| Forget one | `client.delete_blob(digest)` | `client.deleteBlob(digest)` | operator | **yes** |
-| Watch a call's output | `client.stream(name, event)` | `client.stream(name, event)` | either | no |
-| The same, for a pool | `client.stream_script(rt, script)` | `client.streamScript(rt, script)` | either | no |
-| Look a script up | `client.script(digest)` | `client.script(digest)` | either | no |
-| Run a script in a pool | `client.run_script(runtime, script)` | `client.runScript(runtime, script)` | either | no |
-| List runtime pools | `client.runtimes()` | `client.runtimes()` | either | no |
-| Read a tenant | `client.tenant(id)` | `client.tenant(id)` | own, or operator | no |
-| Act for a tenant | `client.for_tenant(id)` | `client.forTenant(id)` | operator | no |
-| List tenants | `client.tenants()` | `client.tenants()` | operator | no |
-| Create a tenant | `client.create_tenant(id)` | `client.createTenant(id)` | operator | no |
-| Serve a function | `client.serve(name, layer)` | `client.serve(name, layer)` | operator | **yes** |
-| Stop one | `client.stop(name)` | `client.stop(name)` | operator | **yes** |
-| One-shot sandbox | `client.run(image, cmd)` | `client.run(image, cmd)` | operator | **yes** |
-| Forget a script | `client.delete_script(digest)` | `client.deleteScript(digest)` | operator | **yes** |
-| Forget a dependency set | `client.delete_deps(id)` | `client.deleteDeps(id)` | operator | **yes** |
-| Delete a tenant | `client.delete_tenant(id)` | `client.deleteTenant(id)` | operator | **yes** |
-| Serve a runtime pool | `client.serve_runtime(name, layer, secrets=[…])` | `client.serveRuntime(name, layer, { secrets })` | operator | **yes** |
-| Stop one | `client.stop_runtime(name)` | `client.stopRuntime(name)` | operator | **yes** |
-| Mint a token | `client.mint_token(tenant)` | `client.mintToken(tenant)` | operator | **yes** |
-| List tokens | `client.tokens()` | `client.tokens()` | operator | **yes** |
-| Revoke one | `client.revoke_token(id)` | `client.revokeToken(id)` | operator | **yes** |
+| | Python | Node | Elixir | Who | Deploy |
+|---|---|---|---|---|---|
+| Call a warm function | `client.call(name, event)` | `client.call(name, event)` | `Zygo.call(client, name, event)` | either | no |
+| A callable for one function | `client.fn(name)` | `client.fn(name)` | `&Zygo.call(client, name, &1)` | either | no |
+| Several events at once | `client.batch(name, events)` | `client.batch(name, events)` | `Zygo.batch(client, name, events)` | either | no |
+| List functions | `client.functions()` | `client.functions()` | `Zygo.functions(client)` | either | no |
+| Counters | `client.stats(name)` | `client.stats(name)` | `Zygo.stats(client, name)` | either | no |
+| Warm one now | `client.warm(name)` | `client.warm(name)` | `Zygo.warm(client, name)` | either | no |
+| Recent log | `client.logs(name)` | `client.logs(name)` | `Zygo.logs(client, name)` | either | no |
+| Version | `client.version()` | `client.version()` | `Zygo.version(client)` | either | no |
+| Health | `client.health()` | `client.health()` | `Zygo.health(client)` | anyone | no |
+| Drain the host | `client.drain(grace)` | `client.drain(grace)` | `Zygo.drain(client, grace: ms)` | operator | **yes** |
+| Register a script | `client.put_script(source)` | `client.putScript(source)` | `Zygo.put_script(client, source)` | either | no |
+| Build a dependency set | `client.put_deps(image, files)` | `client.putDeps(image, files)` | `Zygo.put_deps(client, image, files)` | either | no |
+| How a build went | `client.deps(id)` | `client.deps(id)` | `Zygo.deps(client, id)` | own, or operator | no |
+| Stop a running request | `client.cancel(id)` | `client.cancel(id)` | `Zygo.cancel(client, id)` | own, or operator | no |
+| Limit a tenant | `client.set_limits(id, **keys)` | `client.setLimits(id, keys)` | `Zygo.set_limits(client, id, keys)` | operator | **yes** |
+| A tenant's secret names | `client.secrets(id)` | `client.secrets(id)` | `Zygo.secrets(client, id)` | own, or operator | no |
+| Set one | `client.put_secret(id, name, v)` | `client.putSecret(id, name, v)` | `Zygo.put_secret(client, id, name, v)` | operator | **yes** |
+| Forget one | `client.delete_secret(id, name)` | `client.deleteSecret(id, name)` | `Zygo.delete_secret(client, id, name)` | operator | **yes** |
+| Store a blob | `client.put_blob(tar)` | `client.putBlob(tar)` | `Zygo.put_blob(client, tar)` | either | no |
+| Look one up | `client.blob(digest)` | `client.blob(digest)` | `Zygo.blob(client, digest)` | either | no |
+| Forget one | `client.delete_blob(digest)` | `client.deleteBlob(digest)` | `Zygo.delete_blob(client, digest)` | operator | **yes** |
+| Watch a call's output | `client.stream(name, event)` | `client.stream(name, event)` | `Zygo.stream(client, name, event)` | either | no |
+| The same, for a pool | `client.stream_script(rt, script)` | `client.streamScript(rt, script)` | `Zygo.stream_script(client, rt, script)` | either | no |
+| Look a script up | `client.script(digest)` | `client.script(digest)` | `Zygo.script(client, digest)` | either | no |
+| Run a script in a pool | `client.run_script(runtime, script)` | `client.runScript(runtime, script)` | `Zygo.run_script(client, runtime, script)` | either | no |
+| List runtime pools | `client.runtimes()` | `client.runtimes()` | `Zygo.runtimes(client)` | either | no |
+| Read a tenant | `client.tenant(id)` | `client.tenant(id)` | `Zygo.tenant(client, id)` | own, or operator | no |
+| Act for a tenant | `client.for_tenant(id)` | `client.forTenant(id)` | `Zygo.for_tenant(client, id)` | operator | no |
+| List tenants | `client.tenants()` | `client.tenants()` | `Zygo.tenants(client)` | operator | no |
+| Create a tenant | `client.create_tenant(id)` | `client.createTenant(id)` | `Zygo.create_tenant(client, id)` | operator | no |
+| Serve a function | `client.serve(name, layer)` | `client.serve(name, layer)` | `Zygo.serve(client, name, layer)` | operator | **yes** |
+| Stop one | `client.stop(name)` | `client.stop(name)` | `Zygo.stop(client, name)` | operator | **yes** |
+| One-shot sandbox | `client.run(image, cmd)` | `client.run(image, cmd)` | `Zygo.run(client, image, cmd)` | operator | **yes** |
+| Forget a script | `client.delete_script(digest)` | `client.deleteScript(digest)` | `Zygo.delete_script(client, digest)` | operator | **yes** |
+| Forget a dependency set | `client.delete_deps(id)` | `client.deleteDeps(id)` | `Zygo.delete_deps(client, id)` | operator | **yes** |
+| Delete a tenant | `client.delete_tenant(id)` | `client.deleteTenant(id)` | `Zygo.delete_tenant(client, id)` | operator | **yes** |
+| Serve a runtime pool | `client.serve_runtime(name, layer, secrets=[…])` | `client.serveRuntime(name, layer, { secrets })` | `Zygo.serve_runtime(client, name, layer, secrets: […])` | operator | **yes** |
+| Stop one | `client.stop_runtime(name)` | `client.stopRuntime(name)` | `Zygo.stop_runtime(client, name)` | operator | **yes** |
+| Mint a token | `client.mint_token(tenant)` | `client.mintToken(tenant)` | `Zygo.mint_token(client, tenant)` | operator | **yes** |
+| List tokens | `client.tokens()` | `client.tokens()` | `Zygo.tokens(client)` | operator | **yes** |
+| Revoke one | `client.revoke_token(id)` | `client.revokeToken(id)` | `Zygo.revoke_token(client, id)` | operator | **yes** |
 
 A listing is scoped to the caller: `functions()` and `runtimes()` through a
 tenant token show that tenant's names, and nobody else's. (`/metrics` is
@@ -434,7 +510,7 @@ events](#metrics-otlp-and-usage-events).)
 
 ## Connecting
 
-Both clients find the address in the same order: the argument, then
+All three clients find the address in the same order: the argument, then
 `ZYGO_API_URL`, then `http://127.0.0.1:7700`. These forms are accepted:
 
 ```text
@@ -447,9 +523,10 @@ box:9000                                bare host and port
 The token comes from `ZYGO_API_TOKEN` unless one is passed. That is the same
 variable the server reads, so a shell that can start the API can talk to it.
 A unix socket still needs the token, unless the API was started with
-`--no-auth`. Both clients pool connections and are safe to share between
-threads or tasks. That matters: one connection would line concurrent callers
-up behind a single socket, and the warm path is measured in milliseconds.
+`--no-auth`. Every client pools connections and is safe to share between
+threads, tasks or processes. That matters: one connection would line
+concurrent callers up behind a single socket, and the warm path is measured
+in milliseconds.
 
 The API hangs up on a connection that has waited 30 seconds for its next
 request. A pooled connection older than 20 seconds is therefore dropped, not
@@ -458,11 +535,11 @@ socket ends where the status line should begin — the request goes once more
 on a fresh connection. That is safe because nothing came back, so the
 request never ran. A connection that fails after the first byte of an
 answer, or a new connection that fails at all, is reported as a
-`TransportError`, never retried.
+`TransportError` (in Elixir, `kind: :transport`), never retried.
 
 ### Retries
 
-Both clients can resend a refused request. `retries` (default 0) is how many
+Every client can resend a refused request. `retries` (default 0) is how many
 times; `backoff` (default 1 s) is the base wait. Only `Busy` and
 `Unavailable` qualify — both mean the request never ran, which is what makes
 sending it again safe. A handler that raised, a request the deadline killed,
@@ -476,6 +553,10 @@ client = zygo.connect(retries=3)                 # Busy or Unavailable → wait,
 
 ```js
 const client = connect(undefined, { retries: 3, backoff: 0.5 });
+```
+
+```elixir
+client = Zygo.connect(retries: 3, backoff: 500)   # milliseconds
 ```
 
 ## Tenants
@@ -495,6 +576,11 @@ acme.run_script("py312", script.sha256, event)  # and only acme may run it
 ```js
 await client.createTenant('acme');
 const acme = client.forTenant('acme');
+```
+
+```elixir
+Zygo.create_tenant!(client, "acme")
+acme = Zygo.for_tenant(client, "acme")         # a new struct; the same pool
 ```
 
 Listing or creating tenants is the **operator's**: a customer that could list
@@ -984,6 +1070,12 @@ const { sha256 } = await client.putScript(source);
 const out = await client.runScript('py312', sha256, { month: '2026-09' });
 ```
 
+```elixir
+Zygo.serve_runtime!(client, "py312", %{"image" => "python:3.12-slim", "agent" => "python"})
+%Zygo.Script{sha256: sha256} = Zygo.put_script!(client, source)
+out = Zygo.run_script!(client, "py312", sha256, %{"month" => "2026-09"})
+```
+
 ### How a script gets in
 
 `client.runtimes()` lists the pools with their zygote counts, and
@@ -1137,26 +1229,28 @@ digest is theirs from then on.
 Each kind of failure is its own type, because each one means something
 different about what to do next.
 
-| HTTP | Python and Node error | Means | What to do |
-|---|---|---|---|
-| 429 | `Busy`, with `retry_after` | the pool is full; **the request never ran** | retry after `retry_after` |
-| 408 | `Timeout` | the deadline killed the request | the work is too slow, or the limit too tight |
-| 499 | `Cancelled` | somebody stopped the request | nothing: this is what was asked for |
-| 504 | `Stuck` | the sandbox went quiet with budget left | look at the function, not its `timeout` |
-| 500 from a handler | `HandlerError`, with `stdout`, `stderr`, `exit_code` | the handler raised | fix the function |
-| 404 | `NotFound` | no function (or script, or request) by that name | `serve` it, or check the name |
-| 401, 403 | `AuthError` | wrong token, or a deploy call without deploy rights | check the token or the flag |
-| 400 | `SpecError` | the sandbox as described cannot be resolved | fix the request |
-| no connection | `TransportError` | the API could not be reached | nothing ran |
-| 503 | `Unavailable`, with `code` and `retry_after` | dependencies still building (`deps_building`), a zygote that failed to warm (`warm_failed`), or the API stopping; the request never ran | retry after `retry_after`, or let `retries` do it |
-| anything else | `ZygoError` | e.g. 413, 422; the message has the status | read the message |
+| HTTP | Python and Node error | Elixir `kind` | Means | What to do |
+|---|---|---|---|---|
+| 429 | `Busy`, with `retry_after` | `:busy` | the pool is full; **the request never ran** | retry after `retry_after` |
+| 408 | `Timeout` | `:timeout` | the deadline killed the request | the work is too slow, or the limit too tight |
+| 499 | `Cancelled` | `:cancelled` | somebody stopped the request | nothing: this is what was asked for |
+| 504 | `Stuck` | `:stuck` | the sandbox went quiet with budget left | look at the function, not its `timeout` |
+| 500 from a handler | `HandlerError`, with `stdout`, `stderr`, `exit_code` | `:handler` | the handler raised | fix the function |
+| 404 | `NotFound` | `:not_found` | no function (or script, or request) by that name | `serve` it, or check the name |
+| 401, 403 | `AuthError` | `:auth` | wrong token, or a deploy call without deploy rights | check the token or the flag |
+| 400 | `SpecError` | `:spec` | the sandbox as described cannot be resolved | fix the request |
+| no connection | `TransportError` | `:transport` | the API could not be reached | nothing ran |
+| 503 | `Unavailable`, with `code` and `retry_after` | `:unavailable` | dependencies still building (`deps_building`), a zygote that failed to warm (`warm_failed`), or the API stopping; the request never ran | retry after `retry_after`, or let `retries` do it |
+| anything else | `ZygoError` | `:other` | e.g. 413, 422; the message has the status | read the message |
 
 `Unavailable` is the 503: the host cannot do this *yet*, and nothing about
 the request needs changing. Unlike `Busy` it is not backpressure — the wait
 is for something the host is doing. `health()` raises it once the API is
 stopping. A `422` (a limit above every ceiling) is still a plain `ZygoError`.
 Every error type is a subclass of `ZygoError`, so catching it catches
-everything.
+everything. In Elixir every one is a `Zygo.Error`, returned as `{:error, _}`
+or raised by the `!` functions, with the same fields as the class it stands
+for — `retry_after`, `code`, `stdout`, `stderr`, `exit_code`, `request_id`.
 
 ### Busy or HandlerError: the one that matters
 
@@ -1223,7 +1317,7 @@ call a route it has never heard of.
 
 The document is hand-written, and two tests read the router's own source to
 keep it true: one fails when a route is missing from the document, the other
-when the document names a route that is gone. Both SDKs have a third test,
+when the document names a route that is gone. Each SDK has a third test,
 over every operation, so a route added without a client method is a test
 failure rather than something an embedder finds later.
 
@@ -1238,9 +1332,9 @@ failure rather than something an embedder finds later.
 | `control` | The CLI-to-supervisor protocol, which no SDK speaks. Reported because a mismatch there explains an API that is up but answering errors. |
 | `deploy` | Whether *this caller* has deploy rights — the truth about your own token, not just the flag. |
 
-Both packages are `0.1.3` and follow the repository's `0.x` policy: the shape
-may change with a release note. After `1.0` it will not change without a
-major version.
+All three packages are `0.1.3` and follow the repository's `0.x` policy:
+the shape may change with a release note. After `1.0` it will not change
+without a major version.
 
 ## Running against a real Zygo
 
@@ -1250,6 +1344,7 @@ zygo up                            # warm what sandbox.toml declares
 zygo api --allow-deploy &          # 127.0.0.1:7700
 
 python -c "import zygo_sdk as zygo; print(zygo.connect().functions())"
+elixir -e 'Mix.install([{:zygo_sdk, "~> 0.1"}]); IO.inspect(Zygo.functions!(Zygo.connect()))'
 ```
 
 For one customer rather than the whole host:
@@ -1258,10 +1353,12 @@ For one customer rather than the whole host:
 zygo token mint --tenant acme      # prints the secret, once
 ```
 
-The SDK test suites do **not** need any of that. Both run against a stand-in
-API and check the client: the transport, the error mapping, the connection
-pool. A test that needs a real sandbox belongs in the Rust suites, against a
-real kernel.
+The SDK test suites do **not** need any of that. All three run against a
+stand-in API and check the client: the transport, the error mapping, the
+connection pool. A test that needs a real sandbox belongs in the Rust suites,
+against a real kernel. The Elixir suite also has one read-only check against
+a real API, which runs only when asked: `ZYGO_LIVE=1 mix test --only live` in
+`sdk/elixir`, against the API that `ZYGO_API_URL` names.
 
 ```bash
 make test-sdk

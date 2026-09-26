@@ -1,0 +1,7 @@
+/_build/
+/deps/
+/doc/
+/cover/
+*.ez
+/zygo_sdk-*.tar
+erl_crash.dump
