@@ -142,7 +142,7 @@ rights. Bodies are JSON unless marked raw; the limit is 16 MiB.
 |---|---|---|
 | `GET /healthz` | nobody needs a token | `ok`, `degraded` (a pool below `min_warm`) or `stopping` (503). |
 | `GET /version` | any | Zygo version, API version, and whether you have deploy rights. |
-| `GET /metrics` | any | Prometheus text (below). |
+| `GET /metrics` | any | Prometheus text (below); scoped to the token. |
 | `POST /drain?grace_ms=` | deploy | Stop taking requests, finish the running ones, exit. |
 | `GET /fn` | any | Functions you can see: state, image, memory, request counts. |
 | `PUT /fn/{name}` | deploy | Serve or replace a function. Body: `{layer, base_dir, secrets?, if_changed?}`. |
@@ -173,6 +173,14 @@ rights. Bodies are JSON unless marked raw; the limit is 16 MiB.
 | `GET /tokens` · `DELETE /tokens/{id}` | deploy | List or revoke. |
 | `DELETE /requests/{id}` | any | Cancel your own request, by id or by key. |
 | `POST /run` | deploy | A one-shot sandbox: `{layer, stdin?}`; returns exit code, output, and why it ended. |
+
+A **layer** in a body is one function's table from `sandbox.toml`, sent as
+JSON: the same fields `[fn.NAME]` takes — `image`, `entry` or `cmd`, `mem`,
+`network`, `allow`, `secrets`, and so on — with every field optional, exactly
+as [chapter 20](20-sandbox-toml.md) lists them. It is called a layer because
+it is merged over `[defaults]` the way a `[fn.NAME]` table is. `base_dir` is
+the folder on the server that its relative paths (`entry`, `mounts`,
+`requirements`) are relative to.
 
 A batch runs at most 16 of its events at the same time. `?workspace=` on a
 function call takes only a blob digest, never an inline tar (see
@@ -259,11 +267,12 @@ collector. `--usage-webhook URL` POSTs batches of usage events for billing —
 finished_ms}` — **at least once**, so key on `request_id`. Both count only
 requests that went through this API process.
 
-**A caution about `/metrics`.** It has no per-tenant series. It needs a token,
-but any valid token can read it, tenant tokens included. And it lists every
-function name on the host, so a tenant token can see the names of other
-tenants' functions there. Put `/metrics` behind your own proxy, or do not give
-customers direct access to the API, if those names matter.
+**Who sees what on `/metrics`.** It needs a token, and the answer depends on
+the token, the same way `GET /fn` does. A tenant token gets
+`zygo_api_requests_total` and `zygo_api_errors_total`, which carry no names,
+and the per-function series for its own functions only. An operator token
+gets every function on the host. There are still no per-tenant series; the
+OTLP push and the usage webhook are where per-tenant numbers live.
 
 [Usage, for billing](#usage-for-billing) has the detail on the usage events.
 
@@ -303,7 +312,7 @@ No dependencies. `zygo.connect()` finds the API from its `url` argument, then
 ```python
 import zygo_sdk as zygo
 client = zygo.connect()
-res = client.fn("resize")({"url": "…"})               # a call; ~2 ms of overhead
+res = client.fn("resize")({"url": "…"})               # a call; ~1.4 ms of overhead
 print(res.result)                                      # what the handler returned
 res = client.call("resize", {"url": "…"}, timeout=5)   # the same call, with a timeout
 print(res.result, res.stdout, res.metrics.wall_ms)     # a Result: value, output, timings
@@ -324,20 +333,22 @@ every method.
 needs:
 
 ```python
-import asyncio, zygo.aio
+import asyncio
+import zygo_sdk as zygo
 
-async def main():
+async def main(events):
     async with zygo.aio.connect() as client:
-        results = await asyncio.gather(*(client.call("resize", e) for e in events))
+        return await asyncio.gather(*(client.call("resize", e) for e in events))
 
-asyncio.run(main())
+asyncio.run(main(events))
 ```
 
-It covers calls, streaming, batches, logs, cancelling, functions, one-shot
-runs, pools, scripts and dependency sets. It leaves some things out **on
-purpose**: there is no `workspace` or `out` on `call` and `run_script`, and no
-tenant, secret, token, limit, blob, drain or `for_tenant` methods. Admin work
-is rare and fits the plain client; the async one is for the hot path.
+It is the whole API, not a subset: every method of the plain client, with the
+same name and arguments, as a coroutine — tenants, tokens, secrets, limits,
+blobs, `drain`, `for_tenant`, and `workspace`/`out` on `call` and `run_script`
+included. A test holds the two surfaces equal. `zygo.aio` is reachable after
+`import zygo_sdk as zygo`; `import zygo_sdk.aio` works too. Cancelling the
+task cancels the request on the server.
 
 ## The Node client
 
@@ -357,16 +368,14 @@ const out = await resize({ url: 'https://example.com/a.png' });
 console.log(out.result, out.metrics.wallMs);
 ```
 
-### The TypeScript types lag behind
+### The TypeScript types
 
 TypeScript types ship beside the JavaScript in `index.d.ts`. They are written
 by hand rather than compiled, so the package has no build step and what you
-read in the repository is what runs. The cost is that they are behind the
-code today. `drain`, `cancel`, `stream`, `streamScript`, `putBlob`, `blob`,
-`deleteBlob`, `putDeps`, `deps` and `deleteDeps` have no types, and neither
-do some options: `key`, `signal`, `workspace` and `out` on calls, `deps` on
-`serveRuntime`, and `tenant` in the client options. The methods and options
-all exist at run time; only the declarations are missing.
+read in the repository is what runs. A test (`sdk/node/test/types.test.js`)
+reads the declaration file against the module as it runs — every export,
+every `Client` method, every option a call reads — so a method added without
+a declaration fails the suite rather than shipping untyped.
 
 ## What the clients can do
 
@@ -419,8 +428,8 @@ need deploy rights (see [The deploy gate](#the-deploy-gate)).
 | Revoke one | `client.revoke_token(id)` | `client.revokeToken(id)` | operator | **yes** |
 
 A listing is scoped to the caller: `functions()` and `runtimes()` through a
-tenant token show that tenant's names, and nobody else's. (`/metrics` is the
-exception; see the caution in [Metrics, OTLP and usage
+tenant token show that tenant's names, and nobody else's. (`/metrics` is
+scoped the same way; see [Metrics, OTLP and usage
 events](#metrics-otlp-and-usage-events).)
 
 ## Connecting
@@ -441,6 +450,24 @@ A unix socket still needs the token, unless the API was started with
 `--no-auth`. Both clients pool connections and are safe to share between
 threads or tasks. That matters: one connection would line concurrent callers
 up behind a single socket, and the warm path is measured in milliseconds.
+
+### Retries
+
+Both clients can resend a refused request. `retries` (default 0) is how many
+times; `backoff` (default 1 s) is the base wait. Only `Busy` and
+`Unavailable` qualify — both mean the request never ran, which is what makes
+sending it again safe. A handler that raised, a request the deadline killed,
+a missing function: sent once, never again. Each wait is the longer of the
+server's `Retry-After` and `backoff` doubled per attempt (1 s, 2 s, 4 s …),
+and the last refusal is the error you see.
+
+```python
+client = zygo.connect(retries=3)                 # Busy or Unavailable → wait, send again
+```
+
+```js
+const client = connect(undefined, { retries: 3, backoff: 0.5 });
+```
 
 ## Tenants
 
@@ -487,6 +514,9 @@ without being told. That is what a token is: the one part of a request the
 caller cannot choose.
 
 ```python
+import os
+import zygo_sdk as zygo
+
 operator = zygo.connect(url, token=os.environ["ZYGO_API_TOKEN"])
 minted = operator.mint_token("acme")        # POST /tenants/acme/tokens
 print(minted.secret)                        # the only time this exists
@@ -739,7 +769,7 @@ A warm function's body is the event itself, with nowhere to put a workspace.
 So there it goes in the query string: `client.call(name, event,
 workspace=blob.sha256, out=True)`, which is `?workspace=sha256:…&out=1`. It
 takes a *blob* only, because an inline tar in a URL would be a megabyte of
-base64 in a request line. The async Python client has no `workspace` or `out`.
+base64 in a request line. The async Python client takes both as well.
 
 ### What keeps one request's files from another's
 
@@ -1014,8 +1044,9 @@ script just imports what the lock file named.
 
 * **It answers before the build finishes.** A `pip install` takes minutes,
   and an HTTP request that waited would time out in every proxy on the way.
-  Poll `deps(id)`, or send the `serve_runtime` and retry on the 503, which
-  carries a `Retry-After`.
+  Poll `deps(id)`, or send the `serve_runtime` and retry the `Unavailable` it
+  raises, which carries the host's `Retry-After` as `retry_after` — a client
+  opened with `retries=` does that itself.
 * **A pool named against a build still running is refused, not queued.**
   Nothing is started. A zygote warmed without the dependencies it was promised
   would serve requests that fail at `import`.
@@ -1086,12 +1117,15 @@ different about what to do next.
 | 401, 403 | `AuthError` | wrong token, or a deploy call without deploy rights | check the token or the flag |
 | 400 | `SpecError` | the sandbox as described cannot be resolved | fix the request |
 | no connection | `TransportError` | the API could not be reached | nothing ran |
-| anything else | `ZygoError` | e.g. 413, 422, 503; the message has the status | read the message |
+| 503 | `Unavailable`, with `code` and `retry_after` | dependencies still building (`deps_building`), a zygote that failed to warm (`warm_failed`), or the API stopping; the request never ran | retry after `retry_after`, or let `retries` do it |
+| anything else | `ZygoError` | e.g. 413, 422; the message has the status | read the message |
 
-There is no separate "unavailable" error: a `503` (warming failed,
-dependencies building, or the API stopping) and a `422` both arrive as a plain
-`ZygoError` in both SDKs. Every other error type is a subclass of `ZygoError`,
-so catching it catches everything.
+`Unavailable` is the 503: the host cannot do this *yet*, and nothing about
+the request needs changing. Unlike `Busy` it is not backpressure — the wait
+is for something the host is doing. `health()` raises it once the API is
+stopping. A `422` (a limit above every ceiling) is still a plain `ZygoError`.
+Every error type is a subclass of `ZygoError`, so catching it catches
+everything.
 
 ### Busy or HandlerError: the one that matters
 
@@ -1165,7 +1199,7 @@ failure rather than something an embedder finds later.
 | `control` | The CLI-to-supervisor protocol, which no SDK speaks. Reported because a mismatch there explains an API that is up but answering errors. |
 | `deploy` | Whether *this caller* has deploy rights — the truth about your own token, not just the flag. |
 
-Both packages are `0.1.0` and follow the repository's `0.x` policy: the shape
+Both packages are `0.1.1` and follow the repository's `0.x` policy: the shape
 may change with a release note. After `1.0` it will not change without a
 major version.
 
@@ -1314,8 +1348,9 @@ fix.
 ## What a sandbox gets
 
 Whatever `zygo run` gives. On the `ns` backend that is: no capabilities, a
-read-only root with `pivot_root` and a masked `/proc`, a seccomp allow list of
-about 190 system calls, Landlock where the kernel has it, required memory, CPU
+read-only root with `pivot_root` and a masked `/proc`, the `default` seccomp
+allowlist of about 215 system calls (190 of them exist on aarch64), Landlock
+where the kernel has it, required memory, CPU
 and process limits, and **no network at all** unless the command line said
 otherwise. [Chapter 23](23-security.md) says where that boundary is weaker
 than it looks. `run_code` is not sandboxed *from the model* — running the
@@ -1376,10 +1411,6 @@ To say it plainly in one place:
   `/run/secrets`.
 * **Streaming, progress, workspaces and per-request tenant limits in
   warm-exec pools** (a pool with `cmd` and no agent).
-* **Admin methods, workspaces and `out` in the async Python client**, on
-  purpose.
-* **Complete TypeScript types** for the Node client; several methods and
-  options exist at run time without declarations.
 * **Per-tenant series in `/metrics`**, and billing counts for `zygo exec` and
   MCP requests outside the supervisor log.
 * **Pool, script and tenant tools in MCP.**

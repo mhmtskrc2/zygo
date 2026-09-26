@@ -122,6 +122,19 @@ class OpenApiTests(unittest.TestCase):
             )
 
     def test_every_operation_has_a_client_method(self) -> None:
+        self.assert_covers(zygo.Client)
+
+    def test_every_operation_has_an_async_client_method(self) -> None:
+        """The async client is the whole API, not the calling half of it.
+
+        It used to leave the admin routes out on purpose. That made every
+        embedder that administers from an event loop keep two clients, so
+        the two surfaces are now held equal — here, and by the signature
+        check in the client tests.
+        """
+        self.assert_covers(zygo.aio.AsyncClient)
+
+    def assert_covers(self, client: type) -> None:
         missing = []
         for path, item in self.doc["paths"].items():
             for method in item:
@@ -131,8 +144,8 @@ class OpenApiTests(unittest.TestCase):
                     continue  # deliberately not a client method
                 if not name:
                     missing.append(f"{key} is not in this test's METHODS table")
-                elif not hasattr(zygo.Client, name):
-                    missing.append(f"{key} maps to `{name}`, which the client lacks")
+                elif not hasattr(client, name):
+                    missing.append(f"{key} maps to `{name}`, which {client.__name__} lacks")
         self.assertEqual(missing, [], "\n".join(missing))
 
     def test_the_table_does_not_name_a_route_that_is_gone(self) -> None:
@@ -143,26 +156,6 @@ class OpenApiTests(unittest.TestCase):
         }
         stale = sorted(set(METHODS) - real)
         self.assertEqual(stale, [], "these are in the table and not in the API")
-
-    def test_the_async_client_covers_the_calling_surface(self) -> None:
-        """The async client is the *calling* path, not the admin one.
-
-        Deliberately a smaller surface: an embedder calls functions from an
-        event loop and administers from a script. This pins which half, so
-        that "the async client is missing `create_tenant`" is a decision on
-        the record rather than an oversight somebody reports as a bug.
-        """
-        for name in ["call", "batch", "run_script", "stream", "cancel", "logs"]:
-            self.assertTrue(
-                hasattr(zygo.aio.AsyncClient, name),
-                f"the async client should have `{name}`",
-            )
-        for name in ["create_tenant", "mint_token", "put_secret", "set_limits"]:
-            self.assertFalse(
-                hasattr(zygo.aio.AsyncClient, name),
-                f"`{name}` appeared on the async client; if that is wanted, "
-                "say so here rather than letting the surfaces drift",
-            )
 
 
 if __name__ == "__main__":

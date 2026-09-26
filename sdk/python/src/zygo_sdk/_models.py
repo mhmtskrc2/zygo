@@ -44,7 +44,7 @@ class Result:
     stdout: str = ""
     stderr: str = ""
     metrics: Metrics = field(default_factory=Metrics)
-    #: The request's own id, which :meth:`~zygo.Client.cancel` names.
+    #: The request's own id, which :meth:`~zygo_sdk.Client.cancel` names.
     #:
     #: Of no use for *this* call, which has already finished. It is here so
     #: that a log line about a slow request can be joined back to the request,
@@ -98,7 +98,7 @@ class Event:
         return self.kind == "result"
 
     def raise_for_status(self) -> None:
-        """Raise what :meth:`~zygo.Client.call` would have raised, if anything.
+        """Raise what :meth:`~zygo_sdk.Client.call` would have raised, if anything.
 
         Called after the result line has been yielded, never before: a handler
         that printed and then failed produced both, and a caller that is
@@ -217,7 +217,7 @@ class Token:
     pools and mint more tokens; a tenant token registers scripts and calls, for
     its own tenant only.
 
-    The secret exists once, in the answer to :meth:`~zygo.Client.mint_token`,
+    The secret exists once, in the answer to :meth:`~zygo_sdk.Client.mint_token`,
     and is not stored anywhere: the server keeps a SHA-256 of it. A client that
     loses one revokes it and mints another.
     """
@@ -336,7 +336,7 @@ class Deps:
 
     ``state`` is ``building``, ``ready`` or ``failed``. A build is minutes, so
     ``put_deps`` answers as soon as the files are on disk and the work happens
-    on the host — poll :meth:`~zygo.Client.deps`, or just send the
+    on the host — poll :meth:`~zygo_sdk.Client.deps`, or just send the
     ``serve_runtime`` and read the ``Retry-After`` on the 503.
 
     ``log`` is the build's own output, and it is on this object rather than at

@@ -16,10 +16,19 @@ import os
 import re
 import socket
 import threading
+import time
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Union
 
 from ._endpoint import Endpoint, resolve
-from ._errors import NotFound, SpecError, TransportError, ZygoError, from_response
+from ._errors import (
+    Busy,
+    NotFound,
+    SpecError,
+    TransportError,
+    Unavailable,
+    ZygoError,
+    from_response,
+)
 from ._models import (
     Deps,
     Event,
@@ -77,6 +86,15 @@ class Client:
     default, because the request's real limit is the function's own ``timeout``
     and the supervisor enforces it — a client that gives up first only loses
     the answer, it does not stop the work.
+
+    ``retries`` is how many times a *refused* request is sent again before its
+    error reaches you: a :class:`~zygo_sdk.Busy` (the pool was full) or an
+    :class:`~zygo_sdk.Unavailable` (the host is still building or warming
+    something). Both mean the request never ran, which is what makes sending
+    it again safe. Nothing else is retried — a handler that raised will raise
+    again, and a request the deadline killed did run. Off by default. Each
+    wait is the longer of the server's ``Retry-After`` and ``backoff``
+    seconds doubled per attempt.
     """
 
     def __init__(
@@ -85,12 +103,16 @@ class Client:
         *,
         token: Optional[str] = None,
         timeout: float = 300.0,
+        retries: int = 0,
+        backoff: float = 1.0,
     ) -> None:
         self.endpoint: Endpoint = resolve(url)
         # The environment by default, the same variable the server reads, so a
         # shell that can start the API can also talk to it.
         self.token = token if token is not None else os.environ.get("ZYGO_API_TOKEN")
         self.timeout = timeout
+        self.retries = max(0, int(retries))
+        self.backoff = max(0.0, float(backoff))
         self._idle: List[http.client.HTTPConnection] = []
         self._lock = threading.Lock()
         self._closed = False
@@ -178,11 +200,12 @@ class Client:
     ) -> Result:
         """Call a warm function and return what its handler returned.
 
-        Raises :class:`~zygo.HandlerError` when the handler raised,
-        :class:`~zygo.Timeout` when the deadline killed the request,
-        :class:`~zygo.Cancelled` when somebody stopped it, and
-        :class:`~zygo.Busy` when the function is at its concurrency limit —
-        the last of which means the request never ran and is worth retrying.
+        Raises :class:`~zygo_sdk.HandlerError` when the handler raised,
+        :class:`~zygo_sdk.Timeout` when the deadline killed the request,
+        :class:`~zygo_sdk.Cancelled` when somebody stopped it, and
+        :class:`~zygo_sdk.Busy` when the function is at its concurrency limit —
+        the last of which means the request never ran and is worth retrying,
+        which a client opened with ``retries=`` does for you.
 
         ``key`` is a name *you* choose for this request, so that another
         thread or process can stop it with :meth:`cancel` before it answers.
@@ -253,7 +276,7 @@ class Client:
         only when the two are the same machine.
 
         Needs an API started with ``--allow-deploy``; without it this raises
-        :class:`~zygo.AuthError` and says so.
+        :class:`~zygo_sdk.AuthError` and says so.
         """
         payload = {
             "layer": dict(layer),
@@ -264,7 +287,7 @@ class Client:
         return Served.parse(self._request("PUT", f"/fn/{_escape(name)}", body=payload))
 
     def stop(self, name: str) -> List[str]:
-        """Stop one function. Raises :class:`~zygo.NotFound` if it is not there."""
+        """Stop one function. Raises :class:`~zygo_sdk.NotFound` if it is not there."""
         body = self._request("DELETE", f"/fn/{_escape(name)}")
         return list(body.get("stopped", []))
 
@@ -311,7 +334,7 @@ class Client:
         return [Tenant.parse(t) for t in body.get("tenants", [])]
 
     def tenant(self, id: str) -> Tenant:
-        """One tenant. Raises :class:`~zygo.NotFound` if there is no such id."""
+        """One tenant. Raises :class:`~zygo_sdk.NotFound` if there is no such id."""
         body = self._request("GET", f"/tenants/{_escape(id)}")
         return Tenant.parse(body.get("tenant") or {})
 
@@ -410,13 +433,13 @@ class Client:
         in flight, or from a :class:`~zygo_sdk._models.Result` that has already
         come back. Answers as soon as the kill has been sent, not when the
         request has stopped — the caller waiting on that request is the one who
-        gets the outcome, and they get :class:`~zygo.Cancelled`.
+        gets the outcome, and they get :class:`~zygo_sdk.Cancelled`.
 
         ``started`` in the answer says whether the handler had begun. ``False``
         is the better outcome: the request's process existed but had not been
         let go, so no handler code ran at all.
 
-        Raises :class:`~zygo.NotFound` when nothing is running under that id —
+        Raises :class:`~zygo_sdk.NotFound` when nothing is running under that id —
         which includes a request that finished a moment ago, and one belonging
         to another tenant.
         """
@@ -539,10 +562,11 @@ class Client:
         Needs an API started with ``--allow-deploy``.
 
         ``deps`` is an id from :meth:`put_deps`. A pool named against one that
-        is still building raises :class:`~zygo.Unavailable` rather than
+        is still building raises :class:`~zygo_sdk.Unavailable` rather than
         starting: a zygote warmed without the dependencies it was promised
         serves requests that fail at ``import``. Retry — the exception carries
-        the ``Retry-After`` the host suggested.
+        the ``Retry-After`` the host suggested as ``retry_after``, and a client
+        opened with ``retries=`` waits it and sends the call again itself.
         """
         payload: Dict[str, Any] = {"name": name, "layer": dict(layer)}
         if base_dir is not None:
@@ -670,12 +694,12 @@ class Client:
         Never the bytes: a digest is not a capability, so a store that
         answered with the script would make every tenant's code readable by
         anyone who could guess what it was. Raises
-        :class:`~zygo.NotFound` when the host does not have it.
+        :class:`~zygo_sdk.NotFound` when the host does not have it.
         """
         return Script.parse(self._request("GET", f"/scripts/{_escape_digest(digest)}"))
 
     def delete_script(self, digest: str) -> bool:
-        """Forget a script. Raises :class:`~zygo.NotFound` if it was not there."""
+        """Forget a script. Raises :class:`~zygo_sdk.NotFound` if it was not there."""
         body = self._request("DELETE", f"/scripts/{_escape_digest(digest)}")
         return bool(body.get("deleted", False))
 
@@ -713,19 +737,33 @@ class Client:
             sent["x-zygo-tenant"] = self._tenant
         sent.update(headers)
 
+        payload = json.dumps(body).encode()
+        attempt = 0
         connection = self._open()
         try:
-            connection.request(method, path, body=json.dumps(body).encode(), headers=sent)
-            response = connection.getresponse()
-            # A refusal — a bad token, no such function — is an ordinary JSON
-            # answer with a status, not a stream. Raise it the usual way
-            # rather than yielding a line that says the same thing.
-            if response.status >= 400:
-                raise from_response(
+            while True:
+                connection.request(method, path, body=payload, headers=sent)
+                response = connection.getresponse()
+                # A refusal — a bad token, no such function — is an ordinary
+                # JSON answer with a status, not a stream. Raise it the usual
+                # way rather than yielding a line that says the same thing.
+                if response.status < 400:
+                    break
+                error = from_response(
                     response.status,
                     _body(response.read(MAX_BODY)),
                     _retry_after(response.getheader("retry-after")),
                 )
+                wait = self._retry_wait(error, attempt)
+                if wait is None:
+                    raise error
+                # Nothing has been yielded yet, so this is the same request
+                # sent again on a fresh connection — the refused one may
+                # have been closed by the server.
+                _discard(connection)
+                time.sleep(wait)
+                attempt += 1
+                connection = self._open()
             for line in _stream_lines(response):
                 event = Event.parse(_body(line))
                 yield event
@@ -775,6 +813,28 @@ class Client:
             sent["x-zygo-tenant"] = self._tenant
         sent.update(headers or {})
 
+        attempt = 0
+        while True:
+            try:
+                return self._exchange(method, path, payload, sent)
+            except (Busy, Unavailable) as error:
+                wait = self._retry_wait(error, attempt)
+                if wait is None:
+                    raise
+                time.sleep(wait)
+                attempt += 1
+
+    def _retry_wait(self, error: ZygoError, attempt: int) -> Optional[float]:
+        return _retry_wait(self.retries, self.backoff, error, attempt)
+
+    def _exchange(
+        self,
+        method: str,
+        path: str,
+        payload: Optional[bytes],
+        sent: Dict[str, str],
+    ) -> Any:
+        """One request and its answer, on a pooled connection."""
         connection, reused = self._take()
         try:
             try:
@@ -866,9 +926,16 @@ class FunctionHandle:
         return f"<zygo function {self.name!r}>"
 
 
-def connect(url: Optional[str] = None, *, token: Optional[str] = None, timeout: float = 300.0) -> Client:
+def connect(
+    url: Optional[str] = None,
+    *,
+    token: Optional[str] = None,
+    timeout: float = 300.0,
+    retries: int = 0,
+    backoff: float = 1.0,
+) -> Client:
     """Open a client. See :class:`Client` for what the arguments mean."""
-    return Client(url, token=token, timeout=timeout)
+    return Client(url, token=token, timeout=timeout, retries=retries, backoff=backoff)
 
 
 # ---- shared helpers ---------------------------------------------------
@@ -946,6 +1013,21 @@ def _workspace_query(blob: Optional[str], out: bool) -> str:
     return f"?{'&'.join(parts)}" if parts else ""
 
 
+def _retry_wait(retries: int, backoff: float, error: ZygoError, attempt: int) -> Optional[float]:
+    """How long to wait before sending a refused request again, or ``None``
+    when it should not be sent again.
+
+    Only a refusal qualifies — the request never ran — and only while
+    ``retries`` allows. The wait honours the server's ``Retry-After``: it
+    never sleeps less than that, and it grows past it on repeated refusals so
+    a client does not hammer a host that keeps saying no. Shared by both
+    clients, so they cannot disagree about what is safe to send twice.
+    """
+    if attempt >= retries or not isinstance(error, (Busy, Unavailable)):
+        return None
+    return max(float(error.retry_after), backoff * (2**attempt))
+
+
 def _request_key() -> str:
     """A name for one request, unique enough that a cancel finds only it.
 
@@ -1008,4 +1090,4 @@ def _batch_element(answer: Any) -> Any:
     return from_response(status, answer)
 
 
-__all__ = ["Client", "FunctionHandle", "connect", "NotFound"]
+__all__ = ["Client", "FunctionHandle", "connect"]

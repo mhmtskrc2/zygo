@@ -343,12 +343,34 @@ class DepsTests(unittest.TestCase):
                 {"error": "deps_xyz is still building", "code": "deps_building"},
             )
             with zygo.connect(api.url) as client:
-                with self.assertRaises(zygo.ZygoError) as raised:
+                with self.assertRaises(zygo.Unavailable) as raised:
                     client.serve_runtime("pool", {"image": "x"}, deps=self.ID)
                 self.assertIn("still building", str(raised.exception))
 
+        # Not a plain `ZygoError`: this one is safe to send again, and it
+        # says when. The five seconds are the host's, from `Retry-After`.
+        self.assertEqual(raised.exception.code, "deps_building")
+        self.assertEqual(raised.exception.retry_after, 5.0)
         sent = json.loads(api.requests[0]["raw"])
         self.assertEqual(sent["deps"], self.ID)
+
+    def test_a_pool_whose_warm_up_failed_is_unavailable_too(self) -> None:
+        with FakeApi() as api:
+            api.answer("POST", "/runtimes", 503, {"error": "zygote died", "code": "warm_failed"})
+            with zygo.connect(api.url) as client:
+                with self.assertRaises(zygo.Unavailable) as raised:
+                    client.serve_runtime("pool", {"image": "x"})
+        self.assertEqual(raised.exception.code, "warm_failed")
+        # No header this time, so the default a `Busy` gets.
+        self.assertEqual(raised.exception.retry_after, 1.0)
+
+    def test_a_stopping_api_is_unavailable_from_health(self) -> None:
+        with FakeApi() as api:
+            api.answer("GET", "/healthz", 503, {"ok": False, "status": "stopping", "uptime_s": 9})
+            with zygo.connect(api.url) as client:
+                with self.assertRaises(zygo.Unavailable) as raised:
+                    client.health()
+        self.assertIn("stopping", str(raised.exception))
 
 
 class ScriptTests(unittest.TestCase):
@@ -720,9 +742,241 @@ class OutcomeTests(unittest.TestCase):
         self.assertEqual(run.phase, "run")
 
 
+class RetryTests(unittest.TestCase):
+    """Opt-in retries: a refusal is sent again, a failure is not.
+
+    Off by default, because a retry is a decision about the caller's time
+    that the client should not make unasked. When it is on, only the two
+    errors that mean "the request never ran" qualify — `Busy` and
+    `Unavailable` — and the wait honours what the server asked for.
+    """
+
+    BUSY = (429, {"error": "busy", "in_flight": 2, "queued": 0, "limit": 2})
+
+    def test_a_refused_call_is_sent_again_and_the_answer_is_the_second_one(self) -> None:
+        with FakeApi() as api:
+            api.answer_then("POST", "/fn/f", [self.BUSY, self.BUSY, (200, OK_RESULT)], retry_after=0)
+            with zygo.connect(api.url, retries=3, backoff=0.01) as client:
+                out = client.call("f", {"n": 1})
+        self.assertEqual(out.result, {"size": [80, 60]})
+        self.assertEqual(len(api.requests), 3, "two refusals, then the answer")
+        # The same request each time: one caller, one event, one key.
+        self.assertEqual({json.dumps(r["body"]) for r in api.requests}, {'{"n": 1}'})
+
+    def test_the_wait_is_at_least_what_the_server_asked_for(self) -> None:
+        with FakeApi() as api:
+            api.answer_then("POST", "/fn/f", [self.BUSY, (200, OK_RESULT)], retry_after=0.3)
+            with zygo.connect(api.url, retries=1, backoff=0.0) as client:
+                started = time.monotonic()
+                client.call("f", {})
+                elapsed = time.monotonic() - started
+        # `Retry-After: 0.3` and no backoff of its own: the client slept the
+        # server's number, and not much more.
+        self.assertGreaterEqual(elapsed, 0.3)
+        self.assertLess(elapsed, 1.5)
+
+    def test_the_wait_grows_when_the_host_keeps_refusing(self) -> None:
+        with FakeApi() as api:
+            api.answer_then("POST", "/fn/f", [self.BUSY, self.BUSY, self.BUSY, (200, OK_RESULT)], retry_after=0)
+            with zygo.connect(api.url, retries=3, backoff=0.1) as client:
+                started = time.monotonic()
+                client.call("f", {})
+                elapsed = time.monotonic() - started
+        # 0.1, then 0.2, then 0.4: doubled each time, from the base.
+        self.assertGreaterEqual(elapsed, 0.7)
+        self.assertLess(elapsed, 2.0)
+
+    def test_retries_are_off_unless_asked_for(self) -> None:
+        with FakeApi() as api:
+            api.answer_then("POST", "/fn/f", [self.BUSY, (200, OK_RESULT)])
+            with zygo.connect(api.url) as client:
+                with self.assertRaises(zygo.Busy):
+                    client.call("f", {})
+        self.assertEqual(len(api.requests), 1)
+
+    def test_the_last_refusal_is_the_one_raised(self) -> None:
+        with FakeApi() as api:
+            api.answer("POST", "/fn/f", 429, self.BUSY[1], retry_after=0)
+            with zygo.connect(api.url, retries=2, backoff=0.0) as client:
+                with self.assertRaises(zygo.Busy):
+                    client.call("f", {})
+        self.assertEqual(len(api.requests), 3, "the first try and two retries")
+
+    def test_a_pool_waiting_on_a_build_is_retried(self) -> None:
+        with FakeApi() as api:
+            api.answer_then(
+                "POST",
+                "/runtimes",
+                [
+                    (503, {"error": "still building", "code": "deps_building"}),
+                    (200, {"name": "pool", "warm": 1, "change": "started"}),
+                ],
+                retry_after=0,
+            )
+            with zygo.connect(api.url, retries=1, backoff=0.01) as client:
+                served = client.serve_runtime("pool", {"image": "x"}, deps="deps_1")
+        self.assertEqual(served["warm"], 1)
+        self.assertEqual(len(api.requests), 2)
+
+    def test_a_handler_that_raised_is_never_sent_again(self) -> None:
+        # The one that matters. A handler that raised will raise again, and a
+        # request the deadline killed *ran*; sending either twice is how a
+        # side effect happens twice.
+        failed = {"error": "boom", "exit_code": 1, "stdout": "", "stderr": "Traceback"}
+        with FakeApi() as api:
+            api.answer_then("POST", "/fn/f", [(500, failed), (200, OK_RESULT)])
+            api.answer_then("POST", "/fn/slow", [(408, {"error": "timed out"}), (200, OK_RESULT)])
+            api.answer_then("POST", "/fn/gone", [(404, {"error": "no such"}), (200, OK_RESULT)])
+            with zygo.connect(api.url, retries=5, backoff=0.0) as client:
+                with self.assertRaises(zygo.HandlerError):
+                    client.call("f", {})
+                with self.assertRaises(zygo.Timeout):
+                    client.call("slow", {})
+                with self.assertRaises(zygo.NotFound):
+                    client.call("gone", {})
+        self.assertEqual(len(api.requests), 3, "each was sent exactly once")
+
+    def test_a_stream_refused_before_its_first_line_is_retried(self) -> None:
+        with FakeApi() as api:
+            api.answer("POST", "/fn/f", 429, self.BUSY[1], retry_after=0)
+            with zygo.connect(api.url, retries=1, backoff=0.01) as client:
+                with self.assertRaises(zygo.Busy):
+                    list(client.stream("f", {}))
+        self.assertEqual(len(api.requests), 2)
+        self.assertEqual(api.requests[1]["headers"]["accept"], "application/x-ndjson")
+
+    def test_the_async_client_retries_the_same_way(self) -> None:
+        async def exercise() -> None:
+            with FakeApi() as api:
+                api.answer_then("POST", "/fn/f", [self.BUSY, (200, OK_RESULT)], retry_after=0)
+                api.answer_then("POST", "/fn/bad", [(500, {"error": "boom", "exit_code": 1}), (200, {})])
+                async with zygo.aio.connect(api.url, retries=2, backoff=0.01) as client:
+                    out = await client.call("f", {})
+                    with self.assertRaises(zygo.HandlerError):
+                        await client.call("bad", {})
+                    with self.assertRaises(zygo.Busy):
+                        # Every answer is a refusal here: the last one is raised.
+                        api.answer("POST", "/fn/full", 429, self.BUSY[1], retry_after=0)
+                        await client.call("full", {})
+            self.assertEqual(out.result, {"size": [80, 60]})
+            by_path = {}
+            for r in api.requests:
+                by_path[r["path"]] = by_path.get(r["path"], 0) + 1
+            self.assertEqual(by_path, {"/fn/f": 2, "/fn/bad": 1, "/fn/full": 3})
+
+        asyncio.run(exercise())
+
+
 class AsyncTests(unittest.TestCase):
     """The asynchronous client is a second HTTP implementation, so it gets its
     own checks rather than being assumed to match."""
+
+    def test_it_has_the_same_methods_and_arguments_as_the_synchronous_one(self) -> None:
+        """Parity, held mechanically.
+
+        The async client used to be the calling half of the API and leave
+        administration to the plain one. Now it is the whole thing, and the
+        cheapest way to keep it there is to compare the two surfaces:
+        every public method, with the same parameter names in the same order.
+        """
+        import inspect
+
+        pairs = [
+            (zygo.Client, zygo.aio.AsyncClient),
+            (zygo.FunctionHandle, zygo.aio.AsyncFunctionHandle),
+        ]
+        for sync_type, async_type in pairs:
+            public = lambda t: {  # noqa: E731
+                n for n, v in inspect.getmembers(t) if not n.startswith("_") and callable(v)
+            }
+            self.assertEqual(public(sync_type), public(async_type), sync_type.__name__)
+            for name in sorted(public(sync_type)):
+                self.assertEqual(
+                    list(inspect.signature(getattr(sync_type, name)).parameters),
+                    list(inspect.signature(getattr(async_type, name)).parameters),
+                    f"{name} takes different arguments on the two clients",
+                )
+        self.assertEqual(
+            list(inspect.signature(zygo.connect).parameters),
+            list(inspect.signature(zygo.aio.connect).parameters),
+        )
+
+    def test_acting_for_a_tenant_is_a_header_on_the_same_connection(self) -> None:
+        async def exercise() -> None:
+            with FakeApi() as api:
+                api.answer("PUT", "/scripts", 200, {"sha256": "sha256:" + "a" * 64, "size": 3})
+                api.answer("POST", "/fn/f", 200, OK_RESULT)
+                async with zygo.aio.connect(api.url, token="op") as client:
+                    acme = client.for_tenant("acme")
+                    await acme.put_script("x=1")
+                    await client.call("f", {})
+                    # The view shares the pool, so closing the parent closes it.
+            self.assertEqual(api.requests[0]["headers"].get("x-zygo-tenant"), "acme")
+            self.assertEqual(api.requests[0]["headers"]["authorization"], "Bearer op")
+            self.assertNotIn("x-zygo-tenant", api.requests[1]["headers"])
+
+        asyncio.run(exercise())
+
+    def test_the_admin_routes_go_where_the_synchronous_ones_do(self) -> None:
+        async def exercise() -> None:
+            with FakeApi() as api:
+                api.answer("POST", "/tenants", 200, {"tenant": {"id": "acme", "created_ms": 1}})
+                api.answer("GET", "/tenants", 200, {"tenants": [{"id": "acme"}]})
+                api.answer("PATCH", "/tenants/acme/limits", 200, {"tenant": {"id": "acme", "limits": {"mem": "1G"}}})
+                api.answer("PUT", "/tenants/acme/secrets/KEY", 200, {"secrets": ["KEY"]})
+                api.answer("GET", "/tenants/acme/secrets", 200, {"secrets": ["KEY"]})
+                api.answer("POST", "/tenants/acme/tokens", 200, {"token": {"id": "t1", "tenant": "acme"}, "secret": "s3"})
+                api.answer("GET", "/tokens", 200, {"tokens": [{"id": "t1"}]})
+                api.answer("DELETE", "/tokens/t1", 200, {"revoked": True})
+                api.answer("PUT", "/blobs", 200, {"sha256": "sha256:" + "b" * 64, "size": 4})
+                api.answer("POST", "/drain", 200, {"drained": True, "in_flight": 0})
+                api.answer("DELETE", "/tenants/acme", 200, {"deleted": True})
+                async with zygo.aio.connect(api.url) as client:
+                    tenant = await client.create_tenant("acme")
+                    self.assertEqual(tenant.id, "acme")
+                    self.assertEqual([t.id for t in await client.tenants()], ["acme"])
+                    limited = await client.set_limits("acme", mem="1G")
+                    self.assertEqual(limited.limits["mem"], "1G")
+                    self.assertEqual(await client.put_secret("acme", "KEY", "v"), ["KEY"])
+                    self.assertEqual(await client.secrets("acme"), ["KEY"])
+                    minted = await client.mint_token("acme")
+                    self.assertEqual(minted.secret, "s3")
+                    self.assertEqual([t.id for t in await client.tokens()], ["t1"])
+                    self.assertTrue((await client.revoke_token("t1"))["revoked"])
+                    blob = await client.put_blob(b"\x00tar")
+                    self.assertEqual(blob.size, 4)
+                    self.assertEqual((await client.drain(grace=1.5))["in_flight"], 0)
+                    self.assertTrue((await client.delete_tenant("acme"))["deleted"])
+
+            by_route = {(r["method"], r["path"]): r for r in api.requests}
+            self.assertEqual(by_route[("PUT", "/tenants/acme/secrets/KEY")]["raw"], "v")
+            self.assertEqual(
+                by_route[("PUT", "/tenants/acme/secrets/KEY")]["headers"]["content-type"],
+                "text/plain; charset=utf-8",
+            )
+            self.assertEqual(by_route[("PUT", "/blobs")]["headers"]["content-type"], "application/octet-stream")
+            self.assertEqual(by_route[("PATCH", "/tenants/acme/limits")]["body"], {"mem": "1G"})
+            self.assertIn(("POST", "/drain?grace_ms=1500"), by_route)
+
+        asyncio.run(exercise())
+
+    def test_a_workspace_and_out_go_in_the_query_like_the_synchronous_client(self) -> None:
+        async def exercise() -> None:
+            digest = "sha256:" + "c" * 64
+            with FakeApi() as api:
+                api.answer("POST", "/fn/f", 200, OK_RESULT)
+                api.answer("POST", "/runtimes/py/call", 200, OK_RESULT)
+                async with zygo.aio.connect(api.url) as client:
+                    await client.call("f", {}, workspace=digest, out=True)
+                    await client.run_script("py", "x=1", workspace={"files": {}}, out=True)
+                    with self.assertRaises(zygo.SpecError):
+                        await client.call("f", {}, workspace="not-a-digest")
+            self.assertEqual(api.requests[0]["path"], f"/fn/f?workspace={digest}&out=1")
+            self.assertEqual(api.requests[1]["path"], "/runtimes/py/call?out=1")
+            self.assertEqual(api.requests[1]["body"]["workspace"], {"files": {}})
+            self.assertEqual(len(api.requests), 2, "a bad digest is refused before it is sent")
+
+        asyncio.run(exercise())
 
     def test_it_calls_and_parses_like_the_synchronous_one(self) -> None:
         async def exercise() -> None:

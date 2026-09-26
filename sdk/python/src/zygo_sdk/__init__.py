@@ -15,7 +15,14 @@ advance:
     r = client.run("python:3.12-slim", ["python3", "-c", "print(6*7)"])
     print(r.stdout)
 
-For an event loop, ``zygo.aio`` is the same API with every call a coroutine.
+For an event loop, ``zygo.aio`` is the same API with every call a coroutine:
+
+    async with zygo.aio.connect() as client:
+        out = await client.call("resize", {"url": "..."})
+
+A refused request — :class:`Busy`, or :class:`Unavailable` while the host is
+still building something — can be retried for you: ``zygo.connect(retries=3)``
+waits the server's ``Retry-After`` and sends it again. Off by default.
 
 This package talks to ``zygo api`` over HTTP — on a unix socket when the API is
 on this machine, which is the usual case and needs no token. It has no
@@ -38,6 +45,7 @@ from ._errors import (
     Stuck,
     Timeout,
     TransportError,
+    Unavailable,
     ZygoError,
 )
 from ._models import (
@@ -61,6 +69,7 @@ from ._sync import Client, FunctionHandle, connect
 __version__ = "0.1.1"
 
 __all__ = [
+    "aio",
     "Client",
     "FunctionHandle",
     "connect",
@@ -91,5 +100,20 @@ __all__ = [
     "Stuck",
     "Timeout",
     "TransportError",
+    "Unavailable",
     "ZygoError",
 ]
+
+
+def __getattr__(name: str):  # noqa: ANN202 - PEP 562, a module attribute
+    """``zygo_sdk.aio`` without a second import line.
+
+    Loaded on first use rather than here, so that ``import zygo_sdk`` does not
+    pull in :mod:`asyncio` for a script that never opens an event loop. Both
+    ``import zygo_sdk.aio`` and ``zygo_sdk.aio`` reach the same module.
+    """
+    if name == "aio":
+        from importlib import import_module
+
+        return import_module(".aio", __name__)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

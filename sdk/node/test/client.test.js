@@ -21,6 +21,7 @@ import {
   Stuck,
   Timeout,
   TransportError,
+  Unavailable,
   ZygoError,
   connect,
   parseEndpoint,
@@ -462,11 +463,156 @@ test('a pool on a dependency set that is still building is told to retry', async
   });
   const client = connect(api.url, { token: null });
   try {
+    // Not a plain `ZygoError`: this one is safe to send again, and it says
+    // when. The five seconds are the host's, from `Retry-After`.
     await assert.rejects(
       () => client.serveRuntime('pool', { image: 'node:22-slim' }, { deps: id }),
-      /still building/
+      (e) => e instanceof Unavailable && /still building/.test(e.message) && e.code === 'deps_building' && e.retryAfter === 5
     );
     assert.equal(JSON.parse(api.requests[0].raw).deps, id);
+  } finally {
+    client.close();
+    await api.close();
+  }
+});
+
+test('a stopping API is unavailable from health, and says so', async () => {
+  const api = await FakeApi.start();
+  api.answer('GET', '/healthz', 503, { ok: false, status: 'stopping', uptime_s: 9 });
+  const client = connect(api.url, { token: null });
+  try {
+    await assert.rejects(
+      () => client.health(),
+      (e) => e instanceof Unavailable && /stopping/.test(e.message) && e.retryAfter === 1
+    );
+  } finally {
+    client.close();
+    await api.close();
+  }
+});
+
+// ---- retries: a refusal is sent again, a failure is not ---------------------
+//
+// Off by default, because a retry is a decision about the caller's time that
+// the client should not make unasked. When it is on, only the two errors that
+// mean "the request never ran" qualify — `Busy` and `Unavailable` — and the
+// wait honours what the server asked for.
+
+const BUSY = [429, { error: 'busy', in_flight: 2, queued: 0, limit: 2 }];
+
+test('a refused call is sent again, and the answer is the second one', async () => {
+  const api = await FakeApi.start();
+  api.answerThen('POST', '/fn/f', [BUSY, BUSY, [200, OK_RESULT]], 0);
+  const client = connect(api.url, { token: null, retries: 3, backoff: 0.01 });
+  try {
+    const out = await client.call('f', { n: 1 });
+    assert.deepEqual(out.result, { size: [80, 60] });
+    assert.equal(api.requests.length, 3, 'two refusals, then the answer');
+    // The same request each time: one caller, one event.
+    assert.deepEqual(new Set(api.requests.map((r) => r.raw)), new Set(['{"n":1}']));
+  } finally {
+    client.close();
+    await api.close();
+  }
+});
+
+test('the wait is at least what the server asked for, and grows on repeats', async () => {
+  const api = await FakeApi.start();
+  api.answerThen('POST', '/fn/f', [BUSY, [200, OK_RESULT]], 0.3);
+  api.answerThen('POST', '/fn/g', [BUSY, BUSY, BUSY, [200, OK_RESULT]], 0);
+  const client = connect(api.url, { token: null, retries: 3, backoff: 0 });
+  try {
+    let started = performance.now();
+    await client.call('f', {});
+    let elapsed = (performance.now() - started) / 1000;
+    // `Retry-After: 0.3` and no backoff of its own: the server's number.
+    assert.ok(elapsed >= 0.29 && elapsed < 1.5, `waited ${elapsed}s`);
+
+    client.backoff = 0.1;
+    started = performance.now();
+    await client.call('g', {});
+    elapsed = (performance.now() - started) / 1000;
+    // 0.1, then 0.2, then 0.4: doubled each time, from the base.
+    assert.ok(elapsed >= 0.69 && elapsed < 2, `waited ${elapsed}s`);
+  } finally {
+    client.close();
+    await api.close();
+  }
+});
+
+test('retries are off unless asked for, and the last refusal is the one thrown', async () => {
+  const api = await FakeApi.start();
+  api.answerThen('POST', '/fn/f', [BUSY, [200, OK_RESULT]], 0);
+  api.answer('POST', '/fn/full', ...BUSY, 0);
+  const off = connect(api.url, { token: null });
+  const on = connect(api.url, { token: null, retries: 2, backoff: 0 });
+  try {
+    await assert.rejects(() => off.call('f', {}), Busy);
+    assert.equal(api.requests.length, 1);
+    await assert.rejects(() => on.call('full', {}), Busy);
+    assert.equal(api.requests.length, 4, 'the first try and two retries');
+  } finally {
+    off.close();
+    on.close();
+    await api.close();
+  }
+});
+
+test('a pool waiting on a build is retried, through the tenant view too', async () => {
+  const api = await FakeApi.start();
+  api.answerThen(
+    'POST',
+    '/runtimes',
+    [
+      [503, { error: 'still building', code: 'deps_building' }],
+      [200, { name: 'pool', warm: 1, change: 'started' }],
+    ],
+    0
+  );
+  const client = connect(api.url, { token: null, retries: 1, backoff: 0.01 });
+  try {
+    const served = await client.forTenant('acme').serveRuntime('pool', { image: 'x' }, { deps: 'deps_1' });
+    assert.equal(served.warm, 1);
+    assert.equal(api.requests.length, 2);
+    assert.equal(api.requests[1].headers['x-zygo-tenant'], 'acme');
+  } finally {
+    client.close();
+    await api.close();
+  }
+});
+
+test('a handler that threw is never sent again', async () => {
+  // The one that matters. A handler that threw will throw again, and a
+  // request the deadline killed *ran*; sending either twice is how a side
+  // effect happens twice.
+  const api = await FakeApi.start();
+  api.answerThen('POST', '/fn/f', [[500, { error: 'boom', exit_code: 1, stdout: '', stderr: 'Trace' }], [200, OK_RESULT]]);
+  api.answerThen('POST', '/fn/slow', [[408, { error: 'timed out' }], [200, OK_RESULT]]);
+  api.answerThen('POST', '/fn/gone', [[404, { error: 'no such' }], [200, OK_RESULT]]);
+  const client = connect(api.url, { token: null, retries: 5, backoff: 0 });
+  try {
+    await assert.rejects(() => client.call('f', {}), HandlerError);
+    await assert.rejects(() => client.call('slow', {}), Timeout);
+    await assert.rejects(() => client.call('gone', {}), NotFound);
+    assert.equal(api.requests.length, 3, 'each was sent exactly once');
+  } finally {
+    client.close();
+    await api.close();
+  }
+});
+
+test('a stream refused before its first line is retried', async () => {
+  const api = await FakeApi.start();
+  api.answerThen('POST', '/fn/f', [BUSY, [200, OK_RESULT]], 0);
+  api.stream('POST', '/fn/g', [{ stream: 'stdout', data: 'hi\n' }, { status: 200, ...OK_RESULT }]);
+  const client = connect(api.url, { token: null, retries: 1, backoff: 0.01 });
+  try {
+    // The refusal is a JSON answer; the retry is the same streaming request.
+    const events = [];
+    for await (const event of client.stream('f', {})) events.push(event.kind);
+    assert.deepEqual(events, ['result']);
+    assert.equal(api.requests.length, 2);
+    assert.equal(api.requests[1].headers.accept, 'application/x-ndjson');
   } finally {
     client.close();
     await api.close();

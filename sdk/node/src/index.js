@@ -14,6 +14,10 @@
  *
  *     const r = await client.run('node:22-slim', ['node', '-e', 'console.log(6*7)']);
  *
+ * A refused request — {@link Busy}, or {@link Unavailable} while the host is
+ * still building something — can be retried for you: `connect(url, { retries:
+ * 3 })` waits the server's `Retry-After` and sends it again. Off by default.
+ *
  * This package talks to `zygo api` over HTTP — on a unix socket when the API
  * is on this machine, which is the usual case and needs no token. It has no
  * dependencies, and `node:http` handles both transports and connection reuse,
@@ -40,6 +44,7 @@ import {
   Stuck,
   Timeout,
   TransportError,
+  Unavailable,
   ZygoError,
   fromResponse,
 } from './errors.js';
@@ -55,6 +60,7 @@ export {
   Stuck,
   Timeout,
   TransportError,
+  Unavailable,
   ZygoError,
   parse as parseEndpoint,
 };
@@ -65,12 +71,22 @@ export {
  */
 const MAX_BODY = 64 * 1024 * 1024;
 
-/** A connection to a Zygo API. */
+/**
+ * A connection to a Zygo API.
+ *
+ * `retries` is how many times a *refused* request is sent again before its
+ * error reaches you: a {@link Busy} (the pool was full) or an
+ * {@link Unavailable} (the host is still building or warming something). Both
+ * mean the request never ran, which is what makes sending it again safe.
+ * Nothing else is retried — a handler that threw will throw again, and a
+ * request the deadline killed did run. Off by default. Each wait is the longer
+ * of the server's `Retry-After` and `backoff` seconds doubled per attempt.
+ */
 export class Client {
   /**
    * @param {string} [url]
-   * @param {{token?: string|null, timeout?: number, tenant?: string|null,
-   *          agent?: import('http').Agent}} [options]
+   * @param {{token?: string|null, timeout?: number, retries?: number, backoff?: number,
+   *          tenant?: string|null, agent?: import('http').Agent}} [options]
    */
   constructor(url, options = {}) {
     this.endpoint = resolve(url);
@@ -81,6 +97,8 @@ export class Client {
     // is the function's own `timeout` and the supervisor enforces it, so a
     // client that gives up first only loses the answer.
     this.timeout = options.timeout ?? 300_000;
+    this.retries = Math.max(0, Math.floor(options.retries ?? 0));
+    this.backoff = Math.max(0, options.backoff ?? 1);
     /** Sent as `X-Zygo-Tenant`; set by {@link Client#forTenant}. */
     this._tenantId = options.tenant ?? null;
 
@@ -229,9 +247,17 @@ export class Client {
     if (key) headers['x-zygo-request-key'] = key;
     const stop = this.#onAbort(options.signal, key);
     try {
-      const response = await this.#open('POST', path, body, headers);
-      if ((response.statusCode ?? 0) >= 400) {
-        throw fromResponse(response.statusCode ?? 0, await readJson(response), 1);
+      let response;
+      for (let attempt = 0; ; attempt += 1) {
+        response = await this.#open('POST', path, body, headers);
+        if ((response.statusCode ?? 0) < 400) break;
+        // A refusal — a bad token, no such function — is an ordinary JSON
+        // answer with a status, not a stream. Nothing has been yielded yet,
+        // so a refusal that is safe to send again is sent again.
+        const error = fromResponse(response.statusCode ?? 0, await readJson(response), retryAfterOf(response));
+        const wait = this.#retryWait(error, attempt);
+        if (wait === null) throw error;
+        await sleep(wait);
       }
       for await (const line of lines(response)) {
         const raw = JSON.parse(line);
@@ -569,6 +595,8 @@ export class Client {
     return new Client(this.endpoint.url, {
       token: this.token,
       timeout: this.timeout,
+      retries: this.retries,
+      backoff: this.backoff,
       tenant: id,
       agent: this._agent,
     });
@@ -772,10 +800,10 @@ export class Client {
     });
   }
 
-  #request(method, path, { body = undefined, headers = {}, authenticated = true, rawBody = undefined, binary = false } = {}) {
-    // `rawBody` is for the one route whose body is not JSON: a script is a
-    // file, and wrapping its bytes in a JSON string to unwrap them again is a
-    // transformation with no reader.
+  async #request(method, path, { body = undefined, headers = {}, authenticated = true, rawBody = undefined, binary = false } = {}) {
+    // `rawBody` is for the routes whose body is not JSON: a script is a file
+    // and a blob is a tar, and wrapping either in a JSON string to unwrap it
+    // again is a transformation with no reader.
     const payload = rawBody !== undefined ? rawBody : body === undefined ? null : Buffer.from(JSON.stringify(body));
     const sent = { accept: 'application/json', ...headers };
     if (payload !== null) {
@@ -790,6 +818,34 @@ export class Client {
     if (authenticated && this.token) sent.authorization = `Bearer ${this.token}`;
     if (this._tenantId) sent['x-zygo-tenant'] = this._tenantId;
 
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await this.#exchange(method, path, payload, sent);
+      } catch (error) {
+        const wait = this.#retryWait(error, attempt);
+        if (wait === null) throw error;
+        await sleep(wait);
+      }
+    }
+  }
+
+  /**
+   * How long to wait before sending a refused request again, in seconds, or
+   * `null` when it should not be sent again.
+   *
+   * Only a refusal qualifies — the request never ran — and only while
+   * `retries` allows. The wait honours the server's `Retry-After`: it never
+   * sleeps less than that, and it grows past it on repeated refusals so a
+   * client does not hammer a host that keeps saying no.
+   */
+  #retryWait(error, attempt) {
+    if (attempt >= this.retries) return null;
+    if (!(error instanceof Busy) && !(error instanceof Unavailable)) return null;
+    return Math.max(Number(error.retryAfter) || 0, this.backoff * 2 ** attempt);
+  }
+
+  /** One request and its answer, on a pooled connection. */
+  #exchange(method, path, payload, sent) {
     const options = {
       method,
       path,
@@ -819,9 +875,8 @@ export class Client {
         });
         response.on('end', () => {
           const raw = Buffer.concat(chunks).toString('utf8');
-          const retryAfter = Number(response.headers['retry-after']) || 1;
           try {
-            resolvePromise(decode(response.statusCode ?? 0, raw, retryAfter));
+            resolvePromise(decode(response.statusCode ?? 0, raw, retryAfterOf(response)));
           } catch (e) {
             reject(e);
           }
@@ -855,6 +910,26 @@ export function connect(url, options = {}) {
 }
 
 // ---- parsing ----------------------------------------------------------
+
+/**
+ * `setTimeout` as a promise, in seconds. The timer keeps the process alive on
+ * purpose: a script whose only pending work is a retry must not exit before
+ * sending it.
+ */
+function sleep(seconds) {
+  return new Promise((resolvePromise) => setTimeout(resolvePromise, Math.round(seconds * 1000)));
+}
+
+/**
+ * The server's `Retry-After` in seconds, or 1 when it sent none. `0` is a
+ * value — "now" — and not the absence of one, which `Number(h) || 1` got wrong.
+ */
+function retryAfterOf(response) {
+  const header = response.headers['retry-after'];
+  if (header === undefined || header === '') return 1;
+  const seconds = Number(header);
+  return Number.isFinite(seconds) && seconds >= 0 ? seconds : 1;
+}
 
 function decode(status, raw, retryAfter) {
   let body;

@@ -36,15 +36,47 @@ class Recorder:
     def __init__(self) -> None:
         self.requests: List[Dict[str, Any]] = []
         self.connections = 0
-        self.answers: Dict[Tuple[str, str], Tuple[int, Any]] = {}
+        self.answers: Dict[Tuple[str, str], Any] = {}
         self.delay = 0.0
         # Close each connection after answering, without saying so — what a
         # server that drops idle keep-alive connections looks like to a client.
         self.hang_up = False
         self.lock = threading.Lock()
 
-    def answer(self, method: str, path: str, status: int, body: Any) -> None:
-        self.answers[(method, path)] = (status, body)
+    def answer(
+        self,
+        method: str,
+        path: str,
+        status: int,
+        body: Any,
+        retry_after: Optional[float] = None,
+    ) -> None:
+        """Answer this route the same way every time.
+
+        ``retry_after`` sets the header; left out, it is what the real API
+        sends — one second on a 429, five while dependencies build.
+        """
+        self.answers[(method, path)] = (status, body, retry_after)
+
+    def answer_then(
+        self,
+        method: str,
+        path: str,
+        answers: List[Tuple[int, Any]],
+        retry_after: Optional[float] = None,
+    ) -> None:
+        """Answer this route with each of ``answers`` in turn, then keep
+        giving the last one — a host that refuses twice and then accepts."""
+        self.answers[(method, path)] = [(status, body, retry_after) for status, body in answers]
+
+    def next_answer(self, key: Tuple[str, str]) -> Tuple[int, Any, Optional[float]]:
+        with self.lock:
+            planned = self.answers.get(key)
+            if planned is None:
+                return 404, {"error": f"no route {key[1]}"}, None
+            if isinstance(planned, list):
+                return planned.pop(0) if len(planned) > 1 else planned[0]
+            return planned
 
     def stream(self, method: str, path: str, lines: List[Any], gap: float = 0.0) -> None:
         """Answer this route with NDJSON, one object per line.
@@ -52,7 +84,7 @@ class Recorder:
         `gap` is the pause between lines: with one, a test can tell a client
         that yields as lines arrive from one that waits for the last.
         """
-        self.answers[(method, path)] = (200, _Ndjson(lines, gap))
+        self.answers[(method, path)] = (200, _Ndjson(lines, gap), None)
 
 
 def _handler(recorder: Recorder):
@@ -89,7 +121,7 @@ def _handler(recorder: Recorder):
                 time.sleep(recorder.delay)
 
             key = (method, self.path.split("?", 1)[0])
-            status, body = recorder.answers.get(key, (404, {"error": f"no route {self.path}"}))
+            status, body, retry_after = recorder.next_answer(key)
 
             # A stream is chunked and written a line at a time, like the real
             # API's: a test that received one whole buffer could not tell a
@@ -115,8 +147,14 @@ def _handler(recorder: Recorder):
             self.send_response(status)
             self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(payload)))
-            if status == 429:
-                self.send_header("retry-after", "3")
+            # What the real API sends: a second on backpressure, five while a
+            # dependency set builds, and nothing on any other refusal.
+            if retry_after is None and status == 429:
+                retry_after = 3
+            if retry_after is None and isinstance(body, dict) and body.get("code") == "deps_building":
+                retry_after = 5
+            if retry_after is not None:
+                self.send_header("retry-after", f"{retry_after:g}")
             self.end_headers()
             self.wfile.write(payload)
             if recorder.hang_up:
@@ -133,6 +171,9 @@ def _handler(recorder: Recorder):
 
         def do_DELETE(self) -> None:  # noqa: N802, D102
             self._serve("DELETE")
+
+        def do_PATCH(self) -> None:  # noqa: N802, D102
+            self._serve("PATCH")
 
     return Handler
 
@@ -183,8 +224,24 @@ class FakeApi:
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
 
-    def answer(self, method: str, path: str, status: int, body: Any) -> None:
-        self.recorder.answer(method, path, status, body)
+    def answer(
+        self,
+        method: str,
+        path: str,
+        status: int,
+        body: Any,
+        retry_after: Optional[float] = None,
+    ) -> None:
+        self.recorder.answer(method, path, status, body, retry_after)
+
+    def answer_then(
+        self,
+        method: str,
+        path: str,
+        answers: List[Tuple[int, Any]],
+        retry_after: Optional[float] = None,
+    ) -> None:
+        self.recorder.answer_then(method, path, answers, retry_after)
 
     def stream(self, method: str, path: str, lines: List[Any], gap: float = 0.0) -> None:
         self.recorder.stream(method, path, lines, gap)

@@ -3,7 +3,8 @@
 
 Agent frameworks are asynchronous, and a tool that blocks the event loop for
 the length of a sandbox request is not usable inside one. This is the same API
-as :mod:`zygo`, with every call a coroutine.
+as :mod:`zygo_sdk`, with every call a coroutine: the same method names, the
+same arguments, the same exceptions. A test in the suite holds the two to that.
 
 The HTTP/1.1 here is written out rather than taken from a library, for the same
 reason the synchronous client uses :mod:`http.client`: no dependencies. That is
@@ -21,8 +22,21 @@ import os
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 from ._endpoint import Endpoint, resolve
-from ._errors import TransportError, ZygoError, from_response
-from ._models import Deps, Event, Function, LogPage, Result, Run, Runtime, Script, Served
+from ._errors import Busy, TransportError, Unavailable, ZygoError, from_response
+from ._models import (
+    Deps,
+    Event,
+    Function,
+    LogPage,
+    Minted,
+    Result,
+    Run,
+    Runtime,
+    Script,
+    Served,
+    Tenant,
+    Token,
+)
 from ._sync import (
     MAX_BODY,
     _batch_element,
@@ -32,7 +46,9 @@ from ._sync import (
     _escape_digest,
     _request_key,
     _retry_after,
+    _retry_wait,
     _timeout_header,
+    _workspace_query,
 )
 
 _Connection = Tuple[asyncio.StreamReader, asyncio.StreamWriter]
@@ -44,6 +60,10 @@ class AsyncClient:
     Safe to share between tasks: connections are pooled and one is held for the
     duration of each request, so concurrent callers become concurrent sandbox
     requests rather than a queue behind one socket.
+
+    ``timeout``, ``retries`` and ``backoff`` mean what they mean on
+    :class:`~zygo_sdk.Client`. A retry waits with ``asyncio.sleep``, so the
+    loop keeps running while it does.
     """
 
     def __init__(
@@ -52,13 +72,19 @@ class AsyncClient:
         *,
         token: Optional[str] = None,
         timeout: float = 300.0,
+        retries: int = 0,
+        backoff: float = 1.0,
     ) -> None:
         self.endpoint: Endpoint = resolve(url)
         self.token = token if token is not None else os.environ.get("ZYGO_API_TOKEN")
         self.timeout = timeout
+        self.retries = max(0, int(retries))
+        self.backoff = max(0.0, float(backoff))
         self._idle: List[_Connection] = []
         self._lock = asyncio.Lock()
         self._closed = False
+        #: Set by :meth:`for_tenant`; sent as ``X-Zygo-Tenant`` on every call.
+        self._tenant: Optional[str] = None
 
     # ---- lifecycle ----------------------------------------------------
 
@@ -83,6 +109,11 @@ class AsyncClient:
     async def health(self) -> Dict[str, Any]:
         return await self._request("GET", "/healthz", authenticated=False)
 
+    async def drain(self, grace: float = 30.0) -> Dict[str, Any]:
+        """Stop admitting, let what is running finish, then exit. See
+        :meth:`zygo_sdk.Client.drain`."""
+        return await self._request("POST", f"/drain?grace_ms={int(grace * 1000)}")
+
     async def functions(self) -> List[Function]:
         body = await self._request("GET", "/fn")
         return [Function.parse(f) for f in body.get("functions", [])]
@@ -100,6 +131,8 @@ class AsyncClient:
         *,
         timeout: Optional[float] = None,
         key: Optional[str] = None,
+        workspace: Optional[str] = None,
+        out: bool = False,
     ) -> Result:
         """Call a warm function.
 
@@ -111,13 +144,19 @@ class AsyncClient:
         *with the answer*, which is too late to stop the call it belongs to.
 
         Pass ``key`` to choose the name yourself; otherwise one is generated.
+        ``workspace`` names a blob from :meth:`put_blob` to unpack into the
+        sandbox, and ``out=True`` asks for the sandbox's ``/out`` back, as a
+        tar on the result; see :meth:`zygo_sdk.Client.call`.
         """
         key = key or _request_key()
         headers = _timeout_header(timeout)
         headers["x-zygo-request-key"] = key
         try:
             body = await self._request(
-                "POST", f"/fn/{_escape(name)}", body=event, headers=headers
+                "POST",
+                f"/fn/{_escape(name)}{_workspace_query(workspace, out)}",
+                body=event,
+                headers=headers,
             )
         except asyncio.CancelledError:
             await self._cancel_quietly(key)
@@ -125,7 +164,7 @@ class AsyncClient:
         return Result.parse(body)
 
     async def cancel(self, request_id: str) -> Dict[str, Any]:
-        """Stop a request that is running. See :meth:`zygo.Client.cancel`."""
+        """Stop a request that is running. See :meth:`zygo_sdk.Client.cancel`."""
         return await self._request("DELETE", f"/requests/{_escape(request_id)}")
 
     async def stream(
@@ -139,7 +178,7 @@ class AsyncClient:
         """Call a function and yield its output as it is produced.
 
         An async iterator of :class:`~zygo_sdk._models.Event`; see
-        :meth:`zygo.Client.stream` for what the items are.
+        :meth:`zygo_sdk.Client.stream` for what the items are.
 
         Cancelling the task cancels the request, like :meth:`call` — the key
         is generated for you when you do not pass one.
@@ -196,18 +235,36 @@ class AsyncClient:
         }
         if self.token:
             sent["authorization"] = f"Bearer {self.token}"
+        if self._tenant:
+            sent["x-zygo-tenant"] = self._tenant
         sent.update(headers)
         head = f"POST {path} HTTP/1.1\r\n"
         head += "".join(f"{k}: {v}\r\n" for k, v in sent.items())
         head += "\r\n"
 
+        attempt = 0
         reader, writer = await self._open()
         try:
-            writer.write(head.encode("latin-1") + payload)
-            await writer.drain()
-            status, response_headers = await _read_head(reader)
-            if status >= 400:
-                raise from_response(status, _body(await _read_body(reader, response_headers)))
+            while True:
+                writer.write(head.encode("latin-1") + payload)
+                await writer.drain()
+                status, response_headers = await _read_head(reader)
+                if status < 400:
+                    break
+                error = from_response(
+                    status,
+                    _body(await _read_body(reader, response_headers)),
+                    _retry_after(response_headers.get("retry-after")),
+                )
+                wait = _retry_wait(self.retries, self.backoff, error, attempt)
+                if wait is None:
+                    raise error
+                # Nothing has been yielded yet: the same request again, on a
+                # fresh connection, after the wait the refusal asked for.
+                await _shut(writer)
+                await asyncio.sleep(wait)
+                attempt += 1
+                reader, writer = await self._open()
             async for line in _ndjson(reader, response_headers):
                 event = Event.parse(_body(line))
                 yield event
@@ -300,6 +357,97 @@ class AsyncClient:
         body = await self._request("POST", "/run", body={"layer": described, "stdin": stdin})
         return Run.parse(body)
 
+    async def create_tenant(self, id: str) -> Tenant:
+        """Register a customer, or find the one already registered. See
+        :meth:`zygo_sdk.Client.create_tenant`."""
+        body = await self._request("POST", "/tenants", body={"id": id})
+        return Tenant.parse(body.get("tenant") or {})
+
+    async def tenants(self) -> List[Tenant]:
+        """Every tenant this host holds. Operator-only."""
+        body = await self._request("GET", "/tenants")
+        return [Tenant.parse(t) for t in body.get("tenants", [])]
+
+    async def tenant(self, id: str) -> Tenant:
+        """One tenant. Raises :class:`~zygo_sdk.NotFound` if there is no such id."""
+        body = await self._request("GET", f"/tenants/{_escape(id)}")
+        return Tenant.parse(body.get("tenant") or {})
+
+    async def delete_tenant(self, id: str) -> Dict[str, Any]:
+        """Forget a tenant: stop its work, then remove the scripts only it
+        had. See :meth:`zygo_sdk.Client.delete_tenant`."""
+        return await self._request("DELETE", f"/tenants/{_escape(id)}")
+
+    async def put_blob(self, tar: bytes) -> Script:
+        """Store a tar this host will hold under its digest. See
+        :meth:`zygo_sdk.Client.put_blob`."""
+        body = await self._request("PUT", "/blobs", raw_body=tar, binary=True)
+        return Script.parse(body)
+
+    async def blob(self, digest: str) -> Script:
+        """Whether this host holds a blob, and how big it is."""
+        return Script.parse(await self._request("GET", f"/blobs/{_escape_digest(digest)}"))
+
+    async def delete_blob(self, digest: str) -> bool:
+        """Forget a blob. Operator-only: the store is shared by digest."""
+        body = await self._request("DELETE", f"/blobs/{_escape_digest(digest)}")
+        return bool(body.get("deleted", False))
+
+    async def set_limits(self, tenant: str, **limits: Any) -> Tenant:
+        """What a tenant may not exceed. See :meth:`zygo_sdk.Client.set_limits`."""
+        body = await self._request(
+            "PATCH", f"/tenants/{_escape(tenant)}/limits", body=dict(limits)
+        )
+        return Tenant.parse(body.get("tenant") or {})
+
+    async def put_secret(self, tenant: str, name: str, value: str) -> List[str]:
+        """Store one of a tenant's secrets, and get back their names. See
+        :meth:`zygo_sdk.Client.put_secret`."""
+        body = await self._request(
+            "PUT",
+            f"/tenants/{_escape(tenant)}/secrets/{_escape(name)}",
+            raw_body=value.encode(),
+        )
+        return list(body.get("secrets", []))
+
+    async def secrets(self, tenant: str) -> List[str]:
+        """The **names** a tenant has. There is no way to read a value back."""
+        body = await self._request("GET", f"/tenants/{_escape(tenant)}/secrets")
+        return list(body.get("secrets", []))
+
+    async def delete_secret(self, tenant: str, name: str) -> List[str]:
+        """Forget one. Operator-only, and needs deploy rights."""
+        body = await self._request(
+            "DELETE", f"/tenants/{_escape(tenant)}/secrets/{_escape(name)}"
+        )
+        return list(body.get("secrets", []))
+
+    async def mint_token(self, tenant: Optional[str] = None) -> Minted:
+        """Mint an API token, and get its secret — once. See
+        :meth:`zygo_sdk.Client.mint_token`."""
+        path = "/tokens" if tenant is None else f"/tenants/{_escape(tenant)}/tokens"
+        return Minted.parse(await self._request("POST", path))
+
+    async def tokens(self) -> List[Token]:
+        """Every token this host holds, revoked ones included. Never a secret."""
+        body = await self._request("GET", "/tokens")
+        return [Token.parse(t) for t in body.get("tokens", [])]
+
+    async def revoke_token(self, id: str) -> Dict[str, Any]:
+        """Revoke one, from the next request onwards."""
+        return await self._request("DELETE", f"/tokens/{_escape(id)}")
+
+    def for_tenant(self, id: str) -> "AsyncClient":
+        """A view of this client that acts for one tenant.
+
+        A header on the same connection pool, not a second client; see
+        :meth:`zygo_sdk.Client.for_tenant`. Closing either closes both.
+        """
+        view = AsyncClient.__new__(AsyncClient)
+        view.__dict__.update(self.__dict__)
+        view._tenant = id
+        return view
+
     async def serve_runtime(
         self,
         name: str,
@@ -332,22 +480,27 @@ class AsyncClient:
         entry_point: Optional[str] = None,
         timeout: Optional[float] = None,
         key: Optional[str] = None,
+        workspace: Optional[Dict[str, Any]] = None,
+        out: bool = False,
     ) -> Result:
         """Run one script in a pool. Cancelling the task cancels the request;
-        see :meth:`call`."""
+        see :meth:`call`. ``workspace`` and ``out`` are as on
+        :meth:`zygo_sdk.Client.run_script`."""
         payload: Dict[str, Any] = {
             "script": script if script.startswith("sha256:") else {"source": script},
             "event": event,
         }
         if entry_point is not None:
             payload["entry_point"] = entry_point
+        if workspace is not None:
+            payload["workspace"] = dict(workspace)
         key = key or _request_key()
         headers = _timeout_header(timeout)
         headers["x-zygo-request-key"] = key
         try:
             body = await self._request(
                 "POST",
-                f"/runtimes/{_escape(runtime)}/call",
+                f"/runtimes/{_escape(runtime)}/call{'?out=1' if out else ''}",
                 body=payload,
                 headers=headers,
             )
@@ -405,12 +558,14 @@ class AsyncClient:
         headers: Optional[Dict[str, str]] = None,
         authenticated: bool = True,
         raw_body: Optional[bytes] = None,
+        binary: bool = False,
     ) -> Any:
         if self._closed:
             raise ZygoError("this client has been closed")
 
-        # `raw_body` is for the one route whose body is not JSON: see the
-        # synchronous client, which says why a script travels as itself.
+        # `raw_body` is for the routes whose body is not JSON: see the
+        # synchronous client, which says why a script travels as itself and
+        # why a tar says it is binary.
         payload = raw_body if raw_body is not None else (
             b"" if body is None else json.dumps(body).encode()
         )
@@ -420,20 +575,37 @@ class AsyncClient:
             "content-length": str(len(payload)),
         }
         if raw_body is not None:
-            sent["content-type"] = "text/plain; charset=utf-8"
+            sent["content-type"] = (
+                "application/octet-stream" if binary else "text/plain; charset=utf-8"
+            )
         elif body is not None:
             sent["content-type"] = "application/json"
         if authenticated and self.token:
             sent["authorization"] = f"Bearer {self.token}"
+        if self._tenant:
+            sent["x-zygo-tenant"] = self._tenant
         sent.update(headers or {})
 
         head = f"{method} {path} HTTP/1.1\r\n"
         head += "".join(f"{k}: {v}\r\n" for k, v in sent.items())
         head += "\r\n"
 
+        attempt = 0
+        while True:
+            try:
+                return await self._exchange(method, path, head.encode("latin-1") + payload)
+            except (Busy, Unavailable) as error:
+                wait = _retry_wait(self.retries, self.backoff, error, attempt)
+                if wait is None:
+                    raise
+                await asyncio.sleep(wait)
+                attempt += 1
+
+    async def _exchange(self, method: str, path: str, message: bytes) -> Any:
+        """One request and its answer, on a pooled connection."""
         reader, writer = await self._take()
         try:
-            writer.write(head.encode("latin-1") + payload)
+            writer.write(message)
             await writer.drain()
             status, response_headers, raw = await asyncio.wait_for(
                 _read_response(reader), timeout=self.timeout
@@ -523,13 +695,20 @@ class AsyncFunctionHandle:
         return f"<zygo async function {self.name!r}>"
 
 
-def connect(url: Optional[str] = None, *, token: Optional[str] = None, timeout: float = 300.0) -> AsyncClient:
+def connect(
+    url: Optional[str] = None,
+    *,
+    token: Optional[str] = None,
+    timeout: float = 300.0,
+    retries: int = 0,
+    backoff: float = 1.0,
+) -> AsyncClient:
     """Open an asynchronous client.
 
     Not a coroutine: nothing is connected until the first call, so there is
-    nothing to await here and ``async with zygo.aio.connect() as c`` works.
+    nothing to await here and ``async with zygo_sdk.aio.connect() as c`` works.
     """
-    return AsyncClient(url, token=token, timeout=timeout)
+    return AsyncClient(url, token=token, timeout=timeout, retries=retries, backoff=backoff)
 
 
 # ---- a small HTTP/1.1 reader -----------------------------------------

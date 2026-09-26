@@ -53,6 +53,28 @@ export class Busy extends ZygoError {
 }
 
 /**
+ * The host cannot do this *yet*: a 503, and nothing about the request needs
+ * changing.
+ *
+ * Three things answer this way. A pool named against a dependency set that is
+ * still building (`code === 'deps_building'`, with a `retryAfter` of a few
+ * seconds from the host); a function whose zygote failed to warm
+ * (`code === 'warm_failed'`); and an API that is draining, which is what
+ * `health()` throws once the supervisor is stopping.
+ *
+ * Like {@link Busy}, the request never ran, so sending it again is safe.
+ * Unlike {@link Busy} it is not backpressure: the wait is for something the
+ * host is doing, not for room.
+ */
+export class Unavailable extends ZygoError {
+  constructor(message, { code = '', retryAfter = 1 } = {}) {
+    super(message);
+    this.code = code;
+    this.retryAfter = retryAfter;
+  }
+}
+
+/**
  * The request exceeded the function's timeout and was killed.
  *
  * Zygo's supervisor records that *it* killed the request rather than inferring
@@ -162,6 +184,14 @@ export function fromResponse(status, body, retryAfter = 1) {
       limit: Number(body?.limit ?? 0),
       retryAfter,
     });
+  }
+  if (status === 503) {
+    // `/healthz` says `status: stopping` and carries no `error`.
+    const said =
+      body?.error === undefined && body?.message === undefined && body?.status
+        ? `the API is ${body.status}`
+        : message;
+    return new Unavailable(said, { code: String(body?.code ?? ''), retryAfter });
   }
   if (status === 500 && body && 'exit_code' in body) {
     return new HandlerError(message, {

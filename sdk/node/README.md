@@ -17,6 +17,14 @@ const out = await resize({ url: 'https://example.com/a.png' });
 console.log(out.result, out.metrics.wallMs);
 ```
 
+A refused request can be retried for you. `Busy` (the pool was full) and
+`Unavailable` (the host is still building or warming something) both mean the
+request never ran, so sending it again is safe; nothing else is retried:
+
+```js
+const client = connect(undefined, { retries: 3 });   // waits the server's Retry-After, then again
+```
+
 A one-shot sandbox, needing nothing declared in advance:
 
 ```js

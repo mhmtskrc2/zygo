@@ -17,16 +17,26 @@ out = resize({"url": "https://example.com/a.png"})
 print(out.result, out.metrics.wall_ms)
 ```
 
-Asynchronous, which is what an agent framework needs:
+Asynchronous, which is what an agent framework needs — the same methods,
+every one a coroutine:
 
 ```python
-import asyncio, zygo.aio
+import asyncio
+import zygo_sdk as zygo
 
-async def main():
+async def main(events):
     async with zygo.aio.connect() as client:
         return await asyncio.gather(*(client.call("resize", e) for e in events))
 
-asyncio.run(main())
+asyncio.run(main([{"url": "https://example.com/a.png"}]))
+```
+
+A refused request can be retried for you. `Busy` (the pool was full) and
+`Unavailable` (the host is still building or warming something) both mean the
+request never ran, so sending it again is safe; nothing else is retried:
+
+```python
+client = zygo.connect(retries=3)        # waits the server's Retry-After, then again
 ```
 
 A one-shot sandbox, needing nothing declared in advance:

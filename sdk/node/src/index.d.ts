@@ -5,7 +5,9 @@
  * Hand-written rather than generated, because the package has no build step:
  * it ships the JavaScript that runs, and a declaration file beside it. That
  * keeps `npm install zygo-sdk` free of a compiler and keeps what you read in the
- * repository identical to what executes.
+ * repository identical to what executes. A test (`test/types.test.js`) holds
+ * this file to the JavaScript: every export and every client method has to be
+ * declared here, so the two cannot drift apart unnoticed.
  */
 
 export declare const DEFAULT_URL: string;
@@ -25,6 +27,20 @@ export declare class Busy extends ZygoError {
   inFlight: number;
   queued: number;
   limit: number;
+  /** Seconds, from the server's `Retry-After`. */
+  retryAfter: number;
+}
+
+/**
+ * The host cannot do this *yet*: a 503, and nothing about the request needs
+ * changing. A pool named against a dependency set still building
+ * (`code === 'deps_building'`), a zygote that failed to warm
+ * (`'warm_failed'`), or an API that is draining. The request never ran, so
+ * sending it again is safe; `retries` on the client does that for you.
+ */
+export declare class Unavailable extends ZygoError {
+  code: string;
+  /** Seconds, from the server's `Retry-After`; 1 when it sent none. */
   retryAfter: number;
 }
 
@@ -77,10 +93,55 @@ export interface Metrics {
 export interface Result<T = unknown> {
   /** The handler's own return value. */
   result: T;
+  /** The server's id for this request, which {@link Client.cancel} accepts. */
+  requestId: string;
+  /** The sandbox's `/out` as a tar, when the call asked for it with `out`; otherwise `null`. */
+  workspace: Buffer | null;
   /** What this request's process wrote, separately from the zygote's output. */
   stdout: string;
   stderr: string;
   metrics: Metrics;
+}
+
+/**
+ * One line of a streaming call: a piece of output while the request runs,
+ * then exactly one `result` carrying what {@link Client.call} would have
+ * returned.
+ */
+export type StreamEvent<T = unknown> =
+  | { kind: 'stdout' | 'stderr' | 'progress'; data: string }
+  | { kind: 'result'; result: Result<T>; status: number };
+
+/** What `health()` answers. `stopping` arrives as an {@link Unavailable} instead. */
+export interface Health {
+  ok: boolean;
+  status: 'ok' | 'degraded' | string;
+  uptime_s: number;
+  /** Pools below their `min_warm`, when `status` is `degraded`. */
+  below_min_warm?: string[];
+}
+
+/**
+ * A dependency set: a lockfile built inside an image, once, and mounted into
+ * every pool that names its id. `ready` and `building` are `state` as
+ * booleans, so a typo in the string is not a condition that is never true.
+ */
+export interface Deps {
+  id: string;
+  state: 'building' | 'ready' | 'failed' | string;
+  ready: boolean;
+  building: boolean;
+  /** `python` or `node`: which lockfile it was. */
+  kind: string;
+  image: string;
+  /** Why the build failed, when it did. */
+  error: string | null;
+  /** The build's own output, for a `failed` set. */
+  log: string;
+  /** The files that were sent, by name. */
+  files: Record<string, unknown>;
+  /** Tenants that sent these files; empty is the operator's own. */
+  tenants: string[];
 }
 
 export interface FunctionStatus {
@@ -260,11 +321,44 @@ export interface Layer {
 export interface CallOptions {
   /** Seconds this caller will wait. The function's own timeout still wins. */
   timeout?: number;
+  /**
+   * A name *you* choose for this request, so that something else can stop it
+   * with {@link Client.cancel} before it answers. Reusing a key is allowed and
+   * means one cancel stops every call under it.
+   */
+  key?: string;
+  /** Aborting it sends the cancel for you. A key is generated if none was given. */
+  signal?: AbortSignal;
+  /** A blob digest from {@link Client.putBlob} to unpack into the sandbox. */
+  workspace?: string;
+  /** Ask for the sandbox's `/out` back, as `workspace` on the result. */
+  out?: boolean;
+}
+
+/** What `batch` accepts: only the timeout, since one key cannot name many requests. */
+export interface BatchOptions {
+  timeout?: number;
+}
+
+export interface RunScriptOptions {
+  /** The function in the script to call. The agent's default when absent. */
+  entryPoint?: string;
+  timeout?: number;
+  key?: string;
+  signal?: AbortSignal;
+  /**
+   * Files to put in the sandbox before the script runs: a blob digest, or an
+   * inline description, as the API's `workspace` body field takes it.
+   */
+  workspace?: string | Record<string, unknown>;
+  out?: boolean;
 }
 
 export interface FunctionHandle<T = unknown> {
   (event?: unknown, options?: CallOptions): Promise<Result<T>>;
-  batch(events: unknown[], options?: CallOptions): Promise<Array<Result<T> | ZygoError>>;
+  /** The function's name; `name` is taken by every JavaScript function. */
+  readonly name_: string;
+  batch(events: unknown[], options?: BatchOptions): Promise<Array<Result<T> | ZygoError>>;
   stats(): Promise<FunctionStatus>;
   logs(options?: { after?: number; limit?: number; failed?: boolean }): Promise<LogPage>;
   warm(): Promise<Record<string, unknown>>;
@@ -276,6 +370,19 @@ export interface ClientOptions {
   token?: string | null;
   /** Milliseconds one HTTP exchange may take. Defaults to five minutes. */
   timeout?: number;
+  /**
+   * How many times a *refused* request — {@link Busy} or {@link Unavailable},
+   * both meaning it never ran — is sent again before its error reaches you.
+   * Nothing else is retried. Defaults to 0.
+   */
+  retries?: number;
+  /**
+   * Seconds. Each wait is the longer of the server's `Retry-After` and this,
+   * doubled per attempt. Defaults to 1.
+   */
+  backoff?: number;
+  /** Act for one tenant on every call; what {@link Client.forTenant} sets. */
+  tenant?: string | null;
 }
 
 export declare class Client {
@@ -283,17 +390,45 @@ export declare class Client {
   readonly endpoint: { url: string; socketPath?: string; host: string; port: number; tls: boolean; isUnix: boolean };
   token: string | null;
   timeout: number;
+  retries: number;
+  backoff: number;
 
   close(): void;
 
   version(): Promise<{ version: string; api: number; control: number; deploy: boolean }>;
-  health(): Promise<{ ok: boolean; uptime_s: number }>;
+  /** Needs no token. Throws {@link Unavailable} once the API is stopping. */
+  health(): Promise<Health>;
+  /**
+   * Stop admitting, let what is running finish, then exit. `inFlight` is what
+   * was still running when the grace (seconds) ran out. Operator-only, needs
+   * deploy rights.
+   */
+  drain(grace?: number): Promise<{ drained: boolean; inFlight: number }>;
   functions(): Promise<FunctionStatus[]>;
   stats(name: string): Promise<FunctionStatus>;
   warm(name: string): Promise<Record<string, unknown>>;
 
   call<T = unknown>(name: string, event?: unknown, options?: CallOptions): Promise<Result<T>>;
-  batch<T = unknown>(name: string, events: unknown[], options?: CallOptions): Promise<Array<Result<T> | ZygoError>>;
+  /**
+   * Call a function and yield its output as it is produced. Breaking out of
+   * the loop closes the connection but does not cancel the request; pass a
+   * `key` or a `signal` for that.
+   */
+  stream<T = unknown>(name: string, event?: unknown, options?: CallOptions): AsyncIterable<StreamEvent<T>>;
+  /** Run a script in a pool, yielding its output. See {@link stream}. */
+  streamScript<T = unknown>(
+    runtime: string,
+    script: string,
+    event?: unknown,
+    options?: RunScriptOptions
+  ): AsyncIterable<StreamEvent<T>>;
+  /**
+   * Stop a request that is running, by the server's id or the `key` it was
+   * called with. `started` says whether the handler had begun. Throws
+   * {@link NotFound} when nothing is running under that name.
+   */
+  cancel(requestId: string): Promise<{ cancelled: boolean; started: boolean; [key: string]: unknown }>;
+  batch<T = unknown>(name: string, events: unknown[], options?: BatchOptions): Promise<Array<Result<T> | ZygoError>>;
   logs(name: string, options?: { after?: number; limit?: number; failed?: boolean }): Promise<LogPage>;
 
   /** Needs an API started with `--allow-deploy`. */
@@ -342,8 +477,12 @@ export declare class Client {
   /** Revoke one, from the next request onwards. Operator-only. */
   revokeToken(id: string): Promise<{ revoked: boolean; token: Token | null }>;
 
-  /** Needs an API started with `--allow-deploy`. */
-  serveRuntime(name: string, layer: Layer, options?: { baseDir?: string }): Promise<Record<string, unknown>>;
+  /**
+   * Register a runtime pool. `deps` is an id from {@link putDeps}; a pool
+   * named against one still building throws {@link Unavailable}. Needs an
+   * API started with `--allow-deploy`.
+   */
+  serveRuntime(name: string, layer: Layer, options?: { baseDir?: string; deps?: string }): Promise<Record<string, unknown>>;
   runtimes(): Promise<RuntimePool[]>;
   /** Needs an API started with `--allow-deploy`. */
   stopRuntime(name: string): Promise<string[]>;
@@ -351,7 +490,7 @@ export declare class Client {
     runtime: string,
     script: string,
     event?: unknown,
-    options?: { entryPoint?: string; timeout?: number }
+    options?: RunScriptOptions
   ): Promise<Result<T>>;
 
   /** Needs an API started with `--allow-deploy`. */
@@ -359,6 +498,28 @@ export declare class Client {
   script(digest: string): Promise<Script>;
   /** Needs an API started with `--allow-deploy`. */
   deleteScript(digest: string): Promise<boolean>;
+
+  /**
+   * Store a tar this host will hold under its digest, to name as `workspace`
+   * on calls. The body is the tar itself.
+   */
+  putBlob(tar: Uint8Array | ArrayBuffer | string): Promise<Script>;
+  /** Whether this host holds a blob, and how big it is. */
+  blob(digest: string): Promise<Script>;
+  /** Forget a blob. Operator-only: the store is shared by digest. */
+  deleteBlob(digest: string): Promise<boolean>;
+
+  /**
+   * Build a dependency set from a lockfile, inside `image`. Answers before
+   * the build finishes, with `building` true; poll {@link deps} or name the
+   * id on {@link serveRuntime} and retry the {@link Unavailable}.
+   */
+  putDeps(image: string, files: Record<string, string | Uint8Array>): Promise<Deps>;
+  /** One dependency set with its build log, or every one you can see. */
+  deps(id: string): Promise<Deps>;
+  deps(): Promise<Deps[]>;
+  /** Forget a dependency set. Refused while a pool is built on it. */
+  deleteDeps(id: string): Promise<boolean>;
 
   fn<T = unknown>(name: string): FunctionHandle<T>;
 }

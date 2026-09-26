@@ -41,7 +41,7 @@ export class FakeApi {
       if (this.delay) await new Promise((r) => setTimeout(r, this.delay));
 
       const key = `${request.method} ${request.url.split('?')[0]}`;
-      const answer = this.answers.get(key) ?? { status: 404, body: { error: `no route ${request.url}` } };
+      const answer = this.nextAnswer(key) ?? { status: 404, body: { error: `no route ${request.url}` } };
 
       // A stream is written a line at a time, like the real API's: a test
       // that received one whole buffer could not tell a client that yields as
@@ -58,7 +58,12 @@ export class FakeApi {
 
       const payload = Buffer.from(JSON.stringify(answer.body));
       const headers = { 'content-type': 'application/json', 'content-length': String(payload.length) };
-      if (answer.status === 429) headers['retry-after'] = '3';
+      // What the real API sends: a second on backpressure, five while a
+      // dependency set builds, and nothing on any other refusal.
+      let retryAfter = answer.retryAfter;
+      if (retryAfter === undefined && answer.status === 429) retryAfter = 3;
+      if (retryAfter === undefined && answer.body?.code === 'deps_building') retryAfter = 5;
+      if (retryAfter !== undefined) headers['retry-after'] = String(retryAfter);
       response.writeHead(answer.status, headers);
       response.end(payload);
     });
@@ -67,8 +72,29 @@ export class FakeApi {
     });
   }
 
-  answer(method, path, status, body) {
-    this.answers.set(`${method} ${path}`, { status, body });
+  /**
+   * Answer this route the same way every time. `retryAfter` sets the header;
+   * left out, it is what the real API sends.
+   */
+  answer(method, path, status, body, retryAfter = undefined) {
+    this.answers.set(`${method} ${path}`, { status, body, retryAfter });
+  }
+
+  /**
+   * Answer this route with each of `answers` in turn, then keep giving the
+   * last one — a host that refuses twice and then accepts.
+   */
+  answerThen(method, path, answers, retryAfter = undefined) {
+    this.answers.set(
+      `${method} ${path}`,
+      answers.map(([status, body]) => ({ status, body, retryAfter }))
+    );
+  }
+
+  nextAnswer(key) {
+    const planned = this.answers.get(key);
+    if (!Array.isArray(planned)) return planned;
+    return planned.length > 1 ? planned.shift() : planned[0];
   }
 
   /// Answer this route with NDJSON, one object per line. `gap` is the pause

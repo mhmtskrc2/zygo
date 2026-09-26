@@ -15,7 +15,7 @@ from typing import Any, Dict, Optional
 
 
 class ZygoError(Exception):
-    """Base class, so ``except zygo.ZygoError`` catches everything from here."""
+    """Base class, so ``except zygo_sdk.ZygoError`` catches everything from here."""
 
 
 class TransportError(ZygoError):
@@ -58,6 +58,27 @@ class Busy(ZygoError):
         self.in_flight = in_flight
         self.queued = queued
         self.limit = limit
+        self.retry_after = retry_after
+
+
+class Unavailable(ZygoError):
+    """The host cannot do this *yet*: a `503`, and nothing about the request
+    needs changing.
+
+    Three things answer this way. A pool named against a dependency set that
+    is still building (``code == "deps_building"``, and the host suggests a
+    ``retry_after`` of a few seconds); a function whose zygote failed to warm
+    (``code == "warm_failed"``); and an API that is draining, which is what
+    :meth:`~zygo_sdk.Client.health` raises once the supervisor is stopping.
+
+    Like :class:`Busy`, the request never ran, so sending it again is safe.
+    Unlike :class:`Busy` it is not backpressure: the wait is for something the
+    host is doing, not for room.
+    """
+
+    def __init__(self, message: str, *, code: str = "", retry_after: float = 1.0) -> None:
+        super().__init__(message)
+        self.code = code
         self.retry_after = retry_after
 
 
@@ -204,6 +225,11 @@ def from_response(status: int, body: Dict[str, Any], retry_after: float = 1.0) -
         )
     if status == 400:
         return SpecError(message)
+    if status == 503:
+        # `/healthz` says `status: stopping` and carries no `error`.
+        if "error" not in body and "message" not in body and body.get("status"):
+            message = f"the API is {body['status']}"
+        return Unavailable(message, code=str(body.get("code", "")), retry_after=retry_after)
     if status == 500 and "exit_code" in body:
         return HandlerError(
             message,
