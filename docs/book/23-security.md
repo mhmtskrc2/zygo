@@ -435,8 +435,12 @@ rather than sampled.
 
 These points come from [SECURITY.md](../../SECURITY.md):
 
-- Prefer `isolation = "vm"` for code you did not write. The `ns` backend leans
-  on one kernel, and does not hide it.
+- The `ns` backend leans on one kernel and does not hide it. For code that is
+  hostile rather than semi-trusted, the wall is `isolation = "vm"` — today
+  one-shot only, without a network or a warm path, and in a `make vm-build`
+  binary on a host with KVM ([the `vm` backend today](#the-vm-backend-today)).
+  Until that is more, the honest answer for anonymous code is a separate
+  machine.
 - Keep `network = "none"` unless a function really needs egress, and keep the
   `allow` list to the hosts it needs.
 - Do not run Zygo as root. It does not need it, and `pasta`, `newuidmap` and

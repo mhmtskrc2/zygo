@@ -230,7 +230,7 @@ you did not. This is what you get with no flags at all.
 | Memory, CPU, pids, wall clock | **unlimited** | **all mandatory**: `mem` 256M, `cpu` 1.0, `pids` 64, `timeout` 30s, `nofile` 1024 |
 | Bind mounts | `-v` is **rw** unless `:ro` | `--mount` is **ro** unless `:rw` |
 | cgroupfs inside | mounted read-only | not mounted at all, so `release_agent` is not reachable |
-| Escape suite | — | 20 escape vectors attempted on every change, 0 escaping |
+| Escape suite | — | 21 escape vectors attempted on every change, 0 escaping |
 
 A *denylist* names what is forbidden and allows the rest; an *allowlist*
 names what is allowed and forbids the rest. `release_agent` is an old cgroup
@@ -452,8 +452,8 @@ shortlist. Someone looking for "run this agent's code somewhere safe" ends up
 comparing Zygo with three much closer projects: kern, nono and microsandbox.
 In two of the three cases the honest answer is that they solve a different
 problem. Two more, [Sandlock and Zeroboot](#sandlock-and-zeroboot-two-other-forks),
-fork a warm process as Zygo does and have a section of their own below. Their claims below are theirs, not measured here, and all three move
-quickly.
+fork a warm process as Zygo does and have a section of their own below. Their claims below are theirs, not measured here, and every one of them
+moves quickly.
 
 | | [kern](https://github.com/getkern/kern) | [nono](https://nono.sh) | [microsandbox](https://github.com/superradcompany/microsandbox) | **Zygo** |
 |---|---|---|---|---|

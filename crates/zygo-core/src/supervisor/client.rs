@@ -48,6 +48,23 @@ pub const SERVE_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 /// timeout for a request that was answered.
 pub const REPLY_GRACE: Duration = Duration::from_secs(10);
 
+/// What a `RUN` that outlived [`CONTROL_TIMEOUT`] before `STARTED` is told.
+///
+/// Before it answers, the supervisor builds whatever a first run of the image
+/// still lacks — the Python bytecode layer, a venv, a `system` layer — and on
+/// a slow disk that alone can outlast the budget: a Raspberry Pi 5 on an SD
+/// card took over a minute to compile `python:3.12-slim`, and two runs in a
+/// row were refused while the build went on. The budget is unchanged; this is
+/// the message that replaced the bare `os error 11`. A constant rather than a
+/// literal in the match arm, so a test can read it on every platform — the
+/// arm itself is Linux-only.
+#[cfg(any(target_os = "linux", test))]
+const RUN_START_REMEDY: &str = "an image's first run may still be building its layers — Python \
+    bytecode, a venv, `system` packages — which a slow disk can take longer than this over; \
+    `zygo pull IMAGE` does that work ahead of time, and the build finishes on its own, so the \
+    next run may simply work. If it repeats with nothing to build, the supervisor is not \
+    replying: check `zygo logs`, then `zygo supervisor stop`";
+
 /// A connection to a supervisor, greeted and ready.
 pub struct Client {
     reader: FrameReader<UnixStream, Response>,
@@ -331,6 +348,17 @@ impl Client {
                 reason: "the supervisor closed the connection before the sandbox started".into(),
                 remedy: "check `zygo logs` for why it exited".into(),
             }),
+            // The budget ran out, and until this arm existed that surfaced as a
+            // bare `Resource temporarily unavailable` on the control socket.
+            // [`RUN_START_REMEDY`] says what usually took the time.
+            Err(e) if is_timeout(&e) => Err(Error::BackendUnavailable {
+                backend: "supervisor",
+                reason: format!(
+                    "the supervisor did not start the sandbox within {}s",
+                    CONTROL_TIMEOUT.as_secs()
+                ),
+                remedy: RUN_START_REMEDY.into(),
+            }),
             Err(e) => Err(Error::primitive(
                 "read",
                 "control socket",
@@ -601,6 +629,19 @@ mod tests {
         assert!(message.contains("ps"), "the request is named: {message}");
         drop(client);
         drop(wedged);
+    }
+
+    /// The remedy is one sentence joined from several source lines. The first
+    /// version reached a Raspberry Pi's terminal with twenty-six blanks in the
+    /// middle of it, because the tool that wrote it kept the indentation the
+    /// `\` continuation was meant to drop.
+    #[test]
+    fn the_run_timeout_remedy_is_one_clean_sentence() {
+        let remedy = super::RUN_START_REMEDY;
+        assert!(!remedy.contains("  "), "{remedy:?}");
+        assert!(!remedy.contains('\n'), "{remedy:?}");
+        assert!(remedy.contains("zygo pull"), "{remedy:?}");
+        assert!(remedy.contains("zygo supervisor stop"), "{remedy:?}");
     }
 
     /// The budgets differ by three orders of magnitude on purpose: one number

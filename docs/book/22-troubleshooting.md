@@ -410,6 +410,31 @@ the code's fault.
   started: true,  phase: "run"    ─▶ your program ran, and this is its result
 ```
 
+### "the supervisor did not start the sandbox within 30s" (exit 125)
+
+When a supervisor is running, `zygo run` does not build the sandbox itself:
+it hands the run to the supervisor, which already sits in a delegated cgroup,
+and waits 30 seconds for the answer that the sandbox has started. Before it
+answers, the supervisor builds whatever a first run of that image still
+lacks: the Python bytecode layer, a venv from `requirements`, a `system`
+layer. On a fast disk that is a few seconds; on a slow one it is not.
+A Raspberry Pi 5 on an SD card took over a minute to compile
+`python:3.12-slim`, and the run was refused with this message while the
+build went on. A second run in that minute waits on the same build and is
+refused the same way.
+
+The build finishes on its own, so the next run may simply work. To take it
+off the request path, `zygo pull IMAGE` builds the same layers ahead of time,
+with no budget on it;
+[chapter 15](15-images-and-dependencies.md#the-python-bytecode-layer) says
+which layers. A host with no supervisor running is not affected: there
+`zygo run` builds everything itself and waits as long as it takes.
+
+If the message repeats for an image whose layers are all built, the
+supervisor is running but not replying. `zygo logs` says what it is doing;
+`zygo supervisor stop` ends it, and the next `serve` or `up` starts a fresh
+one.
+
 ### "`<name>` is at its concurrency limit — retry" (HTTP 429, exit 75)
 
 This is *backpressure*, not a failure: **the request never ran**. The function

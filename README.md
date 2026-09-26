@@ -23,8 +23,9 @@ its imports, and parks it inside a sandbox. `zygo exec` forks it. Each child
 has its own cgroup, deadline and secrets, and is thrown away afterwards.
 
 The same import-heavy Python script, run fresh for each call on one host
-(a Linux 6.8 VM, 2 vCPU; [chapter 25](docs/book/25-performance.md#the-result-on-the-lima-vm)
-has the method, and `make bench-embed` repeats it):
+(a Linux 6.8 VM, 2 vCPU, aarch64;
+[chapter 25](docs/book/25-performance.md#the-result-on-the-lima-vm) has the
+method, and `make bench-embed` repeats it):
 
 | | usually | what it pays for |
 |---|---:|---|
@@ -98,9 +99,9 @@ signatures included.
 
 ```bash
 zygo doctor                           # can this host run sandboxes? prints the fix if not
+zygo run --mem 128M --timeout 10s python:3.12-slim python3 -c 'print("hello")'   # pulls the image
 echo 'def handler(event): return {"got": event}' > handler.py
-zygo serve ./handler.py --name echo && zygo exec echo '{"n": 1}'
-zygo run --mem 128M --timeout 10s python:3.12-slim python3 -c 'print("hello")'
+zygo serve ./handler.py --name echo && zygo exec echo '{"n": 1}'   # serve never pulls
 ```
 
 ## What else is in the box

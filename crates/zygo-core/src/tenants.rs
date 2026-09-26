@@ -13,9 +13,12 @@
 //! * the **scripts** registered for it, by digest — which is what makes
 //!   deleting a tenant able to take its code with it without taking anybody
 //!   else's;
-//! * later, its limits, its allowlist, its secrets and its tokens (roadmap
-//!   2.2, 2.7, 2.8). They are not here yet and the struct says so rather than
-//!   carrying empty fields nothing reads.
+//! * its **limits** ([`TenantLimits`], below), which can only narrow what the
+//!   function or pool was declared with.
+//!
+//! Its secrets and its tokens are not fields here: each lives in a store of
+//! its own, keyed by the tenant's id (`crate::secrets`, `crate::tokens`), so
+//! this file stays the record of *who* a tenant is.
 //!
 //! **Persisted**, unlike everything else the supervisor holds. A warm sandbox
 //! does not survive a restart and is not meant to; the existence of a customer

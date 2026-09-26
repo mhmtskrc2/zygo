@@ -85,6 +85,24 @@ break things and will say so here.
   chapter; the README's `zygo exec` comment quoted the API's 1.4 ms for a CLI
   call that measures 2.8 ms. SECURITY.md no longer recommends `isolation =
   "vm"` without saying what the `vm` backend is today.
+- The README's quick start ran `zygo serve` before anything had pulled its
+  image, and `serve` never pulls: on a fresh host the first command stopped
+  with "pull it first". The `zygo run` line now comes first and says that it
+  pulls. In the same pass: chapter 10 counted 20 escape vectors where the
+  suite attempts 21; chapter 26 counted seven ADRs where there are eight;
+  chapter 23's hardening list recommended `isolation = "vm"` without the
+  caveat SECURITY.md carries; the roadmap's phase 4 row now says the
+  Kubernetes pod is still `privileged: true`; chapter 16 said Zygo
+  "contains" hostile code where it confines it; the README's benchmark host
+  now says it is aarch64.
+- A `zygo run` handed to a running supervisor that took longer than 30
+  seconds to answer — which a first run of a Python image does on a slow
+  disk, while the supervisor compiles the image's bytecode layer — was
+  reported as a bare `Resource temporarily unavailable (os error 11)` on the
+  control socket. It now says the supervisor did not start the sandbox
+  within 30 s, and what to do: `zygo pull IMAGE` builds the layers ahead of
+  time, and the build finishes on its own. The budget itself is unchanged
+  (chapter 22). Found on a Raspberry Pi 5 with the release's own quick start.
 - Chapter 10 places Sandlock and Zeroboot, two 2026 projects that fork a
   warm process per call, on the map, and chapter 23 lists the
   tenant-against-tenant vectors the escape suite does not attempt yet.

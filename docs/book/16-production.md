@@ -633,7 +633,7 @@ than one that lacks a feature.
 - **Replace Docker.** Zygo uses OCI images and none of Docker's runtime. If
   you need `docker compose`, long-running services or published ports, you
   need Docker.
-- **Analyse the code it runs.** Zygo contains hostile code. It does not tell
+- **Analyse the code it runs.** Zygo confines hostile code. It does not tell
   you the code *was* hostile: there is no audit mode, no network log and no
   verdict.
 - **Hide the kernel.** The `ns` backend shares one kernel with the host, and
