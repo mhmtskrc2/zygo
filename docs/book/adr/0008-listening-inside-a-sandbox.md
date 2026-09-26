@@ -87,4 +87,4 @@ Nothing changes about ingress: `pasta` still forwards no port in, and under
 
 ---
 
-← [ADR 0007 — A third SDK, in Elixir](0007-elixir-sdk.md) · [Contents](../README.md) · **Next: [Glossary](../glossary.md) →**
+← [ADR 0007 — A third SDK, in Elixir](0007-elixir-sdk.md) · [Contents](../README.md) · **Next: [ADR 0009 — The API may allow private addresses](0009-api-private-net.md) →**

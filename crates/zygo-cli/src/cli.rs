@@ -662,6 +662,17 @@ pub struct ApiArgs {
     #[arg(long)]
     pub allow_deploy: bool,
 
+    /// Let what callers deploy name private and link-local addresses in `allow`.
+    ///
+    /// The API's own spelling of `serve --allow-private-net`, and the only one:
+    /// a request body can never set it. It matters only with `--allow-deploy`,
+    /// because only a deploy call declares a sandbox. It opens nothing by
+    /// itself — a rule still has to name the address and the port — but it
+    /// lets an embedder give its pools a way back to a service of its own on
+    /// the host's LAN address, the way chapter 14 describes for a function.
+    #[arg(long)]
+    pub allow_private_net: bool,
+
     /// Push metrics to an OTLP/HTTP collector at this base URL, e.g.
     /// `http://localhost:4318` (`/v1/metrics` is appended). The same numbers
     /// as `/metrics`, JSON-encoded; `OTEL_EXPORTER_OTLP_HEADERS` adds request

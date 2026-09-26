@@ -164,8 +164,10 @@ Private and link-local ranges — `10/8`, `172.16/12`, `192.168/16`,
 `127/8`, `169.254/16` (the cloud metadata address), `100.64/10`, `0/8`,
 multicast and reserved (`224/4`, `240/4`), `::1`, `fe80::/10`, `fc00::/7`,
 `ff00::/8` — are never reachable in a namespaced mode unless you pass
-`--allow-private-net`, and a CIDR rule inside one of them is refused without
-it.
+`--allow-private-net`, and a rule inside one of them — a CIDR or a single
+address — is refused without it. `network = "egress"` or `"full"` together
+with `seccomp = "strict"` is refused too: `strict` takes `socket` away, so
+nothing could be reached.
 
 ## Files, environment and secrets
 
@@ -229,7 +231,8 @@ only `[fn.*]`; a pool is started by `zygo serve --runtime <name>` or
 Three things are refused unless a flag says so: `network = "host"`
 (`--allow-host-net`), a private range in `allow` (`--allow-private-net`), and
 `timeout = 0` (`--allow-unlimited`). The flags exist on `zygo run`,
-`zygo serve` and `zygo mcp`. **`zygo up` has none of them, on purpose**: a
+`zygo serve` and `zygo mcp`; `zygo api` has `--allow-private-net` for what its
+deploy callers serve. **`zygo up` has none of them, on purpose**: a
 spec that needs one has to be served deliberately, one function at a time,
 with the flag typed by a person.
 

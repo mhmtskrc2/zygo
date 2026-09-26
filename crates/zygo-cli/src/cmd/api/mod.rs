@@ -107,6 +107,11 @@ struct Api {
     /// this user, through a port. P6 says a widened boundary has to be spelled
     /// out, so it is a flag rather than a default.
     deploy: bool,
+    /// Whether a deploy call may name private and link-local addresses in
+    /// `allow`: `zygo api --allow-private-net`, typed by whoever started this
+    /// listener. Never read from a request, for the reason `PUT /fn/<name>`
+    /// gives.
+    private_net: bool,
     /// Idle control connections, one per request in flight at peak. The
     /// supervisor serves each on its own thread, so this is what turns
     /// concurrent HTTP requests into concurrent sandbox requests.
@@ -177,6 +182,7 @@ pub fn run(cli: &Cli, args: &ApiArgs) -> anyhow::Result<u8> {
         exe,
         token,
         deploy: args.allow_deploy,
+        private_net: args.allow_private_net,
         clients: std::sync::Mutex::new(vec![first]),
         usage: std::sync::Mutex::new(Usage::default()),
         health: std::sync::Mutex::new(None),
@@ -201,12 +207,19 @@ pub fn run(cli: &Cli, args: &ApiArgs) -> anyhow::Result<u8> {
         } else {
             "no auth"
         }),
-        style.dim(if api.deploy {
-            "deploy on: callers may serve, stop and run"
-        } else {
-            "call-only: serve, stop and run are refused"
+        style.dim(match (api.deploy, api.private_net) {
+            (true, true) =>
+                "deploy on: callers may serve, stop and run; private addresses may be allowed",
+            (true, false) => "deploy on: callers may serve, stop and run",
+            (false, _) => "call-only: serve, stop and run are refused",
         })
     );
+    if api.private_net && !api.deploy {
+        crate::output::warn(
+            "--allow-private-net does nothing without --allow-deploy: only a deploy call \
+             declares a sandbox",
+        );
+    }
     // The first time this was hit, the warning would have been the difference
     // between a request refused and the whole API gone: systemd's default
     // `OOMPolicy=stop` stops a unit when any process in it is OOM-killed, and
@@ -429,6 +442,10 @@ async fn route(req: Request<Incoming>, api: &Arc<Api>) -> Result<Response<ApiBod
                 // What *this* caller may do, not what the flag says: a tenant
                 // token asking is told the truth about its own request.
                 "deploy": actor.deploy && actor.is_operator(),
+                // Whether a deploy call from this caller may allow a private
+                // address. False for anyone who cannot deploy, whatever the
+                // flag says, for the same reason as `deploy`.
+                "private_net": api.private_net && actor.deploy && actor.is_operator(),
             }),
         )),
         // The body is read *before* the gate, on every route that carries

@@ -24,6 +24,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use zygo_core::Paths;
 use zygo_core::spec::{Layer, Spec};
 
 /// How often the child is checked against its deadline.
@@ -102,6 +103,16 @@ struct Outcome {
     phase: String,
 }
 
+/// What the child is started with: this process's binary, its store and
+/// supervisor, and whether its operator permitted private addresses.
+#[derive(Debug, Clone, Copy)]
+pub struct Host<'a> {
+    pub exe: &'a Path,
+    pub paths: &'a Paths,
+    /// The one-shot half of `zygo api --allow-private-net`.
+    pub private_net: bool,
+}
+
 /// Run one sandbox to completion and collect its output.
 ///
 /// `layer` describes the sandbox as a `[fn.<name>]` table would; `image` and
@@ -109,13 +120,18 @@ struct Outcome {
 /// about them is overridden by these. `deadline` is the outer bound described
 /// on [`Captured::timed_out`].
 pub fn run(
-    exe: &Path,
+    host: &Host<'_>,
     mut layer: Layer,
     image: &str,
     argv: &[String],
     stdin: &[u8],
     deadline: Duration,
 ) -> anyhow::Result<Captured> {
+    let Host {
+        exe,
+        paths,
+        private_net,
+    } = *host;
     // Carried as arguments instead, and leaving them in the spec would make
     // the resolved command depend on which of two places set it.
     layer.image = None;
@@ -141,6 +157,10 @@ pub fn run(
     let started = Instant::now();
     let mut command = std::process::Command::new(exe);
     command
+        // The child runs against this process's own store and supervisor. Without
+        // these an API started with `--data-root` answered `POST /run` from the
+        // default root: a different store, and whatever supervisor was there.
+        .envs(paths.as_vars())
         .arg("run")
         .arg("--outcome")
         .arg(&outcome_path)
@@ -149,7 +169,13 @@ pub fn run(
         // model. "pulling python:3.12-slim" is not something the sandbox said.
         .arg("--quiet")
         .arg("--file")
-        .arg(file.path())
+        .arg(file.path());
+    // Only when the caller's own operator said so on the command line: this
+    // is the one-shot half of `zygo api --allow-private-net`.
+    if private_net {
+        command.arg("--allow-private-net");
+    }
+    command
         .arg(image)
         .args(argv)
         .stdin(std::process::Stdio::piped())
@@ -298,6 +324,19 @@ fn block_sigpipe() {}
 #[cfg(test)]
 #[cfg(unix)]
 mod tests {
+    fn host(exe: &Path) -> Host<'_> {
+        Host {
+            exe,
+            paths: paths_for_tests(),
+            private_net: false,
+        }
+    }
+
+    fn paths_for_tests() -> &'static Paths {
+        static PATHS: std::sync::OnceLock<Paths> = std::sync::OnceLock::new();
+        PATHS.get_or_init(Paths::from_env)
+    }
+
     use super::*;
 
     /// A stand-in for the `zygo` binary, so these tests exercise this module
@@ -329,7 +368,7 @@ mod tests {
         .expect("a layer");
 
         let captured = run(
-            &exe,
+            &host(&exe),
             layer,
             "python:3.12-slim",
             &["python3".into(), "-c".into(), "print(1)".into()],
@@ -357,6 +396,45 @@ mod tests {
         );
     }
 
+    /// The child runs against the same store and supervisor as the process
+    /// that spawned it. An API started with `--data-root` used to answer
+    /// `POST /run` from the default root — a different store, and whatever
+    /// supervisor happened to be there.
+    #[test]
+    fn the_child_is_told_where_this_process_keeps_its_data() {
+        let (_dir, exe) = fake_zygo(r#"echo "data=$ZYGO_DATA_HOME runtime=$ZYGO_RUNTIME_DIR""#);
+        let root = tempfile::tempdir().expect("a root");
+        let paths = Paths::rooted(root.path());
+        let host = Host {
+            exe: &exe,
+            paths: &paths,
+            private_net: true,
+        };
+        let layer: Layer = serde_json::from_str(r#"{"image":"alpine:3"}"#).expect("a layer");
+
+        let captured = run(
+            &host,
+            layer,
+            "alpine:3",
+            &["true".into()],
+            b"",
+            Duration::from_secs(10),
+        )
+        .expect("the stand-in ran");
+
+        let [(_, data), (_, runtime)] = paths.as_vars();
+        assert!(
+            captured
+                .stdout
+                .contains(&format!("data={}", data.display()))
+                && captured
+                    .stdout
+                    .contains(&format!("runtime={}", runtime.display())),
+            "the child was not told: {}",
+            captured.stdout
+        );
+    }
+
     /// The child's account of *why* it ended is read back.
     ///
     /// A deadline kill and an out-of-memory kill are both exit 137, so the
@@ -373,7 +451,7 @@ mod tests {
         );
 
         let captured = run(
-            &exe,
+            &host(&exe),
             Layer::default(),
             "alpine:3",
             &[],
@@ -402,7 +480,7 @@ mod tests {
     fn a_child_that_wrote_no_outcome_still_reports_the_outer_deadline() {
         let (_dir, exe) = fake_zygo("sleep 30");
         let captured = run(
-            &exe,
+            &host(&exe),
             Layer::default(),
             "alpine:3",
             &[],
@@ -428,7 +506,7 @@ mod tests {
         let input = vec![b'x'; 1 << 20];
 
         let captured = run(
-            &exe,
+            &host(&exe),
             Layer::default(),
             "alpine:3",
             &[],
@@ -482,7 +560,7 @@ mod tests {
         // this variable; it exists only to reach the stand-in.
         unsafe { std::env::set_var("ZYGO_TEST_SLEEP", "0") };
         let quick = run(
-            &exe,
+            &host(&exe),
             Layer::default(),
             "alpine:3",
             &[],
@@ -499,7 +577,7 @@ mod tests {
         // of libc calls in this suite that read the environment.
         unsafe { std::env::set_var("ZYGO_TEST_SLEEP", "30") };
         let slow = run(
-            &exe,
+            &host(&exe),
             Layer::default(),
             "alpine:3",
             &[],

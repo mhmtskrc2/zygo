@@ -399,7 +399,8 @@ make sense.
 ## `zygo api` — the HTTP API
 
 ```text
-zygo api [-f PATH] [--listen ADDR] [--no-auth] [--allow-deploy] [--openapi]
+zygo api [-f PATH] [--listen ADDR] [--no-auth] [--allow-deploy]
+         [--allow-private-net] [--openapi]
          [--otlp-endpoint URL] [--otlp-interval D] [--usage-webhook URL]
          [--usage-interval D]
 ```
@@ -413,6 +414,7 @@ default every caller needs a bearer token — `ZYGO_API_TOKEN`, or one from
 | `--listen ADDR` | `[api] listen`, else `127.0.0.1:7700` | `IP:PORT`, or `unix:///path`. |
 | `--no-auth` | off | No tokens. Refused except on a unix socket or a loopback address. |
 | `--allow-deploy` | off | Let the bootstrap token create and destroy sandboxes, not only call them. That makes it a shell as your user; think twice. |
+| `--allow-private-net` | off | Let what deploy callers serve name private and link-local addresses in `allow`. A request body can never set this. Does nothing without `--allow-deploy`. |
 | `--openapi` | off | Print the OpenAPI 3.1 document and exit. |
 | `--otlp-endpoint URL` | `$OTEL_EXPORTER_OTLP_ENDPOINT` | Push metrics to an OpenTelemetry collector (`/v1/metrics` is added). |
 | `--otlp-interval DURATION` | `60s` | How often to push. |

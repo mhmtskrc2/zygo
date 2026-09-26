@@ -724,6 +724,31 @@ fn resolve_layer(
         ));
     }
 
+    // `strict` takes `socket` and `connect` away, so a network under it is a
+    // network nothing can use: the namespace, the firewall and the allowlist
+    // are all built, and every connection fails with EPERM before any of them
+    // is consulted. Refused, the way `allow` without `egress` is, because a
+    // setting that cannot take effect is a setting somebody believes in. A
+    // pool meets this first: it is `strict` unless it says otherwise.
+    if matches!(network, Network::Egress | Network::Full)
+        && l.seccomp == Some(SeccompProfile::Strict)
+    {
+        return Err(SpecError::invalid_with(
+            field("seccomp"),
+            format!(
+                "`strict` refuses `socket` and `connect`, so `network = \"{network}\"` \
+                 could reach nothing"
+            ),
+            if opts.pool {
+                "a pool is `strict` unless it says otherwise; set `seccomp = \"default\"` \
+                 for scripts that call out, or keep `network = \"none\"`"
+            } else {
+                "set `seccomp = \"default\"` for a sandbox that calls out, or \
+                 `network = \"none\"` for one that must not"
+            },
+        ));
+    }
+
     let allow = l.allow.unwrap_or_default();
     if !allow.is_empty() && network != Network::Egress {
         return Err(SpecError::invalid_with(
@@ -740,9 +765,18 @@ fn resolve_layer(
     }
     if !opts.allow_private_net {
         for rule in &allow {
-            if let HostPattern::Cidr(c) = &rule.host
-                && c.is_private_or_link_local()
-            {
+            // An address written without a prefix is as private as the /32
+            // it means. It used to pass this check as a host *name*, and the
+            // firewall then refused it as the private address it is: accepted
+            // here, unreachable there, and nothing said why.
+            let private = match &rule.host {
+                HostPattern::Cidr(c) => c.is_private_or_link_local(),
+                HostPattern::Exact(h) => h
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(super::types::is_private_addr),
+                HostPattern::Wildcard(_) => false,
+            };
+            if private {
                 return Err(SpecError::invalid_with(
                     field("allow"),
                     format!("`{rule}` targets a private or link-local range"),
@@ -1631,6 +1665,83 @@ mem = "1G"
             ..Default::default()
         };
         assert!(s.resolve(Some("f"), &Layer::default(), &o).is_ok());
+    }
+
+    /// An address with no prefix is the /32 it means, and as private.
+    ///
+    /// `192.168.1.70:8765` used to be read as a host *name*, pass the check
+    /// above, and be refused by the firewall as the private address it is:
+    /// accepted by `serve`, and "no route to host" for every request.
+    #[test]
+    fn a_private_address_without_a_prefix_needs_the_flag_too() {
+        for rule in [
+            "192.168.1.70:8765",
+            "10.0.0.5",
+            "[fd00::1]:443",
+            "169.254.169.254:80",
+        ] {
+            let s = spec(&format!(
+                "[fn.f]\nimage=\"a\"\ncmd=[\"x\"]\nnetwork=\"egress\"\nallow=[\"{rule}\"]\n"
+            ));
+            let err = s
+                .resolve(Some("f"), &Layer::default(), &opts())
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("private or link-local"),
+                "{rule}: {err}"
+            );
+
+            let o = ResolveOptions {
+                allow_private_net: true,
+                ..Default::default()
+            };
+            assert!(
+                s.resolve(Some("f"), &Layer::default(), &o).is_ok(),
+                "{rule}"
+            );
+        }
+
+        // A public address, and a name, are what they always were.
+        let s = spec(
+            "[fn.f]\nimage=\"a\"\ncmd=[\"x\"]\nnetwork=\"egress\"\n\
+             allow=[\"203.0.113.9:443\", \"api.example.com:443\"]\n",
+        );
+        assert!(s.resolve(Some("f"), &Layer::default(), &opts()).is_ok());
+    }
+
+    /// `strict` takes `socket` and `connect`, so a network under it cannot be
+    /// used, and saying so beats a sandbox whose every connection is EPERM.
+    ///
+    /// Found embedding a pool: `network = "egress"` with an allowlist, no
+    /// `seccomp` named, and every request — to an allowed host too — failed
+    /// before the firewall was asked anything.
+    #[test]
+    fn a_network_under_strict_is_refused_with_the_way_out() {
+        let s = spec("[fn.f]\nimage=\"a\"\ncmd=[\"x\"]\nseccomp=\"strict\"\nnetwork=\"full\"\n");
+        let err = s
+            .resolve(Some("f"), &Layer::default(), &opts())
+            .unwrap_err();
+        assert!(err.to_string().contains("could reach nothing"), "{err}");
+
+        // A pool is `strict` without saying so, which is exactly how this is met.
+        let s = spec(
+            "[runtime.p]\nimage=\"python:3.12-slim\"\nagent=\"python\"\n\
+             network=\"egress\"\nallow=[\"api.example.com:443\"]\n",
+        );
+        let err = s
+            .resolve_runtime("p", &Layer::default(), &opts())
+            .unwrap_err();
+        assert!(err.to_string().contains("could reach nothing"), "{err}");
+        assert!(err.to_string().contains("a pool is `strict`"), "{err}");
+
+        // The way out works, and `none` under `strict` is what it always was.
+        let s = spec(
+            "[runtime.p]\nimage=\"python:3.12-slim\"\nagent=\"python\"\n\
+             seccomp=\"default\"\nnetwork=\"egress\"\nallow=[\"api.example.com:443\"]\n",
+        );
+        assert!(s.resolve_runtime("p", &Layer::default(), &opts()).is_ok());
+        let s = spec("[runtime.p]\nimage=\"python:3.12-slim\"\nagent=\"python\"\n");
+        assert!(s.resolve_runtime("p", &Layer::default(), &opts()).is_ok());
     }
 
     #[test]

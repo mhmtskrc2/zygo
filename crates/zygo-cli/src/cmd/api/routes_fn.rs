@@ -315,6 +315,7 @@ pub(super) async fn serve_fn(
         ));
     }
 
+    let private_net = api.private_net;
     let reply = control(api, move |c| {
         Ok(c.send(&Control::Serve {
             tenant,
@@ -322,11 +323,12 @@ pub(super) async fn serve_fn(
             spec: None,
             layer: Box::new(request.layer),
             base_dir: request.base_dir,
-            // Never from a socket. Each of these removes a guarantee, and a
+            // Never from a request. Each of these removes a guarantee, and a
             // caller that can widen the boundary over HTTP makes the flag on
-            // the server meaningless. Set them where the sandbox is declared.
+            // the server meaningless. Set them where the sandbox is declared,
+            // or — for private addresses only — on `zygo api` itself.
             allow_host_net: false,
-            allow_private_net: false,
+            allow_private_net: private_net,
             allow_unlimited: false,
             secrets: request.secrets,
             if_changed: request.if_changed,
@@ -449,9 +451,22 @@ pub(super) async fn one_shot(api: &Arc<Api>, body: &[u8]) -> Result<Response<Api
     );
 
     let exe = api.exe.clone();
+    let paths = api.paths.clone();
+    let private_net = api.private_net;
     let stdin = request.stdin;
     let captured = tokio::task::spawn_blocking(move || {
-        crate::cmd::oneshot::run(&exe, layer, &image, &argv, stdin.as_bytes(), deadline)
+        crate::cmd::oneshot::run(
+            &crate::cmd::oneshot::Host {
+                exe: &exe,
+                paths: &paths,
+                private_net,
+            },
+            layer,
+            &image,
+            &argv,
+            stdin.as_bytes(),
+            deadline,
+        )
     })
     .await
     .context("the sandbox task panicked")??;

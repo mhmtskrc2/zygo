@@ -247,6 +247,16 @@ handler cannot use a resolver of its own to get around the list: under
 never enter the sandbox. A blocked connection is rejected at once, not
 silently dropped, so a program fails fast instead of waiting for a timeout.
 
+### A network needs a profile that can open a socket
+
+`seccomp = "strict"` removes `socket` and `connect`
+([chapter 24](24-seccomp-profiles.md)). Under it an `egress` or `full`
+sandbox has a namespace, a firewall and an allowlist, and every connection
+still fails with `EPERM` before any of them is asked. So the combination is
+refused when the sandbox is declared, with the way out in the message. A
+runtime pool is `strict` unless it says otherwise, so a pool that calls out
+names `seccomp = "default"` next to its `network`.
+
 ## The allowlist
 
 `allow` is the list of places an `egress` function may reach. It is only
@@ -285,8 +295,16 @@ with a namespace — `none`, `egress` and `full` — these ranges stay closed:
 Multicast is on the list because a multicast group is a way to talk to the
 neighbours without naming any of them.
 
-Only `--allow-private-net` opens them. An `allow` rule with a CIDR inside one
-of these ranges is refused unless you pass that flag.
+Only `--allow-private-net` opens them. An `allow` rule inside one of these
+ranges — a CIDR, or a single address such as `192.168.1.70:8765` — is refused
+unless you pass that flag. Before 0.1.4 a single address was read as a host
+name: `serve` accepted it, and the firewall then refused every connection to
+it as the private address it is, with nothing to say why.
+
+Over the HTTP API a request body can never set it. Whoever starts the API
+can: `zygo api --allow-deploy --allow-private-net` lets what deploy callers
+serve name private addresses in `allow`
+([chapter 17](17-api-sdk-mcp.md#what-stays-off-for-everybody)).
 
 ## The host's own loopback
 

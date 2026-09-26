@@ -59,4 +59,5 @@ is the project README.
   - [ADR 0006 — The memory limit is each request's](book/adr/0006-memory-limit-per-request.md)
   - [ADR 0007 — A third SDK, in Elixir](book/adr/0007-elixir-sdk.md)
   - [ADR 0008 — A function may listen; a pool may not](book/adr/0008-listening-inside-a-sandbox.md)
+  - [ADR 0009 — The API may allow private addresses](book/adr/0009-api-private-net.md)
 - [Glossary](book/glossary.md)

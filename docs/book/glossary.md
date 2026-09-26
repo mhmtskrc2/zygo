@@ -84,4 +84,4 @@ One line each. The chapter in brackets explains the term in full; the numbers fo
 
 ---
 
-← [ADR 0008 — A function may listen; a pool may not](adr/0008-listening-inside-a-sandbox.md) · [Contents](README.md)
+← [ADR 0009 — The API may allow private addresses](adr/0009-api-private-net.md) · [Contents](README.md)

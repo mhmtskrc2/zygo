@@ -93,9 +93,10 @@ author must not:
 * **`LIMITS`** — memory, CPU, pids, a deadline and `seccomp = "strict"`,
   applied to every script whatever it asks for. The engine owns the limits.
 * **`network = "none"`** — a script gets egress only when the engine's own
-  policy grants it, through `network = "egress"` and an `allow` list of
-  `host:port` entries. There is no in-between and no way for a script to widen
-  it.
+  policy grants it, through `network = "egress"`, an `allow` list of
+  `host:port` entries and `seccomp = "default"` — `strict` has no `socket`,
+  and Zygo refuses a network under it. There is no in-between and no way for
+  a script to widen it.
 * **`WARM_LIMIT`** — how many scripts this worker holds warm. A zygote is a
   held sandbox with an interpreter in it; a platform with ten thousand scripts
   keeps the hot ones and lets the rest go. Zygo's idle tiering does the same

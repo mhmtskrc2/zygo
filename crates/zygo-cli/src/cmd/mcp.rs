@@ -398,8 +398,18 @@ impl Server {
             // that far, and the image pull on a first run lives inside it.
             .saturating_add(std::time::Duration::from_secs(300));
 
-        let captured =
-            super::oneshot::run(&self.exe, layer, &image, &argv, stdin.as_bytes(), deadline)?;
+        let captured = super::oneshot::run(
+            &super::oneshot::Host {
+                exe: &self.exe,
+                paths: &self.paths,
+                private_net: false,
+            },
+            layer,
+            &image,
+            &argv,
+            stdin.as_bytes(),
+            deadline,
+        )?;
         Ok(render(&captured))
     }
 

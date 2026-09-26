@@ -77,6 +77,7 @@ pub(super) async fn serve_runtime(
         .unwrap_or_else(|| std::path::PathBuf::from("/"));
 
     let deps = request.deps;
+    let private_net = api.private_net;
     let reply = control(api, move |c| {
         Ok(c.send(&Control::ServeRuntime {
             tenant,
@@ -85,9 +86,10 @@ pub(super) async fn serve_runtime(
             layer: Box::new(request.layer),
             base_dir,
             deps,
-            // Never from a socket, for the reason `PUT /fn/<name>` gives.
+            // Never from a request, for the reason `PUT /fn/<name>` gives;
+            // private addresses only when `zygo api` itself was told.
             allow_host_net: false,
-            allow_private_net: false,
+            allow_private_net: private_net,
             allow_unlimited: false,
         })?)
     })

@@ -82,7 +82,8 @@ LIMITS = {
     "seccomp": "strict",
     # No network unless the engine grants it. A script that needs egress gets
     # `network = "egress"` and an `allow` list from the engine's own policy,
-    # never from the script.
+    # never from the script — and `seccomp = "default"` with them, because
+    # `strict` takes `socket` away and Zygo refuses a network under it.
     "network": "none",
 }
 

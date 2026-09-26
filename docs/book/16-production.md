@@ -86,7 +86,10 @@ images first.
 on `zygo up`. A deploy from a file should never loosen a wall just because
 the file says so. A function that really needs one must be served by hand
 with `zygo serve` and the flag typed by a person
-([chapter 14](14-limits-network-secrets.md#loosening-by-name)).
+([chapter 14](14-limits-network-secrets.md#loosening-by-name)). The one
+flag of the three on `zygo api` is `--allow-private-net`, for an embedder
+whose pools call back to a service of its own; it is typed by whoever
+starts the API, never sent in a request.
 
 ## The supervisor
 

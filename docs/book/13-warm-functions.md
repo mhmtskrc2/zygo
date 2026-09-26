@@ -454,7 +454,10 @@ the file's bytes) of a script stored earlier with `PUT /scripts`. The forked
 child loads it, runs its `handler` (or the function named by
 `entry_point`), and exits. The script is loaded *after* the child's seccomp
 filter is on, so even its import-time code is filtered, and a pool's seccomp
-profile defaults to `strict`. This is how a platform with ten thousand user
+profile defaults to `strict`. `strict` has no `socket`, so a pool whose
+scripts call out names `seccomp = "default"` beside its `network`; asking
+for a network under `strict` is refused rather than left silently unusable.
+This is how a platform with ten thousand user
 scripts keeps a handful of zygotes warm instead of ten thousand.
 
 ```bash

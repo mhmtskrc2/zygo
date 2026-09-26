@@ -117,10 +117,27 @@ a tenant token is for instead.
 
 ### What stays off for everybody
 
-Over HTTP, host networking, private-range egress and unlimited limits are
-always refused, whatever the caller and whatever the body says. A request
-body must not be able to remove a guarantee. Set those where the sandbox is
-declared, in `sandbox.toml` (see [chapter 20](20-sandbox-toml.md)).
+A request body can never remove a guarantee. Host networking and unlimited
+limits are refused over HTTP whatever the caller and whatever the body says.
+Set those where the sandbox is declared, in `sandbox.toml` (see
+[chapter 20](20-sandbox-toml.md)).
+
+Private-range egress has one more place: the command that starts the API.
+`zygo api --allow-deploy --allow-private-net` lets what deploy callers serve
+— `PUT /fn/{name}`, `POST /runtimes`, `POST /run` — name private and
+link-local addresses in `allow`. It opens nothing by itself: a rule still
+names the address and the port, and everything else in those ranges stays
+shut. It is for an embedder whose scripts must call back to a service of its
+own, which chapter 14 says to put on an address the host really has. Without
+`--allow-deploy` it does nothing, because only a deploy call declares a
+sandbox, and `GET /version` reports it as `private_net` for callers who can
+use it.
+
+```text
+  zygo api --allow-deploy                       zygo api --allow-deploy --allow-private-net
+  POST /runtimes  allow=["10.0.0.5:4010"]       POST /runtimes  allow=["10.0.0.5:4010"]
+    → 400 bad_spec: targets a private range       → served; 10.0.0.5:4010 and nothing else
+```
 
 ## Request and response headers
 
@@ -1331,6 +1348,7 @@ failure rather than something an embedder finds later.
 | `api` | The HTTP surface. Bumped only on an incompatible change to a route, so it stays put across releases that change what happens behind them. This is what a client checks. |
 | `control` | The CLI-to-supervisor protocol, which no SDK speaks. Reported because a mismatch there explains an API that is up but answering errors. |
 | `deploy` | Whether *this caller* has deploy rights — the truth about your own token, not just the flag. |
+| `private_net` | Whether what *this caller* deploys may allow private addresses: `zygo api --allow-private-net`, and deploy rights. |
 
 All three packages are `0.1.3` and follow the repository's `0.x` policy:
 the shape may change with a release note. After `1.0` it will not change

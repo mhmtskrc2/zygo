@@ -62,6 +62,13 @@ break things and will say so here.
   streaming as a lazy `Stream`, and a named pool to put under a supervisor.
   Two dependencies, Mint and NimblePool; Elixir 1.18 or newer. ADR 0007
   says why it lives in this repository.
+- `zygo api --allow-private-net`: what deploy callers serve may name private
+  and link-local addresses in `allow`, the way `zygo serve
+  --allow-private-net` already could. Typed by whoever starts the API and
+  never read from a request; it does nothing without `--allow-deploy`, and
+  `GET /version` reports it as `private_net`. For an embedder whose pools
+  call back to a service of its own on the host's LAN address, which until
+  now only a spec file served by hand could reach. ADR 0009.
 
 ### Fixed
 
@@ -81,6 +88,23 @@ break things and will say so here.
 - Chapter 10 places Sandlock and Zeroboot, two 2026 projects that fork a
   warm process per call, on the map, and chapter 23 lists the
   tenant-against-tenant vectors the escape suite does not attempt yet.
+- `POST /run`, and `zygo mcp`'s `run_code`, run their one-shot sandbox against
+  the store and supervisor of the process that answers them. An API started
+  with `--data-root` spawned the child without it, so the child used the
+  default root: a store without the images just pulled, and whatever
+  supervisor was there. Found when a `POST /run` to an API on a root of its
+  own never answered.
+- A single private address in `allow` — `192.168.1.70:8765`, `10.0.0.5` —
+  is refused without `--allow-private-net`, as a CIDR inside a private range
+  already was. It used to be read as a host name, accepted, and then refused
+  by the firewall on every connection with no word about why.
+- `network = "egress"` or `"full"` under `seccomp = "strict"` is refused when
+  the sandbox is declared. `strict` takes `socket` and `connect` away, so
+  every connection failed with `EPERM` before the allowlist was consulted.
+  A runtime pool is `strict` unless it names another profile, so this is
+  what a pool with an allowlist and no `seccomp` met; the message says to
+  set `seccomp = "default"`. The workflow-engine example said to grant
+  egress by `network` and `allow` alone, and now says this too.
 - **Warm functions and runtime pools:** a request that goes over `mem` is
   now killed alone. The limit and the group kill used to sit on the
   function's cgroup, one budget for the zygote and every request at once, so
