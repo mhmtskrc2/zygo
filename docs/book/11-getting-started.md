@@ -17,6 +17,31 @@ You can stop after any step. A CI job that only needs `zygo run` never has
 to learn about warm functions, and a Mac user can do all of it without
 setting up Linux by hand.
 
+## The five-minute version
+
+If you would rather type first and read later, this is the whole road in
+one block. Every line is explained further down the page.
+
+```bash
+# install: Linux, x86_64 or aarch64 (a Mac: brew install mhmtskrc2/zygo/zygo)
+url=https://github.com/mhmtskrc2/zygo/releases/latest/download
+curl -fsSLO "$url/zygo-$(uname -m)-unknown-linux-musl.tar.gz"
+curl -fsSL "$url/SHA256SUMS" | sha256sum -c --ignore-missing
+tar xzf zygo-*-unknown-linux-musl.tar.gz && sudo install -m 0755 zygo-*/zygo /usr/local/bin/
+
+zygo doctor                                   # can this host run sandboxes? --fix if not
+zygo run python:3.12-slim python3 -c 'print("hello")'   # one sandbox, thrown away
+
+echo 'def handler(event): return {"got": event}' > handler.py
+zygo serve ./handler.py --name echo           # warm it once: about 150 ms
+zygo exec echo '{"n": 1}'                     # a fresh fork of it: about 1.4 ms
+zygo stop echo
+```
+
+If `zygo doctor` reports something red, [its section](#checking-the-host-zygo-doctor)
+below says what each line means, and `zygo doctor --fix` applies the usual
+fixes for you.
+
 ## What you need
 
 Zygo is one *static binary*: a single file that carries everything it needs,

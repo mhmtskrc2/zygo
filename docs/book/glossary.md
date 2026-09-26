@@ -62,6 +62,7 @@ One line each. The chapter in brackets explains the term in full; the numbers fo
 | **`sandbox.toml`** | The file that describes a project's functions, pools and API. [20] |
 | **SBOM** | "Software bill of materials": the list of every library inside a binary, with versions, published with each release. [11] |
 | **seccomp** | A filter on which syscalls a process may make. [4] |
+| **session sandbox** | A sandbox that stays up for minutes or hours with its state kept between commands, as hosted agent platforms sell; the opposite of a call. [10] |
 | **setns** | The syscall that joins a namespace that already exists. [2] |
 | **setuid** | A mark on a program that makes it run as its owner, often root. [4] |
 | **static linking** | A program that carries all its library code inside its own file, so it runs on almost any image. [6, 12] |
