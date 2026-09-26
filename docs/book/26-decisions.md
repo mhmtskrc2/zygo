@@ -44,7 +44,7 @@ are today's plain-English summary; the ADR itself is the exact wording.
 ### The question
 
 Zygo can be described in two ways. One is "a faster Docker": one static binary,
-no daemon, no root, OCI images, a sandbox in 18 ms instead of 300–1000 ms. That
+no daemon, no root, OCI images, a sandbox in about 12 ms instead of 300–1000 ms. That
 is true, but the field is crowded — [kern](10-similar-projects.md#kern),
 [nono](10-similar-projects.md#nono), [microsandbox](10-similar-projects.md#microsandbox)
 and Docker's own sandboxes all compete there. The other is "the runtime a
@@ -110,10 +110,14 @@ Phase 0 was a real gate: without the 10× ratio, the ADR would be wrong, not
 early. It passed at 25× on the Lima VM — and at 60× on Docker Desktop's VM
 before the bytecode layer, and 100× on a Raspberry Pi in an older run that
 [chapter 25](25-performance.md#a-second-host-with-kern-in-it) has not
-repeated. Phase 1 passed too: even the slowest 1 in
-100 calls took only 2.92 ms, and a thousand scripts in one zygote used
-29.4 MB.
-[Chapter 25](25-performance.md#the-embedders-benchmark) has both measurements.
+repeated. Phase 1 passed on the kernel it was set on: on Docker Desktop's
+Linux 5.10 VM even the slowest 1 in 100 calls took 3.2 ms, and a thousand
+scripts in one zygote used 29.4 MB. On the Lima VM's Linux 6.8 the same 1 in
+100 is 11.4 ms as the kernel comes, and 3.3 ms once `zygo doctor --fix` has
+turned on `favordynmods`; a warm function with no pool at all shows the same
+tail, so it is the kernel's cgroup move, not the pool.
+[Chapter 25](25-performance.md#why-1-in-100-is-slow-on-newer-kernels) explains
+the tail and [has both measurements](25-performance.md#the-embedders-benchmark).
 
 ### What would reopen it
 
@@ -345,7 +349,7 @@ aarch64, 2 vCPU, 3.8 GiB), `python:3.12-slim`:
 | what one more script adds | **0 kB** |
 | second call over the API: usually / 1 in 100 | 1.95 ms / 2.38 ms |
 | a warmed function on the same host: usually / 1 in 100 | 1.36 ms / 1.57 ms |
-| the pool's extra cost | +0.6 ms usually, +0.8 ms for the slowest 1 in 100 |
+| the pool's extra cost | +0.5 ms usually, +0.8 ms for the slowest 1 in 100 |
 
 So about **300 warm Python scripts fit in 4 GB** on that VM, and a thousand
 would need 11 GB. [Chapter 25](25-performance.md#memory-per-warm-script-on-a-smaller-vm)
@@ -358,7 +362,9 @@ worth paying once** — an ML model, a large client library. It pays those once
 and about 1.4 ms per call, and costs 11 MB while warm. **A runtime pool is right
 when the script is a few lines over the standard library**, like most such
 scripts. It pays 0.6 ms more per call and *nothing* to stay resident, because
-the script is not kept; it arrives with each request.
+the script is not kept; it arrives with each request. (Chapter 25 puts the
+pool's cost at +0.47 ms on the Lima VM and +0.46 ms on Docker Desktop's;
+the ADR quotes the 0.6 ms of its own, earlier run.)
 
 ```text
   does the script import something expensive?
@@ -366,7 +372,7 @@ the script is not kept; it arrives with each request.
      yes ──► one warm zygote per script version
              pays the imports once · ~1.4 ms a call · ~11 MB warm
      no  ──► a runtime pool
-             +0.6 ms a call · 0 kB per extra script
+             +0.5 ms a call · 0 kB per extra script
   ─────────────────────────────────────────────────────────────
 ```
 

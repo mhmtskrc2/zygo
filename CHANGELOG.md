@@ -136,6 +136,14 @@ break things and will say so here.
 
 ### Fixed
 
+- The docs disagreed with themselves, a third time: a runtime pool costs
+  about 0.5 ms over a warm function everywhere (chapter 25's +0.47 ms on the
+  Lima VM; 0.6 and 0.65 ms were older runs), `vm` costs about six times `ns`
+  in chapter 6 as in chapters 8 and 25, chapter 26 says the one-shot sandbox
+  is about 12 ms rather than 18, and the Phase 1 gate in chapter 26 and ADR
+  0001 now quotes the 25 September measurement on both kernels instead of a
+  2.92 ms that appears nowhere in chapter 25. Chapter 10's "clean state per
+  request" row points at what a fork still shares.
 - The examples suite waited 15 seconds for `zygo api` at `/health`, a path
   the API does not serve; it is `/healthz`.
 - The `cargo check` for the musl target warned twice about `libc::time_t`,

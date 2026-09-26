@@ -103,7 +103,7 @@ These are the time a tool **adds**. Your own code's time comes on top.
 |---|---|---|---|---|---|---|---|---|
 | Per-request overhead | 300–1000 ms | 50–100 ms | ~125 ms boot; 10–20 ms from a snapshot | 50–150 ms | ~1–5 ms + platform | **usually 12 ms** | **usually 1.9 ms** · 1 in 100: 11.4 ms¹ · a different script each time | **usually 1.4 ms** · 1 in 100: 10.5 ms¹ |
 | Paid once, up front | — | a `docker run -d` | the VM's own boot, or a snapshot | — | a cold start, platform-side | — | a `zygo serve --runtime`: the interpreter and its dependencies, once for *every* script | a `zygo serve`: ~150 ms for a Python handler, plus its imports |
-| Clean state per request | yes | no | yes | yes | no | **yes** | **yes** (a fresh process; the script is loaded in it) | **yes** (a fresh process) |
+| Clean state per request | yes | no | yes | yes | no | **yes** | **yes** (a fresh process; the script is loaded in it)² | **yes** (a fresh process)² |
 | Daemon | yes | yes | yes (a VMM per VM) | yes (`runsc` + shim) | n/a | **no** | **no system service**: a supervisor under your user | **no system service**: a supervisor under your user |
 | Root | daemon runs as root | same | needs `/dev/kvm` | no, in rootless mode (how Zygo runs it); then its cgroup limits are advisory | n/a | **no** | **no** | **no** |
 | Wall | kernel | kernel | hardware | userspace kernel | hardware | kernel (`ns`); userspace kernel (`gvisor`); hardware (`vm`) | kernel (`ns` only) | kernel (`ns` only) |
@@ -113,6 +113,11 @@ into its cgroup; on Linux 5.10 the same is 2.6 ms (warm) and 3.2 ms (pool).
 [Chapter 25](25-performance.md#why-1-in-100-is-slow-on-newer-kernels) explains
 it. Zygo numbers are from a Lima VM, Linux 6.8, 25 September 2026.
 
+² Clean as in a fresh process forked from a zygote that has never served a
+request. A fork still shares what the zygote had before any request: its
+memory layout, a socket opened at import time, a literal `/tmp/...` path.
+[Fork safety](fork-safety.md) goes through each.
+
 The first row is the whole argument. A container's cost is the machinery
 around it and the cold start of the interpreter. Zygo takes the machinery off
 the request path entirely, and it pays the interpreter's start only once, in
@@ -121,7 +126,7 @@ a warm zygote.
 The three Zygo columns are three answers to "what is warm?". `zygo run` keeps
 nothing warm. A **pool** keeps the interpreter and its dependencies warm, but
 no code: each request brings its own script, so one pool serves thousands of
-different scripts, for about 0.65 ms more than a function. A warm **function**
+different scripts, for about 0.5 ms more than a function. A warm **function**
 keeps one handler loaded, which is the fastest, but costs one zygote per
 script ([chapter 13](13-warm-functions.md#runtime-pools)).
 
@@ -589,6 +594,50 @@ with a similar shape — a function, a warm instance, a request — and no
 platform around it: no billing, no scaling across machines, and no *ingress*
 (accepting connections from outside).
 
+## Hosted sandboxes for agents: E2B, Modal, Daytona and the rest
+
+Since 2025 a new group of products sells *a sandbox for an AI agent*: E2B,
+Modal Sandboxes, Daytona, Vercel Sandbox, Cloudflare Sandboxes, Blaxel,
+Docker's own Sandboxes, and more every quarter. The README names three of
+them; this section says where they sit on the map above, because the word
+"sandbox" covers two different things.
+
+**What they are.** Each gives an agent a *session*: a machine of its own
+with a filesystem, a shell, packages it can install, ports it can expose,
+and a lifetime of minutes to hours, billed by the second. The wall is a
+microVM (Firecracker at E2B and Vercel, a custom monitor at Docker) or
+gVisor (Modal), and the session can often be paused, snapshotted and
+resumed. They run in the vendor's cloud; some can be self-hosted, at the
+cost of running their control plane. Everything in this paragraph is their
+own description, not measured here.
+
+**Where they sit.** On the map they are the top-left cell — a virtual
+machine, built for each session — with one addition: the session *stays*.
+That is the right shape for an agent that writes code, runs it, reads the
+error and tries again for half an hour. It is the wrong shape for what Zygo
+is for: a function that runs for milliseconds, thousands of times, and must
+start clean each time. A session per call would cost a VM boot, or a
+snapshot restore, per call.
+
+```text
+  a hosted agent sandbox                 a Zygo warm function
+  ──────────────────────                 ────────────────────
+  one session, minutes to hours          one call, milliseconds
+  state kept between commands            no state between calls
+  a VM (or gVisor) per session           a fork per call, on one kernel
+  in their cloud, billed per second      on your machine, no billing
+  pause, snapshot, resume                nothing to resume: warm again
+  ports, a shell, a desktop              no ingress, no shell in the request
+```
+
+**Choosing.** If an agent needs a machine to work in — install packages,
+run a server, keep files between steps — use one of these, or
+microsandbox on your own hardware. If a program needs to run *many small
+pieces of untrusted code* — an agent's tool calls, a customer's plugin, a
+workflow step — and each must be cheap and clean, that is Zygo. The two
+combine: an agent living in a hosted session can still call a Zygo function
+for the tool that must answer in a millisecond.
+
 ## runc, crun and youki
 
 These are the low-level OCI runtimes: given a folder and a `config.json`,
@@ -765,6 +814,7 @@ A run now starts 4 processes, down from 13 at the worst.
 | gVisor | second kernel | OCI | cgroups | no | no, in rootless mode (how Zygo runs it); then its cgroup limits are advisory | safer containers |
 | microsandbox | VM | OCI | the VM's | no (snapshots) | no | hostile code |
 | Firecracker | VM | no (a disk image) | the VM's | no (snapshots) | KVM access | serverless platforms |
+| E2B, Modal, Daytona, Docker Sandboxes | VM or gVisor, per session | OCI or their templates | the VM's | no (snapshots) | their cloud (or self-host) | an agent's working machine |
 | Kata | VM | OCI | the VM's | no | yes | safer Kubernetes pods |
 | FreeBSD jail | host kernel | no (a folder) | rctl, opt-in | no | yes | long-lived services on FreeBSD |
 

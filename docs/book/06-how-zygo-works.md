@@ -138,7 +138,7 @@ through a library. So any language can have an agent: Zygo ships one for
 Python and one for Node, and `zygo agent test` checks a new one against the
 same conversation. A *runtime pool* is the same idea with no handler loaded
 in advance: the script arrives with the request, which lets one warm zygote
-serve thousands of different scripts for about 0.65 ms more.
+serve thousands of different scripts for about 0.5 ms more.
 
 ## The supervisor
 
@@ -382,7 +382,7 @@ flag at a time; Zygo makes you *remove* it one flag at a time.
 else. `ns` is everything above: the host kernel with its locks, and the only
 backend with warm functions. `gvisor` puts gVisor's user-space kernel between
 your program and the host. `vm` boots a small virtual machine with its own
-kernel through libkrun, for code you trust least, at about ten times the
+kernel through libkrun, for code you trust least, at about six times the
 start-up cost. [ADR 0002](adr/0002-warm-paths-stay-on-ns.md) explains why
 the warm path stays on `ns`.
 

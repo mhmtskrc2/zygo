@@ -976,7 +976,7 @@ Neither column is inside the 5 ms budget, including the one with no pool in it
 at all. So this tool measures a Python client making a thousand serial HTTP
 calls on a four-core machine. It does not measure the request path the budget
 was written for. The pool's own cost is the difference, and even that reads high
-here (+2.08 ms, against the +0.65 ms the direct measurement finds), because HTTP
+here (+2.08 ms, against the +0.47 ms the direct measurement finds), because HTTP
 variance lands in both columns.
 
 It is kept as a warning about tools, and as the number an embedder calling over

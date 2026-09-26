@@ -457,16 +457,17 @@ zygo exec --runtime py312 --script sha256:9f2c… --entry-point monthly '{}'
   │    ├── fork ─▶ child loads script B (tenant beta) ─▶ exit   │
   │    └── fork ─▶ child loads script A again         ─▶ exit   │
   └─────────────────────────────────────────────────────────────┘
-      +0.65 ms per request, against a function with its code warmed in
+      +0.5 ms per request, against a function with its code warmed in
 ```
 
 A pool keeps `min_warm` zygotes ready whatever the load (default 1; 0 counts
 as 1) and may grow to `max_warm` under load (default the larger of `min_warm`
 and 4). `--agent` is `python`, `node`, or the path of your own agent inside
-the sandbox. The +0.65 ms was measured in Docker Desktop's VM with a different
-script on every request, a thousand of them. A pool with a `cmd` instead of an
-`agent` is a *warm-exec pool*: the script's path is passed as the last
-argument of `cmd` on each request.
+the sandbox. The +0.5 ms was measured with a different script on every
+request, a thousand of them: +0.47 ms on the Lima VM and +0.46 ms on Docker
+Desktop's ([chapter 25](25-performance.md#the-embedders-benchmark)). A pool
+with a `cmd` instead of an `agent` is a *warm-exec pool*: the script's path
+is passed as the last argument of `cmd` on each request.
 
 **Secrets in a pool.** A pool can name secrets (`secrets = ["STRIPE_KEY"]`
 in `[runtime.<name>]`, or `serve_runtime(..., secrets=[...])`), but it holds
