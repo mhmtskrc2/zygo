@@ -288,6 +288,37 @@ neighbours without naming any of them.
 Only `--allow-private-net` opens them. An `allow` rule with a CIDR inside one
 of these ranges is refused unless you pass that flag.
 
+## The host's own loopback
+
+`127.0.0.0/8` is on that list, but the sandbox has a loopback of its own, and
+the firewall lets it through: Zygo's resolver lives there. So the question
+is whether the sandbox's `127.0.0.1` can lead to the host's. `pasta` can do
+exactly that, and does by default: it forwards a connection to the
+sandbox's loopback on to the same port on the host's loopback, and it answers
+for the gateway address itself and hands those connections to the host too.
+Zygo turns both off (`--tcp-ns none --udp-ns none --no-map-gw`). A Postgres,
+a Redis or `zygo api` bound to `127.0.0.1` on the host is out of reach from a
+sandbox, whatever the allowlist says and whatever the kernel's Landlock can
+or cannot do.
+
+```text
+  sandbox                              host
+  ┌────────────────────────┐           ┌──────────────────────────────┐
+  │ connect 127.0.0.1:5432 │──▶ own    │ 127.0.0.1:5432  postgres     │ ◀── not reachable
+  │                        │  loopback │ 127.0.0.1:7700  zygo api     │ ◀── not reachable
+  │ connect <gateway>:5432 │──▶ the    │                              │
+  │                        │  router   │ 10.0.0.5:5432   postgres     │ ◀── allow 10.0.0.5:5432,
+  └────────────────────────┘           └──────────────────────────────┘     --allow-private-net
+```
+
+A function that must reach a service on its own host is given that service
+on an address the host really has — its LAN address, or one on a dummy
+interface — with an `allow` rule naming it and `--allow-private-net` typed by
+a person. A service on loopback only stays loopback only. Until 0.1.3
+this was not so: an `allow` rule for any name on port 5432 also opened the
+host's own `127.0.0.1:5432`, and on a kernel without Landlock's network
+rules (below 6.7) every port the host had bound on loopback was open.
+
 ## If `pasta` or `nft` is missing
 
 A networked sandbox needs both `pasta` and `nft` on the host. If either is

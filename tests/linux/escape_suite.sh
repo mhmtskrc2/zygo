@@ -696,6 +696,111 @@ else
 fi
 rm -rf "$WORK"
 
+# --- 19. the host's loopback, through the sandbox's own ---------------------
+
+say "19. reach a service the host bound to 127.0.0.1 only"
+# The sandbox has a loopback of its own, and the firewall inside the namespace
+# lets loopback through — it has to, for the resolver. `pasta`, left at its
+# defaults, turned that into a door: a connection to the sandbox's 127.0.0.1
+# on a port the host had bound was spliced through to the host's 127.0.0.1,
+# and the gateway address was answered by pasta itself and handed to the host
+# too. An `allow` naming `example.com:8443` reached a Postgres, a Redis or
+# `zygo api` on the host, if it listened on 8443. Both doors are now told
+# `none`; this attempts to open each of them, under `egress` and `full`.
+#
+# The listener serves a marker file, so "connected" and "reached the host" are
+# told apart by what came back rather than by whether the connect succeeded.
+if [ "$(id -u)" = 0 ] && ! command -v pasta >/dev/null 2>&1; then
+    timeout 300 sh -c 'apt-get update && apt-get install -y --no-install-recommends passt nftables iproute2' \
+        >/tmp/escape-net-install.log 2>&1
+fi
+if ! command -v pasta >/dev/null 2>&1 || ! command -v nft >/dev/null 2>&1; then
+    skip "19. needs pasta and nft on this host"
+elif ! python3 -c 'open("/dev/net/tun", "rb")' 2>/dev/null; then
+    skip "19. needs a usable /dev/net/tun"
+else
+    WORK=$(mktemp -d)
+    printf 'zygo-host-marker\n' > "$WORK/marker"
+    python3 -m http.server 8443 --bind 127.0.0.1 --directory "$WORK" >/dev/null 2>&1 &
+    LISTENER=$!
+    PROBE='
+import socket, sys
+def probe(host, port=8443):
+    try:
+        s = socket.create_connection((host, port), timeout=3)
+    except OSError as e:
+        return "refused:%s" % (e.errno if e.errno is not None else type(e).__name__)
+    try:
+        s.sendall(b"GET /marker HTTP/1.0\r\nHost: x\r\n\r\n")
+        data = s.recv(4096)
+    except OSError as e:
+        return "connected-then:%s" % e.errno
+    finally:
+        s.close()
+    return "REACHED-THE-HOST" if b"zygo-host-marker" in data else "connected-elsewhere"
+def gateway():
+    for line in open("/proc/net/route").readlines()[1:]:
+        f = line.split()
+        if f[1] == "00000000":
+            return socket.inet_ntoa(bytes.fromhex(f[2])[::-1])
+    return None
+'
+    # The listener must be reachable from where it lives, or a refusal below
+    # proves nothing (rule 4).
+    i=0
+    until python3 -c "$PROBE
+print(probe('127.0.0.1'))" 2>/dev/null | grep -q REACHED-THE-HOST || [ $i -ge 20 ]; do
+        i=$((i+1)); sleep 0.1
+    done
+    if [ $i -ge 20 ]; then
+        skip "19. the host-side listener on 127.0.0.1:8443 never answered"
+    else
+        # 19a. egress, with 8443 on the allowlist for a name that is not the host.
+        out=$(zygo run --net egress --allow example.com:8443 "$IMAGE" python3 -c "$PROBE
+print(probe('127.0.0.1'))" 2>/tmp/escape.err | tr -d '\n ')
+        case "$out" in
+            REACHED-THE-HOST) bad "egress: the sandbox's 127.0.0.1:8443 reached the host's listener" ;;
+            refused:*|connected-*) ok "egress: the host's loopback is not behind the sandbox's ($out)" ;;
+            *) nothing_ran "19a" ;;
+        esac
+        # 19b. full: every public port is allowed, so only pasta stands between.
+        out=$(zygo run --net full "$IMAGE" python3 -c "$PROBE
+print(probe('127.0.0.1'))" 2>/tmp/escape.err | tr -d '\n ')
+        case "$out" in
+            REACHED-THE-HOST) bad "full: the sandbox's 127.0.0.1:8443 reached the host's listener" ;;
+            refused:*|connected-*) ok "full: the host's loopback is not behind the sandbox's ($out)" ;;
+            *) nothing_ran "19b" ;;
+        esac
+        # 19c. The gateway address, which pasta used to answer for itself and hand
+        # to the host. Allowed on purpose, with the flag that opens private
+        # ranges, so that the only question left is who answers there.
+        gw=$(zygo run --net egress --allow example.com:8443 "$IMAGE" python3 -c "$PROBE
+print(gateway() or '')" 2>/tmp/escape.err | tr -d '\n ')
+        # Some hosts reflect their own loopback ports off the gateway with no
+        # sandbox involved: a Lima VM's gateway is the Mac, and Lima forwards
+        # the guest's 127.0.0.1 ports there and back. On such a host the probe
+        # would reach the listener whatever pasta did, so it cannot say
+        # anything about pasta and is skipped rather than reported either way.
+        reflected=$(python3 -c "$PROBE
+print(probe('$gw'))" 2>/dev/null)
+        if [ -z "$gw" ]; then
+            nothing_ran "19c (no gateway address inside the sandbox)"
+        elif [ "$reflected" = REACHED-THE-HOST ]; then
+            skip "19c. this host's gateway ($gw) reflects its loopback ports back with no sandbox at all, so pasta's part cannot be told apart here"
+        else
+            out=$(zygo run --net egress --allow-private-net --allow "$gw/32:8443" "$IMAGE" python3 -c "$PROBE
+print(probe('$gw'))" 2>/tmp/escape.err | tr -d '\n ')
+            case "$out" in
+                REACHED-THE-HOST) bad "the gateway address $gw is still answered by the host's loopback" ;;
+                refused:*|connected-*) ok "the gateway address $gw is the gateway, not the host ($out)" ;;
+                *) nothing_ran "19c" ;;
+            esac
+        fi
+    fi
+    kill "$LISTENER" 2>/dev/null; wait "$LISTENER" 2>/dev/null
+    rm -rf "$WORK"
+fi
+
 say ""
 say "----------------------------------------"
 say "escape suite: $PASS blocked, $FAIL escaped, $SKIP skipped"

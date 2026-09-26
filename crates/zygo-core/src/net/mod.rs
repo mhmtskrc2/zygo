@@ -669,6 +669,22 @@ pub(crate) mod linux {
             // from the host.
             .args(["--tcp-ports", "none"])
             .args(["--udp-ports", "none"])
+            // Nor outbound *to the host*. Left at its default, `auto`, pasta
+            // splices a connection to the sandbox's own loopback through to
+            // the same port on the host's loopback — every service bound to
+            // 127.0.0.1 there, a Postgres, a Redis, `zygo api` itself — and
+            // the firewall inside the namespace waves loopback through. On a
+            // kernel with Landlock's network rules only the allowlist's port
+            // numbers stood in the way; below 6.7, nothing did.
+            .args(["--tcp-ns", "none"])
+            .args(["--udp-ns", "none"])
+            // And no second door to the same place: by default pasta answers
+            // for the gateway address itself and hands those connections to
+            // the host, so an `allow` naming the gateway reached the host's
+            // loopback rather than the router it named. A sandbox that must
+            // reach a service on its host is given that service on an
+            // address the host really has, and `--allow-private-net`.
+            .arg("--no-map-gw")
             .args(["--dns-forward", DNS_ADDR])
             .args(["--ns-ifname", SANDBOX_IFNAME])
             .arg("--pid")

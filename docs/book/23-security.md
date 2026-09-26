@@ -143,8 +143,8 @@ out, or find a bug in the kernel underneath them all.
 
 Every row below marked **attempted** is run by `make escape-linux`. It runs
 the escape itself, not a check of a setting, because a test that reads a flag
-also passes on a kernel that ignores that flag. The suite attempts 19 vectors in 27
-checks, and on Linux 5.10 and 6.8 reports **27 blocked, 0 escaped, 0
+also passes on a kernel that ignores that flag. The suite attempts 20 vectors in 30
+checks, and on Linux 5.10 and 6.8 reports **30 blocked, 0 escaped, 0
 skipped**. Run rootless, it skips one: setting up a file capability to try
 needs root on the host.
 
@@ -162,7 +162,7 @@ syscall named in the tables below is refused.
   make escape-linux                        make fuzz-linux
   ─────────────────                        ───────────────
   every known attack, really tried         all 469 syscall numbers
-  → 27 blocked, 0 escaped, 0 skipped       × 3 profiles, one forked child each
+  → 30 blocked, 0 escaped, 0 skipped       × 3 profiles, one forked child each
                                            → profiles ordered, nothing kills
                                              the process, clone3 → ENOSYS
 ```
@@ -207,6 +207,7 @@ syscall named in the tables below is refused.
 |---|---|---|
 | Reaching the host over the network | default `network = "none"`; under `egress`/`full`, RFC1918, CGNAT, link-local, loopback, multicast and reserved ranges are rejected *above* every allow rule, so a hostname that resolves into one is refused too | **attempted** by the supervisor suite, and measured from outside by the first consumer: under `--net full` the cloud metadata address, the host's own Postgres and the LAN router are all *no route*, where Docker's default bridge reaches two of the three (see [below](#measured-against-docker)) |
 | Using a resolver of one's own to dodge the allowlist | DNS is forced to one address; port 53 to anything else is rejected | **attempted** |
+| Reaching a service the host bound to `127.0.0.1` only, through the sandbox's own loopback or the gateway address | `pasta` is started with `--tcp-ns none --udp-ns none --no-map-gw`: it neither splices the sandbox's loopback ports through to the host's nor answers for the gateway itself. Before 0.1.4 both were on by default, and an `allow` rule for any name on port *N* also opened the host's `127.0.0.1:N`; below Linux 6.7, every loopback port | **attempted** (case 19: under `egress` with the port allowed, under `full`, and by the gateway address with `--allow-private-net`; a host whose gateway reflects loopback ports back on its own, as a Lima VM's does, skips the last) |
 
 ## Vectors: secrets and the supervisor
 
@@ -235,7 +236,11 @@ neighbours, the LAN's router), any CGNAT, link-local, multicast or reserved
 address, or the host's loopback — whatever name they resolve from — unless the operator passes
 `--allow-private-net`. This is enforced inside the sandbox's own network
 namespace by nftables rules that sit *above* every allow rule, and by a
-resolver that admits only what the allowlist names. What Zygo does *not*
+resolver that admits only what the allowlist names. The host's loopback is
+closed a second way, because the firewall has to pass the sandbox's own
+loopback: `pasta` is told not to carry the sandbox's loopback ports to the
+host's and not to answer for the gateway address ([chapter
+14](14-limits-network-secrets.md#the-hosts-own-loopback)). What Zygo does *not*
 guarantee is anything about the public internet under `full`: that mode means
 "the internet and nothing of yours".
 
