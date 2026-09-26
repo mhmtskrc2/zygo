@@ -422,6 +422,64 @@ measured says it is needed before `idle_timeout` and a `429` do their job; a
 consumer who shows that need would reopen it.
 [Full ADR 0005](adr/0005-one-warm-zygote-per-script-version.md).
 
+## ADR 0006: The memory limit is each request's, not the function's
+
+### The question
+
+A warm function or a runtime pool runs several requests at once in one
+sandbox: a zygote, and one process per request under it. Its `mem` limit was
+written on the function's cgroup, the group that holds the zygote and every
+request together. So `mem` was one shared budget, and the kernel's "kill the
+whole group" setting sat at that level too. In a pool at `mem = 256M`, one
+request that asked for 2 GB was killed — and so were the zygote and the
+requests sleeping beside it, in the same moment. In a runtime pool those
+other requests can belong to other tenants. The book promised the opposite:
+that a request has its own group and can be killed alone. The question was
+where `mem` should really be written.
+
+### The decision
+
+`mem` goes on the leaves — the smallest groups at the bottom of the tree —
+and nowhere above them. Each request's own cgroup gets `mem`, with the
+group kill turned on there. The zygote's leaf gets the same limit, so the
+warm process is bounded on its own. The function's cgroup keeps the limits
+that really are one budget for the whole function: processes, CPU and swap.
+Its memory limit is set to "none" on purpose, so a folder left over from an
+older Zygo does not keep the old shared limit.
+
+```text
+  BEFORE                                  AFTER
+  ┌─ function: mem, group kill ──────┐    ┌─ function: pids, cpu, swap ──────┐
+  │ ┌────────┐ ┌─────────┐ ┌───────┐ │    │ ┌────────┐ ┌─────────┐ ┌───────┐ │
+  │ │ zygote │ │ req (a) │ │ req b │ │    │ │ zygote │ │ req (a) │ │ req b │ │
+  │ └────────┘ └─────────┘ └───────┘ │    │ │  mem   │ │   mem   │ │  mem  │ │
+  └──────────────────────────────────┘    │ └────────┘ └─────────┘ └───────┘ │
+  (a) goes over: all three die            └──────────────────────────────────┘
+                                          (a) goes over: only (a) dies
+```
+
+### What it costs
+
+A tenant's narrower limits still go on the request's cgroup, in place of the
+function's numbers. A whole function may now use up to `(concurrency + 1) ×
+mem` in each sandbox, not `mem`, so a host sized as "functions × mem" was
+sized for the old rule; chapters 13 and 20 say so. Memory a request shares
+with the zygote from the fork stays counted on the zygote, so only what a
+request allocates after it starts counts against its own `mem`. No extra
+ceiling was added above the leaves: it could only fire on memory the zygote
+holds, and a kill there would again reach the wrong process. `make
+verify-oom-linux` checks the promise, for the Python and the Node agent: a
+request that goes over dies, and the requests beside it finish.
+
+### What would reopen it
+
+- **A kernel that moves a process's memory charge with it** when it changes
+  cgroup. Then a ceiling above the leaves would be exact, and worth adding.
+- **An embedder who wants `mem` to mean the whole function's budget again**,
+  with a measurement of what the per-request shape costs them.
+
+[Full ADR 0006](adr/0006-memory-limit-per-request.md).
+
 ## ADR 0007: A third SDK, in Elixir, in this repository
 
 ### The question
