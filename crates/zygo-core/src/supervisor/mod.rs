@@ -68,7 +68,7 @@ pub use lifecycle::{TermGuard, on_terminate};
 pub use listener::Listener;
 pub use protocol::{CONTROL_VERSION, Change, ControlError, Request, Response, WorkspaceRequest};
 pub use registry::FunctionLoad;
-pub use runtime::RuntimeStatus;
+pub use runtime::{RuntimeStatus, ScriptRequest};
 
 use lifecycle::{Backoff, Launcher};
 use registry::{Cold, Entry};

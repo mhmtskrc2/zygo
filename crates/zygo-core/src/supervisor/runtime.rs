@@ -203,6 +203,59 @@ pub struct RuntimeStatus {
     pub uptime_s: u64,
 }
 
+/// Everything one `EXEC_SCRIPT` can carry, as the supervisor receives it.
+///
+/// The whole of what [`Supervisor::exec_script_full`] takes; `exec_script`
+/// fills in the fields it does not name. One struct rather than eight
+/// arguments, so a call site says which of them it is setting. It is not
+/// [`pool::Call`](crate::pool::Call), which is what the request becomes
+/// once the supervisor has resolved the tenant's limits, secrets and
+/// workspace — this is the shape *before* that work.
+pub struct ScriptRequest<'a> {
+    /// The runtime pool to run in, as `POST /runtimes` named it.
+    pub name: &'a str,
+    /// The script, which reaches the forked child and dies with it.
+    pub script: Script,
+    /// The event the handler receives.
+    pub event: serde_json::Value,
+    /// How long the caller waits. The pool's own budget is the ceiling.
+    pub timeout: Duration,
+    /// Whose request this is: whose limits and secrets apply, and who may
+    /// cancel it. `None` is the operator.
+    pub tenant: Option<&'a str>,
+    /// A name the caller chose, so it can cancel the request before the id
+    /// reaches it.
+    pub key: Option<&'a str>,
+    /// Where output goes as it is produced (v8). `None` is the ordinary path.
+    pub sink: Option<crate::pool::ChunkSink<'a>>,
+    /// Files the request brings, and whether it wants the directory back,
+    /// still by reference: resolved into a [`pool::Workspace`](crate::pool::Workspace)
+    /// here, where the supervisor can reach the store.
+    pub workspace: Option<super::protocol::WorkspaceRequest>,
+}
+
+impl<'a> ScriptRequest<'a> {
+    /// A plain request: the pool, the script, the event and how long to
+    /// wait, nothing else.
+    pub fn new(
+        name: &'a str,
+        script: Script,
+        event: serde_json::Value,
+        timeout: Duration,
+    ) -> ScriptRequest<'a> {
+        ScriptRequest {
+            name,
+            script,
+            event,
+            timeout,
+            tenant: None,
+            key: None,
+            sink: None,
+            workspace: None,
+        }
+    }
+}
+
 impl Supervisor {
     /// Register a runtime pool and bring `min_warm` zygotes up.
     ///
@@ -363,37 +416,28 @@ impl Supervisor {
         tenant: Option<&str>,
         key: Option<&str>,
     ) -> std::result::Result<Response, Response> {
-        self.exec_script_streaming(name, script, event, timeout, tenant, key, None)
-    }
-
-    /// The same, with output delivered as it is produced (v8).
-    #[allow(clippy::too_many_arguments)]
-    pub fn exec_script_streaming(
-        &self,
-        name: &str,
-        script: Script,
-        event: serde_json::Value,
-        timeout: Duration,
-        tenant: Option<&str>,
-        key: Option<&str>,
-        sink: Option<crate::pool::ChunkSink<'_>>,
-    ) -> std::result::Result<Response, Response> {
-        self.exec_script_full(name, script, event, timeout, tenant, key, sink, None)
+        self.exec_script_full(ScriptRequest {
+            tenant,
+            key,
+            ..ScriptRequest::new(name, script, event, timeout)
+        })
     }
 
     /// The whole of what one request to a pool can carry.
-    #[allow(clippy::too_many_arguments)]
     pub fn exec_script_full(
         &self,
-        name: &str,
-        script: Script,
-        event: serde_json::Value,
-        timeout: Duration,
-        tenant: Option<&str>,
-        key: Option<&str>,
-        sink: Option<crate::pool::ChunkSink<'_>>,
-        workspace: Option<crate::supervisor::protocol::WorkspaceRequest>,
+        request: ScriptRequest<'_>,
     ) -> std::result::Result<Response, Response> {
+        let ScriptRequest {
+            name,
+            script,
+            event,
+            timeout,
+            tenant,
+            key,
+            sink,
+            workspace,
+        } = request;
         let workspace = self.resolve_workspace(workspace)?;
         let tenant_limits = self.limits_for(tenant)?;
         let script = self.script_for_request(script, tenant)?;

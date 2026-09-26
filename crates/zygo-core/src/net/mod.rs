@@ -571,7 +571,6 @@ pub(crate) mod linux {
     ///
     /// Returns the resolver's handle for an `egress` sandbox; the caller keeps
     /// it for the sandbox's lifetime.
-    #[allow(clippy::too_many_arguments)]
     pub fn configure(
         pid: u32,
         network: Network,

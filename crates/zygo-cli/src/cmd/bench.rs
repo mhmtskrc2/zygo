@@ -80,7 +80,6 @@ pub fn run(cli: &Cli, command: &BenchCommand) -> anyhow::Result<u8> {
 /// code when the answer was a hot laptop.
 const NOT_A_VERDICT: u8 = 2;
 
-#[allow(clippy::too_many_arguments)]
 fn warm(
     cli: &Cli,
     n: u32,

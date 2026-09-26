@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use super::listener::reject_foreign_peer;
 use super::oneshot::{ClientWatch, receive_stdio};
-use super::{CONTROL_VERSION, ControlError, Request, Response, Supervisor};
+use super::{CONTROL_VERSION, ControlError, Request, Response, ScriptRequest, Supervisor};
 use crate::error::{Error, Result};
 use crate::spec::ResolveOptions;
 
@@ -149,16 +149,13 @@ pub(super) fn handle(supervisor: &Supervisor, stream: UnixStream) -> Result<()> 
             } if greeted => {
                 let out = std::sync::Mutex::new(&mut writer);
                 let sink = chunk_sink(&out);
-                merge(supervisor.exec_script_full(
-                    &runtime,
-                    script,
-                    event,
-                    Duration::from_millis(timeout_ms),
-                    tenant.as_deref(),
-                    key.as_deref(),
-                    Some(&sink),
+                merge(supervisor.exec_script_full(ScriptRequest {
+                    tenant: tenant.as_deref(),
+                    key: key.as_deref(),
+                    sink: Some(&sink),
                     workspace,
-                ))
+                    ..ScriptRequest::new(&runtime, script, event, Duration::from_millis(timeout_ms))
+                }))
             }
             other => dispatch(supervisor, other, &mut greeted),
         };
@@ -338,16 +335,12 @@ pub(super) fn dispatch(supervisor: &Supervisor, request: Request, greeted: &mut 
             key,
             stream: _,
             workspace,
-        } => merge(supervisor.exec_script_full(
-            &runtime,
-            script,
-            event,
-            Duration::from_millis(timeout_ms),
-            tenant.as_deref(),
-            key.as_deref(),
-            None,
+        } => merge(supervisor.exec_script_full(ScriptRequest {
+            tenant: tenant.as_deref(),
+            key: key.as_deref(),
             workspace,
-        )),
+            ..ScriptRequest::new(&runtime, script, event, Duration::from_millis(timeout_ms))
+        })),
         Request::Runtimes => Response::Runtimes {
             runtimes: supervisor.runtimes(),
         },

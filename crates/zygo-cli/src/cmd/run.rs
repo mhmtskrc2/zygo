@@ -158,7 +158,17 @@ fn run_in_phases(cli: &Cli, args: &RunArgs, phase: &std::cell::Cell<Phase>) -> a
         && let Ok(client) = zygo_core::supervisor::client::Client::connect(store.paths())
     {
         return run_through_supervisor(
-            cli, args, client, &spec, &overrides, &options, &resolved, planning, phase,
+            cli,
+            args,
+            client,
+            &Plan {
+                spec: &spec,
+                layer: &overrides,
+                options: &options,
+                resolved: &resolved,
+                started: planning,
+            },
+            phase,
         );
     }
 
@@ -414,6 +424,23 @@ fn run_in_phases(cli: &Cli, args: &RunArgs, phase: &std::cell::Cell<Phase>) -> a
     Ok(code.clamp(0, 255) as u8)
 }
 
+/// What the plan phase produced, handed to the supervisor path whole.
+///
+/// The supervisor resolves the run again from the same spec and layer, so
+/// it needs the inputs rather than only the result; `resolved` is kept for
+/// the deadline this process waits on. One struct rather than five
+/// arguments beside the client and the flags, so the call site says what
+/// the plan is.
+#[cfg(target_os = "linux")]
+struct Plan<'a> {
+    spec: &'a Spec,
+    layer: &'a zygo_core::spec::Layer,
+    options: &'a zygo_core::spec::ResolveOptions,
+    resolved: &'a zygo_core::spec::ResolvedFn,
+    /// When planning began, for the `plan` figure in `--outcome`.
+    started: std::time::Instant,
+}
+
 /// `zygo run`, with the sandbox started by the supervisor on this process's
 /// behalf. See the branch in [`run`] for why.
 ///
@@ -423,20 +450,22 @@ fn run_in_phases(cli: &Cli, args: &RunArgs, phase: &std::cell::Cell<Phase>) -> a
 /// sandbox's own deadline plus grace as a liveness bound, and the supervisor
 /// enforces the real deadline through the cgroup either way.
 #[cfg(target_os = "linux")]
-#[allow(clippy::too_many_arguments)]
 fn run_through_supervisor(
     cli: &Cli,
     args: &RunArgs,
     mut client: zygo_core::supervisor::client::Client,
-    spec: &Spec,
-    layer: &zygo_core::spec::Layer,
-    options: &zygo_core::spec::ResolveOptions,
-    resolved: &zygo_core::spec::ResolvedFn,
-    planning: std::time::Instant,
+    plan: &Plan<'_>,
     phase: &std::cell::Cell<Phase>,
 ) -> anyhow::Result<u8> {
     use zygo_core::supervisor::protocol::{Request, Response};
 
+    let Plan {
+        spec,
+        layer,
+        options,
+        resolved,
+        started: planning,
+    } = *plan;
     let request = Request::Run {
         spec: Some(Box::new(spec.clone())),
         layer: Box::new(layer.clone()),
