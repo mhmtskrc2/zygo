@@ -27,7 +27,7 @@
 //! no scheduler, and the two numbers an operator sets are the two they think
 //! in — "always have this many" and "never have more than this".
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -44,6 +44,13 @@ use crate::spec::ResolvedFn;
 pub(super) struct Zygote {
     function: Function,
     in_flight: AtomicU32,
+    /// The one request in flight has this zygote to itself.
+    ///
+    /// Set for a request that carries secrets: `/run/secrets` is one
+    /// directory per sandbox, so a second request forked beside it — from
+    /// another tenant, on a shared pool — could read the first one's files.
+    /// Cleared with the request. See [`choose`].
+    alone: AtomicBool,
     last_used: Mutex<Instant>,
 }
 
@@ -52,12 +59,22 @@ impl Zygote {
         Zygote {
             function,
             in_flight: AtomicU32::new(0),
+            alone: AtomicBool::new(false),
             last_used: Mutex::new(Instant::now()),
         }
     }
 
     fn in_flight(&self) -> u32 {
         self.in_flight.load(Ordering::SeqCst)
+    }
+
+    /// Count a request in. Under the pool's `zygotes` lock, so two requests
+    /// cannot both find the zygote idle and both take it alone.
+    fn claim(&self, alone: bool) {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        if alone {
+            self.alone.store(true, Ordering::SeqCst);
+        }
     }
 
     fn idle_for(&self, now: Instant) -> Duration {
@@ -73,11 +90,60 @@ impl Zygote {
 /// a panicking request path does not leave a zygote looking permanently busy.
 struct Busy<'a>(&'a Zygote);
 
+/// What [`Supervisor::pick_zygote`] found.
+enum Picked {
+    /// A zygote, with this request already counted on it.
+    Zygote(Arc<Zygote>),
+    /// Every zygote is taken — busy, when the request needs one to itself;
+    /// or held alone by a request with secrets — and the pool is at
+    /// `max_warm`. The caller answers `BUSY`.
+    Full,
+}
+
 impl Drop for Busy<'_> {
     fn drop(&mut self) {
         self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+        // Only a request that was alone could have set it, and it was the
+        // only one in flight — so this is that request leaving.
+        self.0.alone.store(false, Ordering::SeqCst);
         self.0.touch();
     }
+}
+
+/// What one zygote looks like to the scheduler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Seat {
+    healthy: bool,
+    in_flight: u32,
+    alone: bool,
+}
+
+/// Which zygote a request should run on, by position in the pool's list.
+///
+/// The least busy healthy one, ordinarily: every zygote is the same image
+/// with the same dependencies, and none holds anything a particular request
+/// needs, so spreading the load is the whole of the scheduling. A zygote
+/// whose request is alone is skipped — it is, for the moment, not shared.
+///
+/// A request that must be `alone` — one carrying secrets — takes only an
+/// **idle** zygote, because the files it is about to be given are readable
+/// by anything forked from the same sandbox while they exist. `None` for it
+/// means "every zygote is busy", which the caller turns into a new zygote if
+/// the pool has room and `BUSY` if it has not; `None` for an ordinary
+/// request means nothing healthy is left.
+///
+/// Its own function, over plain numbers, so the rule can be tested on a
+/// machine that cannot warm a zygote.
+fn choose(seats: &[Seat], alone: bool) -> Option<usize> {
+    if alone {
+        return seats.iter().position(|s| s.healthy && s.in_flight == 0);
+    }
+    seats
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.healthy && !s.alone)
+        .min_by_key(|(_, s)| s.in_flight)
+        .map(|(index, _)| index)
 }
 
 /// A registered runtime pool.
@@ -164,6 +230,24 @@ impl Supervisor {
         let mut resolved = spec
             .resolve_runtime(name, layer, options)
             .map_err(|e| Response::error(ControlError::BadSpec, e))?;
+
+        // A pool's secret values come from the calling tenant's store at
+        // request time, and from nowhere else — so a pool that names secrets
+        // on a host with no store is a pool whose every request would fail.
+        // Refused here, before a zygote is warmed, rather than one request
+        // at a time.
+        if !resolved.secrets.is_empty() && self.secret_store().is_none() {
+            return Err(Response::error(
+                ControlError::BadSpec,
+                format!(
+                    "runtime.{name}.secrets: this host has no secrets key, and a pool's \
+                     secret values can only come from the tenant store. Set {} (or {}) to \
+                     32 bytes from `zygo secrets keygen` and restart the supervisor",
+                    crate::secrets::KEY_ENV,
+                    crate::secrets::KEY_FILE_ENV,
+                ),
+            ));
+        }
 
         // Before the first zygote, not after: a pool whose dependencies are
         // still building must not exist half-warmed, and the answer to that is
@@ -314,6 +398,9 @@ impl Supervisor {
         let tenant_limits = self.limits_for(tenant)?;
         let script = self.script_for_request(script, tenant)?;
         let pool = self.runtime_named(name)?;
+        // Before the gate, and so before any zygote is touched: a tenant
+        // that lacks a secret the pool names is told so without a fork.
+        let secrets = self.secrets_for_pool_request(&pool, tenant)?;
 
         let permit = match pool.gate.enter(QUEUE_WAIT) {
             Ok(permit) => permit,
@@ -334,10 +421,22 @@ impl Supervisor {
             }
         };
 
-        let zygote = self.pick_zygote(name, &pool)?;
-        // Counted before the call and released on every exit from it, so a
-        // request that fails does not leave a zygote looking busy for ever.
-        zygote.in_flight.fetch_add(1, Ordering::SeqCst);
+        // Claimed inside `pick_zygote`, under the pool's lock, and released
+        // on every exit from here, so a request that fails does not leave a
+        // zygote looking busy — or alone — for ever.
+        let zygote = match self.pick_zygote(name, &pool, secrets.is_some()) {
+            Ok(Picked::Zygote(zygote)) => zygote,
+            Ok(Picked::Full) => {
+                let (in_flight, queued) = pool.gate.load();
+                return Ok(Response::Busy {
+                    name: name.to_string(),
+                    in_flight,
+                    queued,
+                    limit: pool.gate.limit(),
+                });
+            }
+            Err(e) => return Err(e),
+        };
         let _busy = Busy(&zygote);
 
         // Thawing is one write, so a paused zygote answers at warm speed plus
@@ -363,6 +462,8 @@ impl Supervisor {
                 // A pool is shared, so the pool's own tenant cannot answer
                 // this — the same argument cancellation made.
                 tenant_limits,
+                // And whose secrets: the same answer, for the same reason.
+                secrets,
             )
             .map(|(outcome, _)| outcome)
             .map_err(|e| Response::error(ControlError::CallFailed, e));
@@ -447,44 +548,121 @@ impl Supervisor {
         }
     }
 
-    /// The zygote this request should run on.
+    /// The secret values one request to a pool is to be given.
     ///
-    /// The least busy healthy one. With several identical zygotes and a
-    /// `concurrency` each, that is the whole of the scheduling — there is
-    /// nothing to be clever about beyond spreading the load, because every
-    /// zygote is the same image with the same dependencies and none of them
-    /// holds anything a particular request needs.
+    /// `None` for a pool that names no secrets, and then no store is
+    /// consulted — a host with no key serves such a pool as it always has.
+    /// Otherwise the pool's list says which names, and the **calling**
+    /// tenant's store says the values: a pool is shared, so the pool's own
+    /// tenant cannot answer, the same way limits and cancellation are the
+    /// request's. The operator's own requests read the `default` tenant.
     ///
-    /// Dead ones are *stepped over* here and cleared up by
-    /// [`scale_runtimes`], which owns the pool's size. A request that
+    /// A name the caller's tenant does not have fails the request here,
+    /// before it queues and before anything is forked, naming the secret and
+    /// the route that stores it — and never a value. The alternative, a
+    /// handler that fails opening a file that is not there, would say less
+    /// and say it later.
+    pub(super) fn secrets_for_pool_request(
+        &self,
+        pool: &RuntimePool,
+        tenant: Option<&str>,
+    ) -> std::result::Result<Option<std::collections::BTreeMap<String, String>>, Response> {
+        let names = &pool.resolved.secrets;
+        if names.is_empty() {
+            return Ok(None);
+        }
+        // `serve_runtime` refused the pool if there was no store, so this is
+        // a key that went away — which cannot happen, the key is read once —
+        // and is answered the way the store's own routes answer it.
+        let store = self.secrets_or_refuse()?;
+        let tenant = tenant.unwrap_or(crate::spec::resolve::DEFAULT_TENANT);
+        let values = store
+            .values_named(tenant, names)
+            .map_err(|e| Response::error(ControlError::CallFailed, e))?;
+        let missing: Vec<&str> = names
+            .iter()
+            .filter(|n| !values.contains_key(*n))
+            .map(String::as_str)
+            .collect();
+        if !missing.is_empty() {
+            return Err(Response::error(
+                ControlError::BadSpec,
+                format!(
+                    "runtime.{}.secrets: tenant `{tenant}` has no secret named {}; store {} \
+                     with `PUT /tenants/{tenant}/secrets/{}` (or `zygo secrets set {tenant} {}`)",
+                    pool.resolved.name,
+                    missing.join(", "),
+                    if missing.len() == 1 { "it" } else { "each" },
+                    missing[0],
+                    missing[0],
+                ),
+            ));
+        }
+        Ok(Some(values))
+    }
+
+    /// The zygote this request should run on, claimed.
+    ///
+    /// [`choose`] has the rule. Dead ones are *stepped over* and cleared up
+    /// by [`scale_runtimes`], which owns the pool's size: a request that
     /// happened to arrive after a crash should not pay for the rewarm when
-    /// there is a working zygote beside it. Only a pool with nothing healthy
-    /// left warms one on the request's own time, because then there is no
-    /// alternative to offer it.
+    /// there is a working zygote beside it. Only a pool with nothing to offer
+    /// warms one on the request's own time — nothing healthy left, or every
+    /// zygote busy when the request needs one to itself and the pool still
+    /// has room. A pool with no room answers `BUSY`, which a client retries;
+    /// the alternative, waiting on a zygote to empty, would be a second queue
+    /// behind the gate's.
     ///
     /// [`scale_runtimes`]: Supervisor::scale_runtimes
     fn pick_zygote(
         &self,
         name: &str,
         pool: &Arc<RuntimePool>,
-    ) -> std::result::Result<Arc<Zygote>, Response> {
-        let healthy = {
+        alone: bool,
+    ) -> std::result::Result<Picked, Response> {
+        let (picked, any_healthy, warm) = {
             let zygotes = pool.zygotes.lock().expect("zygotes");
-            zygotes
+            let seats: Vec<Seat> = zygotes
                 .iter()
-                .filter(|z| z.function.is_healthy())
-                .min_by_key(|z| z.in_flight())
-                .map(Arc::clone)
+                .map(|z| Seat {
+                    healthy: z.function.is_healthy(),
+                    in_flight: z.in_flight(),
+                    alone: z.alone.load(Ordering::SeqCst),
+                })
+                .collect();
+            let picked = choose(&seats, alone).map(|index| {
+                zygotes[index].claim(alone);
+                Arc::clone(&zygotes[index])
+            });
+            (
+                picked,
+                seats.iter().any(|s| s.healthy),
+                zygotes.len() as u32,
+            )
         };
-        if let Some(zygote) = healthy {
-            return Ok(zygote);
+        if let Some(zygote) = picked {
+            return Ok(Picked::Zygote(zygote));
         }
-        tracing::warn!(
-            runtime = name,
-            "no healthy zygote left in the pool; warming one now"
-        );
+        // Healthy zygotes exist and none is on offer: every one is busy and
+        // this request needs one to itself, or every one is held alone by a
+        // request with secrets. The pool grows if it may, and says so if not.
+        if any_healthy && warm >= pool.resolved.max_warm {
+            return Ok(Picked::Full);
+        }
+        if any_healthy {
+            tracing::info!(
+                runtime = name,
+                "every zygote is taken and this request cannot share one; warming another"
+            );
+        } else {
+            tracing::warn!(
+                runtime = name,
+                "no healthy zygote left in the pool; warming one now"
+            );
+        }
         self.prune_zygotes(pool);
-        self.add_zygote(name, pool)
+        let zygote = self.add_zygote(name, pool, alone)?;
+        Ok(Picked::Zygote(zygote))
     }
 
     /// Drop the zygotes whose agents have died, so the pool's size is the
@@ -499,12 +677,21 @@ impl Supervisor {
     }
 
     /// Add one zygote to a pool and return it.
+    ///
+    /// `claim` counts the caller's request in **before** the zygote is in
+    /// the list, so a request that needs the new zygote to itself cannot
+    /// find another request already forked on it. `None` is the idle
+    /// thread growing the pool for nobody in particular.
     fn add_zygote(
         &self,
         name: &str,
         pool: &Arc<RuntimePool>,
+        claim: impl Into<Option<bool>>,
     ) -> std::result::Result<Arc<Zygote>, Response> {
         let zygote = Arc::new(Zygote::new(self.warm_zygote(&pool.resolved)?));
+        if let Some(alone) = claim.into() {
+            zygote.claim(alone);
+        }
         pool.zygotes
             .lock()
             .expect("zygotes")
@@ -588,7 +775,7 @@ impl Supervisor {
             // zygotes gets them over four seconds, and one that was over in a
             // moment costs a single sandbox rather than a pool's worth.
             if below_floor || loaded {
-                match self.add_zygote(&name, &pool) {
+                match self.add_zygote(&name, &pool, None) {
                     Ok(_) => grown.push(name),
                     Err(response) => {
                         tracing::warn!(runtime = %name, "could not grow the pool: {response:?}");
@@ -720,5 +907,57 @@ impl Supervisor {
                 index += 1;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Seat, choose};
+
+    fn seat(healthy: bool, in_flight: u32, alone: bool) -> Seat {
+        Seat {
+            healthy,
+            in_flight,
+            alone,
+        }
+    }
+
+    #[test]
+    fn an_ordinary_request_takes_the_least_busy_healthy_zygote() {
+        let seats = [
+            seat(true, 2, false),
+            seat(false, 0, false),
+            seat(true, 1, false),
+        ];
+        assert_eq!(choose(&seats, false), Some(2), "not the idle corpse");
+        assert_eq!(choose(&[seat(false, 0, false)], false), None);
+    }
+
+    #[test]
+    fn a_request_with_secrets_takes_only_an_idle_zygote() {
+        // The files it is about to be given are one directory in the sandbox,
+        // readable by anything forked from it: a zygote with a request in
+        // flight — even a lightly loaded one — is not on offer.
+        let seats = [seat(true, 1, false), seat(true, 0, false)];
+        assert_eq!(choose(&seats, true), Some(1));
+        let busy = [seat(true, 1, false), seat(true, 3, false)];
+        assert_eq!(choose(&busy, true), None, "nothing idle: grow or BUSY");
+        let dead = [seat(false, 0, false)];
+        assert_eq!(choose(&dead, true), None, "an idle corpse is not idle");
+    }
+
+    #[test]
+    fn a_zygote_taken_alone_is_not_shared_until_its_request_leaves() {
+        // The other half of the rule: once a request with secrets holds a
+        // zygote, ordinary requests go elsewhere, even though its count of
+        // one would otherwise make it the least busy.
+        let seats = [seat(true, 1, true), seat(true, 2, false)];
+        assert_eq!(choose(&seats, false), Some(1));
+        assert_eq!(
+            choose(&[seat(true, 1, true)], false),
+            None,
+            "with nothing else, the pool grows rather than doubling up"
+        );
+        assert_eq!(choose(&[seat(true, 1, true)], true), None);
     }
 }

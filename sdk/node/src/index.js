@@ -615,10 +615,18 @@ export class Client {
    * the dependencies it was promised serves requests that fail at import. The
    * right reaction is to wait and send the same call again.
    *
+   * `secrets` is a list of **names**, not values — the difference from
+   * {@link serve}. A pool is shared, so no value belongs to it: each call is
+   * given the *calling* tenant's values from the tenant store
+   * ({@link putSecret}), as files under `/run/secrets`, for that call only. A
+   * call from a tenant that lacks one of the names throws {@link BadRequest}
+   * before anything runs.
+   *
    * Needs an API started with `--allow-deploy`.
    */
-  async serveRuntime(name, layer, { baseDir, deps } = {}) {
+  async serveRuntime(name, layer, { baseDir, deps, secrets } = {}) {
     const body = { name, layer: { ...layer } };
+    if (secrets !== undefined) body.layer.secrets = [...secrets];
     if (baseDir !== undefined) {
       const { resolve: resolvePath } = await import('node:path');
       body.base_dir = resolvePath(baseDir);

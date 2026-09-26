@@ -483,6 +483,22 @@ has the numbers.
                             yes ───┴──▶ zygo doctor --fix  (host-wide, asks first)
 ```
 
+### "tenant `acme` has no secret named STRIPE_KEY"
+
+A runtime pool names `secrets`, and a call from `acme` arrived before that
+tenant had a value stored under one of the names. The call was refused
+before anything ran (`400`, `bad_spec`), because a pool's values come from
+the **calling** tenant's store and nowhere else — not from the shell, not
+from the pool's own tenant. Store it, then call again:
+
+```bash
+zygo secrets set acme STRIPE_KEY          # or PUT /tenants/acme/secrets/STRIPE_KEY
+```
+
+A `zygo exec --runtime` call is the `default` tenant's, so it reads
+`default`'s store. A pool that names secrets on a host with no
+`ZYGO_SECRETS_KEY` is refused at `serve` instead, and says so.
+
 ### "no supervisor running"
 
 Nothing is warm. The supervisor is started by `zygo serve` or `zygo up`, and it
@@ -664,7 +680,7 @@ with its default working folder. It runs in the VM's `/`, so a relative path
 that slipped through would name a file that does not exist, rather than a file
 of yours that you did not mean.
 
-### "client speaks control v13, this supervisor speaks v12"
+### "client speaks control v14, this supervisor speaks v13"
 
 The supervisor in the VM is from the previous release. The shim replaced the
 binary, but a supervisor started from the old one was still running. The shim

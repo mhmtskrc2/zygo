@@ -371,7 +371,7 @@ entry = "./resize.ts"     # runtime = "node", inferred from the extension
 |---|---|
 | **The event** | The JSON the caller sent (`null` for an empty body). In Python a JSON object arrives as a `dict` with one extra method, `event.progress(msg)`. |
 | **Environment** | `ZYGO_REQUEST_ID`; `ZYGO_DEADLINE_MS`, the request's time budget in milliseconds; `ZYGO_WORKSPACE` if a workspace was sent; `ZYGO_FUNCTION`, the function's name; plus the function's `env`. `ZYGO_TENANT` holds the same name as `ZYGO_FUNCTION`; it is an older, misleading name kept so that old handlers do not break. |
-| **Secrets** | Files at `/run/secrets/<NAME>`, mode 0400, readable only inside this function's sandbox, and gone once no request of it is running. Never in the environment. |
+| **Secrets** | Files at `/run/secrets/<NAME>`, mode 0400, readable only inside this function's sandbox, and gone once no request of it is running. Never in the environment. In a runtime pool: the *calling* tenant's values, and the request has its zygote to itself while they exist. |
 | **Files** | The image, read-only; your `mounts`; a temporary folder of its own, which `TMPDIR` names and which is removed afterwards; `/venv` if there are `requirements`. `/tmp` itself is shared by every request in the sandbox: write through `tempfile`, `os.tmpdir()` or `$TMPDIR`, not to a literal `/tmp/...` path. |
 | **Working folder** | `workdir` (`/app`), or the workspace if one was sent: the agent changes into it before your code runs. |
 | **Memory** | A copy of the zygote's. What you change is yours alone and gone at the end. |
@@ -467,6 +467,17 @@ the sandbox. The +0.65 ms was measured in Docker Desktop's VM with a different
 script on every request, a thousand of them. A pool with a `cmd` instead of an
 `agent` is a *warm-exec pool*: the script's path is passed as the last
 argument of `cmd` on each request.
+
+**Secrets in a pool.** A pool can name secrets (`secrets = ["STRIPE_KEY"]`
+in `[runtime.<name>]`, or `serve_runtime(..., secrets=[...])`), but it holds
+no values: the zygotes are shared. On each request the *calling* tenant's
+values are read from the tenant secret store and written as
+`/run/secrets/<NAME>` for that one request, exactly as for a function — and
+while they exist, the request has its zygote **to itself**, so no other
+tenant's child is forked beside the files. A tenant that lacks one of the
+names is refused before anything runs. [Chapter
+14](14-limits-network-secrets.md#secrets-in-a-runtime-pool) has the rules;
+`zygo stop <name>` stops a pool as it does a function.
 
 ## A multi-tenant consumer on the warm path
 

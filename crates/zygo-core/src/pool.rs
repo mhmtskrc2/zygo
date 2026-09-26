@@ -1738,7 +1738,7 @@ impl WarmFn {
         caller: Option<&str>,
         key: Option<&str>,
     ) -> Result<(Outcome, CallTiming)> {
-        self.call_streaming(event, script, timeout, caller, key, None, None, None)
+        self.call_streaming(event, script, timeout, caller, key, None, None, None, None)
     }
 
     /// The same, with output delivered as it is produced (proto 1.3).
@@ -1759,6 +1759,7 @@ impl WarmFn {
         sink: Option<ChunkSink<'_>>,
         workspace: Option<Workspace>,
         tenant_limits: Option<crate::tenants::TenantLimits>,
+        secrets: Option<BTreeMap<String, String>>,
     ) -> Result<(Outcome, CallTiming)> {
         if let Some(s) = &script
             && !s.is_loadable()
@@ -1903,7 +1904,7 @@ impl WarmFn {
             narrowed.as_ref(),
         );
         request.running_at(request_cgroup.as_deref(), host_pid);
-        let _secrets = match self.place_secrets() {
+        let _secrets = match self.place_secrets(secrets) {
             Ok(lease) => lease,
             Err(e) => {
                 // The child is waiting for `GO` that will never come; kill it
@@ -2384,6 +2385,12 @@ struct Secrets {
     /// Shared rather than per-lease because it is the *last* request out that
     /// removes the files, and that is rarely the one that wrote them.
     dir: Option<std::fs::File>,
+    /// `values` belong to the request in flight, not to the function.
+    ///
+    /// A runtime pool's zygote is shared between tenants, so it has no values
+    /// of its own: each request brings the calling tenant's, and they are
+    /// forgotten when it leaves. See [`Secrets::adopt`].
+    per_request: bool,
 }
 
 impl Secrets {
@@ -2392,6 +2399,41 @@ impl Secrets {
     fn arrive(&mut self) -> bool {
         self.in_flight += 1;
         self.in_flight == 1 && !self.values.is_empty()
+    }
+
+    /// Take one request's own values, for a runtime pool.
+    ///
+    /// Refused while anything is in flight, and that refusal is a safety
+    /// property rather than a convenience: the files are one directory, so
+    /// values for a request that shares the zygote with another would be
+    /// readable by the other's child. The pool's scheduler gives a request
+    /// with secrets the zygote to itself (`supervisor::runtime`); this is
+    /// the check that the scheduler kept its word, and it fails the request
+    /// rather than trusting it.
+    fn adopt(&mut self, values: BTreeMap<String, String>) -> Result<()> {
+        if self.in_flight > 0 {
+            return Err(Error::BackendUnavailable {
+                backend: "pool",
+                reason: format!(
+                    "a request with its own secrets was given a zygote with {} request{} \
+                     already in flight",
+                    self.in_flight,
+                    if self.in_flight == 1 { "" } else { "s" }
+                ),
+                remedy: "the request was not run; this is a scheduling bug worth reporting".into(),
+            });
+        }
+        self.values = values;
+        self.per_request = true;
+        Ok(())
+    }
+
+    /// Nothing is in flight: values that were a request's go with it.
+    fn forget_if_per_request(&mut self) {
+        if self.in_flight == 0 && self.per_request {
+            self.values.clear();
+            self.per_request = false;
+        }
     }
 
     /// Remove the files, through the descriptor held since they were written.
@@ -2456,8 +2498,25 @@ impl Drop for SecretsLease<'_> {
 /// Ownership needs no `chown`: the supervisor's host uid is exactly what the
 /// sandbox's user namespace maps to the handler's uid, so a file this process
 /// creates is the handler's file inside.
-fn place_secrets<'a>(secrets: &'a Mutex<Secrets>, at: SecretsAt<'_>) -> Result<SecretsLease<'a>> {
+///
+/// `own` is the request's own values — a runtime pool's request, carrying
+/// the calling tenant's secrets — and `None` is a function's request, which
+/// uses the values the function was served with. See [`Secrets::adopt`] for
+/// why the former needs the zygote to itself.
+fn place_secrets<'a>(
+    secrets: &'a Mutex<Secrets>,
+    at: SecretsAt<'_>,
+    own: Option<BTreeMap<String, String>>,
+) -> Result<SecretsLease<'a>> {
     let mut guard = secrets.lock().expect("secrets");
+    // Before the count, so a refused adoption leaves nothing to depart from
+    // and — more to the point — never touches the values in use.
+    if let Some(values) = own {
+        let adopted = guard.adopt(values);
+        drop(guard);
+        adopted?;
+        guard = secrets.lock().expect("secrets");
+    }
     // Counted before writing, and the lease taken whatever happens next, so a
     // failed write still departs and the count stays honest.
     let write_now = guard.arrive();
@@ -2542,10 +2601,12 @@ fn write_secrets(secrets: &mut Secrets, at: SecretsAt<'_>) -> Result<()> {
 /// Remove the secret files once nothing in flight needs them.
 fn withdraw_secrets(secrets: &Mutex<Secrets>) {
     let mut guard = secrets.lock().expect("secrets");
-    if !guard.depart() {
-        return;
+    if guard.depart() {
+        guard.unlink_all();
     }
-    guard.unlink_all();
+    // After the files, because `unlink_all` needs the names: a pool zygote
+    // keeps nothing of a tenant's once the request that brought it has gone.
+    guard.forget_if_per_request();
 }
 
 /// The sandbox's `/run/secrets`, as seen from the host.
@@ -2845,8 +2906,8 @@ impl WarmFn {
         self.secrets.lock().expect("secrets").values = values;
     }
 
-    fn place_secrets(&self) -> Result<SecretsLease<'_>> {
-        place_secrets(&self.secrets, SecretsAt::Proc(self.agent_host_pid))
+    fn place_secrets(&self, own: Option<BTreeMap<String, String>>) -> Result<SecretsLease<'_>> {
+        place_secrets(&self.secrets, SecretsAt::Proc(self.agent_host_pid), own)
     }
 
     /// Decide how a request's script reaches its child, and put it there.
@@ -3130,7 +3191,7 @@ impl WarmExec {
         event: serde_json::Value,
         timeout: std::time::Duration,
     ) -> Result<(Outcome, CallTiming)> {
-        self.call_script_timed(event, None, timeout)
+        self.call_script_timed(event, None, timeout, None)
     }
 
     /// The same, for a request that brought its own script (todo 3.4).
@@ -3151,11 +3212,15 @@ impl WarmExec {
     /// a **read-only bind mount**, so the file the supervisor wrote is the
     /// file that is `execve`d. The agent path carries the digest because its
     /// fallback shape puts the bytes on the wire.
+    ///
+    /// `secrets` is a pool request's own values, or `None` for a function's;
+    /// see [`place_secrets`].
     pub fn call_script_timed(
         &self,
         event: serde_json::Value,
         script: Option<crate::protocol::Script>,
         timeout: std::time::Duration,
+        secrets: Option<BTreeMap<String, String>>,
     ) -> Result<(Outcome, CallTiming)> {
         use crate::backend::ns::enter;
         use std::io::Write as _;
@@ -3263,7 +3328,7 @@ impl WarmExec {
             None => SecretsAt::Proc(self.init_pid),
         };
         request.running_at(request_cgroup.as_deref(), entered.pid);
-        let _secrets = match place_secrets(&self.secrets, at) {
+        let _secrets = match place_secrets(&self.secrets, at, secrets) {
             Ok(lease) => lease,
             Err(e) => {
                 kill_request(request_cgroup.as_deref(), entered.pid);
@@ -3732,7 +3797,7 @@ impl Function {
         key: Option<&str>,
         sink: Option<ChunkSink<'_>>,
     ) -> Result<Outcome> {
-        self.call_full(event, None, timeout, None, key, sink, None, None)
+        self.call_full(event, None, timeout, None, key, sink, None, None, None)
             .map(|(o, _)| o)
     }
 
@@ -3830,10 +3895,14 @@ impl Function {
         key: Option<&str>,
         sink: Option<ChunkSink<'_>>,
     ) -> Result<(Outcome, CallTiming)> {
-        self.call_full(event, script, timeout, caller, key, sink, None, None)
+        self.call_full(event, script, timeout, caller, key, sink, None, None, None)
     }
 
     /// The whole of what one request can carry. Everything above narrows it.
+    ///
+    /// `secrets` is a runtime pool request's own values — the calling
+    /// tenant's, read from the store for this one request — or `None` for a
+    /// function's request, which uses the values it was served with.
     #[allow(clippy::too_many_arguments)]
     pub fn call_full(
         &self,
@@ -3845,6 +3914,7 @@ impl Function {
         sink: Option<ChunkSink<'_>>,
         workspace: Option<Workspace>,
         tenant_limits: Option<crate::tenants::TenantLimits>,
+        secrets: Option<BTreeMap<String, String>>,
     ) -> Result<(Outcome, CallTiming)> {
         match self {
             Function::Agent(f) => f.call_streaming(
@@ -3856,6 +3926,7 @@ impl Function {
                 sink,
                 workspace,
                 tenant_limits,
+                secrets,
             ),
             // A warm-exec pool takes a script as the last word of its
             // command line (todo 3.4); a warm-exec *function* has an `entry`
@@ -3863,7 +3934,7 @@ impl Function {
             // agent here, so `sink`, `workspace` and `tenant_limits` have
             // nowhere to go — see the note on `Function::call_full`.
             #[cfg(target_os = "linux")]
-            Function::Exec(f) => f.call_script_timed(event, script, timeout),
+            Function::Exec(f) => f.call_script_timed(event, script, timeout, secrets),
         }
     }
 
@@ -4217,6 +4288,7 @@ mod tests {
                 .collect(),
             in_flight: 0,
             dir: None,
+            per_request: false,
         }));
 
         let attempt = {
@@ -4224,8 +4296,8 @@ mod tests {
             std::thread::spawn(move || {
                 // Twice: the first failure must not leave the mutex held, or
                 // the second call is what hangs.
-                let first = place_secrets(&secrets, SecretsAt::Proc(u32::MAX)).is_err();
-                let second = place_secrets(&secrets, SecretsAt::Proc(u32::MAX)).is_err();
+                let first = place_secrets(&secrets, SecretsAt::Proc(u32::MAX), None).is_err();
+                let second = place_secrets(&secrets, SecretsAt::Proc(u32::MAX), None).is_err();
                 (first, second)
             })
         };
@@ -4254,10 +4326,114 @@ mod tests {
         let secrets = Mutex::new(Secrets::default());
         {
             let _lease =
-                place_secrets(&secrets, SecretsAt::Proc(u32::MAX)).expect("nothing to write");
+                place_secrets(&secrets, SecretsAt::Proc(u32::MAX), None).expect("nothing to write");
             assert_eq!(secrets.lock().expect("secrets").in_flight, 1);
         }
         assert_eq!(secrets.lock().expect("secrets").in_flight, 0);
+    }
+
+    /// A runtime pool's request: its own values go in with it, exist as
+    /// files only while its lease lives, and are forgotten when it leaves —
+    /// the zygote holds nothing of the tenant's afterwards.
+    ///
+    /// Through a directory descriptor, the route a held sandbox uses, which
+    /// is also the one route that works on a machine with no `/proc`.
+    #[test]
+    fn a_pool_request_brings_its_own_secrets_and_takes_them_away() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let handle = std::fs::File::open(dir.path()).expect("open");
+        let secrets = Mutex::new(Secrets::default());
+        let own = BTreeMap::from([
+            ("STRIPE_KEY".to_string(), "sk_acme".to_string()),
+            ("DB_URL".to_string(), "postgres://acme".to_string()),
+        ]);
+        {
+            let _lease = place_secrets(
+                &secrets,
+                SecretsAt::Dir(std::os::fd::AsFd::as_fd(&handle)),
+                Some(own),
+            )
+            .expect("written");
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("STRIPE_KEY")).expect("read"),
+                "sk_acme"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("DB_URL")).expect("read"),
+                "postgres://acme"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(dir.path().join("STRIPE_KEY"))
+                    .expect("stat")
+                    .permissions()
+                    .mode();
+                assert_eq!(mode & 0o777, 0o400, "readable by the owner only");
+            }
+            let guard = secrets.lock().expect("secrets");
+            assert_eq!(guard.in_flight, 1);
+            assert!(guard.per_request);
+        }
+        assert!(
+            !dir.path().join("STRIPE_KEY").exists(),
+            "gone with the request"
+        );
+        assert!(!dir.path().join("DB_URL").exists());
+        let guard = secrets.lock().expect("secrets");
+        assert_eq!(guard.in_flight, 0);
+        assert!(guard.values.is_empty(), "nothing of the tenant's is kept");
+        assert!(!guard.per_request);
+
+        // The next request — another tenant's — starts from nothing and gets
+        // its own, not a mixture.
+        drop(guard);
+        let other = BTreeMap::from([("STRIPE_KEY".to_string(), "sk_beta".to_string())]);
+        let _lease = place_secrets(
+            &secrets,
+            SecretsAt::Dir(std::os::fd::AsFd::as_fd(&handle)),
+            Some(other),
+        )
+        .expect("written");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("STRIPE_KEY")).expect("read"),
+            "sk_beta"
+        );
+        assert!(
+            !dir.path().join("DB_URL").exists(),
+            "acme's DB_URL is not beta's"
+        );
+    }
+
+    /// The scheduler's promise, checked here rather than trusted: a request
+    /// with its own secrets that finds the zygote shared is refused, and the
+    /// values in use are not touched.
+    #[test]
+    fn a_pool_request_with_secrets_refuses_a_zygote_that_is_shared() {
+        let secrets = Mutex::new(Secrets {
+            values: BTreeMap::from([("STRIPE_KEY".to_string(), "sk_acme".to_string())]),
+            in_flight: 1,
+            dir: None,
+            per_request: true,
+        });
+        let err = match place_secrets(
+            &secrets,
+            SecretsAt::Proc(u32::MAX),
+            Some(BTreeMap::from([(
+                "STRIPE_KEY".to_string(),
+                "sk_beta".to_string(),
+            )])),
+        ) {
+            Ok(_) => panic!("a shared zygote must be refused"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("already in flight"), "{err}");
+        let guard = secrets.lock().expect("still usable");
+        assert_eq!(guard.in_flight, 1, "the refused request never counted in");
+        assert_eq!(
+            guard.values["STRIPE_KEY"], "sk_acme",
+            "acme's value is untouched"
+        );
     }
 
     // --- the log ring ------------------------------------------------------
@@ -4367,6 +4543,7 @@ mod tests {
             values: BTreeMap::from([("KEY".to_string(), "v".to_string())]),
             in_flight: 0,
             dir: None,
+            per_request: false,
         };
         assert!(s.arrive(), "first in: write");
         assert!(!s.arrive(), "second in: already there");
@@ -4391,6 +4568,7 @@ mod tests {
             values: BTreeMap::from([("KEY".to_string(), "v".to_string())]),
             in_flight: 0,
             dir: None,
+            per_request: false,
         };
         assert!(s.depart(), "at zero with values: remove is the safe answer");
         assert_eq!(s.in_flight, 0);

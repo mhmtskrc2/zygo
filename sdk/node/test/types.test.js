@@ -93,6 +93,33 @@ test('every option the code reads is declared', () => {
   }
   // `agent` is the internal seam `forTenant` uses, and undeclared on purpose.
   assert.ok(!declaredClient.has('agent'));
+
+  // The options the two `serve` methods destructure, as the source spells
+  // them, each declared inline on its method. `secrets` is on both and
+  // means a different thing on each — values for a function, names for a
+  // pool — which is why the declaration has to say `string[]` on the pool.
+  const inline = (method) => {
+    const found = source.match(new RegExp(`async ${method}\\(name, layer, \\{ (.*?) \\} = \\{\\}\\)`));
+    assert.ok(found, `${method} no longer destructures its options`);
+    return new Set(found[1].split(',').map((s) => s.trim().split(' ')[0]));
+  };
+  const declaredInline = (method) => {
+    const found = block('class', 'Client').match(new RegExp(`${method}\\([^;]*?options\\?: \\{([^}]*)\\}`));
+    assert.ok(found, `${method} declares no options`);
+    return declaredProperties(found[1].replace(/;\s*/g, ';\n  '));
+  };
+  for (const [method, wanted] of [
+    ['serve', ['baseDir', 'secrets', 'ifChanged']],
+    ['serveRuntime', ['baseDir', 'deps', 'secrets']],
+  ]) {
+    const read = inline(method);
+    const declared = declaredInline(method);
+    for (const name of wanted) {
+      assert.ok(read.has(name), `${method} no longer reads ${name}`);
+      assert.ok(declared.has(name), `${method}'s declared options lack ${name}`);
+    }
+  }
+  assert.match(block('class', 'Client'), /secrets\?: string\[\]/, 'a pool takes names');
 });
 
 test('a result carries what the code puts on it', () => {

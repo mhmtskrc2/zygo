@@ -232,6 +232,25 @@ impl SecretStore {
         Ok(out)
     }
 
+    /// The named values a tenant has, decrypted, for one request.
+    ///
+    /// What a runtime pool's request asks for: the pool names the secrets it
+    /// may deliver, and only those are opened. A name the tenant does not
+    /// have is simply absent from the answer — the caller decides what a
+    /// missing one means, because it is the caller that knows whose request
+    /// this is and which name to put in the message.
+    pub fn values_named(&self, tenant: &str, names: &[String]) -> Result<BTreeMap<String, String>> {
+        crate::tenants::valid_id(tenant)?;
+        let sealed = self.read(tenant)?;
+        let mut out = BTreeMap::new();
+        for name in names {
+            if let Some(value) = sealed.values.get(name) {
+                out.insert(name.clone(), self.open(tenant, name, value)?);
+            }
+        }
+        Ok(out)
+    }
+
     fn seal(&self, tenant: &str, name: &str, value: &str) -> Result<String> {
         use std::io::Read as _;
         // A fresh nonce per write, from the kernel. Never a counter: a counter
@@ -371,6 +390,33 @@ mod tests {
         let key = SecretKey::parse(&SecretKey::generate().expect("keygen")).expect("parse");
         let store = SecretStore::new(&Paths::rooted(root.path()), key);
         (root, store)
+    }
+
+    #[test]
+    fn only_the_named_values_are_opened_and_a_missing_name_is_absent() {
+        // A pool's request names what it may receive; nothing else of the
+        // tenant's is decrypted for it, and a name the tenant lacks is left
+        // for the caller to report rather than answered with an error here.
+        let (root, secrets) = store();
+        secrets.put("acme", "STRIPE_KEY", "sk").expect("put");
+        secrets.put("acme", "DB_URL", "postgres://").expect("put");
+
+        let got = secrets
+            .values_named("acme", &["STRIPE_KEY".into(), "MISSING".into()])
+            .expect("values");
+        assert_eq!(
+            got,
+            BTreeMap::from([("STRIPE_KEY".to_string(), "sk".to_string())])
+        );
+        // A tenant with no store at all is an empty answer, not an error:
+        // the file is only written on the first `put`.
+        assert!(
+            secrets
+                .values_named("nobody", &["STRIPE_KEY".into()])
+                .expect("values")
+                .is_empty()
+        );
+        let _ = root;
     }
 
     #[test]

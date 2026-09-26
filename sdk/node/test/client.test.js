@@ -841,9 +841,13 @@ test('a runtime pool is registered, listed, called and stopped', async () => {
   try {
     const served = await client.serveRuntime('py312', {
       image: 'python:3.12-slim', agent: 'python', min_warm: 2,
-    });
+    }, { secrets: ['STRIPE_KEY'] });
     assert.equal(served.warm, 2);
     assert.equal(api.requests[0].body.layer.agent, 'python');
+    // Names in the layer, as `[runtime.<name>] secrets = [...]` would put
+    // them; the values are the calling tenant's and never travel here.
+    assert.deepEqual(api.requests[0].body.layer.secrets, ['STRIPE_KEY']);
+    assert.equal('secrets' in api.requests[0].body, false);
 
     const pools = await client.runtimes();
     assert.equal(pools[0].max_warm, 4);

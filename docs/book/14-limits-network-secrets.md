@@ -410,6 +410,45 @@ the names the spec lists are delivered; anything extra is dropped.
   a name with no value anywhere → the serve is refused, naming it
 ```
 
+## Secrets in a runtime pool
+
+A runtime pool ([chapter 13](13-warm-functions.md#runtime-pools)) is shared
+by every tenant, so it holds no secret values. It names them instead:
+
+```toml
+[runtime.py312]
+image   = "python:3.12-slim"
+agent   = "python"
+secrets = ["STRIPE_KEY"]      # names a request may receive; no values here
+```
+
+Each request is given the **calling tenant's** values — the tenant in the
+token or the `X-Zygo-Tenant` header; the `default` tenant for `zygo exec` —
+read from the store at that moment. Only the store: a pool never reads your
+shell, and a pool that names secrets on a host with no store key is refused
+when it is served, not on its first request. The files are written from
+outside, exist for that one request, and are removed when it ends.
+
+```text
+  tenant acme calls py312             tenant beta calls py312
+      │                                    │
+      ├──▶ store: acme's STRIPE_KEY        ├──▶ store: beta's STRIPE_KEY
+      ├──▶ /run/secrets/STRIPE_KEY         ├──▶ /run/secrets/STRIPE_KEY
+      │    on a zygote acme has alone      │    on a different zygote
+      └──▶ removed when acme's request ends
+```
+
+Two rules follow from "one directory per sandbox":
+
+* **A request with secrets has its zygote to itself** while the files exist.
+  It takes an idle zygote; if every zygote is busy, the pool grows by one
+  (up to `max_warm`), and at `max_warm` the caller gets `busy`, which the
+  SDKs retry. Ordinary requests skip a zygote that is taken this way.
+  Requests without secrets share zygotes as before.
+* **A missing name fails the request before anything runs.** A tenant that
+  has no secret under one of the pool's names gets `400` (`bad_spec`) naming
+  the secret and the route that stores it, never a value.
+
 ## The store's key
 
 The key comes from `ZYGO_SECRETS_KEY`, or from a file named by

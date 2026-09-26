@@ -153,7 +153,7 @@ rights. Bodies are JSON unless marked raw; the limit is 16 MiB.
 | `GET /fn/{name}/stats` | any | One function's status. |
 | `POST /fn/{name}/warm` | any | Wake a paused or cold function now. |
 | `GET /runtimes` | any | Pools and their load. |
-| `POST /runtimes` | deploy | Start a pool: `{name, layer, base_dir?, deps?}`. |
+| `POST /runtimes` | deploy | Start a pool: `{name, layer, base_dir?, deps?}`. `layer.secrets` names the secrets a call may receive; values are the calling tenant's. |
 | `DELETE /runtimes/{name}` | deploy | Stop a pool. |
 | `POST /runtimes/{name}/call` | any | **Run a script in a pool**: `{script, event?, entry_point?, workspace?}`. |
 | `PUT /scripts` | any | Store a script (raw body); returns its `sha256`. |
@@ -421,7 +421,7 @@ need deploy rights (see [The deploy gate](#the-deploy-gate)).
 | Forget a script | `client.delete_script(digest)` | `client.deleteScript(digest)` | operator | **yes** |
 | Forget a dependency set | `client.delete_deps(id)` | `client.deleteDeps(id)` | operator | **yes** |
 | Delete a tenant | `client.delete_tenant(id)` | `client.deleteTenant(id)` | operator | **yes** |
-| Serve a runtime pool | `client.serve_runtime(name, layer)` | `client.serveRuntime(name, layer)` | operator | **yes** |
+| Serve a runtime pool | `client.serve_runtime(name, layer, secrets=[…])` | `client.serveRuntime(name, layer, { secrets })` | operator | **yes** |
 | Stop one | `client.stop_runtime(name)` | `client.stopRuntime(name)` | operator | **yes** |
 | Mint a token | `client.mint_token(tenant)` | `client.mintToken(tenant)` | operator | **yes** |
 | List tokens | `client.tokens()` | `client.tokens()` | operator | **yes** |
@@ -699,14 +699,34 @@ read one user's files. It does not protect them from a process that can read
 the supervisor's memory, and it is not a hardware root of trust. An operator
 who needs those has a KMS (a key management service).
 
-### Not built: secrets for a runtime pool
+### Secrets for a runtime pool
 
 A pool's sandbox is shared by several tenants, and `/run/secrets` is one
-directory in it. Delivering two tenants' secrets there would put each in reach
-of the other, so a pool holds no secrets today. Per-request delivery needs the
-same per-request directory that workspaces use, and a second place for
-handlers to look is a contract change that deserves its own decision.
-Functions have one tenant and are not affected.
+directory in it — so a pool holds no values. It names them, and each call is
+given the **calling** tenant's values from the store, for that call only:
+
+```python
+client.serve_runtime("py312", {"image": "python:3.12-slim", "agent": "python"},
+                     secrets=["STRIPE_KEY"])            # names, not values
+client.put_secret("acme", "STRIPE_KEY", value)          # acme's value
+client.for_tenant("acme").run_script("py312", digest)   # reads acme's, as a file
+```
+
+```js
+await client.serveRuntime('py312', { image: 'python:3.12-slim', agent: 'python' },
+                          { secrets: ['STRIPE_KEY'] });
+```
+
+The script reads `/run/secrets/STRIPE_KEY` as a function would. While the
+files exist the call has its zygote to itself, so no other tenant's child is
+forked beside them; if every zygote is busy the pool grows, and at
+`max_warm` the call gets `busy`, which the SDKs retry. A call from a tenant
+that has no secret under one of the names is refused with `400` before
+anything runs, naming the secret; a pool that names secrets on a host with no
+store key is refused when it is served. The `serve_runtime` argument is a
+list of names — the difference from `serve`, whose `secrets` are values.
+[Chapter 14](14-limits-network-secrets.md#secrets-in-a-runtime-pool) has
+the rules.
 
 ## Files in and out
 
@@ -958,7 +978,9 @@ const out = await client.runScript('py312', sha256, { month: '2026-09' });
 ### How a script gets in
 
 `client.runtimes()` lists the pools with their zygote counts, and
-`client.stop_runtime(name)` stops one. `run_script` also takes the source
+`client.stop_runtime(name)` stops one (so does `zygo stop <name>`). A pool
+can name `secrets`; each call then gets the calling tenant's values — see
+[Secrets for a runtime pool](#secrets-for-a-runtime-pool). `run_script` also takes the source
 directly, for a one-off not worth registering. The request never reaches the
 zygote: the supervisor writes the script into the sandbox, and the forked
 child loads it after the child's seccomp filter (its list of allowed system
@@ -1168,6 +1190,14 @@ the long ones, stops them, and offboards. `make verify-plugin-host` runs it
 against a real kernel. That includes the two checks this whole layer exists
 for: one customer cannot run another's plugin by naming its digest, and a
 customer is held to their own memory limit rather than the runtime's.
+
+The same host from Node is
+[`examples/plugin-host-node/`](../../examples/plugin-host-node/): a
+`node:http` server that onboards customers with an operator token, registers
+and runs their scripts through `forTenant`, streams one route as NDJSON, and
+turns `HandlerError`, `Timeout`, `Cancelled`, `NotFound`, `Busy` and
+`Unavailable` into its own status codes. `node --test` runs it against a fake
+Zygo; `make verify-plugin-host-node` against a real one.
 
 ## The OpenAPI document
 
@@ -1407,8 +1437,6 @@ goes to standard error, which is where a host shows a server's log.
 
 To say it plainly in one place:
 
-* **Secrets for runtime pools.** Pools hold no secrets; only functions get
-  `/run/secrets`.
 * **Streaming, progress, workspaces and per-request tenant limits in
   warm-exec pools** (a pool with `cmd` and no agent).
 * **Per-tenant series in `/metrics`**, and billing counts for `zygo exec` and

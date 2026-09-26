@@ -479,10 +479,15 @@ export declare class Client {
 
   /**
    * Register a runtime pool. `deps` is an id from {@link putDeps}; a pool
-   * named against one still building throws {@link Unavailable}. Needs an
-   * API started with `--allow-deploy`.
+   * named against one still building throws {@link Unavailable}. `secrets`
+   * names the secrets each call may receive, from the *calling* tenant's
+   * store. Needs an API started with `--allow-deploy`.
    */
-  serveRuntime(name: string, layer: Layer, options?: { baseDir?: string; deps?: string }): Promise<Record<string, unknown>>;
+  serveRuntime(
+    name: string,
+    layer: Layer,
+    options?: { baseDir?: string; deps?: string; secrets?: string[] }
+  ): Promise<Record<string, unknown>>;
   runtimes(): Promise<RuntimePool[]>;
   /** Needs an API started with `--allow-deploy`. */
   stopRuntime(name: string): Promise<string[]>;

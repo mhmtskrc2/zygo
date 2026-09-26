@@ -630,7 +630,10 @@ mod tests {
         // Everything else reads state the supervisor already has.
         assert_eq!(Client::budget(&Request::List), CONTROL_TIMEOUT);
         assert_eq!(
-            Client::budget(&Request::Stop { name: None }),
+            Client::budget(&Request::Stop {
+                name: None,
+                runtimes: true
+            }),
             CONTROL_TIMEOUT
         );
         assert!(CONTROL_TIMEOUT < Duration::from_secs(60));
@@ -690,7 +693,12 @@ mod tests {
             Response::Functions { functions: vec![] }
         );
         assert_eq!(
-            client.send(&Request::Stop { name: None }).expect("stop"),
+            client
+                .send(&Request::Stop {
+                    name: None,
+                    runtimes: true
+                })
+                .expect("stop"),
             Response::Stopped { names: vec![] }
         );
     }

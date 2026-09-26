@@ -57,6 +57,26 @@ break things and will say so here.
 
 ### Added
 
+- A Node plugin host example, `examples/plugin-host-node/`: the API-only
+  plugin host from the Node SDK as a `node:http` server — tenants and tokens
+  minted by an operator client, scripts registered and run per customer
+  through `forTenant`, one stream route, `retries` on `Busy`/`Unavailable`,
+  and Zygo's errors mapped to HTTP status codes. Tested against a fake Zygo
+  with `node --test` and end to end with `make verify-plugin-host-node`.
+- `zygo stop <name>` stops a runtime pool as well as a function, and
+  `zygo stop --all` stops the pools too. A pool used to answer "no function
+  named …", and `--all` printed "nothing to stop" while pools ran. A name
+  that is both a function and a pool stops both; the output says
+  `stopped runtime.<name>` for the pool. `DELETE /fn/{name}` still reaches
+  functions only. Control protocol v14.
+- Secrets for runtime pools. `[runtime.<name>]` takes `secrets = [...]`, and
+  so do `POST /runtimes` (`layer.secrets`) and `serve_runtime(...,
+  secrets=[...])` / `serveRuntime(..., { secrets })` in both SDKs — names,
+  never values. Each request gets the *calling* tenant's values from the
+  tenant secret store, as `/run/secrets/<NAME>`, for that request only, and
+  has its zygote to itself while they exist. A tenant without one of the
+  names is refused (`400`) before anything runs; a pool naming secrets on a
+  host with no store key is refused at `serve`.
 - SDKs: an `Unavailable` error (Python and Node) for every `503` —
   dependencies still building, a zygote that failed to warm, or an API that
   is stopping — with `code` and `retry_after`/`retryAfter`. It was a plain

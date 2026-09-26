@@ -625,8 +625,10 @@ pub fn down(cli: &Cli, file: Option<&std::path::Path>) -> anyhow::Result<u8> {
 
     let mut stopped = Vec::new();
     for name in &names {
+        // Functions only: `up` starts only `[fn.*]`, and `down` undoes `up`.
         if let Response::Stopped { names } = client.send(&Request::Stop {
             name: Some(name.clone()),
+            runtimes: false,
         })? {
             stopped.extend(names);
         }
@@ -972,10 +974,15 @@ pub fn ps(cli: &Cli) -> anyhow::Result<u8> {
 }
 
 /// `zygo stop <name>` / `zygo stop --all`.
+///
+/// A name is looked up among the functions *and* the runtime pools, and a
+/// name that is both stops both: `stop` means "forget this name". The HTTP
+/// API keeps the two apart (`DELETE /fn/<name>`, `DELETE /runtimes/<name>`)
+/// for callers that need to say which.
 pub fn stop(cli: &Cli, name: Option<&str>, all: bool) -> anyhow::Result<u8> {
     anyhow::ensure!(
         all || name.is_some(),
-        "name a function to stop, or pass `--all`"
+        "name a function or pool to stop, or pass `--all`"
     );
     anyhow::ensure!(
         !(all && name.is_some()),
@@ -997,9 +1004,7 @@ pub fn stop(cli: &Cli, name: Option<&str>, all: bool) -> anyhow::Result<u8> {
         Err(e) => return Err(e.into()),
     };
 
-    let stopped = match client.send(&Request::Stop {
-        name: name.map(str::to_string),
-    })? {
+    let stopped = match client.send(&stop_request(name))? {
         Response::Stopped { names } => names,
         other => return report_failure(cli, &other),
     };
@@ -1019,6 +1024,14 @@ pub fn stop(cli: &Cli, name: Option<&str>, all: bool) -> anyhow::Result<u8> {
         }
     }
     Ok(0)
+}
+
+/// What `zygo stop` sends: the name, or everything, pools included.
+fn stop_request(name: Option<&str>) -> Request {
+    Request::Stop {
+        name: name.map(str::to_string),
+        runtimes: true,
+    }
 }
 
 /// Print a non-success response and turn it into an exit code.
@@ -1268,6 +1281,26 @@ mod tests {
 
         let err = stop(&cli(), Some("x"), true).expect_err("both");
         assert!(err.to_string().contains("do not also name"), "{err}");
+    }
+
+    #[test]
+    fn stop_asks_for_pools_as_well_as_functions() {
+        // `zygo stop py312` used to answer "no function named py312" while
+        // the pool ran: the request only ever named the function registry.
+        assert_eq!(
+            stop_request(Some("py312")),
+            Request::Stop {
+                name: Some("py312".into()),
+                runtimes: true,
+            }
+        );
+        assert_eq!(
+            stop_request(None),
+            Request::Stop {
+                name: None,
+                runtimes: true,
+            }
+        );
     }
 
     #[test]

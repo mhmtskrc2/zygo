@@ -455,8 +455,11 @@ class AsyncClient:
         *,
         base_dir: Optional[str] = None,
         deps: Optional[str] = None,
+        secrets: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {"name": name, "layer": dict(layer)}
+        if secrets is not None:
+            payload["layer"]["secrets"] = list(secrets)
         if base_dir is not None:
             payload["base_dir"] = os.path.abspath(base_dir)
         if deps is not None:

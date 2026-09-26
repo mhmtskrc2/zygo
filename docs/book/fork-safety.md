@@ -62,8 +62,11 @@ never in the zygote. The supervisor writes it as a file, `/run/secrets/NAME`
 is told to start. The file goes when the function's last request in flight
 finishes. Requests of the same function that run at the same moment can read
 it too: they have the same value, the same uid and the same folder. A request
-of another function cannot, because that function has its own sandbox. A
-runtime pool, which many tenants share, gets no secrets at all.
+of another function cannot, because that function has its own sandbox. In a
+runtime pool, which many tenants share, a request that receives secrets has
+its zygote to itself while the files exist, so no other tenant's child is
+forked beside them; the values are the calling tenant's and are written the
+same way, never through the zygote.
 [Chapter 14](14-limits-network-secrets.md#a-secret-lives-for-one-request) has
 the details.
 

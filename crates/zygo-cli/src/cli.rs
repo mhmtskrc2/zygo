@@ -72,10 +72,12 @@ pub enum Command {
         failed: bool,
     },
 
-    /// Stop a sandbox.
+    /// Stop a warm function or a runtime pool, by name.
+    ///
+    /// A name that is both a function and a pool stops both.
     Stop {
         name: Option<String>,
-        /// Stop every sandbox.
+        /// Stop every function and pool, then the supervisor.
         #[arg(long)]
         all: bool,
     },
@@ -752,8 +754,8 @@ pub enum SupervisorCommand {
     /// Stop the supervisor and nothing else: it drains, exits, and the next
     /// `serve` or `up` starts one of this release.
     ///
-    /// The remedy for "client speaks control v13, this supervisor speaks
-    /// v12", which `zygo stop --all` was — except that a client the
+    /// The remedy for "client speaks control v14, this supervisor speaks
+    /// v13", which `zygo stop --all` was — except that a client the
     /// supervisor refuses to talk to cannot ask it to stop, so `stop --all`
     /// reported nothing to stop and left it running (on a Mac it worked only
     /// because the shim stops the whole VM afterwards). This goes through

@@ -984,6 +984,8 @@ impl Supervisor {
                 sink,
                 workspace,
                 tenant_limits,
+                // A function's values were set when it was served.
+                None,
             )
             .map(|(outcome, _)| outcome)
             .map_err(|e| Response::error(ControlError::CallFailed, e));
@@ -1684,7 +1686,7 @@ impl Supervisor {
 
         let mut stopped = Vec::new();
         for name in functions {
-            if self.stop(Some(&name)).is_ok() {
+            if self.stop(Some(&name), false).is_ok() {
                 stopped.push(name);
             }
         }
@@ -1760,7 +1762,19 @@ impl Supervisor {
     }
 
     /// Stop one function, or every function when `name` is `None`.
-    pub fn stop(&self, name: Option<&str>) -> std::result::Result<Response, Response> {
+    ///
+    /// With `runtimes`, a pool under that name goes too, and with no name
+    /// every pool: what `zygo stop` asks for. A pool is reported as
+    /// `runtime.<name>`, the way `DELETE /tenants/<id>` reports one, so the
+    /// output says which kind went. A name that is **both** a function and a
+    /// pool stops both — `stop` means "forget this name", and the two
+    /// registries were only ever separate so that `DELETE /fn/<name>`, which
+    /// leaves `runtimes` off, cannot reach a pool that every tenant shares.
+    pub fn stop(
+        &self,
+        name: Option<&str>,
+        runtimes: bool,
+    ) -> std::result::Result<Response, Response> {
         // A cold function has no sandbox left to stop, but it is still
         // registered and would come back on the next request, so `stop` has to
         // deregister it too.
@@ -1779,19 +1793,47 @@ impl Supervisor {
         let removed = {
             let mut functions = self.functions.lock().expect("registry");
             match name {
-                Some(name) => match functions.remove(name) {
-                    Some(entry) => vec![entry],
-                    None if cold_names.is_empty() => {
-                        return Err(Response::error(
-                            ControlError::NotFound,
-                            format!("no function named `{name}`"),
-                        ));
-                    }
-                    None => vec![],
-                },
-                None => std::mem::take(&mut *functions).into_values().collect(),
+                Some(name) => functions.remove(name).into_iter().collect(),
+                None => std::mem::take(&mut *functions)
+                    .into_values()
+                    .collect::<Vec<_>>(),
             }
         };
+
+        let pools: Vec<String> = if runtimes {
+            let held: Vec<String> = {
+                let pools = self.runtimes.lock().expect("runtimes");
+                match name {
+                    Some(name) => pools
+                        .contains_key(name)
+                        .then(|| name.to_string())
+                        .into_iter()
+                        .collect(),
+                    None => pools.keys().cloned().collect(),
+                }
+            };
+            held.into_iter()
+                .filter(|pool| self.stop_runtime(pool).is_ok())
+                .map(|pool| format!("runtime.{pool}"))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        if let Some(name) = name
+            && removed.is_empty()
+            && cold_names.is_empty()
+            && pools.is_empty()
+        {
+            return Err(Response::error(
+                ControlError::NotFound,
+                if runtimes {
+                    format!("no function or runtime pool named `{name}`")
+                } else {
+                    format!("no function named `{name}`")
+                },
+            ));
+        }
 
         let mut names = removed
             .iter()
@@ -1813,6 +1855,7 @@ impl Supervisor {
         for entry in removed {
             self.retire(entry);
         }
+        names.extend(pools);
         Ok(Response::Stopped { names })
     }
 
@@ -2171,7 +2214,7 @@ impl Listener {
             let _ = t.join();
         }
         let _ = tiering.join();
-        let _ = supervisor.stop(None);
+        let _ = supervisor.stop(None, true);
         Ok(())
     }
 }
@@ -2528,7 +2571,7 @@ fn dispatch(supervisor: &Supervisor, request: Request, greeted: &mut bool) -> Re
                     )
                 }),
         ),
-        Request::Stop { name } => merge(supervisor.stop(name.as_deref())),
+        Request::Stop { name, runtimes } => merge(supervisor.stop(name.as_deref(), runtimes)),
         Request::Warm { name, tenant } => merge(
             supervisor
                 .owned_by(&name, tenant.as_deref())
@@ -2938,7 +2981,7 @@ mod tests {
         );
 
         assert_eq!(
-            supervisor.stop(Some("resize")),
+            supervisor.stop(Some("resize"), true),
             Ok(Response::Stopped {
                 names: vec!["resize".into()]
             })
@@ -2946,7 +2989,7 @@ mod tests {
         assert!(supervisor.list().is_empty());
         // And it is gone for good, not merely asleep.
         assert!(matches!(
-            supervisor.stop(Some("resize")),
+            supervisor.stop(Some("resize"), true),
             Err(Response::Error {
                 code: ControlError::NotFound,
                 ..
@@ -2971,7 +3014,7 @@ mod tests {
             );
         }
         assert_eq!(
-            supervisor.stop(None),
+            supervisor.stop(None, true),
             Ok(Response::Stopped {
                 names: vec!["a".into(), "b".into()]
             })
@@ -3367,7 +3410,10 @@ mod tests {
 
         for request in [
             Request::List,
-            Request::Stop { name: None },
+            Request::Stop {
+                name: None,
+                runtimes: true,
+            },
             Request::Exec {
                 name: "x".into(),
                 event: serde_json::Value::Null,
@@ -3914,18 +3960,330 @@ mod tests {
     fn stopping_a_function_that_was_never_served_says_so() {
         let dir = tempfile::tempdir().expect("tempdir");
         let supervisor = Supervisor::new(paths(&dir)).expect("supervisor");
+        match supervisor.stop(Some("nope"), true) {
+            Err(Response::Error {
+                code: ControlError::NotFound,
+                message,
+            }) => assert!(
+                message.contains("no function or runtime pool named `nope`"),
+                "the CLI's stop looked in both registries, and says so: {message}"
+            ),
+            other => panic!("expected not_found, got {other:?}"),
+        }
+        match supervisor.stop(Some("nope"), false) {
+            Err(Response::Error {
+                code: ControlError::NotFound,
+                message,
+            }) => assert_eq!(
+                message, "no function named `nope`",
+                "`DELETE /fn/<name>` asks about functions only"
+            ),
+            other => panic!("expected not_found, got {other:?}"),
+        }
+        // Stopping everything when there is nothing is not an error: `zygo stop
+        // --all` is something you run to be sure, not to be told off.
+        assert_eq!(
+            supervisor.stop(None, true),
+            Ok(Response::Stopped { names: vec![] })
+        );
+    }
+
+    /// A registered pool with no zygote in it: enough for the registry to
+    /// hold, and nothing for a Mac to have to fork.
+    fn empty_pool(name: &str, secrets: &[&str]) -> Arc<runtime::RuntimePool> {
+        let resolved = crate::spec::Spec::default()
+            .resolve_runtime(
+                name,
+                &Layer {
+                    image: Some("python:3.12-slim".into()),
+                    runtime: Some(crate::spec::Runtime::Builtin(
+                        crate::spec::BuiltinRuntime::Python,
+                    )),
+                    secrets: Some(secrets.iter().map(|s| s.to_string()).collect()),
+                    ..Default::default()
+                },
+                &ResolveOptions::default(),
+            )
+            .expect("a pool resolves");
+        Arc::new(runtime::RuntimePool {
+            deps: None,
+            gate: Gate::named(&format!("runtime.{name}"), 4, 16),
+            zygotes: Mutex::new(Vec::new()),
+            resolved,
+            registered: Instant::now(),
+        })
+    }
+
+    #[test]
+    fn stop_by_name_reaches_a_pool_and_says_which_kind_went() {
+        // The gap this closes: `zygo stop py312` answered "no function named
+        // py312" while the pool ran, and the only way to end it was `--all`
+        // or the HTTP route.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let supervisor = Supervisor::new(paths(&dir)).expect("supervisor");
+        supervisor
+            .runtimes
+            .lock()
+            .expect("runtimes")
+            .insert("py312".into(), empty_pool("py312", &[]));
+
+        assert_eq!(
+            supervisor.stop(Some("py312"), true),
+            Ok(Response::Stopped {
+                names: vec!["runtime.py312".into()]
+            })
+        );
+        assert!(supervisor.runtimes().is_empty(), "the pool is deregistered");
         assert!(matches!(
-            supervisor.stop(Some("nope")),
+            supervisor.stop(Some("py312"), true),
             Err(Response::Error {
                 code: ControlError::NotFound,
                 ..
             })
         ));
-        // Stopping everything when there is nothing is not an error: `zygo stop
-        // --all` is something you run to be sure, not to be told off.
+    }
+
+    #[test]
+    fn delete_fn_does_not_reach_a_pool_of_the_same_name() {
+        // `DELETE /fn/<name>` is a route about one function; a pool is shared
+        // by every tenant on the host and is not something that route may
+        // take down by accident.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let supervisor = Supervisor::new(paths(&dir)).expect("supervisor");
+        supervisor
+            .runtimes
+            .lock()
+            .expect("runtimes")
+            .insert("py312".into(), empty_pool("py312", &[]));
+
+        assert!(matches!(
+            supervisor.stop(Some("py312"), false),
+            Err(Response::Error {
+                code: ControlError::NotFound,
+                ..
+            })
+        ));
+        assert_eq!(supervisor.runtimes().len(), 1, "the pool is untouched");
+    }
+
+    #[test]
+    fn a_function_and_a_pool_under_one_name_both_stop() {
+        // `stop` means "forget this name". The clash is the operator's own —
+        // only an operator serves — and stopping half of it would leave them
+        // guessing which half.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let supervisor = Supervisor::new(paths(&dir)).expect("supervisor");
+        supervisor.cold.lock().expect("cold").insert(
+            "shared".into(),
+            Cold {
+                resolved: resolved_fn("shared"),
+                secrets: BTreeMap::new(),
+                sources: Sources::default(),
+                last_status: cold_status("shared"),
+                since: Instant::now(),
+            },
+        );
+        supervisor
+            .runtimes
+            .lock()
+            .expect("runtimes")
+            .insert("shared".into(), empty_pool("shared", &[]));
+
         assert_eq!(
-            supervisor.stop(None),
+            supervisor.stop(Some("shared"), true),
+            Ok(Response::Stopped {
+                names: vec!["shared".into(), "runtime.shared".into()]
+            })
+        );
+        assert!(supervisor.list().is_empty());
+        assert!(supervisor.runtimes().is_empty());
+    }
+
+    #[test]
+    fn stop_all_takes_the_pools_with_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let supervisor = Supervisor::new(paths(&dir)).expect("supervisor");
+        supervisor.cold.lock().expect("cold").insert(
+            "a".into(),
+            Cold {
+                resolved: resolved_fn("a"),
+                secrets: BTreeMap::new(),
+                sources: Sources::default(),
+                last_status: cold_status("a"),
+                since: Instant::now(),
+            },
+        );
+        for name in ["py312", "node22"] {
+            supervisor
+                .runtimes
+                .lock()
+                .expect("runtimes")
+                .insert(name.into(), empty_pool(name, &[]));
+        }
+
+        assert_eq!(
+            supervisor.stop(None, true),
+            Ok(Response::Stopped {
+                names: vec!["a".into(), "runtime.node22".into(), "runtime.py312".into()]
+            })
+        );
+        assert!(supervisor.runtimes().is_empty());
+        // Functions only, when asked for functions only.
+        supervisor
+            .runtimes
+            .lock()
+            .expect("runtimes")
+            .insert("py312".into(), empty_pool("py312", &[]));
+        assert_eq!(
+            supervisor.stop(None, false),
             Ok(Response::Stopped { names: vec![] })
+        );
+        assert_eq!(supervisor.runtimes().len(), 1);
+    }
+
+    // --- secrets for a runtime pool ---------------------------------------
+
+    fn with_secret_key(dir: &tempfile::TempDir) -> Supervisor {
+        let mut supervisor = Supervisor::new(paths(dir)).expect("supervisor");
+        let key = crate::secrets::SecretKey::parse(
+            &crate::secrets::SecretKey::generate().expect("keygen"),
+        )
+        .expect("parse");
+        supervisor.secret_key = Some(key);
+        supervisor
+    }
+
+    #[test]
+    fn a_pool_that_names_secrets_needs_a_key_on_this_host() {
+        // Refused when the pool is registered, not on its first request: a
+        // pool whose every request would fail is a pool nobody meant to
+        // start. Before any zygote is warmed, which is also what lets this
+        // run on a machine with no sandbox.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let supervisor = Supervisor::new(paths(&dir)).expect("supervisor");
+        let layer = Layer {
+            image: Some("python:3.12-slim".into()),
+            runtime: Some(crate::spec::Runtime::Builtin(
+                crate::spec::BuiltinRuntime::Python,
+            )),
+            secrets: Some(vec!["STRIPE_KEY".into()]),
+            ..Default::default()
+        };
+        match supervisor.serve_runtime("py312", None, &layer, &ResolveOptions::default(), None) {
+            Err(Response::Error {
+                code: ControlError::BadSpec,
+                message,
+            }) => {
+                assert!(message.contains("runtime.py312.secrets"), "{message}");
+                assert!(message.contains(crate::secrets::KEY_ENV), "{message}");
+            }
+            other => panic!("expected bad_spec, got {other:?}"),
+        }
+        assert!(supervisor.runtimes().is_empty(), "nothing was registered");
+    }
+
+    #[test]
+    fn a_pool_request_whose_tenant_lacks_a_named_secret_is_refused_before_any_fork() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let supervisor = with_secret_key(&dir);
+        supervisor.runtimes.lock().expect("runtimes").insert(
+            "py312".into(),
+            empty_pool("py312", &["STRIPE_KEY", "DB_URL"]),
+        );
+        let store = supervisor.secret_store().expect("a key was set");
+        store
+            .put("acme", "STRIPE_KEY", "sk_live_acme")
+            .expect("put");
+
+        let script = crate::protocol::Script::inline("def handler(e): return e");
+        let refused = supervisor
+            .exec_script(
+                "py312",
+                script.clone(),
+                serde_json::Value::Null,
+                Duration::from_secs(1),
+                Some("acme"),
+                None,
+            )
+            .expect_err("DB_URL is not in acme's store");
+        match refused {
+            Response::Error {
+                code: ControlError::BadSpec,
+                message,
+            } => {
+                assert!(message.contains("DB_URL"), "{message}");
+                assert!(message.contains("acme"), "{message}");
+                assert!(
+                    !message.contains("STRIPE_KEY"),
+                    "only the missing one is named: {message}"
+                );
+                assert!(!message.contains("sk_live"), "never a value: {message}");
+                assert!(
+                    message.contains("PUT /tenants/acme/secrets/DB_URL"),
+                    "and the remedy: {message}"
+                );
+            }
+            other => panic!("expected bad_spec, got {other:?}"),
+        }
+
+        // The operator's own requests read the operator's own store — the
+        // `default` tenant — and are held to the same rule.
+        let refused = supervisor
+            .exec_script(
+                "py312",
+                script.clone(),
+                serde_json::Value::Null,
+                Duration::from_secs(1),
+                None,
+                None,
+            )
+            .expect_err("the default tenant has nothing stored");
+        match refused {
+            Response::Error {
+                code: ControlError::BadSpec,
+                message,
+            } => assert!(
+                message.contains("`default`") && message.contains("STRIPE_KEY, DB_URL"),
+                "{message}"
+            ),
+            other => panic!("expected bad_spec, got {other:?}"),
+        }
+
+        // With both stored, the request gets past the secrets and on to a
+        // zygote — which this machine cannot warm, so the failure moves to
+        // where a fork would be. That is the boundary under test.
+        store.put("acme", "DB_URL", "postgres://x").expect("put");
+        let past = supervisor
+            .exec_script(
+                "py312",
+                script,
+                serde_json::Value::Null,
+                Duration::from_secs(1),
+                Some("acme"),
+                None,
+            )
+            .expect_err("no zygote can be warmed here");
+        match past {
+            Response::Error { code, message } => {
+                assert_ne!(code, ControlError::BadSpec, "{message}");
+                assert!(!message.contains("sk_live"), "never a value: {message}");
+                assert!(!message.contains("postgres://"), "never a value: {message}");
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_pool_without_secrets_asks_no_store_for_anything() {
+        // A host with no key serves a pool that names no secrets, and its
+        // requests never look for the store — the same bargain a function
+        // with no secrets gets.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let supervisor = Supervisor::new(paths(&dir)).expect("supervisor");
+        let pool = empty_pool("py312", &[]);
+        assert_eq!(
+            supervisor.secrets_for_pool_request(&pool, Some("acme")),
+            Ok(None)
         );
     }
 

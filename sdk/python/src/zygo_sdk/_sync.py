@@ -551,6 +551,7 @@ class Client:
         *,
         base_dir: Optional[str] = None,
         deps: Optional[str] = None,
+        secrets: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
         """Register a **runtime pool**: an image, a dependency set, an agent.
 
@@ -567,8 +568,17 @@ class Client:
         serves requests that fail at ``import``. Retry — the exception carries
         the ``Retry-After`` the host suggested as ``retry_after``, and a client
         opened with ``retries=`` waits it and sends the call again itself.
+
+        ``secrets`` is a list of **names**, not values — the difference from
+        :meth:`serve`. A pool is shared, so no value belongs to it: each call
+        is given the *calling* tenant's values from the tenant store
+        (:meth:`put_secret`), as files under ``/run/secrets``, for that call
+        only. A call from a tenant that lacks one of the names fails with
+        :class:`~zygo_sdk.BadRequest` before anything runs.
         """
         payload: Dict[str, Any] = {"name": name, "layer": dict(layer)}
+        if secrets is not None:
+            payload["layer"]["secrets"] = list(secrets)
         if base_dir is not None:
             payload["base_dir"] = os.path.abspath(base_dir)
         if deps is not None:

@@ -1060,7 +1060,9 @@ class RuntimePoolTests(unittest.TestCase):
 
             with zygo.connect(api.url) as client:
                 served = client.serve_runtime(
-                    "py312", {"image": "python:3.12-slim", "agent": "python", "min_warm": 2}
+                    "py312",
+                    {"image": "python:3.12-slim", "agent": "python", "min_warm": 2},
+                    secrets=["STRIPE_KEY"],
                 )
                 self.assertEqual(served["warm"], 2)
 
@@ -1077,6 +1079,10 @@ class RuntimePoolTests(unittest.TestCase):
                 self.assertEqual(client.stop_runtime("py312"), ["py312"])
 
         self.assertEqual(api.requests[0]["body"]["layer"]["agent"], "python")
+        # Names in the layer, as `[runtime.<name>] secrets = [...]` would put
+        # them; the values are the calling tenant's and never travel here.
+        self.assertEqual(api.requests[0]["body"]["layer"]["secrets"], ["STRIPE_KEY"])
+        self.assertNotIn("secrets", api.requests[0]["body"])
         called = api.requests[2]["body"]
         self.assertEqual(called["script"], self.DIGEST, "a digest goes as a string")
         self.assertEqual(called["event"], {"n": 1})

@@ -2390,7 +2390,12 @@ async fn serve_fn(
 async fn stop(api: &Arc<Api>, name: String) -> Result<Response<ApiBody>, HttpError> {
     let wanted = name.clone();
     let reply = control(api, move |c| {
-        Ok(c.send(&Control::Stop { name: Some(name) })?)
+        Ok(c.send(&Control::Stop {
+            name: Some(name),
+            // A route about one function. A pool of the same name is every
+            // tenant's, and has `DELETE /runtimes/<name>`.
+            runtimes: false,
+        })?)
     })
     .await?;
     // The supervisor answers `Stopped { names }` with an empty list for a name

@@ -199,15 +199,19 @@ zygo stop NAME
 zygo stop --all
 ```
 
-Stops one function, or everything and then the supervisor itself. Give a
-name or `--all`, not both. `--all` with nothing running exits `0`; a named
-stop with no supervisor is an error (`125`). On a Mac, `stop --all` also
-stops the Linux VM afterwards.
+Stops one function or runtime pool by name, or everything — every function
+and every pool — and then the supervisor itself. Give a name or `--all`, not
+both. `--all` with nothing running exits `0`; a named stop with no supervisor
+is an error (`125`), and a name that is neither a function nor a pool is
+"no function or runtime pool named …" (exit `4`). On a Mac, `stop --all`
+also stops the Linux VM afterwards.
 
-**Pools:** `NAME` must be a function; a runtime pool's name gives "no function
-named …" (exit `4`). To end a pool, use `--all` — which ends it with the
-supervisor, even though it prints "nothing to stop" when only pools are
-running — or `DELETE /runtimes/{name}` through the API.
+**Output:** one line per thing stopped — `stopped NAME` for a function,
+`stopped runtime.NAME` for a pool — so you can see which kind went. A name
+that is **both** a function and a pool stops both: `stop` means "forget this
+name". To stop only one of the pair, use the API, which keeps them apart:
+`DELETE /fn/{name}` never reaches a pool, and `DELETE /runtimes/{name}`
+never reaches a function.
 
 ## `zygo top` — live resource table
 

@@ -61,7 +61,10 @@ use crate::spec::{Layer, Spec};
 /// - v13: `PUT_DEPS`, `DEPS`, `DELETE_DEPS`, their `DEPENDENCIES` answer, and
 ///   a `deps` on `SERVE_RUNTIME` — a dependency set built from files that
 ///   arrived over the API rather than from a path on this host.
-pub const CONTROL_VERSION: u32 = 13;
+/// - v14: a `runtimes` on `STOP` — `zygo stop` reaches the pools as well as
+///   the functions, so a name that is a pool no longer answers "no function
+///   named …". `DELETE /fn/<name>` leaves it off and keeps its meaning.
+pub const CONTROL_VERSION: u32 = 14;
 
 /// The files one request brings with it and takes away (v9).
 ///
@@ -228,7 +231,17 @@ pub enum Request {
     List,
 
     /// Shut a function down, or all of them.
-    Stop { name: Option<String> },
+    ///
+    /// With `runtimes`, a pool under that name goes too — and with no name,
+    /// every pool. It is a flag rather than the default because the two
+    /// registries are separate and `DELETE /fn/<name>` must not reach into
+    /// the other one: a pool is shared by every tenant on the host, and a
+    /// route about one function is not the place to take it down (v14).
+    Stop {
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        runtimes: bool,
+    },
 
     /// Ask the supervisor itself to exit once in-flight requests finish.
     Shutdown,
@@ -365,10 +378,13 @@ pub enum Request {
 
     /// Register a runtime pool and warm `min_warm` zygotes.
     ///
-    /// The same inputs as `SERVE` minus the secrets, because a pool holds
-    /// none: a secret belongs to a tenant's request, and a pool's zygotes are
-    /// shared. What it may not carry is `entry` or `cmd` — the resolver
-    /// refuses those for a pool, and that refusal is the isolation claim.
+    /// The same inputs as `SERVE` minus the secret *values*: a pool's zygotes
+    /// are shared, so no value belongs to the pool. The layer's `secrets`
+    /// lists the *names* a request may receive; the values are read from the
+    /// calling tenant's store when the request arrives, and the request has a
+    /// zygote to itself while they are in place. What it may not carry is
+    /// `entry` — the resolver refuses that for a pool, and the refusal is the
+    /// isolation claim.
     ServeRuntime {
         name: String,
         spec: Option<Box<Spec>>,
@@ -899,8 +915,12 @@ mod tests {
             },
             Request::Stop {
                 name: Some("resize".into()),
+                runtimes: false,
             },
-            Request::Stop { name: None },
+            Request::Stop {
+                name: None,
+                runtimes: true,
+            },
             Request::Shutdown,
             Request::Drain { grace_ms: 5_000 },
             Request::Ping,
@@ -1286,6 +1306,35 @@ mod tests {
         assert!(json.get("secrets").is_none(), "{json}");
         assert!(json.get("if_changed").is_none(), "{json}");
         assert_eq!(roundtrip_request(&request), request);
+    }
+
+    #[test]
+    fn a_stop_from_before_v14_still_parses_and_means_functions_only() {
+        // `DELETE /fn/<name>` and a v13 client both send a `STOP` with no
+        // `runtimes`, and both mean the function. The flag is off the wire
+        // when it is off, so the frame they send is the frame they sent.
+        let json = serde_json::json!({ "type": "STOP", "name": "resize" });
+        let parsed: Request = serde_json::from_value(json).expect("a v13 STOP");
+        assert_eq!(
+            parsed,
+            Request::Stop {
+                name: Some("resize".into()),
+                runtimes: false,
+            }
+        );
+        let request = Request::Stop {
+            name: Some("resize".into()),
+            runtimes: false,
+        };
+        let json = serde_json::to_value(&request).expect("json");
+        assert!(json.get("runtimes").is_none(), "{json}");
+
+        let json = serde_json::to_value(Request::Stop {
+            name: None,
+            runtimes: true,
+        })
+        .expect("json");
+        assert_eq!(json["runtimes"], true);
     }
 
     #[test]

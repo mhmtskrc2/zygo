@@ -173,7 +173,7 @@ it.
 |---|---|---|---|
 | `mounts` | list of `host:guest[:ro\|rw]` | `[]` | Bind mounts, **read-only unless `:rw`**, and always `nosuid,nodev`. Both apply to every mount below the host path too. `guest` must be absolute. A host path cannot contain `:`. Two mounts cannot share a target. |
 | `env` | table | `{}` | Environment variables for the sandbox. The zygote sees them, so **never put a secret here**. |
-| `secrets` | list of names | `[]` | Each name is read from the environment of the shell that runs `serve`/`up`, and delivered as the file `/run/secrets/<NAME>` (mode 0400), only for the length of one request. A name cannot be in both `env` and `secrets`. |
+| `secrets` | list of names | `[]` | Each name is read from the environment of the shell that runs `serve`/`up` (or the tenant store), and delivered as the file `/run/secrets/<NAME>` (mode 0400), only for the length of one request. A name cannot be in both `env` and `secrets`. In `[runtime.<name>]` the values come from the calling tenant's store instead; see below. |
 
 A mount may not target `/`, `/proc`, `/sys`, `/dev`, `/dev/pts`, `/dev/shm`,
 `/tmp`, `/run`, `/run/script` or `/work`. These are Zygo's own; a folder
@@ -209,11 +209,13 @@ above means the same thing here, except these:
 | `max_warm` | the larger of `min_warm` and `4` | Zygotes the pool may grow to, one per second while every zygote is full. Cannot be below `min_warm`. |
 | `entry` | refused | Anything warmed into a shared zygote would be forked into every tenant's request. |
 | `seccomp` | `strict` | Unless a layer sets it. |
+| `secrets` | `[]` | Names a request may receive, never values: each request gets the **calling tenant's** values from the tenant store, as `/run/secrets/<NAME>`, and has its zygote to itself while they exist. A tenant without one of the names is refused before anything runs; a pool naming secrets on a host with no store key is refused at `serve`. Never read from a shell. [Chapter 14](14-limits-network-secrets.md#secrets-in-a-runtime-pool). |
 
 `min_warm` and `max_warm` are refused in `[fn.*]`. A pool admits
 `concurrency × max_warm` requests before it answers busy. `zygo up` starts
 only `[fn.*]`; a pool is started by `zygo serve --runtime <name>` or
-`POST /runtimes`.
+`POST /runtimes`, and stopped by `zygo stop <name>` or
+`DELETE /runtimes/{name}`.
 
 ## `[api]`
 
