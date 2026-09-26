@@ -23,7 +23,7 @@ toml = "0.8"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 # Secrets at rest. RustCrypto, pure Rust, and the same family as
 # `sha2` above — a cipher is the one thing this project will not write itself,
