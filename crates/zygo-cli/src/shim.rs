@@ -34,6 +34,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "macos")]
 use zygo_core::paths::which;
 use zygo_core::spec::Mount;
 
