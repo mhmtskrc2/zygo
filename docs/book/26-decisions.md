@@ -107,7 +107,10 @@ declared done by whoever did the work.
 ```
 
 Phase 0 was a real gate: without the 10× ratio, the ADR would be wrong, not
-early. It passed at 60× and 100×. Phase 1 passed too: even the slowest 1 in
+early. It passed at 25× on the Lima VM — and at 60× on Docker Desktop's VM
+before the bytecode layer, and 100× on a Raspberry Pi in an older run that
+[chapter 25](25-performance.md#a-second-host-with-kern-in-it) has not
+repeated. Phase 1 passed too: even the slowest 1 in
 100 calls took only 2.92 ms, and a thousand scripts in one zygote used
 29.4 MB.
 [Chapter 25](25-performance.md#the-embedders-benchmark) has both measurements.
@@ -264,7 +267,7 @@ invisible to callers, and both already exist
   ──────────────────────────────────────────────────────────────────────
   old supervisor   serving ████████████ POST /drain ▓▓▓ finish ▓▓ exit
   new supervisor              start ░░ re-warm ░░ ready ████████ serving
-                                        ~500 ms per zygote
+                                        ~150–185 ms per Python zygote
   callers see:     no dropped request; at worst, slower ones while warm-up runs
   ──────────────────────────────────────────────────────────────────────
 ```
@@ -291,8 +294,11 @@ What would have to cross the `exec` is much more than process ids:
 
 ### What it costs
 
-A pool re-warms in about **500 ms per zygote** for `python:3.12-slim` (502 ms
-measured for a pool, 508 ms for a function); a Node zygote is ready in
+A Python zygote re-warms in about **150–185 ms** on a Raspberry Pi 5, the
+supervisor's start included, and in 34 ms on the Lima VM with a supervisor
+already running ([chapter 25](25-performance.md#warming-up)). When this was
+decided, before the bytecode layer, it was about 500 ms (502 ms for a pool,
+508 ms for a function, from `poc/api_driver.py`). A Node zygote is ready in
 15–43 ms. So an upgrade costs `min_warm × warm-up` of cold pool per replica,
 once. A single-replica deployment has a short window where requests are slow,
 not failed; two replicas remove it, and the Kubernetes example uses two. In
@@ -301,8 +307,8 @@ copy of its state: the running one.
 
 ### What would reopen it
 
-- **A warm-up of tens of seconds**, not half of one. Even then, the better fix
-  may be to make that warm-up faster.
+- **A warm-up of tens of seconds**, not a fraction of one. Even then, the
+  better fix may be to make that warm-up faster.
 - **A deployment that cannot have two replicas**, with a latency budget a cold
   start breaks. `--reexec` is one answer; a second supervisor on the same host
   behind a load balancer is another, and needs nothing new.

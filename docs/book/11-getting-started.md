@@ -248,9 +248,16 @@ If the VM cannot be reached, a command exits with status **111**;
 
 A one-shot `zygo run` typed in a Mac shell takes about 29 ms end to end, when
 a supervisor is running in the VM. About 6 ms of that is the sandbox, and
-about 22 ms is the trip into the VM. These are medians of nine runs on the Mac
-that [chapter 25](25-performance.md) names. The same run through Docker
+about 22 ms is the trip into the VM. These are medians of nine runs on the
+Mac that [chapter 25](25-performance.md) names. The same run through Docker
 Desktop on the same Mac took 397 ms.
+
+Why does a one-shot run care about a supervisor? For its cgroup. Without one,
+`zygo run` on a systemd login must make a transient scope of its own and
+re-execute itself inside it, which costs about 12 ms more (25.7 against
+13.5 ms inside the Lima VM,
+[chapter 25](25-performance.md#a-one-shot-sandbox-on-a-systemd-login)). With
+a supervisor running, the run is handed to its cgroup tree instead.
 
 The trip is paid per *command*, not per request. The millisecond warm path is
 still there when you call functions through the HTTP API or the SDKs,
@@ -454,7 +461,7 @@ def handler(event):
     return {"doubled": event.get("n", 0) * 2}
 EOF
 
-zygo serve handler.py --name double      # pulls python:3.12-slim, then warms it
+zygo serve handler.py --name double      # python:3.12-slim is in the store from the run above
 zygo exec double '{"n": 21}'             # {"doubled": 42}
 zygo ps                                  # what is running
 ```
@@ -547,6 +554,7 @@ overrides it. [Chapter 20](20-sandbox-toml.md) lists every field.
 ## Bringing the project up
 
 ```bash
+zygo pull alpine:3                     # up never pulls; python:3.12-slim is already there
 export API_KEY=…                       # read from this shell, delivered as a file
 zygo up                                # every [fn.*] warm
 zygo exec fetch '{"path": "/v1/ping"}'
@@ -554,8 +562,11 @@ zygo logs fetch -f                     # follow the function's log
 zygo down                              # stop them all
 ```
 
-`zygo up` warms every function in the file. Run it again after an edit, and
-only the functions that changed are restarted.
+`zygo up` warms every function in the file. It never pulls an image — a deploy
+should not quietly depend on a registry — so pull first, as above; `zygo run`
+is the one command that pulls for you
+([chapter 15](15-images-and-dependencies.md#when-zygo-pulls-for-you)). Run
+`up` again after an edit, and only the functions that changed are restarted.
 
 ## Calling the functions over HTTP
 

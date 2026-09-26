@@ -179,10 +179,12 @@ curl -X POST -H "Authorization: Bearer $ZYGO_API_TOKEN" \
 
 This stops taking new requests, finishes the running ones, and exits. The
 answer carries the number still running: `in_flight: 0` is a clean drain,
-and anything else means the grace time ran out. The cost is about half a
-second of warm-up per function afterwards. No request is dropped, as long as
-something else is ready to take them — which is what two replicas and
-`min_warm` are for.
+and anything else means the grace time ran out. The cost is a warm-up per
+function afterwards: about 150–185 ms for a Python handler, the supervisor's
+own start included, measured on a Raspberry Pi 5
+([chapter 25](25-performance.md#warming-up)); heavy imports add to it. No
+request is dropped, as long as something else is ready to take them — which
+is what two replicas and `min_warm` are for.
 
 ```text
   replica A: ███ serving ███ drain ▓▓ exit │ start new ░ warm ░ ███ serving ███

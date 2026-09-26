@@ -53,7 +53,7 @@ classes*, and gives each one a backend and a risk that is accepted.
 |---|---|---|---|
 | T1 | Your own team, CI | `ns`, relaxed seccomp | A kernel CVE |
 | T2 | Authenticated, contracted customers | `ns` + strict seccomp + Landlock + a network allowlist | A kernel local-privilege-escalation CVE — historically a few critical ones a year |
-| T3 | Anonymous, hostile | `vm` | A VMM or KVM CVE, which are much rarer |
+| T3 | Anonymous, hostile | `vm` — today one-shot only, no network, no in-guest cgroups, seccomp or Landlock; needs KVM and a `make vm-build` binary | A VMM or KVM CVE, which are much rarer |
 
 ```text
   who wrote the code?            backend                     what could still break it
@@ -165,7 +165,7 @@ syscall named in the tables below is refused.
 
 | Vector | Control | Status |
 |---|---|---|
-| Kernel syscall surface | seccomp allowlist (~215 syscalls named; about 200 of them exist on a given architecture); `bpf`, `io_uring`, `userfaultfd`, `keyctl`, `perf_event_open` and `ptrace` refused | **attempted** — and swept: all 469 syscall numbers under each profile, 271 refused with EPERM under `default` (Linux 6.8, aarch64); the numbers above the table answer ENOSYS |
+| Kernel syscall surface | seccomp allowlist (`default`: ~215 syscalls named; 190 of them exist on aarch64, all on x86_64); `bpf`, `io_uring`, `userfaultfd`, `keyctl`, `perf_event_open` and `ptrace` refused | **attempted** — and swept: all 469 syscall numbers under each profile, 271 refused with EPERM under `default` (Linux 6.8, aarch64); the numbers above the table answer ENOSYS |
 | `mount()` to reach the host | `CAP_SYS_ADMIN` dropped; seccomp refuses `mount` | **attempted** |
 | `setns` into the host's namespaces | refused: no capability in the host's user namespace | **attempted** |
 | Regaining capabilities via a new user namespace | `unshare(CLONE_NEWUSER)` refused by seccomp | **attempted** |
@@ -303,10 +303,20 @@ then kept apart by namespaces and file modes, but not also by different uids.
 On older kernels the filesystem allowlist is absent, and the mount plan is the
 only filesystem boundary. The process-level network rules — `bind` refused
 everywhere, `connect` limited to the allowlist's ports under `egress` — are
-built and unit-tested. They have **not** been run on a 6.7+ kernel by this
-project's own suite; CI's ubuntu-24.04 runner is where that happens. Below
-6.7, the nftables allowlist inside the namespace is the only egress control,
-and it is the one every check here runs against.
+built and unit-tested, and enforced for real in one place: CI's
+`landlock-network` job, on an ubuntu-24.04 runner (Linux 6.8, Landlock ABI
+v4), runs `poc/verify_landlock_net.sh` (`make landlock-net-linux` runs the
+same script in a container). It picks the two refusals nftables cannot
+produce: a `bind()` on a TCP port, which sends no packet, and a loopback
+`connect()` to a port off the allowlist, which the packet filter accepts on its
+first line. Both must fail with `EACCES`; a loopback connect on an allowed
+port must get past Landlock; under `network = "none"` both are refused. On a
+kernel below 6.7 the script says `SKIP` and exits 0 — which is why the job is
+not mixed into one that also runs on 22.04. Neither of this project's own
+development machines can run it: Docker Desktop's 5.10 kernel reports ABI 0,
+and the Raspberry Pi's kernel has no Landlock at all. Below 6.7, the nftables
+allowlist inside the namespace is the only egress control, and it is the one
+every other check here runs against.
 
 ### `cgroup.kill` needs 5.14
 

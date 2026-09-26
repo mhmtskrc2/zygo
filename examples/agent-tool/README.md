@@ -38,6 +38,7 @@ mistakes survivable.
 
 For code you did not write and cannot read, the design's answer is
 `isolation = "vm"`, a hardware boundary. That backend needs a machine with KVM
-is not ready yet; until it is, this runs
-on `ns` with the tightest profile it has, and the [threat model](../../docs/book/23-security.md)
-says plainly what that does and does not hold against.
+and is one-shot only, so it cannot hold a warm function yet; until it can,
+this runs on `ns` with the tightest profile it has, and the
+[threat model](../../docs/book/23-security.md) says plainly what that does and
+does not hold against.

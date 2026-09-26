@@ -93,9 +93,11 @@ of syscalls a sandbox should never need.)
 ## `default`
 
 `default` is what a function gets when its author does not choose. It names
-about 215 syscalls, found by running five reference packages through their
-real work: numpy's BLAS threads, Pillow's image codecs, pandas' file I/O,
-pydantic's Rust core, and requests' TLS setup. `clone`, the call that makes a
+about 215 syscalls (216 in the source; 190 of them exist on aarch64 and all
+of them on x86_64, and a name the kernel does not have is left out of the
+filter), found by running five reference packages through their real work:
+numpy's BLAS threads, Pillow's image codecs, pandas' file I/O, pydantic's
+Rust core, and requests' TLS setup. `clone`, the call that makes a
 new process or thread, is allowed only when no `CLONE_NEW*` flag is set, so a
 sandbox cannot make a new namespace. `ioctl` is allowed except for `TIOCSTI`
 and its relatives, which could push keystrokes into a terminal. `bpf`,

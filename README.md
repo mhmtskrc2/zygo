@@ -2,7 +2,8 @@
 
 **Zygo forks a warm, sandboxed interpreter for every request: 1.4 ms, and
 every request starts from a process that has never served one.**
-Daemonless, rootless, OCI images.
+Rootless, OCI images, and no daemon to install: the one long-lived process is a
+supervisor under your own user, not a system service.
 
 *This page is the first page of [the Zygo book](docs/book/README.md), also on
 the web at [mhmtskrc2.github.io/zygo](https://mhmtskrc2.github.io/zygo/).*
@@ -105,7 +106,7 @@ zygo run --mem 128M --timeout 10s python:3.12-slim python3 -c 'print("hello")'
 - **Secrets are files**, written from outside the sandbox for one request:
   never environment variables, never in the warm process's memory.
 - **Any language.** Python and Node agents ship; anything else is a fresh
-  process per request in a held sandbox (about 2 ms), or an agent of your own
+  process per request in a held sandbox (about 1.4 ms), or an agent of your own
   against [the protocol](spec/protocol.md).
 - **For programs:** an HTTP API, dependency-free Python and Node clients
   (`zygo-sdk`), and an MCP server. [Chapter 17](docs/book/17-api-sdk-mcp.md)

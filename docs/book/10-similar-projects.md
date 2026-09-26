@@ -104,8 +104,8 @@ These are the time a tool **adds**. Your own code's time comes on top.
 | Per-request overhead | 300–1000 ms | 50–100 ms | ~125 ms boot; 10–20 ms from a snapshot | 50–150 ms | ~1–5 ms + platform | **usually 12 ms** | **usually 1.9 ms** · 1 in 100: 11.4 ms¹ · a different script each time | **usually 1.4 ms** · 1 in 100: 10.5 ms¹ |
 | Paid once, up front | — | a `docker run -d` | the VM's own boot, or a snapshot | — | a cold start, platform-side | — | a `zygo serve --runtime`: the interpreter and its dependencies, once for *every* script | a `zygo serve`: ~150 ms for a Python handler, plus its imports |
 | Clean state per request | yes | no | yes | yes | no | **yes** | **yes** (a fresh process; the script is loaded in it) | **yes** (a fresh process) |
-| Daemon | yes | yes | yes (a VMM per VM) | yes (`runsc` + shim) | n/a | **no** | **no** | **no** |
-| Root | daemon runs as root | same | needs `/dev/kvm` | no | n/a | **no** | **no** | **no** |
+| Daemon | yes | yes | yes (a VMM per VM) | yes (`runsc` + shim) | n/a | **no** | **no system service**: a supervisor under your user | **no system service**: a supervisor under your user |
+| Root | daemon runs as root | same | needs `/dev/kvm` | no, in rootless mode (how Zygo runs it); then its cgroup limits are advisory | n/a | **no** | **no** | **no** |
 | Wall | kernel | kernel | hardware | userspace kernel | hardware | kernel (`ns`); userspace kernel (`gvisor`); hardware (`vm`) | kernel (`ns` only) | kernel (`ns` only) |
 
 ¹ On Linux 6.x, 1 request in 100 waits about 9 ms for the kernel to move it
@@ -188,7 +188,7 @@ cgroup values without running anything; Docker has nothing like it.
 
 The container you keep around and step into is a separate idea in Zygo:
 `zygo serve` and `zygo exec`, a warm function. It looks like `docker exec`,
-except that every request is a fresh process and costs about 2 ms.
+except that every request is a fresh process and costs about 1.4 ms.
 
 ```text
   docker run IMAGE                          zygo run IMAGE
@@ -210,7 +210,7 @@ you did not. This is what you get with no flags at all.
 |---|---|---|
 | Root filesystem | writable (a copy-on-write upper layer) | **read-only**; the only writable place is `/tmp`, a tmpfs sized by `scratch` (the smaller of 64M and half of `mem`, so 64M by default) |
 | Capabilities | 14 kept (`NET_RAW`, `SYS_CHROOT`, `MKNOD`, …) | **none** |
-| seccomp | a denylist-shaped profile allowing ~350 syscalls | **an allowlist of ~215**; `bpf`, `io_uring`, `userfaultfd`, `ptrace`, `mount`, `unshare` absent; `clone` refused with any namespace flag |
+| seccomp | a denylist-shaped profile allowing ~350 syscalls | **an allowlist of ~215 names** (the `default` profile; 190 of them exist on aarch64, all on x86_64); `bpf`, `io_uring`, `userfaultfd`, `ptrace`, `mount`, `unshare` absent; `clone` refused with any namespace flag |
 | Landlock | no | yes, where the kernel has it |
 | Runs as | root in the container, root on the host (outside rootless mode) | the image's uid 1000, mapped to **your** uid |
 | Network | bridge; everything reachable | **`none`**: loopback only |
@@ -449,7 +449,7 @@ quickly.
 | Per-call cost | a fresh box, single-digit ms | none — it confines a process you were starting anyway | a microVM, boot under ~100 ms | a fresh sandbox, 12 ms — **or a fork into a warm one, 1.4 ms** |
 | State between calls | none: the box is destroyed | whatever your process kept | a sandbox can be kept, branched and snapshotted | none, and not by destroying anything: each request is a `fork()` of a process that has never served one |
 | Runs on macOS | Linux and WSL2 | yes, natively, with Seatbelt | yes | through a Linux VM it manages |
-| Daemon | no | no | no | no |
+| Daemon | no | no | no | no system service; warm functions live under a supervisor that runs as your user |
 
 ## kern
 
@@ -762,7 +762,7 @@ A run now starts 4 processes, down from 13 at the worst.
 | minijail | host kernel | no | some | no | usually | OS services |
 | kern | host kernel | OCI | cgroups | no | no | fast throwaway boxes |
 | nono | host kernel (Landlock) | no | no | n/a | no | confining an agent |
-| gVisor | second kernel | OCI | cgroups | no | usually | safer containers |
+| gVisor | second kernel | OCI | cgroups | no | no, in rootless mode (how Zygo runs it); then its cgroup limits are advisory | safer containers |
 | microsandbox | VM | OCI | the VM's | no (snapshots) | no | hostile code |
 | Firecracker | VM | no (a disk image) | the VM's | no (snapshots) | KVM access | serverless platforms |
 | Kata | VM | OCI | the VM's | no | yes | safer Kubernetes pods |

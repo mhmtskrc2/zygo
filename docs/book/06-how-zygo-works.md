@@ -118,8 +118,9 @@ A Go or Rust binary starts in a millisecond, so there is nothing to keep
 warm inside it. For these Zygo keeps only the *sandbox* warm: namespaces,
 mounts and filters built once. Each request is a new process that enters the
 sandbox with `setns` and execs your `cmd`, reading the event on standard input
-and writing the result on standard output. This costs a median of about 2 ms.
-It works for any language and any image, with no agent at all.
+and writing the result on standard output. This costs about 1.4 ms, measured
+with `sh -c cat` as the program; a bigger program adds its own start. It works
+for any language and any image, with no agent at all.
 
 | | warm-exec (`cmd`) | agent (`entry`) |
 |---|---|---|
@@ -334,7 +335,8 @@ The mistake to avoid is a glibc binary in `alpine:3`: it fails with "the
 program does not exist", because the loader it asks for is not in the image
 ([chapter 12](12-one-shot-sandboxes.md#programs-from-your-host)). And for a
 binary you call again and again, do not pay even the 12 ms of a fresh
-sandbox: keep the sandbox warm with `cmd`, and each call costs about 2 ms
+sandbox: keep the sandbox warm with `cmd`, and each call costs about 1.4 ms
+plus the program's own start
 ([warm-exec](#warm-exec-for-programs-that-start-fast)).
 
 ```toml

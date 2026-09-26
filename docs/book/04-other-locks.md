@@ -63,7 +63,8 @@ in classic BPF, that looks at the syscall number and its arguments and
 answers "allow", "fail with an error" or "kill". Once installed it cannot be
 removed, and children inherit it. Docker's default filter lists what is
 *blocked* and allows about 350 syscalls. Zygo's lists what is *allowed* —
-about 190 — so a syscall added to the kernel next year is blocked until
+about 215 names, of which 190 exist on an arm64 kernel and all on x86_64 — so
+a syscall added to the kernel next year is blocked until
 someone chooses to allow it. [Seccomp profiles](24-seccomp-profiles.md) has the
 full lists.
 

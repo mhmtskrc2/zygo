@@ -36,6 +36,7 @@ One line each. The chapter in brackets explains the term in full; the numbers fo
 | **KVM** | The Linux feature that lets it run virtual machines using the CPU's hardware support. [10] |
 | **Landlock** | A Linux feature that lets a process limit its own file and network access. [4] |
 | **layer** | One tar file of changes in an image, named by the hash of its content. [5] |
+| **layer (of a spec)** | One `sandbox.toml` table — `[defaults]`, `[fn.NAME]` or `[runtime.NAME]` — with every field optional, merged over the one below; what the API's `PUT /fn/{name}` and `POST /run` bodies carry. [17, 20] |
 | **Lima** | The tool Zygo uses to run a Linux virtual machine on a Mac. [11] |
 | **MCP** | Model Context Protocol: how an AI agent host starts and talks to a tool server; `zygo mcp` is one. [17] |
 | **microVM** | A very small virtual machine that boots fast, such as Firecracker's. [10] |

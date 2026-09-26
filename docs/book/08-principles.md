@@ -16,7 +16,7 @@ the chapter takes them one by one.
 | P2 | The sandbox waits warm | a warm function uses memory while it waits |
 | P3 | Isolation is one flag | `vm` is slower and does less; `gvisor` is one-shot only |
 | P4 | OCI images, no Dockerfile | the first build of a derived layer takes about five seconds |
-| P5 | No root, no daemon | the host must have a few programs installed |
+| P5 | No root, no system service | the host must have a few programs installed |
 | P6 | Safe by default | the first thing a new user hits is a limit |
 | P7 | Every limit is required | disk I/O and bandwidth have no default |
 | P8 | Honest about what is not proven | the status text says "not built" often |
@@ -25,7 +25,7 @@ the chapter takes them one by one.
   ┌──────────── how it is made ────────────┐   ┌──────────── how it is fast ────────────┐
   │ P1 one process, no container machinery │   │ P2 the sandbox is ready before a call  │
   │ P4 any OCI image, dependencies in spec │   │ P3 one flag picks where the wall is    │
-  │ P5 your user, no root, no daemon       │   │                                        │
+  │ P5 your user, no root, no root service │   │                                        │
   └────────────────────────────────────────┘   └────────────────────────────────────────┘
   ┌──────────────────────────── how it stays safe and honest ─────────────────────────────┐
   │ P6 locked by default · P7 every limit has a value · P8 every claim measured or marked │
@@ -70,11 +70,12 @@ backend exists, for code you did not write. `zygo doctor` and the
 Nothing is built while a request waits. There are two ways Zygo does this.
 For a compiled program the sandbox is *held*: namespaces, mounts and locks are
 set up once, and each request is a fresh process that enters them. That costs
-about 2 ms. For an interpreter such as Python, the sandbox holds an *agent*, a
-small program that has already imported your handler. Each request is a
-`fork()` of it — a copy of the process. The copy is *copy-on-write*: memory is
-shared until one side changes it, so nothing is copied up front. And because
-each request is a fresh process, no state carries over from the last one.
+about 1.4 ms, plus the program's own start. For an interpreter such as
+Python, the sandbox holds an *agent*, a small program that has already
+imported your handler. Each request is a `fork()` of it — a copy of the
+process. The copy is *copy-on-write*: memory is shared until one side changes
+it, so nothing is copied up front. And because each request is a fresh
+process, no state carries over from the last one.
 
 Measured: usually 1.4 ms at 250 requests per
 second, on the machines named in [chapter 25](25-performance.md).
@@ -117,8 +118,10 @@ built-in support for virtual machines) with a guest kernel of its own.
 ```
 
 **What it costs.** `ns` and `gvisor` are built. `vm` boots a guest and runs
-one-shot sandboxes, at about ten times the setup cost of `ns`, and without
-scratch space, network or warm functions. `zygo backend install gvisor`
+one-shot sandboxes, at about six times the setup cost of `ns` (422 ms against
+73 ms on a Raspberry Pi 5, [chapter 25](25-performance.md#a-sandbox-with-a-hardware-boundary)).
+The guest writes to a private layer bounded by `scratch`; it has no network
+and no warm functions. `zygo backend install gvisor`
 downloads the gVisor runtime. The same command run on both backends gives the
 same answer, while `uname -r` inside reports `4.19.0-gvisor` instead of the
 host's kernel — which is the point.
@@ -197,11 +200,11 @@ names the field and the fix.
 ## P7: every limit is required
 
 Memory, CPU, process count, wall-clock time, scratch space, open files, and,
-for a networked function, connections and bandwidth: each has a default, and
-there is no "unlimited" without the flag. The deadline kills the request's
-whole *process tree* (the process and every child it started), not a single
-process. The per-request cgroup is what makes that one write, to its
-`cgroup.kill` file.
+for a networked function, connections: each has a default, and there is no
+"unlimited" without the flag. Disk I/O and bandwidth are the two exceptions,
+below. The deadline kills the request's whole *process tree* (the process and
+every child it started), not a single process. The per-request cgroup is what
+makes that one write, to its `cgroup.kill` file.
 
 ```text
   request cgroup ── cgroup.kill ◀── one write at the deadline
@@ -244,7 +247,7 @@ forks it. [Chapter 13](13-warm-functions.md) shows how to write each one.
 | What is warm | the sandbox | the sandbox *and* a loaded interpreter |
 | A request is | a fresh process entered into the sandbox | a `fork()` of the agent |
 | Overhead | ~1.4 ms + the program's own start | ~1.4 ms |
-| Needs | nothing: any image, any language | an agent that speaks the [protocol](../../spec/protocol.md); Python ships, Node and sh are in `examples/` |
+| Needs | nothing: any image, any language | an agent that speaks the [protocol](../../spec/protocol.md); Python and Node ship (in [`agents/`](../../agents)); a POSIX sh one is in [`examples/agents/sh`](../../examples/agents/sh) |
 | Use when | the runtime starts fast: Go, Rust, C, sh | starting the runtime is the cost: Python with imports, a JVM, Node with a dependency tree |
 
 ```text

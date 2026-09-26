@@ -203,7 +203,7 @@ handler with no imports, measured on a Raspberry Pi 5.
 
 | State | In memory? | Uses CPU? | Cost of the next request |
 |---|---|---|---|
-| warm | yes | only while serving | a fork, about 1.7 ms |
+| warm | yes | only while serving | a fork, about 1.4 ms |
 | paused | yes | no | one write to wake it, then a fork |
 | cold | no | no | a full warm-up, then a fork |
 
