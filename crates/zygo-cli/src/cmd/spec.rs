@@ -31,12 +31,19 @@ fn load(file: Option<&Path>) -> anyhow::Result<Spec> {
 fn validate(cli: &Cli, spec: &Spec) -> anyhow::Result<u8> {
     let style = Style::stdout();
     let names: Vec<String> = spec.function_names().map(str::to_string).collect();
+    let pools: Vec<String> = spec.runtimes.keys().cloned().collect();
 
-    // Parsing already succeeded; the real work is resolving every function,
-    // since that is where limits and network rules are checked.
+    // Parsing already succeeded; the real work is resolving every function
+    // and every pool, since that is where limits and network rules are
+    // checked. A pool used to be skipped here, so a `[runtime.*]` table with
+    // a bad limit passed `validate` and failed at `serve`.
     let mut warnings = Vec::new();
     for name in &names {
         let resolved = spec.resolve(Some(name), &Layer::default(), &ResolveOptions::default())?;
+        warnings.extend(resolved.warnings);
+    }
+    for name in &pools {
+        let resolved = spec.resolve_runtime(name, &Layer::default(), &pool_options())?;
         warnings.extend(resolved.warnings);
     }
     let warnings = group_warnings(&warnings);
@@ -45,6 +52,7 @@ fn validate(cli: &Cli, spec: &Spec) -> anyhow::Result<u8> {
         output::json(&serde_json::json!({
             "file": spec.source.as_ref().map(|p| p.display().to_string()),
             "functions": names,
+            "runtimes": pools,
             "warnings": warnings,
             "ok": true,
         }))?;
@@ -55,20 +63,82 @@ fn validate(cli: &Cli, spec: &Spec) -> anyhow::Result<u8> {
         output::warn(w);
     }
 
-    match names.len() {
-        0 => println!("{} valid, but no functions are declared", style.yellow("!")),
-        n => println!(
-            "{} {} valid — {n} function{} ({})",
-            style.green("✓"),
-            spec.source
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "spec".into()),
-            if n == 1 { "" } else { "s" },
+    let file = spec
+        .source
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "spec".into());
+    let mut parts = Vec::new();
+    if !names.is_empty() {
+        parts.push(format!(
+            "{} function{} ({})",
+            names.len(),
+            if names.len() == 1 { "" } else { "s" },
             names.join(", ")
-        ),
+        ));
+    }
+    if !pools.is_empty() {
+        parts.push(format!(
+            "{} pool{} ({})",
+            pools.len(),
+            if pools.len() == 1 { "" } else { "s" },
+            pools.join(", ")
+        ));
+    }
+    if parts.is_empty() {
+        println!(
+            "{} valid, but no functions or pools are declared",
+            style.yellow("!")
+        );
+    } else {
+        println!("{} {file} valid — {}", style.green("✓"), parts.join(", "));
     }
     Ok(0)
+}
+
+/// How a pool is resolved for `validate` and `explain`: as `serve --runtime`
+/// would, so what is printed is what would run.
+fn pool_options() -> ResolveOptions {
+    ResolveOptions {
+        pool: true,
+        ..Default::default()
+    }
+}
+
+/// What `explain NAME` is looking at: a `[fn.<name>]`, a `[runtime.<name>]`,
+/// or the `zygo run` defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Explained {
+    Run,
+    Function,
+    Pool,
+}
+
+/// Which table a name belongs to. A name in both is the function: `stop`
+/// treats the pair as one thing, but `explain` has to pick, and
+/// `[fn.<name>]` is the one `zygo up` and `exec <name>` mean. A name in
+/// neither is the error `resolve` gives, with the pools among the
+/// suggestions — `spec explain py312` used to say "function `py312` is not
+/// defined" about a pool the spec declared two lines down.
+fn kind_of(spec: &Spec, name: Option<&str>) -> Result<Explained, zygo_core::spec::SpecError> {
+    let Some(n) = name else {
+        return Ok(Explained::Run);
+    };
+    if spec.functions.contains_key(n) {
+        Ok(Explained::Function)
+    } else if spec.runtimes.contains_key(n) {
+        Ok(Explained::Pool)
+    } else {
+        let known: Vec<&str> = spec
+            .function_names()
+            .chain(spec.runtimes.keys().map(String::as_str))
+            .collect();
+        Err(zygo_core::spec::SpecError::unknown_function(
+            n,
+            spec.source.as_deref(),
+            &known,
+        ))
+    }
 }
 
 fn explain(cli: &Cli, spec: &Spec, name: Option<&str>) -> anyhow::Result<u8> {
@@ -77,19 +147,39 @@ fn explain(cli: &Cli, spec: &Spec, name: Option<&str>) -> anyhow::Result<u8> {
     // from the image rather than the spec. Resolving it as a served function
     // made `zygo spec explain` fail with `nothing to run` on every spec that
     // does not put a `cmd` in `[defaults]`.
-    let opts = ResolveOptions {
-        one_shot: name.is_none(),
-        ..Default::default()
+    let kind = kind_of(spec, name)?;
+    let resolved = match kind {
+        Explained::Pool => {
+            spec.resolve_runtime(name.unwrap_or_default(), &Layer::default(), &pool_options())?
+        }
+        _ => {
+            let opts = ResolveOptions {
+                one_shot: name.is_none(),
+                ..Default::default()
+            };
+            spec.resolve(name, &Layer::default(), &opts)?
+        }
     };
-    let resolved = spec.resolve(name, &Layer::default(), &opts)?;
     // Where the profile came from, beside what it is: the first adoption
     // report (Z-3) could not tell whether `--seccomp` had taken effect,
     // and "which table answered" is the question that settles it.
-    let seccomp_source = spec.seccomp_source(name, &Layer::default());
+    let seccomp_source = match kind {
+        Explained::Pool => spec.seccomp_source_runtime(name.unwrap_or_default(), &Layer::default()),
+        _ => spec.seccomp_source(name, &Layer::default()),
+    };
 
     if cli.json {
         let mut value = to_json(&resolved);
         value["seccomp"]["source"] = serde_json::json!(seccomp_source);
+        value["kind"] = serde_json::json!(match kind {
+            Explained::Run => "run",
+            Explained::Function => "fn",
+            Explained::Pool => "runtime",
+        });
+        if kind == Explained::Pool {
+            value["min_warm"] = serde_json::json!(resolved.min_warm);
+            value["max_warm"] = serde_json::json!(resolved.max_warm);
+        }
         output::json(&value)?;
         return Ok(0);
     }
@@ -99,7 +189,11 @@ fn explain(cli: &Cli, spec: &Spec, name: Option<&str>) -> anyhow::Result<u8> {
     }
 
     let style = Style::stdout();
-    println!("{}", style.bold(&format!("fn {}", resolved.name)));
+    let heading = match kind {
+        Explained::Pool => format!("runtime {}", resolved.name),
+        _ => format!("fn {}", resolved.name),
+    };
+    println!("{}", style.bold(&heading));
 
     let mut rows: Vec<Vec<String>> = vec![
         row("image", &resolved.image),
@@ -166,6 +260,10 @@ fn explain(cli: &Cli, spec: &Spec, name: Option<&str>) -> anyhow::Result<u8> {
         row("idle_timeout", &resolved.idle_timeout.to_string()),
         row("cold_after", &resolved.cold_after.to_string()),
     ]);
+    if kind == Explained::Pool {
+        rows.push(row("min_warm", &resolved.min_warm.to_string()));
+        rows.push(row("max_warm", &resolved.max_warm.to_string()));
+    }
 
     print!("{}", output::table(&["field", "value"], &rows));
     Ok(0)
@@ -290,6 +388,29 @@ mod tests {
     fn grouping_preserves_warnings_it_cannot_parse() {
         let out = group_warnings(&["something unstructured".into()]);
         assert_eq!(out, ["something unstructured"]);
+    }
+
+    #[test]
+    fn explain_knows_a_pool_from_a_function_and_names_both_when_lost() {
+        let spec = Spec::parse(
+            "[fn.resize]\nimage=\"alpine\"\ncmd=[\"/bin/true\"]\n\n[runtime.py312]\nagent=\"python\"\nmin_warm=2\n",
+            None,
+        )
+        .unwrap();
+        assert_eq!(kind_of(&spec, None).unwrap(), Explained::Run);
+        assert_eq!(kind_of(&spec, Some("resize")).unwrap(), Explained::Function);
+        assert_eq!(kind_of(&spec, Some("py312")).unwrap(), Explained::Pool);
+
+        let err = kind_of(&spec, Some("py31")).unwrap_err().to_string();
+        assert!(err.contains("did you mean `py312`"), "{err}");
+
+        // A pool resolves as `serve --runtime` would: strict by default, and
+        // carrying its own warm counts.
+        let pool = spec
+            .resolve_runtime("py312", &Layer::default(), &pool_options())
+            .unwrap();
+        assert_eq!(pool.min_warm, 2);
+        assert_eq!(pool.seccomp.to_string(), "strict");
     }
 
     #[test]

@@ -344,10 +344,17 @@ fn serve_runtime(cli: &Cli, args: &ServeArgs, name: &str) -> anyhow::Result<u8> 
                         style.dim("replaced the previous pool under this name")
                     );
                 }
+                // The example script is in the pool's language: a Node pool
+                // used to be told to run `handler.py`.
+                let script = if runtime.starts_with("node") {
+                    "handler.js"
+                } else {
+                    "handler.py"
+                };
                 println!(
                     "  {}",
                     style.dim(&format!(
-                        "zygo exec --runtime {name} --script handler.py '{{}}'"
+                        "zygo exec --runtime {name} --script {script} '{{}}'"
                     ))
                 );
             }

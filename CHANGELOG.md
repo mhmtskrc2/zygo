@@ -78,6 +78,13 @@ break things and will say so here.
   killed at its deadline and reported as timed out (exit 137, HTTP 408).
   Serving a pool, `POST /fn/<name>/warm` and `zygo shell`, which warm a
   zygote before answering, now get the budget `serve` has.
+- `zygo spec explain <name>` knows a `[runtime.<name>]` pool: it prints the
+  pool's resolved settings, with `min_warm` and `max_warm`, where it used to
+  answer "function `<name>` is not defined". `zygo spec validate` resolves
+  pools as well as functions, and counts both. A name that is neither is
+  told about the pools among its suggestions.
+- `zygo serve --runtime` for a Node pool suggests `--script handler.js`,
+  not `handler.py`.
 
 ## [0.1.3] — 2026-09-26
 

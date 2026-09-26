@@ -285,11 +285,14 @@ zygo spec [-f PATH] validate
 zygo spec [-f PATH] explain [NAME]
 ```
 
-`validate` resolves every function, so limits, names and network rules are
-really checked, and prints the warnings once each. `explain NAME` prints the
-final settings for one function after every layer is merged — and says, for
-each value, which layer it came from. `explain` with no name shows what `zygo
-run` would use. Both need a `sandbox.toml`.
+`validate` resolves every function and every pool, so limits, names and
+network rules are really checked, and prints the warnings once each. `explain
+NAME` prints the final settings for one function or one pool after every layer
+is merged — and says, for each value, which layer it came from. A pool is
+resolved the way `serve --runtime` resolves it (`strict` unless a layer says
+otherwise) and shows its `min_warm` and `max_warm` too; a name that is both a
+function and a pool is explained as the function. `explain` with no name
+shows what `zygo run` would use. Both need a `sandbox.toml`.
 
 ## `zygo pull` — download an image
 

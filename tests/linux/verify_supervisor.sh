@@ -734,6 +734,24 @@ case "$out" in
     *"not a package name"*) ok "a malformed package name is a spec error" ;;
     *) bad "malformed package name: $(printf '%s' "$out" | head -2 | tr '\n' ' ')" ;;
 esac
+
+# A pool is explained too. `spec explain py312` used to say "function
+# `py312` is not defined" about a `[runtime.py312]` two lines down.
+printf '[runtime.py312]\nimage = "python:3.12-slim"\nagent = "python"\nmin_warm = 2\n' > sandbox.toml
+out=$("$ZYGO" spec explain py312 2>&1)
+case "$out" in
+    *"runtime py312"*"min_warm"*"2"*) ok "\`spec explain\` resolves a pool, with its warm counts" ;;
+    *) bad "spec explain on a pool: $(printf '%s' "$out" | head -3 | tr '\n' ' ' | cut -c1-200)" ;;
+esac
+case $("$ZYGO" spec explain py31 2>&1) in
+    *"did you mean \`py312\`"*) ok "and a mistyped pool name is corrected" ;;
+    *) bad "a mistyped pool name got no suggestion" ;;
+esac
+out=$("$ZYGO" spec validate 2>&1)
+case "$out" in
+    *"1 pool (py312)"*) ok "\`spec validate\` counts the pool" ;;
+    *) bad "spec validate with a pool: $(printf '%s' "$out" | head -2 | tr '\n' ' ')" ;;
+esac
 work /tmp/sup-work
 
 say ""
@@ -1730,6 +1748,74 @@ exits 1 "a pool that is given a handler is refused" \
     "$ZYGO" serve a.py --runtime pool2 --image "$IMAGE"
 exits 4 "a script for a runtime nobody served is \`not found\`" \
     "$ZYGO" exec --runtime nowhere --script a.py '{}'
+
+# A pooled script is held to its own deadline, like a function's request, and
+# the client waits for that deadline rather than its thirty-second control
+# budget. It used to give up at 30 s with "the supervisor did not answer
+# running a script", telling the operator to restart a healthy supervisor:
+# every pooled request allowed longer than that failed.
+cat > nap.py <<'PY'
+import time
+
+
+def handler(event):
+    time.sleep(35)
+    return {"napped": 35}
+PY
+cat > forever.py <<'PY'
+def handler(event):
+    while True:
+        pass
+PY
+if served slowpool --runtime slowpool --image "$IMAGE" --agent python --timeout 60s; then
+    started=$(date +%s)
+    out=$("$ZYGO" exec --runtime slowpool --script nap.py --timeout 60s '{}' 2>&1)
+    elapsed=$(( $(date +%s) - started ))
+    case $out in
+        *'"napped": 35'*) ok "a pooled script running 35 s under a 60 s deadline finishes (${elapsed} s)" ;;
+        *) bad "a 35 s pooled script under a 60 s deadline: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)" ;;
+    esac
+
+    # A real overrun is still a timeout, reported as one.
+    out=$("$ZYGO" exec --runtime slowpool --script forever.py --timeout 3s '{}' 2>&1)
+    code=$?
+    if [ "$code" -eq 137 ]; then
+        ok "a pooled script over its deadline is killed and exits 137"
+    else
+        bad "a pooled overrun exited $code: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)"
+    fi
+    case $out in
+        *'did not answer'*) bad "a pooled overrun blamed the supervisor: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)" ;;
+        *) ok "and the supervisor is not blamed for it" ;;
+    esac
+
+    "$ZYGO" api --no-auth --listen 127.0.0.1:7704 >>/tmp/api.log 2>&1 &
+    API=$!
+    if wait_http 7704; then
+        body=$(python3 -c 'import json; print(json.dumps({"script": {"source": open("forever.py").read()}, "event": {}}))')
+        out=$(PORT=7704 python3 - "$body" <<'PY'
+import sys, urllib.request, urllib.error
+req = urllib.request.Request("http://127.0.0.1:7704/runtimes/slowpool/call", data=sys.argv[1].encode(),
+                             method="POST", headers={"content-type": "application/json",
+                                                     "x-zygo-timeout-ms": "3000"})
+try:
+    with urllib.request.urlopen(req, timeout=30) as r:
+        print(r.status)
+except urllib.error.HTTPError as e:
+    print(e.code)
+PY
+)
+        if [ "$out" = 408 ]; then
+            ok "over HTTP a pooled overrun is a 408"
+        else
+            bad "a pooled overrun over HTTP answered $out, not 408"
+        fi
+    else
+        bad "the API for the pooled-timeout check did not come up: $(tail -2 /tmp/api.log)"
+    fi
+    kill "$API" 2>/dev/null; wait "$API" 2>/dev/null
+    "$ZYGO" stop slowpool >/dev/null 2>&1
+fi
 
 say ""
 say "replacement and shutdown"
