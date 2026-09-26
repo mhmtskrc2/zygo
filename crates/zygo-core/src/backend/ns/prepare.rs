@@ -531,6 +531,7 @@ pub fn prepare(config: &SandboxConfig) -> Result<PreparedLaunch, PrepareError> {
             &config.mounts,
             super::landlock::NetPolicy::of(config.network, &config.allow),
             config.writable_root,
+            config.shared_namespace,
         ),
         program_candidates,
         _argv: argv,

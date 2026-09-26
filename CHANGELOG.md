@@ -30,6 +30,20 @@ break things and will say so here.
 - The secret store's key is held once, wiped from memory when the supervisor
   drops it, and can no longer be copied.
 
+### Changed
+
+- A function, and a `zygo run` sandbox, may open a TCP listener on its own
+  loopback. Landlock's `bind` refusal is kept only where the namespace is
+  shared between tenants — a runtime pool — and a sealed function
+  (`network = "none"`) is no longer refused `connect` to itself. Nothing from
+  outside reaches a port a sandbox opens, on any kernel: `pasta` forwards
+  none in. Programs that talk to themselves over `127.0.0.1` — Jupyter, Ray,
+  a headless Chrome, n8n's runner launcher with its health-check port — now
+  run in a sandbox on 6.7+ as they already did on older kernels. Under
+  `egress`, connecting to one's own listener still meets the allowlist's
+  port rule (chapters 13, 14, 23; ADR 0008). Escape case 20 attempts a
+  listener in a pool.
+
 ### Added
 
 - `zygo doctor` has a `systemd OOM policy` check, and `zygo api` warns at

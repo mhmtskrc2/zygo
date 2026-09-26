@@ -147,7 +147,7 @@ These are enforced for every request. None can be switched off, except
 
 | Field | Type | Default | What it does |
 |---|---|---|---|
-| `network` | `none` \| `egress` \| `full` \| `host` | `none` | `none`: loopback only. `egress`: only what `allow` names, plus DNS through Zygo's own resolver. `full`: the public internet (`bridge` is accepted as another spelling). `host`: no network namespace at all; needs `--allow-host-net`. |
+| `network` | `none` \| `egress` \| `full` \| `host` | `none` | `none`: its own loopback only, on which a function may listen. `egress`: only what `allow` names, plus DNS through Zygo's own resolver. `full`: the public internet (`bridge` is accepted as another spelling). `host`: no network namespace at all; needs `--allow-host-net`. |
 | `allow` | list of rules | `[]` | The egress allowlist. Only valid with `network = "egress"`; `egress` with an empty list allows nothing, and warns. |
 
 The forms an `allow` rule takes:

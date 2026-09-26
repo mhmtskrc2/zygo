@@ -811,6 +811,60 @@ print(probe('$gw'))" 2>/dev/null)" = REACHED-THE-HOST ]; then
     rm -rf "$WORK"
 fi
 
+# --- 20. a listener in a pool, for the other tenants ------------------------
+
+say "20. a pooled script opens a TCP listener the other tenants' requests could reach"
+# A pool's requests share one network namespace. A script that binds a port
+# on loopback there offers a channel to every other request in the pool,
+# whoever they belong to. Two layers refuse it: `strict`, the pool default,
+# removes the socket calls (EPERM from seccomp); underneath, Landlock refuses
+# `bind` in a shared namespace (EACCES, kernel 6.7+). A function's own
+# namespace has no such rule, on purpose (ADR 0008): nothing from outside
+# reaches a port opened there.
+WORK=$(mktemp -d)
+cat > "$WORK/listen.py" <<'PY'
+import errno, socket
+def handler(event):
+    s = None
+    try:
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0)); s.listen(1)
+        return {"bound": True, "port": s.getsockname()[1]}
+    except OSError as e:
+        return {"bound": False, "errno": errno.errorcode.get(e.errno, str(e.errno))}
+    finally:
+        if s is not None:
+            s.close()
+PY
+if zygo serve --runtime escape-listen --image "$IMAGE" --agent python >/tmp/escape-listen.err 2>&1; then
+    out=$(zygo exec --runtime escape-listen --script "$WORK/listen.py" '{}' 2>>/tmp/escape-listen.err | tr -d '\n ')
+    zygo stop --all >/dev/null 2>&1
+    case "$out" in
+        *'"bound":false'*) ok "under strict, the pool default, the socket is never made ($out)" ;;
+        *'"bound":true'*)  bad "a pooled script under strict opened a listener: $out" ;;
+        *) nothing_ran "20a" ;;
+    esac
+else
+    skip "20a. the pool would not start: $(tail -2 /tmp/escape-listen.err | tr '\n' ' ')"
+fi
+# The layer underneath: the same pool with `strict` taken away.
+abi=$(zygo doctor 2>/dev/null | sed -n 's/.*landlock.*ABI v\([0-9]*\).*/\1/p' | head -1)
+if [ "${abi:-0}" -lt 4 ]; then
+    skip "20b. Landlock ABI v${abi:-0}: its network rules need v4 (kernel 6.7), so only strict stands here"
+elif zygo serve --runtime escape-listen2 --image "$IMAGE" --agent python --seccomp default >/tmp/escape-listen.err 2>&1; then
+    out=$(zygo exec --runtime escape-listen2 --script "$WORK/listen.py" '{}' 2>>/tmp/escape-listen.err | tr -d '\n ')
+    zygo stop --all >/dev/null 2>&1
+    case "$out" in
+        *'"errno":"EACCES"'*) ok "without strict, Landlock refuses the bind in the shared namespace ($out)" ;;
+        *'"bound":true'*)     bad "a pooled script under default seccomp opened a listener: $out" ;;
+        *'"bound":false'*)    ok "without strict the bind is still refused, by another layer ($out)" ;;
+        *) nothing_ran "20b" ;;
+    esac
+else
+    skip "20b. the pool would not start: $(tail -2 /tmp/escape-listen.err | tr '\n' ' ')"
+fi
+rm -rf "$WORK"
+
 say ""
 say "----------------------------------------"
 say "escape suite: $PASS blocked, $FAIL escaped, $SKIP skipped"

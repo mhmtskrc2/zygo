@@ -191,7 +191,7 @@ network = "none"     # the default
 
 | Mode | What the sandbox can reach |
 |---|---|
-| `none` | nothing: an empty network namespace with only loopback |
+| `none` | nothing: an empty network namespace with only loopback. A function may talk to itself over TCP there |
 | `egress` | exactly what `allow` names, plus DNS for those names |
 | `full` | the public internet (`bridge`, Docker's word, is accepted and printed back as `full`) |
 | `host` | everything the host can reach; no network namespace. Needs `--allow-host-net` |
@@ -318,6 +318,39 @@ a person. A service on loopback only stays loopback only. Before 0.1.4
 this was not so: an `allow` rule for any name on port 5432 also opened the
 host's own `127.0.0.1:5432`, and on a kernel without Landlock's network
 rules (below 6.7) every port the host had bound on loopback was open.
+
+## Listening inside a sandbox
+
+A **function**, and a `zygo run` sandbox, may open a TCP listener on its own
+loopback. Nothing from outside reaches it: `pasta` forwards no port in, and
+under `none` there is no interface but loopback. So a program that talks to
+itself over `127.0.0.1` — a Jupyter kernel, a Ray or Dask worker, a test
+suite with a local server, n8n's runner with its health-check port — works in
+a sandbox the way it works on a laptop.
+
+A **runtime pool** may not. Its requests belong to different tenants and share
+one network namespace, so a listener on loopback there would be a channel from
+one tenant's request to another's. `strict`, the pool default, removes the
+socket calls; under it, Landlock refuses `bind` in a shared namespace on
+kernels from 6.7 ([chapter 13](13-warm-functions.md#runtime-pools)).
+
+```text
+  function (one tenant's namespace)        runtime pool (shared between tenants)
+  ┌──────────────────────────────┐         ┌──────────────────────────────┐
+  │ listen 127.0.0.1:8888  ✓     │         │ listen 127.0.0.1:8888  ✗     │
+  │ connect to it          ✓     │         │   strict: no socket at all   │
+  │ from outside: nothing gets in│         │   Landlock: bind refused     │
+  └──────────────────────────────┘         └──────────────────────────────┘
+```
+
+One corner under `egress`: the `connect` half of talking to yourself is
+subject to the allowlist's port rule, which applies to loopback too. A
+function that listens on 5681 and connects to it names the port —
+`allow = ["127.0.0.1:5681"]`, which needs `--allow-private-net` — or runs
+under `none` or `full`, where no port rule stands in the way. Until 0.1.3 no
+sandbox could listen on TCP at all on a kernel from 6.7, and a sealed one
+could not connect to itself either; [ADR 0008](adr/0008-listening-inside-a-sandbox.md)
+records why that changed.
 
 ## If `pasta` or `nft` is missing
 

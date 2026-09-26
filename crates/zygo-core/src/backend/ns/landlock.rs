@@ -234,9 +234,19 @@ impl Ruleset {
 /// than restating it is the point: a mount added later is covered automatically,
 /// and the two can never disagree.
 ///
+/// `shared` says whether the namespace is shared between tenants' requests —
+/// a runtime pool — which is the one thing that decides whether a TCP
+/// listener inside it is refused.
+///
 /// `abi == 0` means the kernel has no Landlock; the result is empty and the
 /// caller skips it.
-pub fn build(abi: u32, plan: &MountPlan, network: NetPolicy, writable_root: bool) -> Ruleset {
+pub fn build(
+    abi: u32,
+    plan: &MountPlan,
+    network: NetPolicy,
+    writable_root: bool,
+    shared: bool,
+) -> Ruleset {
     if abi == 0 {
         return Ruleset {
             abi: 0,
@@ -303,18 +313,29 @@ pub fn build(abi: u32, plan: &MountPlan, network: NetPolicy, writable_root: bool
     rules.dedup_by(|a, b| a.path == b.path);
 
     // Handling a right while adding no rule for it denies it outright. That
-    // is the whole mechanism: `bind` is handled everywhere a namespace exists
-    // and never granted, so no mode can listen; `connect` is handled where
-    // the allowlist names ports, and granted on exactly those.
+    // is the whole mechanism. `connect` is handled where the allowlist names
+    // ports, and granted on exactly those. `bind` is handled — and never
+    // granted — only where the namespace is *shared* between tenants, a
+    // runtime pool: there a listener on loopback is a channel from one
+    // tenant's request to another's. In a function's own namespace nothing
+    // from outside can reach a listener (pasta forwards no port in), so a
+    // TCP listener on its own loopback is the function's business, and a
+    // sealed function is bounded by its empty namespace rather than by a
+    // rule that also broke every program talking to itself over TCP
+    // (ADR 0008).
+    let bind = if shared { ACCESS_NET_BIND_TCP } else { 0 };
     let (handled_net, net_rules) = if handled_net_access(abi) == 0 {
         (0, Vec::new())
     } else {
         match &network {
-            NetPolicy::Sealed => (ACCESS_NET_BIND_TCP | ACCESS_NET_CONNECT_TCP, Vec::new()),
-            NetPolicy::Open => (ACCESS_NET_BIND_TCP, Vec::new()),
-            NetPolicy::Egress(ports) if ports.is_empty() => (ACCESS_NET_BIND_TCP, Vec::new()),
+            NetPolicy::Sealed if shared => {
+                (ACCESS_NET_BIND_TCP | ACCESS_NET_CONNECT_TCP, Vec::new())
+            }
+            NetPolicy::Sealed => (0, Vec::new()),
+            NetPolicy::Open => (bind, Vec::new()),
+            NetPolicy::Egress(ports) if ports.is_empty() => (bind, Vec::new()),
             NetPolicy::Egress(ports) => (
-                ACCESS_NET_BIND_TCP | ACCESS_NET_CONNECT_TCP,
+                bind | ACCESS_NET_CONNECT_TCP,
                 ports
                     .iter()
                     .map(|&port| NetRule {
@@ -570,7 +591,7 @@ mod tests {
 
     #[test]
     fn an_unavailable_abi_produces_nothing_to_apply() {
-        let r = build(0, &plan(&[]), NetPolicy::Sealed, false);
+        let r = build(0, &plan(&[]), NetPolicy::Sealed, false, false);
         assert!(r.is_empty());
         assert!(r.rules.is_empty());
         assert_eq!(r.handled_fs, 0);
@@ -582,7 +603,7 @@ mod tests {
             "/host/ro:/ro".parse::<Mount>().unwrap(),
             "/host/rw:/rw:rw".parse::<Mount>().unwrap(),
         ];
-        let r = build(1, &plan(&mounts), NetPolicy::Sealed, false);
+        let r = build(1, &plan(&mounts), NetPolicy::Sealed, false, false);
 
         let rights = |p: &str| {
             r.rules
@@ -622,7 +643,7 @@ mod tests {
     #[test]
     fn a_read_only_mount_inside_a_writable_one_gets_no_rule_of_its_own() {
         let mounts = vec!["/host/scripts:/run/script:ro".parse::<Mount>().unwrap()];
-        let r = build(1, &plan(&mounts), NetPolicy::Sealed, false);
+        let r = build(1, &plan(&mounts), NetPolicy::Sealed, false, false);
         let named = |p: &str| r.rules.iter().any(|rule| rule.path.to_str().unwrap() == p);
         assert!(named("/run"), "the tmpfs is writable and says so");
         assert!(
@@ -633,7 +654,7 @@ mod tests {
 
     #[test]
     fn writable_paths_are_named_as_the_sandbox_sees_them() {
-        let r = build(1, &plan(&[]), NetPolicy::Sealed, false);
+        let r = build(1, &plan(&[]), NetPolicy::Sealed, false, false);
         for rule in &r.rules {
             let path = rule.path.to_str().unwrap();
             assert!(path.starts_with('/'), "{path} is not absolute");
@@ -657,8 +678,8 @@ mod tests {
     /// in and the container's 5.10 reports ABI 0.
     #[test]
     fn a_writable_root_is_writable_to_landlock_too() {
-        let ro = build(1, &plan(&[]), NetPolicy::Sealed, false);
-        let rw = build(1, &plan(&[]), NetPolicy::Sealed, true);
+        let ro = build(1, &plan(&[]), NetPolicy::Sealed, false, false);
+        let rw = build(1, &plan(&[]), NetPolicy::Sealed, true, false);
 
         let root = |r: &Ruleset| {
             r.rules
@@ -758,7 +779,7 @@ mod tests {
 
     #[test]
     fn rules_are_sorted_and_unique() {
-        let r = build(1, &plan(&[]), NetPolicy::Sealed, false);
+        let r = build(1, &plan(&[]), NetPolicy::Sealed, false, false);
         let mut sorted = r.rules.clone();
         sorted.sort_by(|a, b| a.path.cmp(&b.path));
         assert_eq!(r.rules, sorted);
@@ -817,8 +838,11 @@ mod tests {
     /// namespace exists, so nothing can listen; `connect` is handled only where
     /// the allowlist names ports, and granted on exactly those.
     #[test]
-    fn a_sealed_sandbox_can_neither_bind_nor_connect() {
-        let none = build(4, &plan(&[]), NetPolicy::Sealed, false);
+    fn a_sealed_pool_can_neither_bind_nor_connect() {
+        // Shared between tenants: a loopback listener would be a channel
+        // between their requests, so both rights are handled and never
+        // granted.
+        let none = build(4, &plan(&[]), NetPolicy::Sealed, false, true);
         assert_eq!(
             none.handled_net,
             ACCESS_NET_BIND_TCP | ACCESS_NET_CONNECT_TCP
@@ -827,15 +851,25 @@ mod tests {
     }
 
     #[test]
-    fn no_networked_mode_may_listen() {
-        // No mode has ingress, so `bind` is refused at the process level in
-        // every one of them — including `full`, whose egress is unrestricted.
+    fn a_sealed_function_is_bounded_by_its_empty_namespace() {
+        // One tenant's own namespace with only loopback in it: there is
+        // nobody to reach and nobody to listen for, and a rule here only
+        // broke programs that talk to themselves over TCP (ADR 0008).
+        let none = build(4, &plan(&[]), NetPolicy::Sealed, false, false);
+        assert_eq!(none.handled_net, 0);
+        assert!(none.net_rules.is_empty());
+    }
+
+    #[test]
+    fn a_shared_namespace_may_not_listen() {
+        // A pool under any networked mode — including `full`, whose egress
+        // is unrestricted — refuses `bind` at the process level.
         for policy in [
             NetPolicy::Open,
             NetPolicy::Egress(vec![443]),
             NetPolicy::Egress(vec![]),
         ] {
-            let r = build(4, &plan(&[]), policy.clone(), false);
+            let r = build(4, &plan(&[]), policy.clone(), false, true);
             assert_ne!(r.handled_net & ACCESS_NET_BIND_TCP, 0, "{policy:?}");
             assert!(
                 r.net_rules
@@ -844,7 +878,7 @@ mod tests {
                 "{policy:?} granted bind"
             );
         }
-        let host = build(4, &plan(&[]), NetPolicy::Unrestricted, false);
+        let host = build(4, &plan(&[]), NetPolicy::Unrestricted, false, true);
         assert_eq!(
             host.handled_net, 0,
             "the host's namespace is not ours to police"
@@ -852,8 +886,33 @@ mod tests {
     }
 
     #[test]
+    fn a_function_may_listen_on_its_own_loopback() {
+        // Nothing from outside reaches a port a function opens: pasta
+        // forwards none in. So `bind` is not handled for a function, in any
+        // mode, and `connect` stays exactly what it was.
+        for policy in [
+            NetPolicy::Open,
+            NetPolicy::Egress(vec![443]),
+            NetPolicy::Egress(vec![]),
+        ] {
+            let r = build(4, &plan(&[]), policy.clone(), false, false);
+            assert_eq!(r.handled_net & ACCESS_NET_BIND_TCP, 0, "{policy:?}");
+        }
+        let egress = build(4, &plan(&[]), NetPolicy::Egress(vec![443]), false, false);
+        assert_eq!(egress.handled_net, ACCESS_NET_CONNECT_TCP);
+        let full = build(4, &plan(&[]), NetPolicy::Open, false, false);
+        assert_eq!(full.handled_net, 0);
+    }
+
+    #[test]
     fn egress_grants_connect_on_exactly_the_listed_ports() {
-        let r = build(4, &plan(&[]), NetPolicy::Egress(vec![53, 443, 5432]), false);
+        let r = build(
+            4,
+            &plan(&[]),
+            NetPolicy::Egress(vec![53, 443, 5432]),
+            false,
+            false,
+        );
         assert_ne!(r.handled_net & ACCESS_NET_CONNECT_TCP, 0);
         let ports: Vec<u16> = r.net_rules.iter().map(|n| n.port).collect();
         assert_eq!(ports, [53, 443, 5432]);
@@ -869,9 +928,11 @@ mod tests {
         // Landlock cannot say "any port to this host", so handling `connect`
         // with a port list would refuse what the allowlist permits. It steps
         // aside on `connect` and keeps only the `bind` denial.
-        let r = build(4, &plan(&[]), NetPolicy::Egress(vec![]), false);
-        assert_eq!(r.handled_net, ACCESS_NET_BIND_TCP);
-        assert!(r.net_rules.is_empty());
+        let pool = build(4, &plan(&[]), NetPolicy::Egress(vec![]), false, true);
+        assert_eq!(pool.handled_net, ACCESS_NET_BIND_TCP);
+        assert!(pool.net_rules.is_empty());
+        let function = build(4, &plan(&[]), NetPolicy::Egress(vec![]), false, false);
+        assert_eq!(function.handled_net, 0, "nothing left for Landlock to say");
     }
 
     #[test]
@@ -903,7 +964,7 @@ mod tests {
     fn before_abi_v4_the_network_policy_is_silently_nothing() {
         // A v1–v3 kernel is given an 8-byte attr and must not be asked to
         // handle rights it has never heard of.
-        let r = build(3, &plan(&[]), NetPolicy::Egress(vec![443]), false);
+        let r = build(3, &plan(&[]), NetPolicy::Egress(vec![443]), false, false);
         assert_eq!(r.handled_net, 0);
         assert!(r.net_rules.is_empty());
     }
@@ -974,7 +1035,7 @@ mod tests {
     #[test]
     fn building_against_this_hosts_real_abi_is_consistent() {
         let abi = abi_version();
-        let r = build(abi, &plan(&[]), NetPolicy::Sealed, false);
+        let r = build(abi, &plan(&[]), NetPolicy::Sealed, false, false);
         assert_eq!(r.abi, abi);
         if abi == 0 {
             assert!(r.is_empty(), "no ABI means nothing may be claimed");

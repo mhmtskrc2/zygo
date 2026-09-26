@@ -71,7 +71,7 @@ container. For hostile code the same spec runs on `gvisor` (a kernel in user
 space) or `vm` (libkrun), one-shot only.
 
 Every vector in [the threat model](docs/book/23-security.md) is attempted
-by `make escape-linux` — 20 vectors, 0 escapes — and every syscall number is
+by `make escape-linux` — 21 vectors, 0 escapes — and every syscall number is
 swept against the seccomp profiles. The same chapter says where the boundary
 is weaker than it looks. **No external audit has been done.**
 [Fork safety, question by question](docs/book/fork-safety.md) covers what

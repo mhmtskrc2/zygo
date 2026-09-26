@@ -83,4 +83,4 @@ same fields. Every function returns `{:ok, value}` or `{:error, error}`, and a
 
 ---
 
-← [ADR 0006 — The memory limit is each request's](0006-memory-limit-per-request.md) · [Contents](../README.md) · **Next: [Glossary](../glossary.md) →**
+← [ADR 0006 — The memory limit is each request's](0006-memory-limit-per-request.md) · [Contents](../README.md) · **Next: [ADR 0008 — A function may listen; a pool may not](0008-listening-inside-a-sandbox.md) →**

@@ -143,10 +143,11 @@ out, or find a bug in the kernel underneath them all.
 
 Every row below marked **attempted** is run by `make escape-linux`. It runs
 the escape itself, not a check of a setting, because a test that reads a flag
-also passes on a kernel that ignores that flag. The suite attempts 20 vectors in 30
-checks, and on Linux 5.10 and 6.8 reports **30 blocked, 0 escaped, 0
-skipped**. Run rootless, it skips one: setting up a file capability to try
-needs root on the host.
+also passes on a kernel that ignores that flag. The suite attempts 21 vectors in 32
+checks, and on Linux 6.8 reports **32 blocked, 0 escaped, 0 skipped**. On
+5.10 it skips one, the Landlock half of case 20, which needs a 6.7 kernel.
+Run rootless, it skips another: setting up a file capability to try needs
+root on the host.
 
 Beside it, `make fuzz-linux` sweeps *every* syscall number the architecture
 has — 469 of them — against all three seccomp profiles. Each call is made in a
@@ -162,7 +163,7 @@ syscall named in the tables below is refused.
   make escape-linux                        make fuzz-linux
   ─────────────────                        ───────────────
   every known attack, really tried         all 469 syscall numbers
-  → 30 blocked, 0 escaped, 0 skipped       × 3 profiles, one forked child each
+  → 32 blocked, 0 escaped, 0 skipped       × 3 profiles, one forked child each
                                            → profiles ordered, nothing kills
                                              the process, clone3 → ENOSYS
 ```
@@ -207,6 +208,7 @@ syscall named in the tables below is refused.
 |---|---|---|
 | Reaching the host over the network | default `network = "none"`; under `egress`/`full`, RFC1918, CGNAT, link-local, loopback, multicast and reserved ranges are rejected *above* every allow rule, so a hostname that resolves into one is refused too | **attempted** by the supervisor suite, and measured from outside by the first consumer: under `--net full` the cloud metadata address, the host's own Postgres and the LAN router are all *no route*, where Docker's default bridge reaches two of the three (see [below](#measured-against-docker)) |
 | Using a resolver of one's own to dodge the allowlist | DNS is forced to one address; port 53 to anything else is rejected | **attempted** |
+| A pooled script opening a TCP listener for the other tenants' requests to reach | a pool's namespace is shared, so `bind` is handled and never granted there (Landlock, 6.7+), and `strict`, the pool default, removes the socket calls before that. A function's own namespace has no such rule: nothing from outside reaches a port opened in it ([ADR 0008](adr/0008-listening-inside-a-sandbox.md)) | **attempted** (case 20: under `strict`, and under `default` where the kernel has Landlock's network rules; below 6.7 the second is skipped) |
 | Reaching a service the host bound to `127.0.0.1` only, through the sandbox's own loopback or the gateway address | `pasta` is started with `--tcp-ns none --udp-ns none --no-map-gw`: it neither splices the sandbox's loopback ports through to the host's nor answers for the gateway itself. Before 0.1.4 both were on by default, and an `allow` rule for any name on port *N* also opened the host's `127.0.0.1:N`; below Linux 6.7, every loopback port | **attempted** (case 19: under `egress` with the port allowed, under `full`, and by the gateway address with `--allow-private-net`; a host whose gateway reflects loopback ports back on its own, as a Lima VM's does, skips the last) |
 
 ## Vectors: tenant against tenant
@@ -331,18 +333,20 @@ then kept apart by namespaces and file modes, but not also by different uids.
 ### Landlock needs 5.13, and its network rules 6.7
 
 On older kernels the filesystem allowlist is absent, and the mount plan is the
-only filesystem boundary. The process-level network rules — `bind` refused
-everywhere, `connect` limited to the allowlist's ports under `egress` — are
-built and unit-tested, and enforced for real in one place: CI's
+only filesystem boundary. The process-level network rules — `bind` refused in
+a runtime pool, `connect` limited to the allowlist's ports under `egress` —
+are built and unit-tested, and enforced for real in one place: CI's
 `landlock-network` job, on an ubuntu-24.04 runner (Linux 6.8, Landlock ABI
 v4), runs `tests/linux/verify_landlock_net.sh` (`make landlock-net-linux` runs the
-same script in a container). It picks the two refusals nftables cannot
-produce: a `bind()` on a TCP port, which sends no packet, and a loopback
+same script in a container). It picks the refusals nftables cannot produce:
+a `bind()` on a TCP port in a pool, which sends no packet, and a loopback
 `connect()` to a port off the allowlist, which the packet filter accepts on its
 first line. Both must fail with `EACCES`; a loopback connect on an allowed
-port must get past Landlock; under `network = "none"` both are refused. On a
-kernel below 6.7 the script says `SKIP` and exits 0 — which is why the job is
-not mixed into one that also runs on 22.04. Neither of this project's own
+port must get past Landlock; a function must be able to listen on its own
+loopback, and under `network = "none"` connect to itself, with anything off
+loopback `ENETUNREACH` from the empty namespace. On a kernel below 6.7 the
+script says `SKIP` and exits 0 — which is why the job is not mixed into one
+that also runs on 22.04. Neither of this project's own
 development machines can run it: Docker Desktop's 5.10 kernel reports ABI 0,
 and the Raspberry Pi's kernel has no Landlock at all. Below 6.7, the nftables
 allowlist inside the namespace is the only egress control, and it is the one

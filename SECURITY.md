@@ -72,10 +72,11 @@ Anything that crosses one of the boundaries the project claims to hold:
 ## What the project already does about this
 
 Every escape vector in the [threat model](docs/book/23-security.md) is **actually
-attempted** by `make escape-linux` — 20 vectors in 30 checks, currently 30
-blocked, 0 escaped and none skipped when run as root (a rootless run skips the
-file-capability case, which needs root to set one up, and a host whose gateway
-reflects its own loopback ports skips one network check). The rule the whole suite is
+attempted** by `make escape-linux` — 21 vectors in 32 checks, currently 32
+blocked, 0 escaped and none skipped when run as root on a 6.7+ kernel (a
+rootless run skips the file-capability case, which needs root to set one up; a
+kernel below 6.7 skips the Landlock half of the pool-listener case; and a host
+whose gateway reflects its own loopback ports skips one network check). The rule the whole suite is
 built on is that a test must attempt the thing rather than read a setting: a
 test that checks a flag also passes on a kernel that ignores that flag.
 

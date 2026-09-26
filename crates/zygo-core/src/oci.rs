@@ -494,6 +494,7 @@ mod tests {
             allow_private_net: false,
             pasta_pid_file: None,
             own_limits: true,
+            shared_namespace: false,
         }
     }
 

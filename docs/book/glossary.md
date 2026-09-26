@@ -84,4 +84,4 @@ One line each. The chapter in brackets explains the term in full; the numbers fo
 
 ---
 
-← [ADR 0007 — A third SDK, in Elixir](adr/0007-elixir-sdk.md) · [Contents](README.md)
+← [ADR 0008 — A function may listen; a pool may not](adr/0008-listening-inside-a-sandbox.md) · [Contents](README.md)

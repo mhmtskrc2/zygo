@@ -14,7 +14,9 @@
 #
 #   * **`bind`** — nftables filters the *output* hook. It cannot refuse a
 #     `bind()`, because binding sends no packet. A refused `bind` is Landlock
-#     or it is nothing.
+#     or it is nothing. Since ADR 0008 it is refused only where the namespace
+#     is shared between tenants — a runtime pool; a function may listen on its
+#     own loopback, where nothing from outside can reach it.
 #   * **a connect on loopback** — the first line of Zygo's nftables ruleset is
 #     `oifname "lo" accept`, so every loopback connection is permitted by the
 #     filter. Landlock's rules are by port and apply to loopback too, so a
@@ -118,6 +120,29 @@ def handler(event):
         finally:
             s.close()
 
+    if what == "listen_self":
+        # Bind, listen, and connect to it from the same process: what a
+        # program that talks to itself over TCP does. Under `egress` the
+        # connect is subject to the allowlist's port rule like any other.
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(1)
+            port = srv.getsockname()[1]
+            cli = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            cli.settimeout(4)
+            try:
+                cli.connect(("127.0.0.1", port))
+                return {"result": "ok", "port": port}
+            except OSError as e:
+                return {"result": "connect:" + named(e), "port": port}
+            finally:
+                cli.close()
+        except OSError as e:
+            return {"result": "bind:" + named(e)}
+        finally:
+            srv.close()
+
     if what == "connect":
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(float(event.get("timeout", 4)))
@@ -144,8 +169,8 @@ entry = "probe.py"
 network = "egress"
 allow = ["1.1.1.1:443"]
 
-# No network at all: `bind` and `connect` are both denied by Landlock, and
-# there is no nftables ruleset in the way to share the credit with.
+# No network at all. For a *function* Landlock adds nothing here: the empty
+# namespace is the boundary, and the function may talk to itself over TCP.
 [fn.sealed]
 network = "none"
 TOML
@@ -198,16 +223,26 @@ esac
 
 # --- what has to be refused, and by Landlock --------------------------------
 
-# nftables filters the output hook and cannot refuse a bind. This is Landlock
-# or it is nothing.
+# A function's namespace is one tenant's, and pasta forwards no port into it,
+# so a TCP listener there is the function's own business (ADR 0008).
 r=$(probe limited '{"do": "bind_tcp"}')
 case "$r" in
-    EACCES)
-        ok "bind() on a TCP port is refused by Landlock with EACCES — nftables cannot refuse a bind" ;;
-    ok)
-        bad "the sandbox bound a TCP port; no networked mode has ingress, and ABI v$abi should have refused it" ;;
+    ok) ok "a function may bind a TCP port on its own loopback" ;;
+    *)  bad "a function's bind() answered $r; only a shared namespace refuses it" ;;
+esac
+
+# Talking to itself is still subject to the allowlist's *port* rule, which
+# Landlock applies to loopback too: the listener's random port is not on the
+# list, so the connect half is refused. A function that needs this names the
+# port it listens on in `allow`, with `--allow-private-net`.
+r=$(probe limited '{"do": "listen_self"}')
+case "$r" in
+    connect:EACCES)
+        ok "under egress, connecting to its own listener is refused on a port off the list (connect:EACCES)" ;;
+    bind:*)
+        bad "the listener could not be set up: $r" ;;
     *)
-        bad "bind() was refused with $r, not EACCES; Landlock refuses with EACCES and something else answered" ;;
+        bad "a self-connect under egress answered $r, not connect:EACCES" ;;
 esac
 
 # The first nftables rule is `oifname "lo" accept`, so the filter permits this
@@ -226,17 +261,51 @@ esac
 say ""
 say "under network = \"none\""
 
-r=$(probe sealed '{"do": "bind_tcp"}')
-[ "$r" = EACCES ] \
-    && ok "bind() is refused with EACCES" \
-    || bad "a sealed sandbox answered $r to bind(), not EACCES"
+# A sealed function is bounded by its namespace, which has only loopback in
+# it. Landlock handles nothing here, so a program that talks to itself over
+# TCP works, and there is nobody else to reach.
+r=$(probe sealed '{"do": "listen_self"}')
+[ "$r" = ok ] \
+    && ok "a sealed function listens on its own loopback and connects to itself" \
+    || bad "a sealed function's listen-and-connect answered $r, not ok"
 
-# A sealed sandbox has no nftables ruleset and an empty network namespace, so
-# without Landlock this would be `ECONNREFUSED` from its own loopback.
 r=$(probe sealed '{"do": "connect", "host": "127.0.0.1", "port": 443}')
-[ "$r" = EACCES ] \
-    && ok "connect() is refused with EACCES, even on its own loopback" \
-    || bad "a sealed sandbox answered $r to connect(), not EACCES"
+[ "$r" = ECONNREFUSED ] \
+    && ok "a loopback connect to a closed port is the TCP stack's ECONNREFUSED, not a policy's" \
+    || bad "a sealed function answered $r to a closed loopback port, not ECONNREFUSED"
+
+# Anything that is not loopback has no route: the namespace has no other
+# interface. That, not a rule, is what seals it.
+r=$(probe sealed '{"do": "connect", "host": "1.1.1.1", "port": 443}')
+[ "$r" = ENETUNREACH ] \
+    && ok "an address off loopback is ENETUNREACH: the empty namespace is the boundary" \
+    || bad "a sealed function answered $r to 1.1.1.1:443, not ENETUNREACH"
+
+say ""
+say "in a runtime pool, whose namespace tenants share"
+# The one place `bind` is still refused. The pool is served with
+# `seccomp = "default"` on purpose: `strict`, the pool default, removes the
+# socket calls outright (EPERM from seccomp), and this script is about the
+# layer underneath it.
+# Served from a directory with an empty spec of its own: the spec above puts
+# `entry` in `[defaults]`, a pool may not carry an entry, and the spec file is
+# searched for upwards from the working directory.
+mkdir -p "$work/pool" && : > "$work/pool/sandbox.toml"
+if (cd "$work/pool" && zygo serve --runtime shared --image python:3.12-slim --agent python --seccomp default) \
+        >/tmp/landlock-pool.log 2>&1; then
+    r=$(zygo exec --runtime shared --script "$work/probe.py" '{"do": "bind_tcp"}' 2>&1 | tr -d '\n ')
+    r=$(field "$r" result)
+    [ "$r" = EACCES ] \
+        && ok "a pooled script's bind() is refused by Landlock with EACCES: a listener there would be a channel between tenants" \
+        || bad "a pooled script answered $r to bind(), not EACCES"
+    r=$(zygo exec --runtime shared --script "$work/probe.py" '{"do": "bind_unix"}' 2>&1 | tr -d '\n ')
+    r=$(field "$r" result)
+    [ "$r" = ok ] \
+        && ok "and the same script binds a unix socket, so it is the TCP rule that refused" \
+        || bad "a pooled script could not bind a unix socket ($r); the TCP refusal above proves nothing"
+else
+    bad "the pool did not come up: $(tail -2 /tmp/landlock-pool.log | tr '\n' ' ' | cut -c1-200)"
+fi
 
 zygo down >/dev/null 2>&1
 zygo stop --all >/dev/null 2>&1

@@ -484,6 +484,14 @@ Desktop's ([chapter 25](25-performance.md#the-embedders-benchmark)). A pool
 with a `cmd` instead of an `agent` is a *warm-exec pool*: the script's path
 is passed as the last argument of `cmd` on each request.
 
+**No listener in a pool.** A pool's requests belong to different tenants and
+share one network namespace, so a script that opened a TCP port on loopback
+would be offering a channel to every other request in the pool. Two layers
+refuse it: `strict`, the pool default, removes the socket calls, and under it
+Landlock refuses `bind` in a shared namespace (kernel 6.7+). A *function* has
+no such rule: its namespace is one tenant's, and it may listen on its own
+loopback ([chapter 14](14-limits-network-secrets.md#listening-inside-a-sandbox)).
+
 **Secrets in a pool.** A pool can name secrets (`secrets = ["STRIPE_KEY"]`
 in `[runtime.<name>]`, or `serve_runtime(..., secrets=[...])`), but it holds
 no values: the zygotes are shared. On each request the *calling* tenant's

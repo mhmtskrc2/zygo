@@ -132,6 +132,16 @@ pub struct SandboxConfig {
     /// sandbox and not everything running under that name at once. See
     /// [`crate::cgroup::Hierarchy::function_name`].
     pub own_limits: bool,
+    /// Whether the sandbox's network namespace is shared by requests that
+    /// belong to different tenants — a runtime pool.
+    ///
+    /// Decides one Landlock rule: a TCP listener inside the sandbox. In a
+    /// function the namespace is one tenant's, nothing from outside can reach
+    /// a port opened in it (pasta forwards nothing in), so a listener on its
+    /// own loopback is that tenant's business. In a pool the same listener
+    /// is a channel from one tenant's request to another's, so `bind` is
+    /// refused there (the `ns` backend's Landlock ruleset; ADR 0008).
+    pub shared_namespace: bool,
 }
 
 impl SandboxConfig {
@@ -171,6 +181,7 @@ impl SandboxConfig {
             allow_private_net: false,
             pasta_pid_file: None,
             own_limits: true,
+            shared_namespace: false,
         }
     }
 }
@@ -293,6 +304,7 @@ impl SandboxConfig {
             allow_private_net: f.allow_private_net,
             pasta_pid_file: None,
             own_limits: f.one_shot,
+            shared_namespace: f.pool,
         }
     }
 }
