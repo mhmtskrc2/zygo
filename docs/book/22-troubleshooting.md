@@ -179,6 +179,34 @@ systemd-run --user --scope -p Delegate=yes -- zygo run alpine:3 /bin/true
 If that works and a plain `zygo run` does not, your `systemd-run` is refusing
 the delegation. `loginctl enable-linger $USER` is often the missing piece.
 
+### "A process of this unit has been killed by the OOM killer", and the API is gone
+
+`zygo api` was running under systemd. One request went over its `mem` limit,
+the kernel killed it inside its own cgroup — which is correct — and then
+every later request failed with *connection refused*. The journal for the
+unit says:
+
+```text
+n8n-zygo-api.service: A process of this unit has been killed by the OOM killer.
+n8n-zygo-api.service: Failed with result 'oom-kill'.
+```
+
+Systemd's default `OOMPolicy=stop` stops a unit when any process in its
+cgroup is OOM-killed, and every sandbox's cgroup is inside the unit's. So the
+one request took the API, the supervisor and every pool down with it. The
+fix is one line in the unit, `OOMPolicy=continue`, then `daemon-reload` and a
+restart; for a transient unit, `systemd-run -p OOMPolicy=continue …`.
+[Chapter 16](16-production.md#running-zygo-api-under-systemd) has the whole
+unit file. `zygo doctor` reports the unit's setting:
+
+```text
+systemd OOM policy   n8n-zygo-api.service: OOMPolicy=stop: one sandbox over its memory limit stops this unit, the supervisor and every pool with it   degraded
+```
+
+and `zygo api` prints the same warning when it starts inside such a unit.
+The same applies to any unit that ends up holding the supervisor, including
+one running `zygo run` for a long-lived sandbox.
+
 ## Networking
 
 A sandbox with a network uses `pasta`, a program that moves packets between the

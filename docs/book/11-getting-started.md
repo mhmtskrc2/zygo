@@ -332,6 +332,7 @@ and the VM's kernel. You get one report with one verdict.
 | `procfs (fully visible)` | Can a fresh `/proc` be mounted inside a sandbox? |
 | `cgroup v2` | Is the unified cgroup tree there, with controllers delegated to you? |
 | `cgroup moves` | On Linux 6.0+, is cgroup2 mounted with `favordynmods`? Without it, about 1 warm request in 100 waits several ms ([chapter 22](22-troubleshooting.md#1-request-in-100-takes-10-ms-and-the-rest-take-15)). |
+| `systemd OOM policy` | Would the systemd unit that holds the sandboxes be stopped when one of them is OOM-killed? `degraded` under the default `OOMPolicy=stop` ([chapter 16](16-production.md#running-zygo-api-under-systemd)). |
 | `overlayfs (userns)` | Can image layers be stacked inside a user namespace? |
 | `landlock` | Which Landlock version (ABI) does the kernel offer? |
 | `seccomp` | Can a seccomp filter be installed? |

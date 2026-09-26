@@ -456,9 +456,10 @@ zygo doctor [--fix [--yes]]
 
 Tries each requirement for real rather than reading a setting: kernel
 version, user namespaces, `/proc`, cgroup v2 delegation, whether moving a
-process into a cgroup can stall (`cgroup moves`), overlayfs, Landlock,
-seccomp, subordinate uids, KVM, the guest kernel, `runsc`, and the network
-helpers. Each line says `ok`, `degraded`, `-` (absent) or `FAIL`, with the
+process into a cgroup can stall (`cgroup moves`), whether the systemd unit
+holding the sandboxes would be stopped by one of them being OOM-killed
+(`systemd OOM policy`), overlayfs, Landlock, seccomp, subordinate uids, KVM,
+the guest kernel, `runsc`, and the network helpers. Each line says `ok`, `degraded`, `-` (absent) or `FAIL`, with the
 fix under it. On a Mac it checks the host side and then the VM's own doctor.
 [Chapter 11](11-getting-started.md) walks through it.
 

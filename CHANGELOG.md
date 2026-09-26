@@ -7,6 +7,16 @@ break things and will say so here.
 
 ## [Unreleased]
 
+### Added
+
+- `zygo doctor` has a `systemd OOM policy` check, and `zygo api` warns at
+  start, when the systemd unit holding the sandboxes has `OOMPolicy=stop`
+  (systemd's default): one request over its `mem` limit, killed by the kernel
+  inside its own cgroup, then stops the whole unit — the API, the supervisor
+  and every pool — and every later request is refused. Chapter 16 now has a
+  unit file with `OOMPolicy=continue` and `Delegate=yes`, and chapter 22 the
+  journal lines this looks like.
+
 ### Fixed
 
 - **SDKs:** a call on a pooled connection that `zygo api` had closed while it

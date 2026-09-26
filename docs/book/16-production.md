@@ -107,6 +107,64 @@ zygo supervisor run       # run it in the foreground, to see why it will not sta
 `zygo supervisor` is a hidden command: it does not appear in `zygo --help`,
 because you seldom need it.
 
+## Running `zygo api` under systemd
+
+On a Linux host the natural home for `zygo api` is a systemd unit: it starts
+at boot, restarts if it dies, and its logs go to the journal. One line in
+that unit matters more than the others. When any process inside a unit's
+cgroup is killed by the kernel's out-of-memory killer, systemd's default
+(`OOMPolicy=stop`) **stops the whole unit**. A sandbox that goes over its
+`mem` limit is killed exactly that way, inside its own cgroup, which sits
+under the unit's. So with the default, one request allocating too much
+memory takes down the API, the supervisor and every pool with it, and every
+later request is refused until somebody restarts the unit.
+`OOMPolicy=continue` tells systemd the kill was handled and the unit goes on.
+
+```text
+  n8n-zygo-api.service            ◀── systemd watches memory.events here
+  └─ zygo api
+     └─ zygo.slice/
+        └─ tenants/acme/resize/
+           └─ req-0192            ◀── the kernel kills the hog here
+```
+
+A user unit, in `~/.config/systemd/user/zygo-api.service`:
+
+```ini
+[Unit]
+Description=Zygo API
+
+[Service]
+ExecStart=/usr/local/bin/zygo api --listen 127.0.0.1:7700
+Environment=ZYGO_API_TOKEN=change-me
+Restart=on-failure
+# A sandbox over its memory limit is killed alone; the unit goes on.
+OOMPolicy=continue
+# The unit owns its cgroup subtree, which is where every sandbox goes.
+Delegate=yes
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now zygo-api
+loginctl enable-linger $USER          # keep it running when you log out
+```
+
+The same two settings on a transient unit, which is how a script or another
+service often starts it:
+
+```bash
+systemd-run --user --unit=zygo-api -p OOMPolicy=continue -p Delegate=yes -- zygo api
+```
+
+`zygo doctor` reports the unit's policy as `systemd OOM policy`, and
+`zygo api` prints a warning at start when the unit it is in would stop.
+[Chapter 22](22-troubleshooting.md#a-process-of-this-unit-has-been-killed-by-the-oom-killer-and-the-api-is-gone)
+has the journal lines this looks like when it has already happened.
+
 ## Watching it
 
 ```bash

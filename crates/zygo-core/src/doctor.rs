@@ -537,6 +537,137 @@ mod disk_cache {
     }
 }
 
+/// The systemd unit a cgroup path is inside: `n8n-zygo-api.service`,
+/// `session-3.scope`, `user@1000.service`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemdUnit {
+    pub name: String,
+    /// Managed by the user's own `systemd --user`, so `systemctl --user` is
+    /// the one to ask about it. `user@1000.service` itself is not: that is
+    /// the system's unit for the user manager.
+    pub user: bool,
+}
+
+impl SystemdUnit {
+    /// The `systemctl` invocation that reaches this unit.
+    pub fn systemctl(&self) -> &'static str {
+        if self.user {
+            "systemctl --user"
+        } else {
+            "systemctl"
+        }
+    }
+}
+
+/// The innermost systemd unit on a cgroup path, as `/proc/self/cgroup`
+/// writes it (with or without the `0::` prefix) or as an absolute path under
+/// `/sys/fs/cgroup`. `None` where there is no unit: a container's `/`, or a
+/// host without systemd.
+pub fn systemd_unit_of(cgroup_path: &str) -> Option<SystemdUnit> {
+    let path = cgroup_path.trim();
+    let path = path.strip_prefix("0::").unwrap_or(path);
+    let path = path.strip_prefix("/sys/fs/cgroup").unwrap_or(path);
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    let at = parts
+        .iter()
+        .rposition(|p| p.ends_with(".service") || p.ends_with(".scope"))?;
+    let user = parts[..at]
+        .iter()
+        .any(|p| p.starts_with("user@") && p.ends_with(".service"));
+    Some(SystemdUnit {
+        name: parts[at].to_string(),
+        user,
+    })
+}
+
+/// What systemd does to the unit that holds `zygo.slice` when a process in
+/// it — a sandbox that went over its memory limit — is killed by the kernel's
+/// OOM killer. Systemd watches a unit's `memory.events`, which counts kills
+/// in every cgroup below it, so a kill inside a request's own cgroup is seen
+/// by the unit all the way up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OomPolicy {
+    /// Not inside a systemd unit: a container, or no systemd. Nothing to set.
+    NotUnderSystemd,
+    /// Sandboxes will run in a transient scope Zygo makes with `Delegate=yes`,
+    /// and systemd defaults such a unit to `continue`.
+    TransientScope,
+    /// Inside a unit, but `systemctl show` could not say what it does.
+    Unknown { unit: SystemdUnit, reason: String },
+    /// The unit's `OOMPolicy=`: `continue`, `stop` or `kill`.
+    Policy { unit: SystemdUnit, policy: String },
+}
+
+impl OomPolicy {
+    /// Whether one sandbox's OOM kill would stop the unit — and the
+    /// supervisor and every pool in it — with it. Only `continue` leaves the
+    /// unit alone; `stop` stops it and `kill` kills everything in it.
+    pub fn stops_the_unit(&self) -> bool {
+        matches!(self, OomPolicy::Policy { policy, .. } if policy != "continue")
+    }
+}
+
+/// The OOM policy of the unit sandboxes started from here would live in.
+///
+/// Asked of where `zygo.slice` goes ([`crate::cgroup::Hierarchy::discover`]),
+/// not of this process's own cgroup: from a shell, the slice goes to the top
+/// of the user's delegated tree, whose unit is `user@<uid>.service`, and
+/// that is the unit systemd would stop.
+#[cfg(target_os = "linux")]
+pub fn oom_policy_of_sandboxes() -> OomPolicy {
+    let Ok(hierarchy) = crate::cgroup::Hierarchy::discover() else {
+        return OomPolicy::NotUnderSystemd;
+    };
+    if !hierarchy.usable_from_here() {
+        // The commands that build a sandbox step into a scope of their own
+        // (`scope.rs` in the CLI), made with `Delegate=yes`.
+        return OomPolicy::TransientScope;
+    }
+    let Some(unit) = systemd_unit_of(&hierarchy.root().to_string_lossy()) else {
+        return OomPolicy::NotUnderSystemd;
+    };
+    let mut command = std::process::Command::new("systemctl");
+    if unit.user {
+        command.arg("--user");
+    }
+    let output = command
+        .args(["show", "-p", "OOMPolicy", "--value", &unit.name])
+        .output();
+    match output {
+        Err(e) => OomPolicy::Unknown {
+            unit,
+            reason: format!("systemctl could not be started ({e})"),
+        },
+        Ok(output) if !output.status.success() => OomPolicy::Unknown {
+            unit,
+            reason: String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .next_back()
+                .unwrap_or("systemctl show failed")
+                .trim()
+                .to_string(),
+        },
+        Ok(output) => {
+            let policy = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if policy.is_empty() {
+                // A systemd from before 243 has no `OOMPolicy=` and prints
+                // nothing; it does not stop units on an OOM kill either.
+                OomPolicy::Unknown {
+                    unit,
+                    reason: "this systemd has no OOMPolicy= setting".into(),
+                }
+            } else {
+                OomPolicy::Policy { unit, policy }
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn oom_policy_of_sandboxes() -> OomPolicy {
+    OomPolicy::NotUnderSystemd
+}
+
 #[cfg(target_os = "linux")]
 mod probe {
     use std::path::Path;
@@ -556,6 +687,7 @@ mod probe {
             procfs(&probe),
             cgroup_v2(),
             cgroup_moves(),
+            systemd_oom_policy(),
             overlayfs(),
             landlock(),
             seccomp(),
@@ -1080,6 +1212,54 @@ mod probe {
         }
     }
 
+    /// Whether one sandbox's OOM kill would take the unit that runs Zygo —
+    /// the API, the supervisor, every pool — down with it.
+    ///
+    /// Seen first under `systemd-run --user --unit=n8n-zygo-api zygo api`: a
+    /// request allocated 2 GB, the kernel killed it inside its own cgroup,
+    /// and systemd, with the default `OOMPolicy=stop`, stopped the whole
+    /// unit. Every later request was refused until somebody restarted it.
+    fn systemd_oom_policy() -> Check {
+        const NAME: &str = "systemd OOM policy";
+        if in_a_container() {
+            return Check::ok(NAME, "in a container; there is no unit to stop");
+        }
+        match super::oom_policy_of_sandboxes() {
+            OomPolicy::NotUnderSystemd => Check::ok(NAME, "not under a systemd unit"),
+            OomPolicy::TransientScope => Check::ok(
+                NAME,
+                "sandboxes run in a transient scope with Delegate=yes, which continues",
+            ),
+            OomPolicy::Unknown { unit, reason } => Check::absent(
+                NAME,
+                format!("{}: {reason}", unit.name),
+                format!(
+                    "ask it yourself: {} show -p OOMPolicy {}",
+                    unit.systemctl(),
+                    unit.name
+                ),
+            ),
+            OomPolicy::Policy { unit, policy } if policy == "continue" => {
+                Check::ok(NAME, format!("{}: OOMPolicy=continue", unit.name))
+            }
+            OomPolicy::Policy { unit, policy } => Check::degraded(
+                NAME,
+                format!(
+                    "{}: OOMPolicy={policy}: one sandbox over its memory limit stops this \
+                     unit, the supervisor and every pool with it",
+                    unit.name
+                ),
+                format!(
+                    "set OOMPolicy=continue (and Delegate=yes) in the unit that runs Zygo, \
+                     then `{} daemon-reload` and restart it; for a transient unit: \
+                     systemd-run {}-p OOMPolicy=continue -p Delegate=yes -- zygo api …",
+                    unit.systemctl(),
+                    if unit.user { "--user " } else { "" }
+                ),
+            ),
+        }
+    }
+
     fn cgroup_v2() -> Check {
         if !Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
             return Check::failed(
@@ -1484,6 +1664,67 @@ mod tests {
             "nsdelegate,favordynmods,memory_recursiveprot",
         );
         assert_eq!(cgroup2_favors_moves(&favoured), Some(true));
+    }
+
+    #[test]
+    fn the_unit_is_the_innermost_service_or_scope() {
+        let unit = |p: &str| systemd_unit_of(p).map(|u| (u.name, u.user));
+        // The case this was written for: a transient user service holding
+        // the API, the supervisor and zygo.slice.
+        assert_eq!(
+            unit(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/n8n-zygo-api.service/zygo.slice/system"
+            ),
+            Some(("n8n-zygo-api.service".into(), true))
+        );
+        // From a shell, the slice goes to the top of the delegated tree: the
+        // unit is the user manager's own, which the *system* manager runs.
+        assert_eq!(
+            unit("/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/zygo.slice"),
+            Some(("user@1000.service".into(), false))
+        );
+        assert_eq!(
+            unit("/user.slice/user-1000.slice/session-3.scope"),
+            Some(("session-3.scope".into(), false))
+        );
+        assert_eq!(
+            unit("/system.slice/zygo.service/zygo.slice/tenants/acme"),
+            Some(("zygo.service".into(), false))
+        );
+        assert_eq!(
+            unit("0::/user.slice/user-1000.slice/user@1000.service/user.slice/run-u42.scope"),
+            Some(("run-u42.scope".into(), true))
+        );
+        // A container with its own cgroup namespace, and no systemd at all.
+        assert_eq!(unit("0::/"), None);
+        assert_eq!(unit("/zygo.slice/system"), None);
+        assert_eq!(unit(""), None);
+    }
+
+    #[test]
+    fn only_continue_leaves_the_unit_alone() {
+        let unit = SystemdUnit {
+            name: "zygo.service".into(),
+            user: false,
+        };
+        let with = |policy: &str| OomPolicy::Policy {
+            unit: unit.clone(),
+            policy: policy.into(),
+        };
+        assert!(!with("continue").stops_the_unit());
+        assert!(with("stop").stops_the_unit());
+        assert!(with("kill").stops_the_unit());
+        assert!(!OomPolicy::NotUnderSystemd.stops_the_unit());
+        assert!(!OomPolicy::TransientScope.stops_the_unit());
+        assert_eq!(unit.systemctl(), "systemctl");
+        assert_eq!(
+            SystemdUnit {
+                name: "x.service".into(),
+                user: true
+            }
+            .systemctl(),
+            "systemctl --user"
+        );
     }
 
     #[test]

@@ -207,6 +207,22 @@ pub fn run(cli: &Cli, args: &ApiArgs) -> anyhow::Result<u8> {
             "call-only: serve, stop and run are refused"
         })
     );
+    // The first time this was hit, the warning would have been the difference
+    // between a request refused and the whole API gone: systemd's default
+    // `OOMPolicy=stop` stops a unit when any process in it is OOM-killed, and
+    // a sandbox over its memory limit is exactly that. Said at start, where
+    // the person starting the unit is reading.
+    let oom_policy = zygo_core::doctor::oom_policy_of_sandboxes();
+    if let zygo_core::doctor::OomPolicy::Policy { unit, policy } = &oom_policy
+        && oom_policy.stops_the_unit()
+    {
+        crate::output::warn(&format!(
+            "{} has OOMPolicy={policy}: one sandbox over its memory limit will stop this \
+             unit, the supervisor and every pool with it. Set OOMPolicy=continue (and \
+             Delegate=yes) in the unit; `zygo doctor` shows the same",
+            unit.name
+        ));
+    }
     if let Some(exporter) = &exporter {
         eprintln!(
             "{} {}  every {:?}",
