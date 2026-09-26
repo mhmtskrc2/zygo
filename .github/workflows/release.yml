@@ -283,7 +283,9 @@ jobs:
   # PyPI by trusted publishing: no token at all, PyPI trusts this workflow
   # on this repository. Turned on by the repository variable
   # `PYPI_TRUSTED_PUBLISHING=true` once the publisher is registered on
-  # pypi.org. npm with provenance, from the `NPM_TOKEN` secret.
+  # pypi.org. npm with provenance, from the `NPM_TOKEN` secret — a granular
+  # access token that bypasses 2FA, since nobody is here to type a one-time
+  # password; a token without that fails with EOTP.
   sdks:
     needs: what
     runs-on: ubuntu-24.04
@@ -337,6 +339,11 @@ jobs:
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           packages-dir: dist/python
+          # So that this job can be re-run after the npm step fails: PyPI
+          # refuses a file it already has, and without this the re-run would
+          # stop here and never reach npm. A version that is already up is
+          # left alone, not replaced.
+          skip-existing: true
 
       - name: Publish to npm
         if: needs.what.outputs.publish == 'true' && env.NPM_TOKEN != ''
