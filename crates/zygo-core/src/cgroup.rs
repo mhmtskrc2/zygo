@@ -466,7 +466,7 @@ pub fn attach(dir: &Path, pid: u32) -> Result<()> {
 /// Kill every process in a cgroup.
 ///
 /// One write on kernel 5.14 and above, where `cgroup.kill` does it atomically.
-/// Below that it falls back to [`kill_by_freezing`], which achieves the same
+/// Below that it falls back to `kill_by_freezing`, which achieves the same
 /// thing with three writes and a loop. Either way the guarantee is the one that
 /// matters: *everything* in the cgroup dies, not just the process we happen to
 /// have a pid for.

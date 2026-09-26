@@ -11,6 +11,11 @@ readme = "../../README.md"
 keywords = ["sandbox", "container", "seccomp", "namespaces", "serverless"]
 categories = ["command-line-utilities", "virtualization", "os::linux-apis"]
 
+# The lint table is the workspace's, in the root `Cargo.toml`, so both crates
+# are held to one policy.
+[lints]
+workspace = true
+
 [[bin]]
 name = "zygo"
 path = "src/main.rs"

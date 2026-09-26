@@ -77,6 +77,43 @@ libkrun = { version = "1.19" }
 [patch.crates-io]
 libkrun = { git = "https://github.com/containers/libkrun.git", tag = "v1.19.4" }
 
+# What the code is held to. CI and `make lint` run
+# `cargo clippy --workspace --all-targets -- -D warnings`, so `warn` here is
+# a failure there; this table writes that policy down instead of leaving it
+# to whatever the toolchain's defaults happen to be. Each crate opts in with
+# `[lints] workspace = true`.
+#
+# Deliberately not on, and why:
+#
+# * `rust.missing_docs` — about a quarter of the public items have no doc
+#   comment. Turning it on today would mean a few hundred "the name says it"
+#   lines; it goes on when the pass that writes real ones lands.
+# * `clippy.undocumented_unsafe_blocks` — 187 `unsafe` blocks lack a
+#   `// SAFETY:` comment. Same plan: a later pass adds them, and the lint
+#   then keeps them.
+# * `clippy.unwrap_used`, `expect_used` — `--all-targets` lints the tests,
+#   and a test that cannot `unwrap` is a worse test.
+# * `clippy.mem_forget` — `mem::forget` is used on purpose, where a `Drop`
+#   must not run; each site says why.
+# * `rust.unused_qualifications`, `clippy.manual_let_else`,
+#   `rust.trivial_numeric_casts`, `clippy.semicolon_if_nothing_returned`,
+#   `clippy.large_stack_arrays`, `clippy.inefficient_to_string` — tried on
+#   2026-09-26 and not clean (51, 6, 4, 1, 1 and 5 sites; the last five only
+#   show on Linux, which is why a lint is checked there before it lands
+#   here). Style, not correctness; nobody is rewriting sixty lines for a
+#   table entry.
+[workspace.lints.rust]
+# The 2024 edition's default, made explicit: the body of an `unsafe fn` is
+# not an `unsafe` block, so every unsafe operation in one is marked itself.
+unsafe_op_in_unsafe_fn = "warn"
+unused_import_braces = "warn"
+
+[workspace.lints.clippy]
+# Debugging leftovers: none of these belongs in a commit.
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

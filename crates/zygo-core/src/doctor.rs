@@ -127,7 +127,7 @@ impl Report {
     ///
     /// Deliberately not "whether you can use it": that also depends on
     /// whether this build implements the backend, and asking a backend here
-    /// is a cycle — [`crate::backend::ns::NsBackend::availability`] calls
+    /// is a cycle — `crate::backend::ns::NsBackend::availability` calls
     /// [`run`], so a `supports` that consulted it recursed until the stack
     /// ran out. It did, on a real host, as a `SIGSEGV` from `zygo doctor`.
     /// The two questions are joined where the claim is actually printed,

@@ -27,10 +27,16 @@ installed and sandboxes run directly.
 ```bash
 make build          # the zygo binary
 make test           # Rust, agent and SDK suites
-make lint           # rustfmt, clippy with warnings as errors, and the book's links
+make lint           # rustfmt, clippy with warnings as errors, rustdoc with warnings as errors, and the book's links
 make check-linux    # type-check the Linux-only code from a non-Linux host
 make test-linux     # the full suite inside a Linux container
 ```
+
+The lint policy is the `[workspace.lints]` table in `Cargo.toml`; a lint goes
+in only after clippy is clean with it on macOS and on Linux, and the comment
+there says which ones were tried and left out. CI also builds with the
+`rust-version` in `Cargo.toml`, so a change that needs a newer compiler must
+bump it.
 
 The suites that attempt real things against a real kernel:
 

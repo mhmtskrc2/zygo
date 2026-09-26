@@ -515,6 +515,7 @@ fmt:
 lint:
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets -- -D warnings
+	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 	python3 docs/nav.py --check
 	@missing=$$(git ls-files '*.rs' '*.py' '*.sh' '*.js' '*.mjs' '*.ts' '*.c' '*.go' \
 		| xargs grep -L 'SPDX-License-Identifier: Apache-2.0'); \

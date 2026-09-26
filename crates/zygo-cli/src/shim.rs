@@ -20,7 +20,7 @@
 //! forwarding it would silently run against a directory that is not the one
 //! the user is looking at.
 //!
-//! The provider is [`Lima`], driven through `limactl`. The design allows for a
+//! The provider is Lima, driven through `limactl`. The design allows for a
 //! Virtualization.framework helper instead; Lima is what a `brew install` can
 //! rely on today, it gives virtiofs mounts
 //! and a working init without a signed helper binary, and everything above
@@ -696,7 +696,7 @@ pub fn is_forwardable_env_name(name: &str) -> bool {
 /// can read.
 ///
 /// Pure, so the rule is tested on every host: the probing is
-/// [`describe_vm`]'s. The first adoption report (Z-4) read `platform: FAIL`
+/// `describe_vm`'s. The first adoption report (Z-4) read `platform: FAIL`
 /// with "macos has no kernel to build a sandbox in" — true, and useless on
 /// the one platform Zygo ships a VM for. These are the checks that matter
 /// here: whether the VM can be started, whether it *is*, whether it was

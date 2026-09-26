@@ -20,6 +20,11 @@ exclude = [
     "agents/**/*.test.js",
 ]
 
+# The lint table is the workspace's, in the root `Cargo.toml`, so both crates
+# are held to one policy.
+[lints]
+workspace = true
+
 [features]
 default = ["registry"]
 # OCI Distribution client. Disabled builds can still use a pre-populated image

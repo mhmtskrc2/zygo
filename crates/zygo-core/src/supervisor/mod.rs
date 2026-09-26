@@ -770,7 +770,7 @@ impl Supervisor {
     /// Run a one-shot sandbox on a client's behalf, with the client's streams.
     ///
     /// The start goes to the launcher thread like every other start (see
-    /// [`Launcher`]); the *wait* stays here, on this connection's own thread,
+    /// `Launcher`); the *wait* stays here, on this connection's own thread,
     /// because a launcher that waited would hold every other start on the
     /// machine for as long as this program ran.
     ///
@@ -778,7 +778,7 @@ impl Supervisor {
     /// exists and before it is waited on, so the client can forward its
     /// terminal's signals to it — a Ctrl-C at the client reaches the client,
     /// and the sandbox is this process's child, not the client's — and so the
-    /// connection can kill it if the client goes away (see [`ClientWatch`]).
+    /// connection can kill it if the client goes away (see `ClientWatch`).
     pub fn run(
         &self,
         spec: Option<&Spec>,

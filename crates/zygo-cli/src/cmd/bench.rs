@@ -1053,7 +1053,7 @@ fn cold(
 ///
 /// The acceptance criterion is ≥ 600 requests/s at a
 /// concurrency of 4. Measuring it needs concurrent callers, and the interesting
-/// number is not just the total: [`CallTiming::lock`] says how much of each
+/// number is not just the total: [`CallTiming::lock`](zygo_core::pool::CallTiming::lock) says how much of each
 /// request was spent waiting for the connection, which is the difference
 /// between "the machine is busy" and "the callers are queueing behind each
 /// other".

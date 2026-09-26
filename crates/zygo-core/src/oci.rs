@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The mount plan, rendered as an OCI runtime `config.json` (design doc §3.9).
 //!
-//! The `ns` backend *executes* a [`MountPlan`]; `gvisor` hands the same plan to
+//! The `ns` backend *executes* a [`MountPlan`](crate::sandbox::mount::MountPlan); `gvisor` hands the same plan to
 //! `runsc`, which executes it on the other side of a process boundary. That is
 //! the whole reason the plan is pure data (see [`crate::sandbox::mount`]): two
 //! backends that each derived their own idea of what a sandbox looks like would
@@ -18,7 +18,7 @@
 //!   the spec has `linux.rootfsPropagation` for it, and `private` is the
 //!   default every runtime already applies.
 //! * **The overlay root.** `root.path` is one directory, so a
-//!   [`RootfsView::Overlay`] has nowhere to go. The `gvisor` backend asks the
+//!   [`RootfsView::Overlay`](crate::sandbox::mount::RootfsView::Overlay) has nowhere to go. The `gvisor` backend asks the
 //!   store to flatten instead, which is the fallback the store already has for
 //!   old kernels. gVisor's Sentry keeps its own overlay above it anyway.
 //!

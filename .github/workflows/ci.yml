@@ -97,6 +97,12 @@ jobs:
 
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # The API docs, with a dangling intra-doc link as an error. A link that
+      # points nowhere is a comment that lies, and rustdoc is the only thing
+      # that ever follows them. `--no-deps`: the dependencies' docs are theirs.
+      - run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
       - run: cargo test --workspace
 
       - name: Python agent unit tests
@@ -134,6 +140,39 @@ jobs:
       - name: macOS shim
         if: runner.os == 'macOS'
         run: make verify-shim
+
+  # The floor `rust-version` declares, actually compiled with. The number
+  # drifted once — 1.85 was declared for code that needed 1.88, and nobody
+  # noticed because every machine that ran `cargo check` was newer. Nothing
+  # was building with the toolchain the manifest named; now something is. The
+  # version is read from `Cargo.toml` rather than repeated here, so there is
+  # one copy to bump, and the job goes red the day a dependency or a language
+  # feature moves the real floor above the declared one.
+  msrv:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    name: msrv (rust-version)
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: |
+          version=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          test -n "$version" || { echo "no rust-version in Cargo.toml"; exit 1; }
+          echo "rust-version: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable; the toolchain is the input
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      # `check` rather than `build`: the question is whether the code compiles
+      # on the floor, not whether it links. `--all-targets` so the tests, which
+      # use the same language features, are asked too; `--locked` so the answer
+      # is about the dependency versions that are checked in.
+      - run: cargo check --workspace --all-targets --locked
+      # Cheap after the check above — the same compilation, linked into test
+      # binaries — and it catches a dev-dependency above the floor.
+      - run: cargo test --workspace --no-run --locked
 
   # The launcher can only be exercised on Linux, and the interesting question is
   # whether it works *without* root — requirement N5.

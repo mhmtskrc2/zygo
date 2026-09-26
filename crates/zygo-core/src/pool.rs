@@ -561,7 +561,7 @@ impl Drop for RequestLease<'_> {
 
 /// What a one-shot started for another process carries of that process:
 /// its three streams, whether they are one terminal, and the signals it
-/// ignores (see [`SandboxConfig::ignored_signals`]).
+/// ignores (see [`SandboxConfig::ignored_signals`](crate::sandbox::SandboxConfig::ignored_signals)).
 pub struct ClientStreams {
     pub stdio: [std::os::fd::OwnedFd; 3],
     pub tty: bool,
@@ -1729,7 +1729,7 @@ impl WarmFn {
         self.call_script_keyed(event, script, timeout, caller, None)
     }
 
-    /// The same, under a name the caller chose. See [`InFlight::key`].
+    /// The same, under a name the caller chose. See `InFlight::key`.
     pub fn call_script_keyed(
         &self,
         event: serde_json::Value,
@@ -3720,7 +3720,7 @@ impl Function {
 
     /// The same, under a name the caller chose, streaming if asked.
     ///
-    /// See [`InFlight::key`] and [`WarmFn::call_streaming`]. Only the agent
+    /// See `InFlight::key` and [`WarmFn::call_streaming`]. Only the agent
     /// shape carries either: a warm-exec function has no agent to tell, and
     /// its output is collected from pipes at the end. That is not a limitation
     /// worth closing until something asks — the pool shape is what an
@@ -3766,7 +3766,7 @@ impl Function {
 
     /// The same, for a named tenant and under a name they chose.
     ///
-    /// See [`WarmFn::call_script_for`] and [`InFlight::key`].
+    /// See [`WarmFn::call_script_for`] and `InFlight::key`.
     pub fn call_script_as(
         &self,
         event: serde_json::Value,
@@ -3806,7 +3806,7 @@ impl Function {
         self.call_script_keyed(event, script, timeout, caller, None)
     }
 
-    /// The same, under a name the caller chose. See [`InFlight::key`].
+    /// The same, under a name the caller chose. See `InFlight::key`.
     pub fn call_script_keyed(
         &self,
         event: serde_json::Value,

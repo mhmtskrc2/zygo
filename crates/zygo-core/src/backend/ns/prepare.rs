@@ -208,7 +208,7 @@ pub enum PreparedOp {
         readonly: bool,
         /// Where the mounts below `source` land inside the sandbox — filled
         /// only on a kernel without `mount_setattr`, where the child has to
-        /// lock each one by hand. See [`submounts_under`].
+        /// lock each one by hand. See `submounts_under`.
         submounts: Vec<CString>,
     },
     Proc {
@@ -255,7 +255,7 @@ pub struct PreparedLaunch {
     /// the child may not.
     pub seccomp: Vec<super::seccomp::SockFilter>,
     /// Ask the kernel to log every syscall the filter refuses
-    /// ([`super::seccomp::SECCOMP_FILTER_FLAG_LOG`]). Decided here, from the
+    /// (`SECCOMP_FILTER_FLAG_LOG` in `seccomp`). Decided here, from the
     /// log level, because the child may not consult a subscriber.
     pub seccomp_log: bool,
     /// The Landlock ruleset, empty when the kernel has no Landlock.

@@ -18,7 +18,7 @@
 //!   namespace. Zygo has no capabilities on the host, but it created the
 //!   sandbox's user namespace, so entering that namespace grants a full
 //!   capability set inside it — and the network namespace is owned by it.
-//!   This is the same property [`crate::backend::ns::enter`] relies on.
+//!   This is the same property `crate::backend::ns::enter` relies on.
 //! * **`tc`** (from `iproute2`), only when a `bandwidth` is set: a token
 //!   bucket on what the sandbox sends, and — where the host has an `ifb`
 //!   device — the same on what it receives.

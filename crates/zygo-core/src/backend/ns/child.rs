@@ -1002,7 +1002,7 @@ fn fail_with(err_fd: c_int, step: Step, errno: c_int) -> ! {
     }
 }
 
-/// Decode what [`fail_with`] wrote.
+/// Decode what `fail_with` wrote.
 pub fn decode_failure(payload: &[u8]) -> Option<(Step, i32)> {
     if payload.len() < 8 {
         return None;

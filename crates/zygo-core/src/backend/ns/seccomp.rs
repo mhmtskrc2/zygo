@@ -997,7 +997,7 @@ const SECCOMP_FILTER_FLAG_LOG: libc::c_uint = 2;
 /// Install a filter on the calling process.
 ///
 /// `log_denials` asks the kernel to write every refusal to its audit log —
-/// see [`SECCOMP_FILTER_FLAG_LOG`]. A kernel too old to know the flag answers
+/// see `SECCOMP_FILTER_FLAG_LOG`. A kernel too old to know the flag answers
 /// `EINVAL`, and the filter is then installed without it: the policy matters
 /// more than the log line, and an unfiltered sandbox is not an option.
 ///
