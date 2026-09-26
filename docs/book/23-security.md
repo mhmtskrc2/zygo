@@ -305,7 +305,7 @@ only filesystem boundary. The process-level network rules — `bind` refused
 everywhere, `connect` limited to the allowlist's ports under `egress` — are
 built and unit-tested, and enforced for real in one place: CI's
 `landlock-network` job, on an ubuntu-24.04 runner (Linux 6.8, Landlock ABI
-v4), runs `poc/verify_landlock_net.sh` (`make landlock-net-linux` runs the
+v4), runs `tests/linux/verify_landlock_net.sh` (`make landlock-net-linux` runs the
 same script in a container). It picks the two refusals nftables cannot
 produce: a `bind()` on a TCP port, which sends no packet, and a loopback
 `connect()` to a port off the allowlist, which the packet filter accepts on its

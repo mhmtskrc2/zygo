@@ -11,17 +11,18 @@ __pycache__/
 # is newer than the one the lock was written against.
 /examples/**/zygo.lock
 
-# PoC artefacts: cross-compiled binaries, not source.
+# Build outputs the Linux suites run, not source: the static binary
+# (`make tests/linux/bin/zygo-linux-musl`), the vm-capable one
+# (`make vm-build`), the guest kernel and the V1 probe's log (`make vm-kernel`,
+# `make vm-probe`, 24 MB of artefact that a checkout should rebuild). All in
+# one folder, so a clean checkout has nothing to rebuild by hand.
 #
-# `zygo-linux` is gone: it was a leftover from an earlier workflow that no
-# `make` target built, and every container suite defaulted to it — so on a
-# machine that still had one, twelve suites silently measured a binary from
-# whenever it was last copied there. They all default to `zygo-linux-musl`
-# now, and every target that runs one rebuilds it first.
-/poc/poc3-linux
-/poc/zygo-linux
-/poc/zygo-linux-musl
-/poc/zygo-linux-musl-vm
+# A bare `zygo-linux` there is a leftover from an earlier workflow that no
+# `make` target built; every suite defaults to `zygo-linux-musl` now, and
+# every target that runs one rebuilds it first.
+/tests/linux/bin/
+# The Phase 0 proof-of-concept binary, cross-compiled.
+/tests/poc/poc3-linux
 
 # Built by `make examples-go-linux`
 /examples/warm-exec/go/bin/
@@ -31,9 +32,6 @@ __pycache__/
 # the image holds the binary the size and static-linking checks were run
 # against — but it is still a build artefact.
 /packaging/oci/zygo
-# The guest kernel and the V1 probe's log: built by `make vm-kernel` and
-# `make vm-probe`, 24 MB of artefact that a checkout should rebuild.
-poc/vm-out/
 
 # Development material: the roadmap, the design document, the review reports
 # and the test plans. Useful to whoever is building Zygo and noise to whoever

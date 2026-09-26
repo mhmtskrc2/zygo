@@ -223,12 +223,12 @@ jobs:
       # checkout inside its containers; here the checkout is the workspace.
       - name: Isolation and limits
         run: |
-          . poc/ci_cgroup.sh
-          install -m 0755 target/release/zygo poc/zygo-linux-musl
+          . tests/linux/ci_cgroup.sh
+          install -Dm755 target/release/zygo tests/linux/bin/zygo-linux-musl
           if [ "${{ matrix.privilege }}" = root ]; then
-            sudo -E sh poc/verify_launcher.sh
+            sudo -E sh tests/linux/verify_launcher.sh
           else
-            sh poc/verify_launcher.sh
+            sh tests/linux/verify_launcher.sh
           fi
         env:
           # Its own tree, because the root entry runs this one step under
@@ -244,9 +244,9 @@ jobs:
         # instead of six. The job still fails.
         if: ${{ !cancelled() }}
         run: |
-          . poc/ci_cgroup.sh
-          install -m 0755 target/release/zygo poc/zygo-linux-musl
-          sh poc/escape_suite.sh
+          . tests/linux/ci_cgroup.sh
+          install -Dm755 target/release/zygo tests/linux/bin/zygo-linux-musl
+          sh tests/linux/escape_suite.sh
         env:
           ZYGO_DATA_HOME: /tmp/zygo-ci
           SRC: ${{ github.workspace }}
@@ -260,8 +260,8 @@ jobs:
         # instead of six. The job still fails.
         if: ${{ !cancelled() }}
         run: |
-          . poc/ci_cgroup.sh
-          bash poc/fuzz_syscalls.sh
+          . tests/linux/ci_cgroup.sh
+          bash tests/linux/fuzz_syscalls.sh
         env:
           ZYGO_DATA_HOME: /tmp/zygo-ci
           SRC: ${{ github.workspace }}
@@ -274,8 +274,8 @@ jobs:
         # instead of six. The job still fails.
         if: ${{ !cancelled() }}
         run: |
-          . poc/ci_cgroup.sh
-          sh poc/verify_gvisor.sh
+          . tests/linux/ci_cgroup.sh
+          sh tests/linux/verify_gvisor.sh
         env:
           ZYGO_DATA_HOME: /tmp/zygo-gvisor
           SRC: ${{ github.workspace }}
@@ -290,15 +290,15 @@ jobs:
         # instead of six. The job still fails.
         if: ${{ !cancelled() }}
         run: |
-          . poc/ci_cgroup.sh
-          install -m 0755 target/release/zygo poc/zygo-linux-musl
+          . tests/linux/ci_cgroup.sh
+          install -Dm755 target/release/zygo tests/linux/bin/zygo-linux-musl
           # Not fatal: `passt` is not packaged before Ubuntu 23.04, and the
           # suite has a prerequisite check that skips the egress section and
           # says so. A failed `apt-get` here ended the whole step instead,
           # with exit 100 and no result at all.
           sudo apt-get install -y --no-install-recommends passt nftables iproute2 jq >/dev/null || \
             echo "::warning::some egress packages are unavailable here; the suite will skip that section"
-          sh poc/verify_supervisor.sh
+          sh tests/linux/verify_supervisor.sh
         env:
           SRC: ${{ github.workspace }}
 
@@ -311,8 +311,8 @@ jobs:
         # instead of six. The job still fails.
         if: ${{ !cancelled() }}
         run: |
-          . poc/ci_cgroup.sh
-          sh poc/seccomp_matrix.sh
+          . tests/linux/ci_cgroup.sh
+          sh tests/linux/seccomp_matrix.sh
         env:
           SRC: ${{ github.workspace }}
 
@@ -322,8 +322,8 @@ jobs:
       - name: Seccomp compatibility matrix (Node)
         if: ${{ !cancelled() }}
         run: |
-          . poc/ci_cgroup.sh
-          sh poc/seccomp_matrix_node.sh
+          . tests/linux/ci_cgroup.sh
+          sh tests/linux/seccomp_matrix_node.sh
         env:
           SRC: ${{ github.workspace }}
           ZYGO_DATA_HOME: /tmp/zygo-matrix-node
@@ -336,7 +336,7 @@ jobs:
       - name: Registry credentials
         if: ${{ !cancelled() && matrix.os == 'ubuntu-24.04' && matrix.privilege == 'rootless' }}
         run: |
-          install -m 0755 target/release/zygo poc/zygo-linux-musl
+          install -Dm755 target/release/zygo tests/linux/bin/zygo-linux-musl
           make verify-login-linux
 
       - name: Examples
@@ -345,9 +345,9 @@ jobs:
         # instead of six. The job still fails.
         if: ${{ !cancelled() }}
         run: |
-          . poc/ci_cgroup.sh
+          . tests/linux/ci_cgroup.sh
           (cd examples/warm-exec/go && CGO_ENABLED=0 go build -o bin/parse .) || echo "::warning::no Go toolchain; the Go example is skipped"
-          sh poc/verify_examples.sh
+          sh tests/linux/verify_examples.sh
         env:
           SRC: ${{ github.workspace }}
 
@@ -385,11 +385,11 @@ jobs:
 
       - name: bind and connect, refused by the kernel
         run: |
-          . poc/ci_cgroup.sh
-          install -m 0755 target/release/zygo poc/zygo-linux
-          sh poc/verify_landlock_net.sh
+          . tests/linux/ci_cgroup.sh
+          install -Dm755 target/release/zygo tests/linux/bin/zygo-linux
+          sh tests/linux/verify_landlock_net.sh
         env:
-          ZYGO: ${{ github.workspace }}/poc/zygo-linux
+          ZYGO: ${{ github.workspace }}/tests/linux/bin/zygo-linux
           ZYGO_DATA_HOME: /tmp/zygo-landlock
           SRC: ${{ github.workspace }}
 
@@ -420,7 +420,7 @@ jobs:
       # The same script `make dist-linux` and the release workflow run, so
       # there is one copy of the budget rather than three.
       - name: It must be static, and inside the size budget
-        run: sh poc/check_dist.sh target/${{ matrix.target }}/release/zygo
+        run: sh tests/linux/check_dist.sh target/${{ matrix.target }}/release/zygo
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -464,7 +464,7 @@ jobs:
           fi
 
       - run: cargo build --release
-      - run: install -m 0755 target/release/zygo poc/zygo-linux-musl
+      - run: install -Dm755 target/release/zygo tests/linux/bin/zygo-linux-musl
 
       # The runner's Docker now uses the systemd cgroup driver, which takes a
       # slice rather than a path for `--cgroup-parent`. This job tests the
@@ -498,7 +498,7 @@ jobs:
             --cgroupns=host --cgroup-parent=/zygo-unpriv \
             -v /sys/fs/cgroup/zygo-unpriv:/sys/fs/cgroup/zygo-unpriv:rw \
             -v "$PWD:/src:ro" -e ZYGO_DATA_HOME=/tmp/zdata \
-            python:3.12-slim /src/poc/zygo-linux-musl doctor
+            python:3.12-slim /src/tests/linux/bin/zygo-linux-musl doctor
 
       - name: Supervisor lifecycle, unprivileged
         run: |
@@ -509,7 +509,7 @@ jobs:
             --cgroupns=host --cgroup-parent=/zygo-unpriv \
             -v /sys/fs/cgroup/zygo-unpriv:/sys/fs/cgroup/zygo-unpriv:rw \
             -v "$PWD:/src:ro" -e ZYGO_DATA_HOME=/tmp/zdata-sup \
-            python:3.12-slim sh /src/poc/verify_supervisor.sh
+            python:3.12-slim sh /src/tests/linux/verify_supervisor.sh
 
       - name: The HTTP API, unprivileged
         # Run even when the suite above failed: they test different things,
@@ -523,7 +523,7 @@ jobs:
             --cgroupns=host --cgroup-parent=/zygo-unpriv \
             -v /sys/fs/cgroup/zygo-unpriv:/sys/fs/cgroup/zygo-unpriv:rw \
             -v "$PWD:/src:ro" -e ZYGO_DATA_HOME=/tmp/zdata-api \
-            python:3.12-slim sh /src/poc/verify_api.sh
+            python:3.12-slim sh /src/tests/linux/verify_api.sh
 
       # The negative half: without the two `--security-opt`s, `zygo doctor`
       # has to *say so* rather than a sandbox dying four steps later with a
@@ -533,20 +533,20 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           out=$(docker run --rm -v "$PWD:/src:ro" -e ZYGO_DATA_HOME=/tmp/zd \
-            python:3.12-slim /src/poc/zygo-linux-musl doctor 2>&1 || true)
+            python:3.12-slim /src/tests/linux/bin/zygo-linux-musl doctor 2>&1 || true)
           printf '%s\n' "$out"
           echo "$out" | grep -q "seccomp=unconfined" \
             || { echo "::error::doctor did not name the seccomp profile"; exit 1; }
           out=$(docker run --rm --security-opt seccomp=unconfined \
             -v "$PWD:/src:ro" -e ZYGO_DATA_HOME=/tmp/zd \
-            python:3.12-slim /src/poc/zygo-linux-musl doctor 2>&1 || true)
+            python:3.12-slim /src/tests/linux/bin/zygo-linux-musl doctor 2>&1 || true)
           printf '%s\n' "$out"
           echo "$out" | grep -q "apparmor=unconfined" \
             || { echo "::error::doctor did not name the AppArmor profile"; exit 1; }
           out=$(docker run --rm --security-opt seccomp=unconfined \
             --security-opt apparmor=unconfined \
             -v "$PWD:/src:ro" -e ZYGO_DATA_HOME=/tmp/zd \
-            python:3.12-slim /src/poc/zygo-linux-musl doctor 2>&1 || true)
+            python:3.12-slim /src/tests/linux/bin/zygo-linux-musl doctor 2>&1 || true)
           printf '%s\n' "$out"
           echo "$out" | grep -q "systempaths=unconfined" \
             || { echo "::error::doctor did not name the masked /proc"; exit 1; }
@@ -688,7 +688,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3    # for the non-native architecture
-      - run: python3 poc/gen_syscall_tables.py
+      - run: python3 tools/gen_syscall_tables.py
       - name: The committed tables must match
         run: |
           git diff --exit-code crates/zygo-core/src/backend/ns/syscalls.rs \

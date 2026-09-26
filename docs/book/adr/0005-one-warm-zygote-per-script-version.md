@@ -2,7 +2,7 @@
 
 **Status:** accepted, 2026-09-23. Answers the open question the first adoption
 report — a consumer's own write-up, not in this repository — ends on, with numbers from
-`poc/bench_density.py` on the 2-core, 4 GB Lima VM.
+`tests/linux/bench_density.py` on the 2-core, 4 GB Lima VM.
 
 ## Context
 

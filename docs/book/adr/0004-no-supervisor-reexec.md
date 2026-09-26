@@ -45,7 +45,7 @@ What would have to cross the boundary, though, is not the pids. It is:
 Against that, what a restart actually costs:
 
 * A pool re-warms at about **500 ms per zygote** (`python:3.12-slim`, measured
-  in `poc/api_driver.py`: "a runtime pool is warm (1 zygote, 502 ms)"; a
+  in `tests/linux/api_driver.py`: "a runtime pool is warm (1 zygote, 502 ms)"; a
   function, 508 ms). That was before the bytecode layer; the same warm-up
   is now 154–185 ms on a Raspberry Pi 5, the supervisor's start included,
   and 34 ms on the Lima VM with one running

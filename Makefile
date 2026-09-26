@@ -80,10 +80,10 @@ test-sdk-node:
 # `zygo mcp` driven over a pipe, the way an agent host drives it: a real
 # handshake, a real tool list, and a tool call that really runs a sandbox.
 # Needs a kernel, so it runs in a container.
-verify-mcp: poc/zygo-linux-musl
+verify-mcp: tests/linux/bin/zygo-linux-musl
 	docker run --rm --privileged -v "$(PWD):/src:ro" \
 		-e ZYGO_DATA_HOME=/tmp/zdata python:3.12-slim \
-		sh /src/poc/verify_mcp.sh
+		sh /src/tests/linux/verify_mcp.sh
 
 check:
 	cargo check --workspace --all-targets
@@ -120,14 +120,14 @@ conformance: build
 # `.ts` support is checked end to end: no build step, the digest over the
 # source as uploaded, and an `enum` in it so that a runtime which only blanks
 # type annotations cannot pass.
-conformance-node: poc/zygo-linux-musl
+conformance-node: tests/linux/bin/zygo-linux-musl
 	docker run --rm -v "$(PWD):/src:ro" node:22-slim \
-		/src/poc/zygo-linux-musl agent test node \
+		/src/tests/linux/bin/zygo-linux-musl agent test node \
 		--script /src/examples/agents/conformance/script.js \
 		--script-spawn /src/examples/agents/conformance/spawn.js -- \
 		/src/agents/node/zygo_agent.js /src/examples/agents/conformance/handler.js
 	docker run --rm -v "$(PWD):/src:ro" node:22-slim \
-		/src/poc/zygo-linux-musl agent test node \
+		/src/tests/linux/bin/zygo-linux-musl agent test node \
 		--pool-script /src/examples/agents/conformance/handler.js \
 		--script /src/examples/agents/conformance/script.ts \
 		--script-spawn /src/examples/agents/conformance/spawn.js -- \
@@ -136,12 +136,12 @@ conformance-node: poc/zygo-linux-musl
 # The same Node agent with the *kernel* filter rather than Node's permission
 # model: `node:22` has a compiler, so the helper object can be built and the
 # `seccomp` branch of the agent exercised for real.
-conformance-node-seccomp: poc/zygo-linux-musl
+conformance-node-seccomp: tests/linux/bin/zygo-linux-musl
 	docker run --rm -v "$(PWD):/src:ro" node:22 sh -c '\
 		cc -shared -fPIC -O2 -o /tmp/zygo_child_seccomp.so \
 			/src/agents/node/zygo_child_seccomp.c && \
 		ZYGO_CHILD_SECCOMP_HELPER=/tmp/zygo_child_seccomp.so \
-		/src/poc/zygo-linux-musl agent test node \
+		/src/tests/linux/bin/zygo-linux-musl agent test node \
 		--script /src/examples/agents/conformance/script.js \
 		--script-spawn /src/examples/agents/conformance/spawn.js -- \
 		/src/agents/node/zygo_agent.js /src/examples/agents/conformance/handler.js'
@@ -164,42 +164,42 @@ conformance-node-seccomp: poc/zygo-linux-musl
 # the VM; the target directory is the VM's own, not this checkout's.
 .PHONY: guest-build
 guest-build:
-	limactl shell zygo -- sh poc/build_guest.sh
-	@ls -lh poc/zygo-linux-musl
+	limactl shell zygo -- sh tests/linux/build_guest.sh
+	@ls -lh tests/linux/bin/zygo-linux-musl
 
-.PHONY: poc/zygo-linux-musl
-poc/zygo-linux-musl:
+.PHONY: tests/linux/bin/zygo-linux-musl
+tests/linux/bin/zygo-linux-musl:
 	docker run --rm -v "$(PWD):/w" -w /w \
 		-v zygo-musl-target:/target -v zygo-musl-registry:/usr/local/cargo/registry \
 		-e CARGO_TARGET_DIR=/target \
 		rust:1-alpine sh -c 'apk add --no-cache musl-dev >/dev/null && \
 		cargo build --release --locked --offline -p zygo-cli \
 		|| cargo build --release --locked -p zygo-cli; \
-		cp /target/release/zygo /w/poc/zygo-linux-musl'
+		mkdir -p /w/tests/linux/bin && cp /target/release/zygo /w/tests/linux/bin/zygo-linux-musl'
 
 # The container image: the static binary, `pasta`, `nft`, `tc` and
 # `newuidmap`, a non-root user and `zygo api` as the entrypoint.
 #
-# The binary is the one `poc/zygo-linux-musl` built rather than a second
+# The binary is the one `tests/linux/bin/zygo-linux-musl` built rather than a second
 # compile inside Docker: an image whose contents differ from what the size and
 # static-linking checks were run against is an image nobody checked.
-oci-image: poc/zygo-linux-musl
-	cp poc/zygo-linux-musl packaging/oci/zygo
+oci-image: tests/linux/bin/zygo-linux-musl
+	cp tests/linux/bin/zygo-linux-musl packaging/oci/zygo
 	docker build -f packaging/oci/Dockerfile -t $(OCI_IMAGE) packaging/oci
 
 OCI_IMAGE ?= zygo:local
 
 # And the same image, run: a sandbox inside a container with no privileges.
 verify-oci: oci-image
-	OCI_IMAGE=$(OCI_IMAGE) sh poc/verify_oci.sh
+	OCI_IMAGE=$(OCI_IMAGE) sh tests/linux/verify_oci.sh
 
 # The Go warm-exec example, built in a Go container and then run for real:
 # `zygo up` on alpine, `zygo exec` through the CLI.
-examples-go-linux: poc/zygo-linux-musl
+examples-go-linux: tests/linux/bin/zygo-linux-musl
 	docker run --rm -v "$(PWD)/examples/warm-exec/go:/w" -w /w -e CGO_ENABLED=0 \
 		golang:1.23-alpine sh -c 'mkdir -p bin && go build -o bin/parse .'
 	docker run --rm --privileged -v "$(PWD):/src:ro" python:3.12-slim \
-		sh /src/poc/verify_examples.sh
+		sh /src/tests/linux/verify_examples.sh
 
 # The `ns` backend, the cgroup hierarchy and the doctor probes are all behind
 # `#[cfg(target_os = "linux")]`, so a macOS `cargo check` never sees them.
@@ -209,17 +209,17 @@ examples-go-linux: poc/zygo-linux-musl
 # sharing its network namespace so the registry is at `127.0.0.1:5000` — one
 # of the names Zygo reaches over plain HTTP. Nothing here needs a sandbox, so
 # it needs no privileges either.
-verify-login-linux: poc/zygo-linux-musl
+verify-login-linux: tests/linux/bin/zygo-linux-musl
 	@mkdir -p /tmp/zygo-reg-auth
 	@docker run --rm httpd:2 htpasswd -Bbn zygotest s3cret > /tmp/zygo-reg-auth/htpasswd
 	@docker rm -f zygo-reg >/dev/null 2>&1 || true
 	@docker run -d --name zygo-reg -v /tmp/zygo-reg-auth:/auth \
 		-e REGISTRY_AUTH=htpasswd -e REGISTRY_AUTH_HTPASSWD_REALM=zygo \
 		-e REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd registry:2 >/dev/null
-	@poc/wait_for_registry.sh
+	@tests/linux/wait_for_registry.sh
 	@set +e; \
 		docker run --rm --network container:zygo-reg -v "$(PWD):/src:ro" \
-			python:3.12-slim sh /src/poc/verify_login.sh; \
+			python:3.12-slim sh /src/tests/linux/verify_login.sh; \
 		status=$$?; \
 		docker rm -f zygo-reg >/dev/null 2>&1; \
 		exit $$status
@@ -227,12 +227,12 @@ verify-login-linux: poc/zygo-linux-musl
 # The macOS shim: a real Lima VM, a real Linux kernel, from this Mac. Skips
 # itself anywhere else, and where `limactl` is not installed.
 verify-shim: build
-	sh poc/verify_shim.sh
+	sh tests/linux/verify_shim.sh
 
 # Z-2 of the first adoption report: 24 `zygo run`s at once, six rounds, from
 # a Mac. Wants 144/144; the baseline before the fix was about 7 failures.
 verify-shim-concurrency: build
-	sh poc/verify_shim_concurrency.sh
+	sh tests/linux/verify_shim_concurrency.sh
 
 # Type-checking against a Linux target does, without needing a Linux host.
 # `--no-default-features` drops the registry client, whose TLS stack needs a
@@ -254,72 +254,72 @@ test-linux:
 # The `ns` launcher can only be exercised on Linux. Runs the isolation and
 # limit checks against a real kernel.
 # `-t` allocates a terminal, without which the TIOCSTI check cannot run.
-verify-linux: poc/zygo-linux-musl
+verify-linux: tests/linux/bin/zygo-linux-musl
 	docker run --rm -t --privileged -v "$(PWD):/src:ro" \
 		-e ZYGO_DATA_HOME=/tmp/zdata python:3.12-slim \
-		sh /src/poc/verify_launcher.sh
+		sh /src/tests/linux/verify_launcher.sh
 
 # What the first adoption report found about seccomp, attempted on a kernel:
 # `shutil.copy2` and `pip install --target` across a mount under every
 # profile (Z-1), the profiles observably different from inside a sandbox,
 # and `--seccomp` visible in `--dry-run` (Z-3). Needs the network for the
 # `pip` half, which skips without it.
-verify-seccomp-profiles-linux: poc/zygo-linux-musl
+verify-seccomp-profiles-linux: tests/linux/bin/zygo-linux-musl
 	docker run --rm --privileged -v "$(PWD):/src:ro" \
 		-e ZYGO_DATA_HOME=/tmp/zdata-seccomp -e ZYGO_VERIFY_OUT=/tmp/zverify-out \
 		python:3.12-slim \
-		sh /src/poc/verify_seccomp_profiles.sh
+		sh /src/tests/linux/verify_seccomp_profiles.sh
 
 # End-to-end supervisor lifecycle: serve, exec, ps, backpressure, stop.
 #
 # Separate from verify-linux because it is the only suite where the client
 # process exits between steps, which is what exposes failures that live in the
 # supervisor's threading rather than in the sandbox.
-verify-supervisor-linux: poc/zygo-linux-musl
+verify-supervisor-linux: tests/linux/bin/zygo-linux-musl
 	docker run --rm --privileged -v "$(PWD):/src:ro" \
 		python:3.12-slim \
-		sh /src/poc/verify_supervisor.sh
+		sh /src/tests/linux/verify_supervisor.sh
 
 # The one open supervisor question, on its own: a request queued behind a
 # function being replaced. `verify-supervisor-linux` checks it once inside a
 # thirty-five minute run and it failed once on a Raspberry Pi; this runs only
 # that scenario, five times, and prints the timings of each.
-repro-blue-green-linux: poc/zygo-linux-musl
+repro-blue-green-linux: tests/linux/bin/zygo-linux-musl
 	docker run --rm --privileged -v "$(PWD):/src:ro" \
 		-e ZYGO_DATA_HOME=/tmp/zdata-bluegreen python:3.12-slim \
-		sh /src/poc/repro_blue_green.sh
+		sh /src/tests/linux/repro_blue_green.sh
 
 # The HTTP API end to end, driven by the Python client that ships with it:
 # client -> unix socket -> `zygo api` -> the supervisor -> a real sandbox. The
 # unit tests on either side of that line cannot reach it.
-verify-api-linux: poc/zygo-linux-musl
+verify-api-linux: tests/linux/bin/zygo-linux-musl
 	docker run --rm --privileged -v "$(PWD):/src:ro" \
 		-e ZYGO_DATA_HOME=/tmp/zdata-api python:3.12-slim \
-		sh /src/poc/verify_api.sh
+		sh /src/tests/linux/verify_api.sh
 
 # The embedder API's exit criterion: a plugin host on the API alone. If it
 # needs a spec file or a file on the Zygo host, the API is missing a route.
-verify-plugin-host: poc/zygo-linux-musl
+verify-plugin-host: tests/linux/bin/zygo-linux-musl
 	docker run --rm --privileged -v "$(PWD):/src:ro" \
 		-e ZYGO_DATA_HOME=/tmp/zdata-plugin python:3.12-slim \
-		sh /src/poc/verify_plugin_host.sh
+		sh /src/tests/linux/verify_plugin_host.sh
 
 # The same claim from the Node SDK, as an HTTP server of its own: a customer's
 # routes in front, one operator client and `forTenant` behind.
-verify-plugin-host-node: poc/zygo-linux-musl
+verify-plugin-host-node: tests/linux/bin/zygo-linux-musl
 	docker run --rm --privileged -v "$(PWD):/src:ro" \
 		-e ZYGO_DATA_HOME=/tmp/zdata-plugin-node node:22-slim \
-		sh /src/poc/verify_plugin_host_node.sh
+		sh /src/tests/linux/verify_plugin_host_node.sh
 
 # V1, the question the whole `vm` plan rests on: does libkrun build and link
 # against musl? `dist-linux` ships one static binary under 15 MB, and if the
 # answer is no the vm-capable build is a separate glibc target and the README
 # has to say so. The probe reports rather than fails — either answer is the
 # deliverable.
-vm-build: poc/zygo-linux-musl-vm
+vm-build: tests/linux/bin/zygo-linux-musl-vm
 
 # The vm-capable binary: `zygo` with `--features vm`, built natively on musl in
-# the same container `make poc/zygo-linux-musl` uses.
+# the same container `make tests/linux/bin/zygo-linux-musl` uses.
 #
 # Natively, and that is not incidental. A cross-check from a Mac to
 # `aarch64-unknown-linux-musl` fails inside libkrun's virtiofs passthrough on
@@ -327,59 +327,59 @@ vm-build: poc/zygo-linux-musl-vm
 # cargo keeps host and target feature resolution apart, and what the native
 # build gets from that unification the cross-build does not. The container is
 # the host, so the question does not arise.
-.PHONY: poc/zygo-linux-musl-vm
-poc/zygo-linux-musl-vm: poc/vm-builder
+.PHONY: tests/linux/bin/zygo-linux-musl-vm
+tests/linux/bin/zygo-linux-musl-vm: vm-builder
 	docker run --rm -v "$(PWD):/w" -w /w \
 		-v zygo-musl-target-vm:/target -v zygo-musl-registry:/usr/local/cargo/registry \
 		-e CARGO_TARGET_DIR=/target \
 		zygo-vm-build sh -c 'cargo build --release -p zygo-cli --features zygo-core/vm && \
-		cp /target/release/zygo /w/poc/zygo-linux-musl-vm'
-	@file poc/zygo-linux-musl-vm 2>/dev/null || true
-	@ls -lh poc/zygo-linux-musl-vm
+		mkdir -p /w/tests/linux/bin && cp /target/release/zygo /w/tests/linux/bin/zygo-linux-musl-vm'
+	@file tests/linux/bin/zygo-linux-musl-vm 2>/dev/null || true
+	@ls -lh tests/linux/bin/zygo-linux-musl-vm
 
-.PHONY: poc/vm-builder
-poc/vm-builder:
-	docker build -f poc/Dockerfile.vm -t zygo-vm-build poc/
+.PHONY: vm-builder
+vm-builder:
+	docker build -f tests/linux/Dockerfile.vm -t zygo-vm-build tests/linux/
 
 # The guest kernel: built once, extracted, and its config checked against what
 # a Zygo guest needs. The output is what `zygo backend install vm` will
 # download, and the digest to pin it by.
-vm-kernel: poc/vm-builder
-	@mkdir -p poc/vm-out
+vm-kernel: vm-builder
+	@mkdir -p tests/linux/bin/vm-out
 	@set +e; \
-		docker run --rm -v "$(PWD)/poc/vm-out:/out" --entrypoint sh \
-			zygo-vm-build /build/vm_kernel.sh > poc/vm-out/kernel.log 2>&1; \
+		docker run --rm -v "$(PWD)/tests/linux/bin/vm-out:/out" --entrypoint sh \
+			zygo-vm-build /build/vm_kernel.sh > tests/linux/bin/vm-out/kernel.log 2>&1; \
 		status=$$?; \
-		tail -40 poc/vm-out/kernel.log; \
+		tail -40 tests/linux/bin/vm-out/kernel.log; \
 		exit $$status
 	@echo ""
-	@echo "the image is in poc/vm-out/Image"
+	@echo "the image is in tests/linux/bin/vm-out/Image"
 
 # The V1 probe: libkrun on its own, with a verdict. Kept because the answer is
 # a record, and because it is where a newer libkrun gets asked the same
 # question.
-vm-probe: poc/vm-builder
-	@mkdir -p poc/vm-out
+vm-probe: vm-builder
+	@mkdir -p tests/linux/bin/vm-out
 	@set +e; \
 		docker run --rm --entrypoint /build/vm_build_probe.sh \
-			-v "$(PWD)/poc/vm-out:/out" zygo-vm-build > poc/vm-out/v1-probe.log 2>&1; \
+			-v "$(PWD)/tests/linux/bin/vm-out:/out" zygo-vm-build > tests/linux/bin/vm-out/v1-probe.log 2>&1; \
 		status=$$?; \
-		cat poc/vm-out/v1-probe.log; \
+		cat tests/linux/bin/vm-out/v1-probe.log; \
 		exit $$status
 	@echo ""
-	@echo "the log is in poc/vm-out/v1-probe.log"
+	@echo "the log is in tests/linux/bin/vm-out/v1-probe.log"
 
 # The `vm` backend on a real KVM, compared with `ns`. Says so rather than
 # reporting a pass on a host where no guest ran — see V11.
-verify-vm-pi: poc/zygo-linux-musl-vm
-	@sh poc/vm_pi.sh
+verify-vm-pi: tests/linux/bin/zygo-linux-musl-vm
+	@sh tests/linux/vm_pi.sh
 
 # Twenty use cases for the `vm` backend that do not need the guest to boot:
 # what it refuses, what it resolves, what `doctor` says, and what is left
 # behind when a guest never comes up. `verify_vm.sh` is the other half — the
 # one that needs a working guest — and this is the half that runs today.
-vm-use-cases-linux: poc/zygo-linux-musl-vm poc/zygo-linux-musl
-	@sh poc/vm_use_cases.sh
+vm-use-cases-linux: tests/linux/bin/zygo-linux-musl-vm tests/linux/bin/zygo-linux-musl
+	@sh tests/linux/vm_use_cases.sh
 
 # Fifty scenarios organised by who is asking rather than by mechanism: an
 # agent tool runner, a platform embedder, multi-tenant functions, untrusted
@@ -390,26 +390,26 @@ vm-use-cases-linux: poc/zygo-linux-musl-vm poc/zygo-linux-musl
 # say whether the egress refusals mean anything. `file` is for the
 # static-binary check. The Raspberry Pi has all three and confines `pasta`
 # with AppArmor instead, so the two hosts test different halves.
-use-cases-linux: poc/zygo-linux-musl
+use-cases-linux: tests/linux/bin/zygo-linux-musl
 	docker run --rm --privileged -v "$(PWD):/src:ro" \
 		-e ZYGO_DATA_HOME=/tmp/zdata-usecases python:3.12-slim \
 		sh -c 'apt-get -qq update >/dev/null 2>&1 && \
 		apt-get -qq install -y passt nftables file >/dev/null 2>&1; \
-		sh /src/poc/use_cases.sh' 
+		sh /src/tests/linux/use_cases.sh' 
 
 # Known escape vectors (design doc §3.10), each actually attempted.
-escape-linux: poc/zygo-linux-musl
+escape-linux: tests/linux/bin/zygo-linux-musl
 	docker run --rm --privileged -v "$(PWD):/src:ro" \
 		-e ZYGO_DATA_HOME=/tmp/zdata python:3.12-slim \
-		sh /src/poc/escape_suite.sh
+		sh /src/tests/linux/escape_suite.sh
 
 # The `gvisor` backend against a real `runsc`, including the same command run
 # on `ns` and on `gvisor` for comparison (requirement N8). The data directory
 # is a volume so the 114 MB runtime is downloaded once, not once per run.
-gvisor-linux: poc/zygo-linux-musl
+gvisor-linux: tests/linux/bin/zygo-linux-musl
 	docker run --rm --privileged -v "$(PWD):/src:ro" \
 		-v zygo-gvisor-data:/data -e ZYGO_DATA_HOME=/data python:3.12-slim \
-		sh /src/poc/verify_gvisor.sh
+		sh /src/tests/linux/verify_gvisor.sh
 
 # Landlock's network rules, which need ABI v4 (kernel 6.7). The container
 # shares the host kernel, so this only runs where the *host* is new enough —
@@ -420,28 +420,28 @@ gvisor-linux: poc/zygo-linux-musl
 # a token, and installing a package runs that package's code. Its own target
 # rather than part of `verify-api-linux` for that reason: the rest of that
 # suite needs no network at all.
-verify-deps-linux: poc/zygo-linux-musl
+verify-deps-linux: tests/linux/bin/zygo-linux-musl
 	docker run --rm --privileged -v "$(PWD):/src:ro" \
 		-e ZYGO_DATA_HOME=/tmp/zdata-deps python:3.12-slim \
 		sh -c 'apt-get -qq update >/dev/null 2>&1 && \
 		apt-get -qq install -y passt nftables >/dev/null 2>&1; \
-		sh /src/poc/deps_probe.sh'
+		sh /src/tests/linux/deps_probe.sh'
 
-landlock-net-linux: poc/zygo-linux-musl
+landlock-net-linux: tests/linux/bin/zygo-linux-musl
 	docker run --rm --privileged -v "$(PWD):/src:ro" \
 		-e ZYGO_DATA_HOME=/tmp/zdata-landlock python:3.12-slim \
 		sh -c 'apt-get -qq update >/dev/null 2>&1 && \
 		apt-get -qq install -y passt nftables >/dev/null 2>&1; \
-		sh /src/poc/verify_landlock_net.sh'
+		sh /src/tests/linux/verify_landlock_net.sh'
 
 # The escape suite attempts the vectors somebody thought of; this attempts
 # every syscall number the architecture has, against all three profiles, and
 # compares what the kernel answered. `bash` because the comparisons use
 # process substitution.
-fuzz-linux: poc/zygo-linux-musl
+fuzz-linux: tests/linux/bin/zygo-linux-musl
 	docker run --rm --privileged -v "$(PWD):/src:ro" \
 		-e ZYGO_DATA_HOME=/tmp/zdata python:3.12-slim \
-		sh -c 'apt-get -qq update >/dev/null 2>&1 && apt-get -qq install -y bash >/dev/null 2>&1; bash /src/poc/fuzz_syscalls.sh'
+		sh -c 'apt-get -qq update >/dev/null 2>&1 && apt-get -qq install -y bash >/dev/null 2>&1; bash /src/tests/linux/fuzz_syscalls.sh'
 
 # Regenerate crates/zygo-core/src/backend/ns/syscalls.rs.
 #
@@ -450,7 +450,7 @@ fuzz-linux: poc/zygo-linux-musl
 # a syscall to any profile in seccomp.rs — a name with no number is silently
 # dropped from the filter.
 syscall-tables:
-	python3 poc/gen_syscall_tables.py
+	python3 tools/gen_syscall_tables.py
 
 # The embedder's benchmark: one import-heavy script through the warm fork, a
 # one-shot sandbox and a container, on one host. The docker socket is mounted
@@ -460,14 +460,14 @@ syscall-tables:
 # `kern` is not downloaded by this target. Point ZYGO_BENCH_KERN at a binary
 # you fetched yourself to add the column — the path is read inside the
 # container, so it has to be under the checkout or another mounted directory.
-bench-embed: poc/zygo-linux-musl
+bench-embed: tests/linux/bin/zygo-linux-musl
 	@mkdir -p /tmp/zygo-bench-embed
 	docker run --rm --privileged -v "$(PWD):/src:ro" \
 		-v /var/run/docker.sock:/var/run/docker.sock \
 		-v /tmp/zygo-bench-embed:/work \
 		-e ZYGO_DATA_HOME=/tmp/zdata-embed -e ZYGO_BENCH_KERN \
 		-e WORK_DIR=/work -e ZYGO_BENCH_HOST_DIR=/tmp/zygo-bench-embed \
-		python:3.12-slim sh /src/poc/bench_embed.sh $(ARGS)
+		python:3.12-slim sh /src/tests/linux/bench_embed.sh $(ARGS)
 
 # What one more warm script costs this host. The number an embedder with ten
 # thousand scripts asks first, and the one Phase 1 of the embedded-runtime
@@ -476,10 +476,10 @@ bench-embed: poc/zygo-linux-musl
 #   ARGS="--scripts 32"            a zygote per script, the Phase 0 shape
 #   ARGS="--pool --scripts 1000"   one runtime pool, the Phase 1 shape, with
 #                                  a warm function as the control
-bench-density: poc/zygo-linux-musl
+bench-density: tests/linux/bin/zygo-linux-musl
 	docker run --rm --privileged -v "$(PWD):/src:ro" \
 		-e ZYGO_DATA_HOME=/tmp/zdata-density python:3.12-slim \
-		sh /src/poc/bench_density.sh $(ARGS)
+		sh /src/tests/linux/bench_density.sh $(ARGS)
 
 # Every number in the README and docs/book/25-performance.md, reproduced on this
 # host, with the host printed. Privileged because it starts real sandboxes;
@@ -489,21 +489,21 @@ bench-density: poc/zygo-linux-musl
 # It exits 2 rather than 0 or 1 when the machine was throttled or busy while it
 # ran: those numbers are not a verdict and the exit code says which kind of
 # non-zero it is.
-bench: poc/zygo-linux-musl
+bench: tests/linux/bin/zygo-linux-musl
 	docker run --rm --privileged -v "$(PWD):/src:ro" \
 		-e ZYGO_DATA_HOME=/tmp/zdata-bench python:3.12-slim \
-		sh /src/poc/bench_all.sh
+		sh /src/tests/linux/bench_all.sh
 
 # `make bench`, and the warm path's phases with and without a per-request
 # cgroup, kept as JSON in bench/results/<date>-<kernel>-<arch>/ — the raw
 # record behind docs/book/25-performance.md. A missed budget is recorded too.
-bench-record: poc/zygo-linux-musl
+bench-record: tests/linux/bin/zygo-linux-musl
 	@mkdir -p bench/results
 	docker run --rm --privileged -v "$(PWD):/src:ro" -v "$(PWD)/bench/results:/out" \
 		-e ZYGO_DATA_HOME=/tmp/zdata-bench python:3.12-slim sh -c '\
 		dir=/out/$$(date +%Y-%m-%d)-$$(uname -r | cut -d- -f1)-$$(uname -m); mkdir -p $$dir; \
-		sh /src/poc/bench_all.sh --json | sed -n "/^{/,\$$p" > $$dir/all.json; \
-		. /src/poc/cgroup_harness.sh >/dev/null; zygo=/src/poc/zygo-linux-musl; \
+		sh /src/tests/linux/bench_all.sh --json | sed -n "/^{/,\$$p" > $$dir/all.json; \
+		. /src/tests/linux/cgroup_harness.sh >/dev/null; zygo=/src/tests/linux/bin/zygo-linux-musl; \
 		$$zygo bench warm --n 3000 --rate 250 --json > $$dir/warm.json; \
 		$$zygo bench warm --n 3000 --rate 250 --no-cgroup --json > $$dir/warm-no-cgroup.json; \
 		echo "recorded in bench/results/$${dir#/out/}; add a line for it to bench/README.md"'
@@ -515,7 +515,7 @@ dist-linux:
 		rust:1-alpine sh -c '\
 		apk add --no-cache musl-dev file >/dev/null && \
 		cargo build --release && \
-		sh /src/poc/check_dist.sh /tmp/target/release/zygo'
+		sh /src/tests/linux/check_dist.sh /tmp/target/release/zygo'
 
 fmt:
 	cargo fmt --all
@@ -561,20 +561,20 @@ clean:
 #
 # Two containers because they are two images. The Node half is the one that
 # found `socketpair` missing from `strict`.
-seccomp-matrix-linux: poc/zygo-linux-musl
+seccomp-matrix-linux: tests/linux/bin/zygo-linux-musl
 	docker run --rm --privileged -v "$(PWD):/src:ro" python:3.12-slim \
-		sh /src/poc/seccomp_matrix.sh
+		sh /src/tests/linux/seccomp_matrix.sh
 	docker run --rm --privileged -v "$(PWD):/src:ro" python:3.12-slim \
-		sh /src/poc/seccomp_matrix_node.sh
+		sh /src/tests/linux/seccomp_matrix_node.sh
 
 # Popular PyPI packages imported in a zygote and forked under load: hangs,
 # disagreeing children, shared randomness, leaked state, the spawn fallback.
 # The data home is a volume, so venvs are built once. `PACKAGES=a,b` narrows
 # it; `HEAVY=1` adds torch.
-fork-sweep-linux: poc/zygo-linux-musl
+fork-sweep-linux: tests/linux/bin/zygo-linux-musl
 	docker run --rm --privileged -v "$(PWD):/src:ro" -v zygo-sweep-data:/zdata \
 		-v "$(PWD)/mhmt:/out" -e REPORT=/out/fork_sweep.json \
 		-e PACKAGES -e HEAVY -e REQUESTS -e PARALLEL python:3.12-slim \
 		sh -c 'apt-get -qq update >/dev/null 2>&1 && \
 		apt-get -qq install -y passt nftables >/dev/null 2>&1; \
-		sh /src/poc/fork_sweep.sh'
+		sh /src/tests/linux/fork_sweep.sh'

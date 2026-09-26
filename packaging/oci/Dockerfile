@@ -7,7 +7,7 @@
 #
 # The binary comes from the **build context** rather than from a builder stage
 # here. The release workflow has already built, size-checked and run it for
-# each architecture (`poc/check_dist.sh`, requirement N6), and compiling it a
+# each architecture (`tests/linux/check_dist.sh`, requirement N6), and compiling it a
 # second time inside Docker would produce a *different* binary from the one
 # that was checked — the one thing a release image must not do. `make
 # oci-image` does the same locally.

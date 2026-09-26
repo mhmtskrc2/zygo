@@ -610,8 +610,8 @@ brew install lima
 ### "the Linux build is missing"
 
 ```bash
-make guest-build             # compiled inside the VM; needs no Docker
-make poc/zygo-linux-musl     # the same binary, built in a Docker container
+make guest-build                       # compiled inside the VM; needs no Docker
+make tests/linux/bin/zygo-linux-musl   # the same binary, built in a Docker container
 ```
 
 That is the binary that runs inside the VM. A release ships it beside the Mac

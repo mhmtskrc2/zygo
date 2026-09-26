@@ -316,8 +316,8 @@ this reason ([chapter 22](22-troubleshooting.md) has the error and the fix).
 A container set up this way is no easier to escape than the host it runs on.
 That is the point: the wall Zygo enforces is the one it builds *inside* — the
 sandboxes — not the container around it. The test scripts
-`poc/verify_supervisor.sh` and `poc/verify_api.sh` run in exactly this shape
-in CI, unprivileged, on every change. `make verify-oci` builds the image and
+`tests/linux/verify_supervisor.sh` and `tests/linux/verify_api.sh` run in
+exactly this shape in CI, unprivileged, on every change. `make verify-oci` builds the image and
 runs a sandbox inside it the same way.
 
 ## The container image
@@ -333,7 +333,7 @@ listed in the release's `SHA256SUMS`. It is Alpine plus a few programs:
 
 | In the image | Why |
 |---|---|
-| `zygo` | the static musl binary, the one `poc/check_dist.sh` checked for size |
+| `zygo` | the static musl binary, the one `tests/linux/check_dist.sh` checked for size |
 | `pasta`, `nft`, `tc` | what `network = "egress"` needs; without them egress is refused with a reason, never quietly opened |
 | `newuidmap`, `newgidmap` | how a non-root user maps a *range* of user ids; without them every tenant maps to one host uid and that separation is lost |
 | user 65532 | `nonroot`, the number distroless images use, with a 65536-wide range of sub-ids |

@@ -95,7 +95,7 @@ jobs:
 
       # N6, checked by the same script `make dist-linux` runs.
       - name: Static, and inside the size budget
-        run: sh poc/check_dist.sh target/${{ matrix.target }}/release/zygo
+        run: sh tests/linux/check_dist.sh target/${{ matrix.target }}/release/zygo
 
       # It has to actually run, on this architecture, before it is a release.
       # `doctor` is the one command that works anywhere and exercises the
@@ -359,7 +359,7 @@ jobs:
   # The release itself. Last, so a build that fails leaves no half-release.
   # The container image, one per architecture, then one manifest list over
   # both. Built from the binary the `linux` job already produced and checked
-  # (`poc/check_dist.sh`): compiling a second time inside Docker would put a
+  # (`tests/linux/check_dist.sh`): compiling a second time inside Docker would put a
   # *different* binary in the image from the one that was size-checked and
   # run, which is the one thing a release image must not do.
   #
@@ -424,7 +424,7 @@ jobs:
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
-          OCI_IMAGE=zygo:${{ matrix.arch }} sh poc/verify_oci.sh
+          OCI_IMAGE=zygo:${{ matrix.arch }} sh tests/linux/verify_oci.sh
 
       - name: Log in to ghcr.io
         if: needs.what.outputs.publish == 'true'

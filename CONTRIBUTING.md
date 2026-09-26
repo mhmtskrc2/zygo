@@ -71,6 +71,11 @@ spec/protocol.md     the wire protocol
 sdk/python           the Python client, and the async one beside it
 sdk/node             the Node client, with types and no build step
 packaging/oci        the container image, and a worker image built on it
+tests/linux          the suites that need a real kernel: escapes, syscalls,
+                     seccomp, the supervisor, the API; see tests/README.md
+tests/poc            the Phase 0 proofs of concept the design was checked on
+tools                the seccomp syscall table generator
+bench                benchmark records behind chapter 25
 ```
 
 ## The rules the code is held to

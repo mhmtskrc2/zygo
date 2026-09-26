@@ -962,7 +962,7 @@ class Agent:
                 # a fresh two seconds. Waiting a fixed period and beating only
                 # when the wait expired is what this did, and it meant the
                 # heartbeat was starved by traffic: measured with
-                # `poc/agent_stall.py`, one `PING` from the supervisor a
+                # `tests/linux/agent_stall.py`, one `PING` from the supervisor a
                 # second into a three-second request pushed the beat past the
                 # end of the request, and an agent busy enough to be woken
                 # every couple of seconds would never beat at all. That is
@@ -1326,7 +1326,7 @@ class Agent:
         to completion inside this method and answer every `EXEC` that arrived
         meanwhile with `overloaded`: a function served with `concurrency = 8`
         whose import started a thread failed 40 of 49 requests in the fork
-        sweep (`poc/fork_sweep.py`).
+        sweep (`tests/linux/fork_sweep.py`).
         """
         import subprocess
 

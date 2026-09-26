@@ -33,6 +33,13 @@ break things and will say so here.
 
 ### Changed
 
+- The kernel-level test suites moved from `poc/` to `tests/linux/`, the
+  Phase 0 proofs of concept to `tests/poc/`, and the syscall table generator
+  to `tools/`. The `make` targets are unchanged, except the one named after
+  the binary it builds: `make tests/linux/bin/zygo-linux-musl` replaces
+  `make poc/zygo-linux-musl`, and every build output now lands in
+  `tests/linux/bin/`.
+
 - CI builds with the `rust-version` the manifest declares and treats a broken
   rustdoc link as an error; `make lint` does the same. The lint policy is
   written down in `Cargo.toml`'s `[workspace.lints]`.

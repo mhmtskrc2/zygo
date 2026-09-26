@@ -1,0 +1,2 @@
+# The build outputs beside the suites are not part of the vm build image.
+bin/

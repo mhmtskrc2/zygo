@@ -40,7 +40,7 @@ cgroup on the host, which is worse than the privilege it was avoiding.
 
 | | |
 |---|---|
-| `zygo` | the static musl binary, the one `poc/check_dist.sh` size-checked |
+| `zygo` | the static musl binary, the one `tests/linux/check_dist.sh` size-checked |
 | `pasta`, `nft`, `tc` | what `network = "egress"` needs. Without them egress is refused with a reason rather than quietly opened |
 | `newuidmap`, `newgidmap` | how a non-root uid maps a *range*. Without them every tenant maps to one host uid and the uid-level separation is gone |
 | uid 65532 | `nonroot`, the number distroless uses, with a 65536-wide subordinate range |

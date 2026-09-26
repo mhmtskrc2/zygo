@@ -985,8 +985,8 @@ directly, for a one-off not worth registering. The request never reaches the
 zygote: the supervisor writes the script into the sandbox, and the forked
 child loads it after the child's seccomp filter (its list of allowed system
 calls) is installed. That is what makes it safe for two tenants to share a
-pool. It is checked, not just claimed: `poc/verify_api.sh` asks a script where
-it was loaded from and whether it can list what else is in flight.
+pool. It is checked, not just claimed: `tests/linux/verify_api.sh` asks a
+script where it was loaded from and whether it can list what else is in flight.
 
 ### A pool with no agent
 

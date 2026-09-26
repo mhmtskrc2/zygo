@@ -618,7 +618,7 @@ has to be at least **10× under** the best one-shot runner on an import-heavy
 script, or the product idea is wrong.
 
 ```bash
-make bench-embed            # or: sh poc/bench_embed.sh --runs 100
+make bench-embed            # or: sh tests/linux/bench_embed.sh --runs 100
 ```
 
 ## What the embedder's benchmark ran

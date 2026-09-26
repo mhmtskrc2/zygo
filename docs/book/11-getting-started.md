@@ -277,8 +277,8 @@ make guest-build             # the Linux build that runs inside it, compiled in 
 
 `make guest-build` needs nothing but the VM. It installs a Rust toolchain
 inside the VM on first use. On a Mac that already has Docker,
-`make poc/zygo-linux-musl` builds the same binary in a Docker container
-instead.
+`make tests/linux/bin/zygo-linux-musl` builds the same binary in a Docker
+container instead.
 
 ## Checking the host: `zygo doctor`
 

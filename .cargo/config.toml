@@ -14,7 +14,7 @@
 # down here rather than rediscovered.
 #
 # The assertion is true where Zygo builds: Alpine has shipped musl 1.2.x since
-# 3.12, and `make poc/zygo-linux-musl` builds in `rust:1-alpine`. A host with
-# musl older than 1.2.3 is not one this project supports.
+# 3.12, and `make tests/linux/bin/zygo-linux-musl` builds in `rust:1-alpine`.
+# A host with musl older than 1.2.3 is not one this project supports.
 [target.'cfg(target_env = "musl")']
 rustflags = ["--cfg", "musl_v1_2_3"]

@@ -1,0 +1,59 @@
+# Build environment for the `vm` backend .
+#
+# The question this image exists to answer is **V1**: does libkrun build and
+# link against musl? Everything about the plan's distribution story hangs on
+# it — `dist-linux` ships one static binary under 15 MB, and if libkrun needs
+# glibc then the vm-capable build is a separate target and the README has to
+# say so rather than pretending.
+#
+# So this is deliberately an *experiment* before it is a build: it clones the
+# pinned libkrun, tries the build, and reports what it produced. The answer is
+# the deliverable, whichever way it goes.
+#
+# Alpine, because that is what `make tests/linux/bin/zygo-linux-musl` already uses to
+# produce the binary this would link into.
+FROM rust:1-alpine
+
+# libkrun's own build needs a C toolchain, `make`, and `patch` for the
+# vendored crates it fixes up. `linux-headers` because it compiles against
+# KVM's uapi. `bash` because its Makefile is not POSIX sh.
+# `clang-dev` and `llvm-dev` are not optional: libkrun's dependency tree
+# reaches `bindgen` through `clang-sys`, which needs a real `libclang` at
+# build time. The first run of this probe discovered that by failing on it.
+# Two sets of dependencies, for two different builds.
+#
+# libkrun's: a C toolchain, `make`, `patch`, and `clang-dev`/`llvm-dev`,
+# because its dependency tree reaches `bindgen` through `clang-sys` and that
+# needs a real `libclang` at build time.
+#
+# The guest kernel's: `xz`, `tar`, `cpio`, `rsync`, `perl`, `bc`, `elfutils`
+# and `openssl` headers. A kernel build without `xz` fails in
+# `kernel/kheaders_data.tar.xz` with exit 127 — "command not found", four
+# hundred lines into an otherwise healthy compile.
+RUN apk add --no-cache \
+        musl-dev gcc make patch bash git curl file pkgconfig \
+        linux-headers python3 flex bison \
+        clang-dev llvm-dev clang-static \
+        xz tar cpio rsync perl bc diffutils findutils \
+        elfutils-dev openssl-dev zstd py3-elftools \
+    && rustup component add rust-src
+
+WORKDIR /build
+
+# Pinned, not `main`: a build that answers V1 has to answer it about a
+# specific commit, and "it worked last week" is not a pin. Overridable so the
+# question can be re-asked of a newer one.
+ARG LIBKRUN_REF=v1.9.7
+ARG LIBKRUNFW_REF=v4.5.1
+
+# The script does the work and prints a verdict, rather than the Dockerfile
+# failing with a wall of compiler output: a `RUN` that exits non-zero loses
+# the thing being measured.
+COPY vm_build_probe.sh /build/vm_build_probe.sh
+COPY vm_kernel.sh /build/vm_kernel.sh
+RUN chmod +x /build/vm_build_probe.sh /build/vm_kernel.sh
+
+# No entrypoint: this image is used two ways — `make vm-build` runs a cargo
+# build in it, and `make vm-probe` runs the script above. An entrypoint would
+# make the first awkward and the second no clearer.
+

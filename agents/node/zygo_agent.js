@@ -574,7 +574,7 @@ function withProgress(event, id, streaming) {
 /// Node writes to a **pipe** asynchronously: `process.stdout.write` copies
 /// into an in-process queue and the bytes leave on a later turn of the event
 /// loop. A handler that is computing never gives that turn back, so measured
-/// with `poc/agent_stall.py --bytes 1048576` on `node:22` against a handler
+/// with `tests/linux/agent_stall.py --bytes 1048576` on `node:22` against a handler
 /// that wrote a megabyte and then spun for three seconds:
 ///
 /// * 70 KB of it reached the supervisor while the handler spun; the rest sat

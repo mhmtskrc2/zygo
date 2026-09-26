@@ -612,7 +612,7 @@ Node sandbox Zygo runs.
 ## A handler that computes without yielding
 
 A request that spends three seconds in a tight loop is the test of whether an
-agent's own housekeeping survives. [`poc/agent_stall.py`](../../poc/agent_stall.py)
+agent's own housekeeping survives. [`tests/linux/agent_stall.py`](../../tests/linux/agent_stall.py)
 measures it. It drives an agent over a socket pair and sends one streaming
 request whose script writes, reports progress, then spins without yielding. It
 prints when each frame came back. Against both reference agents, with the

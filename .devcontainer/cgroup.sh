@@ -1,7 +1,7 @@
 #!/bin/sh
 # SPDX-License-Identifier: Apache-2.0
 # Run at every container start: make the container's cgroup tree one Zygo can
-# build sandboxes in. The same steps poc/cgroup_harness.sh takes for the test
+# build sandboxes in. The same steps tests/linux/cgroup_harness.sh takes for the test
 # suites' containers.
 #
 # The container starts at the root of its own cgroup namespace, with processes

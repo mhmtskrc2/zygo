@@ -298,8 +298,8 @@ A Python zygote re-warms in about **150–185 ms** on a Raspberry Pi 5, the
 supervisor's start included, and in 34 ms on the Lima VM with a supervisor
 already running ([chapter 25](25-performance.md#warming-up)). When this was
 decided, before the bytecode layer, it was about 500 ms (502 ms for a pool,
-508 ms for a function, from `poc/api_driver.py`). A Node zygote is ready in
-15–43 ms. So an upgrade costs `min_warm × warm-up` of cold pool per replica,
+508 ms for a function, from `tests/linux/api_driver.py`). A Node zygote is
+ready in 15–43 ms. So an upgrade costs `min_warm × warm-up` of cold pool per replica,
 once. A single-replica deployment has a short window where requests are slow,
 not failed; two replicas remove it, and the Kubernetes example uses two. In
 return, descriptors stay `CLOEXEC` with no exceptions, and Zygo keeps only one

@@ -47,13 +47,13 @@ jobs:
           SRC: ${{ github.workspace }}
           ZYGO_DATA_HOME: /tmp/zygo-bench
         run: |
-          . poc/ci_cgroup.sh
-          install -m 0755 target/release/zygo poc/zygo-linux-musl
+          . tests/linux/ci_cgroup.sh
+          install -Dm755 target/release/zygo tests/linux/bin/zygo-linux-musl
           dir="bench-results/$(date +%Y-%m-%d)-$(uname -r | cut -d- -f1)-$(uname -m)"
           mkdir -p "$dir"
           # Exit 1 is a missed budget and 2 a disturbed machine: both are
           # results worth keeping, so neither stops the step.
-          sh poc/bench_all.sh --json | sed -n '/^{/,$p' > "$dir/all.json" || true
+          sh tests/linux/bench_all.sh --json | sed -n '/^{/,$p' > "$dir/all.json" || true
           ./target/release/zygo bench warm --n 3000 --rate 250 --json > "$dir/warm.json" || true
           ./target/release/zygo bench warm --n 3000 --rate 250 --no-cgroup --json \
             > "$dir/warm-no-cgroup.json" || true
