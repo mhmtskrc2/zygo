@@ -132,7 +132,7 @@ A reader once used this profile wrongly and drew the wrong conclusion, so it
 is worth saying plainly. `permissive` means "the default plus namespaces,
 mounts, ptrace and friends" — the set Docker's default profile allows. It is
 **not** "no filter", and it is not the "turn seccomp off" step when you debug.
-The first adoption report tried `--seccomp permissive` against a failure whose
+An early user tried `--seccomp permissive` against a failure whose
 cause (`listxattr`, below) was in *no* list, saw no change, and decided the
 flag did nothing. It did work; the syscall was simply missing from all three
 profiles. If something fails under `permissive` too, follow the
@@ -150,7 +150,7 @@ without running anything.
 *Extended attributes* are small name–value labels stored on a file, next to
 its normal owner and mode. Every profile allows the whole family —
 `getxattr`, `listxattr`, `setxattr`, `removexattr` and their `l`/`f` forms —
-since the first adoption report found `listxattr` missing. `shutil.copy2` calls
+since an early user found `listxattr` missing. `shutil.copy2` calls
 it, and `pip install --target` is one `copy2` per file, so a profile without it
 broke every Python package install into a mounted folder, with a traceback
 about `RECORD`.

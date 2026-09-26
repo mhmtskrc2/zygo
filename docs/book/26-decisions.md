@@ -325,10 +325,10 @@ free of dropped requests, which is the part that matters.
 
 ### The question
 
-The first product to use Zygo as its default sandbox was a multi-tenant application: tenant code
+The shape that forced the question is a multi-tenant application: tenant code
 that changes whenever someone presses Save, hundreds of projects, each with its
-own mounts, network allowlist and per-run secrets. It started with `zygo run`,
-a sandbox per event, and asked three things. Is **one warm zygote per script
+own mounts, network allowlist and per-run secrets. Such a product starts with
+`zygo run`, a sandbox per event, and asks three things. Is **one warm zygote per script
 version** the intended shape? What **evicts** warm zygotes when a server has
 four hundred projects? And can secrets and mounts vary under one warm zygote?
 

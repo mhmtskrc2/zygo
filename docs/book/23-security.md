@@ -255,8 +255,8 @@ guarantee is anything about the public internet under `full`: that mode means
 
 ## Measured against Docker
 
-This was measured, not read from the code, by the first adoption report through
-its own driver on one host. The same probe through Zygo's `--net full` found
+This was measured, not read from the code, with a small connection probe on
+one host. The probe through Zygo's `--net full` found
 *no route* to the metadata address, the host's Postgres, the LAN router and
 `10.0.0.1`, and reached `1.1.1.1:53`. Docker's `--network bridge` on the same
 host reached the host's Postgres and the LAN router, and routed the metadata

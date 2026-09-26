@@ -45,10 +45,10 @@ says 12.3 ms for that, while `zygo bench warm` says **1.44 ms** and 1,108
 requests a second — more than eight times faster, and the gap grows with
 every module the handler imports.
 
-A real multi-tenant application that adopted Zygo chose `run` for
-exactly that reason, and the fourth recommendation of its adoption report was
-to move to warm functions. [The multi-tenant example
-below](#a-multi-tenant-consumer-on-the-warm-path) shows what that looks like.
+A multi-tenant application that starts with `run` for exactly that reason
+should expect to move to warm functions once it counts the events. [The
+multi-tenant example below](#a-multi-tenant-consumer-on-the-warm-path) shows
+what that looks like.
 
 ```text
   one sandbox per event (zygo run)          one warm function (zygo serve + exec)

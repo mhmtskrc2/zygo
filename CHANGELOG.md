@@ -151,6 +151,10 @@ break things and will say so here.
   0001 now quotes the 25 September measurement on both kernels instead of a
   2.92 ms that appears nowhere in chapter 25. Chapter 10's "clean state per
   request" row points at what a fork still shares.
+- The book no longer cites a "first adoption report" that is not in the
+  repository. What it reported — the network probe against Docker, the
+  missing `listxattr`, the `run`-then-`serve` path — stays, as the project's
+  own findings.
 - The examples suite waited 15 seconds for `zygo api` at `/health`, a path
   the API does not serve; it is `/healthz`.
 - The `cargo check` for the musl target warned twice about `libc::time_t`,

@@ -279,9 +279,9 @@ services. [Chapter 14](14-limits-network-secrets.md) covers the modes in use.
 
 ## What the sandbox can reach
 
-The first product to make Zygo its default sandbox (a multi-tenant application, whose adoption
-report this comes from) ran the same probe on the same host, through Zygo's
-`--net full` and Docker's `--network bridge`.
+The same probe, on the same host, was run through Zygo's `--net full` and
+Docker's `--network bridge`: a small script that tries to open a connection to
+each target and reports what the kernel answers.
 
 | target | Zygo `--net full` | Docker `--network bridge` |
 |---|---|---|

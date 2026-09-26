@@ -329,8 +329,8 @@ Find out which syscall, in this order:
 ```
 
 Then report it. A syscall that a real package needs and the profile refuses is
-a bug in the profile. The extended-attribute family was one, until the first
-adoption report found it.
+a bug in the profile. The extended-attribute family was one, until an early
+user found it.
 
 ### Exit 137, and you cannot tell why
 

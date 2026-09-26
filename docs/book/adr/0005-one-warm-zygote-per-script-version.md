@@ -6,12 +6,12 @@ report — a consumer's own write-up, not in this repository — ends on, with n
 
 ## Context
 
-The first product to make Zygo its default sandbox is a multi-tenant application: arbitrary tenant
+The shape that forced this decision is a multi-tenant application: arbitrary tenant
 code that changes whenever somebody presses Save, hundreds of projects, each
-with its own mounts and egress allowlist, and per-run secrets. It adopted
-`zygo run` — a sandbox per event, 171 ms from a Mac shell of which ~23 ms is
-the sandbox — because the mapping was obvious, and asked whether `zygo serve`
-was meant for its shape at all. Three things had to be decided:
+with its own mounts and egress allowlist, and per-run secrets. Such a product
+reaches for `zygo run` first — a sandbox per event, 171 ms from a Mac shell of
+which ~23 ms is the sandbox — because the mapping is obvious, and then asks
+whether `zygo serve` is meant for its shape at all. Three things had to be decided:
 
 1. Is **one warm zygote per script version** the intended shape?
 2. What is the **eviction policy** when a server has four hundred projects?
