@@ -8,7 +8,7 @@
 //!
 //! What keeps a hand-written document from drifting is not discipline — it is
 //! `tests::every_route_in_the_router_is_in_the_document`, which reads
-//! `api.rs`'s own source with `include_str!`, extracts every arm of the
+//! `api/mod.rs`'s own source with `include_str!`, extracts every arm of the
 //! routing `match`, and fails if one is missing here. Adding a route without
 //! documenting it is a test failure rather than a thing somebody notices in
 //! six months.
@@ -416,7 +416,7 @@ mod tests {
 
     /// Every arm of the router's `match` appears in [`ROUTES`].
     ///
-    /// The whole reason a hand-written document is safe. It reads `api.rs`'s
+    /// The whole reason a hand-written document is safe. It reads `api/mod.rs`'s
     /// source — not its behaviour, which cannot be enumerated from outside —
     /// and fails when a route is added without being documented.
     ///
@@ -425,7 +425,7 @@ mod tests {
     /// generated artefact to go stale.
     #[test]
     fn every_route_in_the_router_is_in_the_document() {
-        let source = include_str!("api.rs");
+        let source = include_str!("api/mod.rs");
         let documented: BTreeSet<String> = ROUTES
             .iter()
             .map(|r| format!("{} {}", r.method.to_uppercase(), r.path))
@@ -452,7 +452,7 @@ mod tests {
     /// Nothing is documented that the router does not answer.
     #[test]
     fn nothing_is_documented_that_does_not_exist() {
-        let source = include_str!("api.rs");
+        let source = include_str!("api/mod.rs");
         let real: BTreeSet<String> = source.lines().filter_map(route_of).collect();
         for route in ROUTES {
             let arm = format!("{} {}", route.method.to_uppercase(), route.path);

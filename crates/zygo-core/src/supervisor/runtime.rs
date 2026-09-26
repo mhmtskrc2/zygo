@@ -450,11 +450,9 @@ impl Supervisor {
         // owner is the only answer to "who may cancel this?".
         let outcome = zygote
             .function
-            .call_full(
-                event,
-                Some(script),
-                timeout,
-                tenant,
+            .call_full(crate::pool::Call {
+                script: Some(script),
+                caller: tenant,
                 key,
                 sink,
                 workspace,
@@ -464,7 +462,8 @@ impl Supervisor {
                 tenant_limits,
                 // And whose secrets: the same answer, for the same reason.
                 secrets,
-            )
+                ..crate::pool::Call::new(event, timeout)
+            })
             .map(|(outcome, _)| outcome)
             .map_err(|e| Response::error(ControlError::CallFailed, e));
         drop(permit);

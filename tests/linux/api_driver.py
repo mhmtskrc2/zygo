@@ -3,7 +3,7 @@
 """The HTTP API and the Python client, against a real kernel.
 
 The unit tests on either side of this are thorough and neither can catch what
-it does. `cmd/api.rs`'s tests check the routing and the ceilings with no
+it does. `cmd/api/`'s tests check the routing and the ceilings with no
 supervisor behind them; `sdk/python`'s check the client against a stand-in that
 runs no sandbox. What is untested until here is the whole line:
 
