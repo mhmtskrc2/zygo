@@ -109,11 +109,12 @@ jobs:
       # one way is a build nobody has tried.
       - run: cargo test -p zygo-core --no-default-features
 
-      # The two SDKs against their stand-in API. Both have Python and Node on
-      # every runner in this matrix; the release workflow runs the same suite
-      # again before it publishes them.
+      # The Python and Node SDKs against their stand-in API. Both languages
+      # are on every runner in this matrix; the Elixir one is not, and has a
+      # job of its own below. The release workflow runs all three again
+      # before it publishes them.
       - name: SDK tests
-        run: make test-sdk
+        run: make test-sdk-python test-sdk-node
 
       - name: Python agent unit tests
         run: python3 -W error::ResourceWarning -m unittest discover -s agents/python
@@ -183,6 +184,29 @@ jobs:
       # Cheap after the check above — the same compilation, linked into test
       # binaries — and it catches a dev-dependency above the floor.
       - run: cargo test --workspace --no-run --locked
+
+  # The Elixir SDK, on the oldest Elixir it declares (1.18, the first with a
+  # JSON module) and a current one. `make test-sdk-elixir` is what a
+  # developer runs too: formatted, no compiler warning, and the suite.
+  sdk-elixir:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    name: sdk (elixir ${{ matrix.elixir }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - elixir: "1.18"
+            otp: "27"
+          - elixir: "1.20"
+            otp: "28"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+        with:
+          elixir-version: ${{ matrix.elixir }}
+          otp-version: ${{ matrix.otp }}
+      - run: make test-sdk-elixir
 
   # The launcher can only be exercised on Linux, and the interesting question is
   # whether it works *without* root — requirement N5.

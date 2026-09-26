@@ -19,7 +19,8 @@ secret that leaks goes through [SECURITY.md](SECURITY.md), privately.
 
 ## Building
 
-You need Rust 1.88 or newer. Everything that needs a Linux kernel — the
+You need Rust 1.88 or newer, and for the SDK suites Python 3.9, Node 18 and
+Elixir 1.18 or newer. Everything that needs a Linux kernel — the
 sandbox itself — runs in Docker, so a Mac works for all of it. Or open the
 repository in its dev container (VS Code, or a Codespace), where the tools are
 installed and sandboxes run directly.
@@ -71,6 +72,7 @@ agents/node          the reference Node agent: a worker pool, not a fork
 spec/protocol.md     the wire protocol
 sdk/python           the Python client, and the async one beside it
 sdk/node             the Node client, with types and no build step
+sdk/elixir           the Elixir client (`zygo_sdk` on Hex), on Mint and NimblePool
 packaging/oci        the container image, and a worker image built on it
 tests/linux          the suites that need a real kernel: escapes, syscalls,
                      seccomp, the supervisor, the API; see tests/README.md
@@ -112,7 +114,7 @@ alike. The ones a first pull request most often trips on:
 * Add a line under *Unreleased* in [CHANGELOG.md](CHANGELOG.md) for anything a
   user would notice.
 * New source files start with `// SPDX-License-Identifier: Apache-2.0`
-  (or `#` for Python and shell).
+  (or `#` for Python, shell and Elixir).
 
 By sending a pull request you agree that your contribution is licensed under
 the [Apache License 2.0](LICENSE), the same as the rest of the project.
@@ -121,11 +123,12 @@ the [Apache License 2.0](LICENSE), the same as the rest of the project.
 
 A release is one tag; the workflow in `.github/workflows/release.yml` builds
 and publishes everything from it — binaries, the image, the crates, the
-Homebrew formula and the two `zygo-sdk` packages. It refuses a tag whose
-version differs from any manifest, so the version is written in one step:
+Homebrew formula, the two `zygo-sdk` packages and `zygo_sdk` on Hex. It
+refuses a tag whose version differs from any manifest, so the version is
+written in one step:
 
 ```bash
-make bump VERSION=0.1.4      # Cargo.toml, both SDK manifests, spec/openapi.json, chapter 17
+make bump VERSION=0.1.4      # Cargo.toml, all three SDK manifests, spec/openapi.json, chapter 17
 ```
 
 Then turn *Unreleased* in [CHANGELOG.md](CHANGELOG.md) into the version's

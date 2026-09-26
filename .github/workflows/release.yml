@@ -275,17 +275,18 @@ jobs:
             echo "::warning::CARGO_REGISTRY_TOKEN is not set, so nothing went to crates.io"
           fi
 
-  # The two SDKs, `zygo-sdk` on PyPI and on npm. Both are built and tested on
-  # every run; they are uploaded only on a real tag, and only where the
-  # repository has been set up for it — otherwise the job says so, as the
-  # crates job does.
+  # The three SDKs: `zygo-sdk` on PyPI and on npm, `zygo_sdk` on Hex. All are
+  # built and tested on every run; they are uploaded only on a real tag, and
+  # only where the repository has been set up for it — otherwise the job says
+  # so, as the crates job does.
   #
   # PyPI by trusted publishing: no token at all, PyPI trusts this workflow
   # on this repository. Turned on by the repository variable
   # `PYPI_TRUSTED_PUBLISHING=true` once the publisher is registered on
   # pypi.org. npm with provenance, from the `NPM_TOKEN` secret — a granular
   # access token that bypasses 2FA, since nobody is here to type a one-time
-  # password; a token without that fails with EOTP.
+  # password; a token without that fails with EOTP. Hex from the
+  # `HEX_API_KEY` secret, a key with the `api:write` permission only.
   sdks:
     needs: what
     runs-on: ubuntu-24.04
@@ -297,6 +298,7 @@ jobs:
       id-token: write
     env:
       NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+      HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
       PYPI_TRUSTED_PUBLISHING: ${{ vars.PYPI_TRUSTED_PUBLISHING }}
       VERSION: ${{ needs.what.outputs.version }}
     steps:
@@ -308,6 +310,10 @@ jobs:
         with:
           node-version: "22"
           registry-url: https://registry.npmjs.org
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+        with:
+          elixir-version: "1.18"
+          otp-version: "27"
 
       # The same rule as for Cargo.toml: the tag and the manifests agree, or
       # the upload is a version nobody can check out.
@@ -316,7 +322,8 @@ jobs:
         run: |
           py=$(grep -m1 '^version' sdk/python/pyproject.toml | cut -d'"' -f2)
           js=$(node -p "require('./sdk/node/package.json').version")
-          for v in "$py" "$js"; do
+          ex=$(sed -n 's/^  @version "\(.*\)"$/\1/p' sdk/elixir/mix.exs)
+          for v in "$py" "$js" "$ex"; do
             if [ "$v" != "$VERSION" ]; then
               echo "::error::an SDK says $v, the tag says $VERSION"
               exit 1
@@ -333,6 +340,14 @@ jobs:
 
       - name: Pack the Node package
         run: npm pack ./sdk/node --pack-destination dist
+
+      # `hex.build` checks the package metadata and the file list the same
+      # way `hex.publish` will, so a rehearsal finds what a release would.
+      - name: Build the Elixir package
+        working-directory: sdk/elixir
+        run: |
+          mix local.hex --force
+          mix hex.build
 
       - name: Publish to PyPI
         if: needs.what.outputs.publish == 'true' && env.PYPI_TRUSTED_PUBLISHING == 'true'
@@ -351,8 +366,17 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish ./sdk/node --provenance --access public
 
+      # Last, because Hex refuses a version it already has and has no
+      # `skip-existing`. Every step before this one tolerates a re-run, so a
+      # re-run of the job reaches this step again only if it has not yet
+      # succeeded.
+      - name: Publish to Hex
+        if: needs.what.outputs.publish == 'true' && env.HEX_API_KEY != ''
+        working-directory: sdk/elixir
+        run: mix hex.publish --yes
+
       - name: Say what was not published
-        if: needs.what.outputs.publish != 'true' || env.PYPI_TRUSTED_PUBLISHING != 'true' || env.NPM_TOKEN == ''
+        if: needs.what.outputs.publish != 'true' || env.PYPI_TRUSTED_PUBLISHING != 'true' || env.NPM_TOKEN == '' || env.HEX_API_KEY == ''
         run: |
           if [ "${{ needs.what.outputs.publish }}" != true ]; then
             echo "a rehearsal: built and tested, not published"
@@ -362,6 +386,8 @@ jobs:
             echo "::warning::PYPI_TRUSTED_PUBLISHING is not true, so nothing went to PyPI"
           [ -n "$NPM_TOKEN" ] || \
             echo "::warning::NPM_TOKEN is not set, so nothing went to npm"
+          [ -n "$HEX_API_KEY" ] || \
+            echo "::warning::HEX_API_KEY is not set, so nothing went to Hex"
 
   # The release itself. Last, so a build that fails leaves no half-release.
   # The container image, one per architecture, then one manifest list over

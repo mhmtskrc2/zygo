@@ -5,8 +5,8 @@
 #   tools/bump_version.sh 0.1.4
 #
 # The release workflow refuses a tag whose version differs from Cargo.toml or
-# either SDK manifest, and a unit test refuses a spec/openapi.json whose
-# `info.version` is not this build's. Five files and one generated document,
+# any SDK manifest, and a unit test refuses a spec/openapi.json whose
+# `info.version` is not this build's. Six files and one generated document,
 # in one place; CHANGELOG.md is still written by hand.
 set -eu
 
@@ -25,7 +25,8 @@ sub Cargo.toml "s/^version = \"$old\"/version = \"$v\"/; s/version = \"$old\" }/
 sub sdk/python/pyproject.toml "s/^version = \"$old\"/version = \"$v\"/"
 sub sdk/python/src/zygo_sdk/__init__.py "s/^__version__ = \"$old\"/__version__ = \"$v\"/"
 sub sdk/node/package.json "s/\"version\": \"$old\"/\"version\": \"$v\"/"
-sub docs/book/17-api-sdk-mcp.md "s/Both packages are \`$old\`/Both packages are \`$v\`/"
+sub sdk/elixir/mix.exs "s/@version \"$old\"/@version \"$v\"/"
+sub docs/book/17-api-sdk-mcp.md "s/All three packages are \`$old\`/All three packages are \`$v\`/"
 
 cargo update -w --quiet
 # The document carries the version, and the test that guards it compares
@@ -33,7 +34,7 @@ cargo update -w --quiet
 cargo run -q --bin zygo -- api --openapi > spec/openapi.json
 
 for f in Cargo.toml sdk/python/pyproject.toml sdk/python/src/zygo_sdk/__init__.py \
-         sdk/node/package.json spec/openapi.json docs/book/17-api-sdk-mcp.md; do
+         sdk/node/package.json sdk/elixir/mix.exs spec/openapi.json docs/book/17-api-sdk-mcp.md; do
   grep -q "\"$v\"\|\`$v\`" "$f" || { echo "$f does not say $v" >&2; exit 1; }
 done
 echo "$old -> $v; now write CHANGELOG.md, then: make test && make lint"
