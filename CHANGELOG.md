@@ -105,6 +105,9 @@ break things and will say so here.
   `tenant`, `retries`, `backoff`), and a test fails when a declaration goes
   missing.
 
+- The examples suite (`make examples-go-linux`) now runs the web-api example
+  end to end: `zygo up`, `zygo serve --runtime`, `zygo api`, the stdlib web
+  server, and the four answers its README prints.
 - Chapter 17: adding `zygo mcp` to Claude Code and Codex.
 - Chapter 11: Windows through WSL2 — systemd, cgroup v2 only, then the
   Linux install. Not yet tested by the project, and marked so.
@@ -133,6 +136,8 @@ break things and will say so here.
 
 ### Fixed
 
+- The examples suite waited 15 seconds for `zygo api` at `/health`, a path
+  the API does not serve; it is `/healthz`.
 - The `cargo check` for the musl target warned twice about `libc::time_t`,
   which the libc crate has deprecated on musl; the timestamp cast no longer
   names it.

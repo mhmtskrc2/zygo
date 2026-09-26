@@ -214,6 +214,33 @@ pull_image node:22-slim || bad "could not pull node:22-slim"
 # API started straight from the shell lands in a cgroup with no delegated
 # controllers, and every `PUT /fn/<name>` then fails with "the ns backend is
 # not available on this host".
+# `zygo` here is the harness's wrapper: a subshell that moves itself into the
+# delegated cgroup and then execs the binary. Backgrounded, `$!` is the
+# subshell, and killing it leaves the API running under init with the port
+# still taken — so the API is stopped by finding its real pid in /proc.
+kill_api() {
+    python3 -c "
+import os, signal
+for pid in os.listdir('/proc'):
+    if not pid.isdigit(): continue
+    try:
+        argv = open(f'/proc/{pid}/cmdline', 'rb').read().split(b'\0')
+    except OSError:
+        continue
+    if len(argv) > 1 and os.path.basename(argv[0]).startswith(b'zygo') and argv[1] == b'api':
+        os.kill(int(pid), signal.SIGTERM)
+"
+    i=0
+    while [ $i -lt 50 ]; do
+        python3 -c "
+import socket, sys
+s = socket.socket(); s.settimeout(0.2)
+sys.exit(0 if s.connect_ex(('127.0.0.1', $1)) != 0 else 1)
+" 2>/dev/null && return 0
+        i=$((i+1)); sleep 0.1
+    done
+    return 1
+}
 zygo api --allow-deploy >/tmp/wf-api.log 2>&1 &
 wf_api=$!
 i=0
@@ -221,7 +248,7 @@ while [ $i -lt 150 ]; do
     python3 -c "
 import sys, urllib.request
 try:
-    urllib.request.urlopen('http://127.0.0.1:7700/health', timeout=1).read()
+    urllib.request.urlopen('http://127.0.0.1:7700/healthz', timeout=1).read()
 except Exception:
     sys.exit(1)
 " >/dev/null 2>&1 && break
@@ -255,7 +282,107 @@ sys.exit(0 if len(rows) == 2 else 1)
     fi
     kill "$wf_api" 2>/dev/null
     wait "$wf_api" 2>/dev/null
+    kill_api 7700 || bad "the workflow engine's API did not release port 7700"
 fi
+cd /tmp || exit 1
+
+# The web-api example, end to end: the three endpoints its README promises,
+# each running code a different way — a warm function from `zygo up`, a
+# runtime pool from `zygo serve --runtime`, and a fresh sandbox through
+# `POST /run` — behind a stdlib web server that talks to `zygo api` with the
+# Python SDK. The answers checked are the ones the README prints.
+say ""
+say "a web API, three ways to run code"
+mkdir -p /tmp/webapi-example && cp -r "$SRC/examples/web-api/." /tmp/webapi-example/
+cd /tmp/webapi-example || exit 1
+rm -f zygo.lock
+if "$ZYGO" up >/tmp/up-webapi.log 2>&1; then
+    ok "\`up\` warms the \`lower\` function"
+else
+    bad "up: $(grep -v '^$' /tmp/up-webapi.log | tail -3 | tr '\n' ' ' | cut -c1-200)"
+fi
+if "$ZYGO" serve --runtime py312 >/tmp/serve-webapi.log 2>&1; then
+    ok "\`serve --runtime py312\` warms the pool"
+else
+    bad "serve --runtime: $(grep -v '^$' /tmp/serve-webapi.log | tail -3 | tr '\n' ' ' | cut -c1-200)"
+fi
+ZYGO_API_TOKEN=$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+export ZYGO_API_TOKEN
+# Its own port, so a lingering API from the section above cannot answer for
+# it; the app finds it through ZYGO_API_URL, as the SDK documents.
+ZYGO_API_URL=http://127.0.0.1:7710
+export ZYGO_API_URL
+zygo api --listen 127.0.0.1:7710 --allow-deploy >/tmp/webapi-api.log 2>&1 &
+webapi_api=$!
+i=0
+while [ $i -lt 150 ]; do
+    python3 -c "
+import sys, urllib.request
+try:
+    urllib.request.urlopen('http://127.0.0.1:7710/healthz', timeout=1).read()
+except Exception:
+    sys.exit(1)
+" >/dev/null 2>&1 && break
+    i=$((i+1)); sleep 0.1
+done
+if ! kill -0 "$webapi_api" 2>/dev/null; then
+    bad "zygo api did not start: $(tail -3 /tmp/webapi-api.log | tr '\n' ' ' | cut -c1-200)"
+else
+    PYTHONPATH=/tmp/wf-sdk python3 app.py >/tmp/webapi-app.log 2>&1 &
+    webapi_app=$!
+    # One POST to the app; prints "<status> <body>" on one line, so a case
+    # pattern can check both without a JSON parser in the shell.
+    post() {
+        python3 -c "
+import json, sys, urllib.request, urllib.error
+req = urllib.request.Request('http://127.0.0.1:8000' + sys.argv[1],
+                             data=sys.argv[2].encode(), method='POST')
+try:
+    with urllib.request.urlopen(req, timeout=30) as r:
+        print(r.status, r.read().decode())
+except urllib.error.HTTPError as e:
+    print(e.code, e.read().decode())
+except Exception as e:
+    print('000', e)
+" "$1" "$2" 2>&1
+    }
+    i=0
+    while [ $i -lt 100 ]; do
+        case "$(post /lower '{"text": "ready?"}')" in
+            200*) break ;;
+            000*) i=$((i+1)); sleep 0.1 ;;
+            *) break ;;
+        esac
+    done
+    case "$(post /lower '{"text": "Hello WORLD"}')" in
+        200*'"text": "hello world"'*) ok "POST /lower: the warm function lower-cases the text" ;;
+        *) bad "POST /lower: $(post /lower '{"text": "Hello WORLD"}' | cut -c1-200)" ;;
+    esac
+    script_body='{"code": "def handler(e):\n    return {\"words\": len(e[\"text\"].split())}", "event": {"text": "one two three"}}'
+    case "$(post /script "$script_body")" in
+        200*'"words": 3'*) ok "POST /script: the pool loads the caller's code and runs it" ;;
+        *) bad "POST /script: $(post /script "$script_body" | cut -c1-200)" ;;
+    esac
+    case "$(post /cold '{"code": "print(6 * 7)"}')" in
+        200*'"exit_code": 0'*'"stdout": "42\n"'*) ok "POST /cold: a fresh sandbox runs the code and its stdout comes back" ;;
+        *) bad "POST /cold: $(post /cold '{"code": "print(6 * 7)"}' | cut -c1-200)" ;;
+    esac
+    case "$(post /script '{"code": "def handler(e):\n    1/0"}')" in
+        422*ZeroDivisionError*) ok "POST /script with code that raises: 422 and the traceback, and the pool survives" ;;
+        *) bad "POST /script raising: $(post /script '{"code": "def handler(e):\n    1/0"}' | cut -c1-200)" ;;
+    esac
+    case "$(post /lower '{"text": "Still UP"}')" in
+        200*'"text": "still up"'*) ok "POST /lower still answers after the failed request" ;;
+        *) bad "POST /lower after a failure: $(post /lower '{"text": "Still UP"}' | cut -c1-200)" ;;
+    esac
+    kill "$webapi_app" 2>/dev/null
+    wait "$webapi_app" 2>/dev/null
+    kill "$webapi_api" 2>/dev/null
+    wait "$webapi_api" 2>/dev/null
+    kill_api 7710 || bad "the web API's zygo api did not release port 7710"
+fi
+unset ZYGO_API_TOKEN ZYGO_API_URL
+"$ZYGO" down >/dev/null 2>&1
 cd /tmp || exit 1
 
 "$ZYGO" stop --all >/dev/null 2>&1
