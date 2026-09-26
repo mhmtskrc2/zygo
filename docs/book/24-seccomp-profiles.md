@@ -221,7 +221,9 @@ the caller asked for.
 | `crypto` + `zlib` + `fs` | works | works | works |
 | `child_process` | works | refused, which is the point of the profile | refused |
 
-Measured on Linux 5.10 (aarch64, Docker Desktop). "Works" means the handler
+Measured on Linux 6.8 (aarch64, the Lima VM) on 26 September 2026, with the
+same result as on Linux 5.10 (Docker Desktop), where it was first run.
+"Works" means the handler
 returned `{"ok": true}` from a real operation — a validation error caught, a
 mean over a million numbers, a CSV grouped, an image resized and encoded, a
 worker thread joined — not just that the module imported.
