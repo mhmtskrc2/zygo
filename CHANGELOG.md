@@ -34,6 +34,8 @@ break things and will say so here.
 ### Changed
 
 - The container image is built on Alpine 3.24 (was 3.21).
+- The `zygo-sdk` packages for PyPI and npm now carry the LICENSE and NOTICE
+  files, as the Apache-2.0 license asks of a distribution.
 - The kernel-level test suites moved from `poc/` to `tests/linux/`, the
   Phase 0 proofs of concept to `tests/poc/`, and the syscall table generator
   to `tools/`. The `make` targets are unchanged, except the one named after
