@@ -791,7 +791,17 @@ print(probe('$gw'))" 2>/dev/null)
             out=$(zygo run --net egress --allow-private-net --allow "$gw/32:8443" "$IMAGE" python3 -c "$PROBE
 print(probe('$gw'))" 2>/tmp/escape.err | tr -d '\n ')
             case "$out" in
-                REACHED-THE-HOST) bad "the gateway address $gw is still answered by the host's loopback" ;;
+                REACHED-THE-HOST)
+                    # Lima starts forwarding a guest port to the Mac a few seconds
+                    # after it is bound, so the reflection can appear between the
+                    # check above and the probe. Ask the host once more before
+                    # calling it an escape.
+                    if [ "$(python3 -c "$PROBE
+print(probe('$gw'))" 2>/dev/null)" = REACHED-THE-HOST ]; then
+                        skip "19c. this host's gateway ($gw) reflects its loopback ports back with no sandbox at all, so pasta's part cannot be told apart here"
+                    else
+                        bad "the gateway address $gw is still answered by the host's loopback"
+                    fi ;;
                 refused:*|connected-*) ok "the gateway address $gw is the gateway, not the host ($out)" ;;
                 *) nothing_ran "19c" ;;
             esac
