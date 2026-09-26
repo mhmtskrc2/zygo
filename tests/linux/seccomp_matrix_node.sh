@@ -42,7 +42,7 @@ while [ $i -lt 100 ]; do
 done
 
 mkdir -p /tmp/matrix-node && cd /tmp/matrix-node || exit 1
-zygo pull node:22-slim >/dev/null 2>&1
+pull_image node:22-slim || exit 1
 
 cat > h_worker.js <<'JS'
 const { Worker } = require('worker_threads');

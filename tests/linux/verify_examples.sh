@@ -56,7 +56,7 @@ else
     # but the source tree is read-only here, so the example is copied out.
     mkdir -p /tmp/go-example && cp -r $SRC/examples/warm-exec/go/. /tmp/go-example/
     cd /tmp/go-example || exit 1
-    "$ZYGO" pull alpine:3 >/dev/null 2>&1
+    pull_image alpine:3 || bad "could not pull alpine:3"
 
     if "$ZYGO" up >/tmp/up-go.log 2>&1; then
         ok "\`up\` brings a Go binary up as a warm-exec function on alpine"
@@ -174,7 +174,7 @@ done
 # two inputs its README promises are refused.
 mkdir -p /tmp/tool-example && cp -r "$SRC/examples/agent-tool/." /tmp/tool-example/
 cd /tmp/tool-example || exit 1
-"$ZYGO" pull python:3.12-slim >/dev/null 2>&1
+pull_image python:3.12-slim || bad "could not pull python:3.12-slim"
 if "$ZYGO" up >/tmp/up-tool.log 2>&1; then
     ok "the agent-tool example comes up under seccomp = \"strict\""
     out=$("$ZYGO" exec calc '{"expression": "2 ** 10 / 4"}' 2>&1 | tr -d '\n ')
@@ -208,8 +208,8 @@ mkdir -p /tmp/wf-example && cp -r "$SRC/examples/workflow-engine/." /tmp/wf-exam
 mkdir -p /tmp/wf-sdk && cp -r "$SRC/sdk/python/src/." /tmp/wf-sdk/
 cd /tmp/wf-example || exit 1
 rm -f jobs.db
-"$ZYGO" pull python:3.12-slim >/dev/null 2>&1
-"$ZYGO" pull node:22-slim >/dev/null 2>&1
+pull_image python:3.12-slim || bad "could not pull python:3.12-slim"
+pull_image node:22-slim || bad "could not pull node:22-slim"
 # Through the harness wrapper, like every other long-lived process here: an
 # API started straight from the shell lands in a cgroup with no delegated
 # controllers, and every `PUT /fn/<name>` then fails with "the ns backend is

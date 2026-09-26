@@ -49,7 +49,7 @@ while [ $i -lt 100 ]; do
 done
 
 mkdir -p /tmp/matrix && cd /tmp/matrix || exit 1
-"$ZYGO" pull python:3.12-slim >/dev/null 2>&1
+pull_image python:3.12-slim || exit 1
 
 cat > requirements.txt <<'REQ'
 requests==2.32.3
