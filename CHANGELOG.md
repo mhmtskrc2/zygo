@@ -7,6 +7,13 @@ break things and will say so here.
 
 ## [Unreleased]
 
+## [0.1.3] — 2026-09-26
+
+The code is v0.1.2's. That release's upload to npm failed after PyPI had
+accepted the package (the token asked for a one-time password nobody was there
+to type), so the Node package first appears at 0.1.3; the Python package has
+both versions.
+
 ## [0.1.2] — 2026-09-26
 
 The first release whose `zygo-sdk` packages reach PyPI and npm; the security
@@ -225,7 +232,8 @@ The first public version.
 - `gvisor` and `vm` backends for one-shot sandboxes.
 - `zygo doctor`, and the book.
 
-[Unreleased]: https://github.com/mhmtskrc2/zygo/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/mhmtskrc2/zygo/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/mhmtskrc2/zygo/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/mhmtskrc2/zygo/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/mhmtskrc2/zygo/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/mhmtskrc2/zygo/releases/tag/v0.1.0
