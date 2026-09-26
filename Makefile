@@ -2,7 +2,7 @@
         verify-mcp check check-linux test-linux \
         verify-linux verify-supervisor-linux escape-linux dist-linux \
         fuzz-linux gvisor-linux verify-login-linux verify-shim verify-deps-linux \
-        repro-blue-green-linux bench-record verify-api-linux verify-plugin-host vm-build vm-probe vm-kernel \
+        repro-blue-green-linux bench-record verify-api-linux verify-plugin-host verify-plugin-host-node vm-build vm-probe vm-kernel \
         verify-vm-pi use-cases-linux vm-use-cases-linux \
         syscall-tables conformance conformance-node conformance-node-seccomp \
         examples-go-linux oci-image verify-oci \
@@ -15,6 +15,7 @@ help:
 	@echo "verify-mcp   drive the MCP server over a pipe, as an agent host does"
 	@echo "verify-api-linux  the HTTP API end to end, through the Python client"
 	@echo "verify-plugin-host  a plugin host on the API alone — the embedder exit criterion"
+	@echo "verify-plugin-host-node  the same host from the Node SDK, as an HTTP server"
 	@echo "oci-image / verify-oci  the container image, built and run unprivileged"
 	@echo "guest-build  the Linux build for the macOS VM, compiled in the VM (no Docker)"
 	@echo "vm-build     build the vm-capable binary (libkrun linked in)"
@@ -302,6 +303,13 @@ verify-plugin-host: poc/zygo-linux-musl
 	docker run --rm --privileged -v "$(PWD):/src:ro" \
 		-e ZYGO_DATA_HOME=/tmp/zdata-plugin python:3.12-slim \
 		sh /src/poc/verify_plugin_host.sh
+
+# The same claim from the Node SDK, as an HTTP server of its own: a customer's
+# routes in front, one operator client and `forTenant` behind.
+verify-plugin-host-node: poc/zygo-linux-musl
+	docker run --rm --privileged -v "$(PWD):/src:ro" \
+		-e ZYGO_DATA_HOME=/tmp/zdata-plugin-node node:22-slim \
+		sh /src/poc/verify_plugin_host_node.sh
 
 # V1, the question the whole `vm` plan rests on: does libkrun build and link
 # against musl? `dist-linux` ships one static binary under 15 MB, and if the
