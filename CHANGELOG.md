@@ -7,6 +7,11 @@ break things and will say so here.
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-09-26
+
+The first release whose `zygo-sdk` packages reach PyPI and npm; the security
+fixes below are the reason to upgrade the binary.
+
 ### Security
 
 - `GET /metrics` no longer shows a tenant token every function name on the
@@ -220,6 +225,7 @@ The first public version.
 - `gvisor` and `vm` backends for one-shot sandboxes.
 - `zygo doctor`, and the book.
 
-[Unreleased]: https://github.com/mhmtskrc2/zygo/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/mhmtskrc2/zygo/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/mhmtskrc2/zygo/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/mhmtskrc2/zygo/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/mhmtskrc2/zygo/releases/tag/v0.1.0

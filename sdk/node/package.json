@@ -1,6 +1,6 @@
 {
   "name": "zygo-sdk",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Node client for Zygo — warm, isolated sandboxes for function-shaped code",
   "license": "Apache-2.0",
   "type": "module",

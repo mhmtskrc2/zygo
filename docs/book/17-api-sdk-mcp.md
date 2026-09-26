@@ -1229,7 +1229,7 @@ failure rather than something an embedder finds later.
 | `control` | The CLI-to-supervisor protocol, which no SDK speaks. Reported because a mismatch there explains an API that is up but answering errors. |
 | `deploy` | Whether *this caller* has deploy rights — the truth about your own token, not just the flag. |
 
-Both packages are `0.1.1` and follow the repository's `0.x` policy: the shape
+Both packages are `0.1.2` and follow the repository's `0.x` policy: the shape
 may change with a release note. After `1.0` it will not change without a
 major version.
 
