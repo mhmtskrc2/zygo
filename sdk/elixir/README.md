@@ -1,7 +1,11 @@
 # zygo — Elixir client
 
-Warm, isolated sandboxes for function-shaped code. A warm function costs about
-a millisecond and gets a clean process per request.
+Run code you did not write — a customer's script, a plugin, something an
+LLM just generated — without letting it touch your host. Zygo keeps a warm
+sandbox per runtime, forks a fresh process for each request inside
+namespaces, cgroups and seccomp, and answers in about a millisecond. This
+package is the Elixir side of that: register a script once, then call it
+with JSON in and JSON out.
 
 ```elixir
 # mix.exs
@@ -11,17 +15,34 @@ a millisecond and gets a clean process per request.
 ```elixir
 client = Zygo.connect()                  # `zygo api`, on loopback or a unix socket
 
-{:ok, out} = Zygo.call(client, "resize", %{"url" => "https://example.com/a.png"})
-IO.inspect({out.result, out.metrics.wall_ms})
+Zygo.serve_runtime!(client, "py312", %{"image" => "python:3.12-slim", "agent" => "python"})
+
+script = Zygo.put_script!(client, """
+def handler(event):
+    words = event["text"].split()
+    return {"words": len(words), "longest": max(words, key=len)}
+""")
+
+Zygo.run_script!(client, "py312", script.sha256, %{"text" => "the quick brown fox"}).result
+#=> %{"words" => 4, "longest" => "quick"}
+```
+
+The script ran in its own process, in a sandbox that cannot see your files,
+your network or the other requests. What it does wrong stays there:
+
+```elixir
+{:error, %Zygo.Error{kind: :handler, stderr: stderr}} =
+  Zygo.run_script(client, "py312", "def handler(e):\n    open('/etc/shadow').read()\n")
+#=> the sandbox reports a PermissionError; your host never noticed
 ```
 
 Every function returns `{:ok, value}` or `{:error, %Zygo.Error{}}`, and has a
 `!` twin that returns the value or raises. The error has a `kind` to branch
 on — `:busy` means the request never ran and is worth sending again,
-`:handler` means your code raised:
+`:handler` means the script raised, `:timeout` means it ran out of time:
 
 ```elixir
-case Zygo.call(client, "resize", event) do
+case Zygo.run_script(client, "py312", script.sha256, event) do
   {:ok, out} -> out.result
   {:error, %Zygo.Error{kind: :busy, retry_after: ms}} -> {:later, ms}
   {:error, %Zygo.Error{kind: :handler, stderr: stderr}} -> {:bug, stderr}
@@ -34,15 +55,6 @@ the request never ran, so sending it again is safe; nothing else is retried:
 
 ```elixir
 client = Zygo.connect(retries: 3)        # waits the server's Retry-After, then again
-```
-
-A runtime pool — one image, many scripts — with the script sent once and
-named by its digest after that:
-
-```elixir
-Zygo.serve_runtime!(client, "py312", %{"image" => "python:3.12-slim", "agent" => "python"})
-script = Zygo.put_script!(client, "def handler(event):\n    return event\n")
-Zygo.run_script!(client, "py312", script.sha256, %{"n" => 1})
 ```
 
 A one-shot sandbox, needing nothing declared in advance:

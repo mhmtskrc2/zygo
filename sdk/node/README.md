@@ -1,7 +1,11 @@
 # zygo — Node client
 
-Warm, isolated sandboxes for function-shaped code. A warm function costs about
-a millisecond and gets a clean process per request.
+Run code you did not write — a customer's script, a plugin, something an
+LLM just generated — without letting it touch your host. Zygo keeps a warm
+sandbox per runtime, forks a fresh process for each request inside
+namespaces, cgroups and seccomp, and answers in about a millisecond.
+This package is the Node side of that: register a script once, then call it
+with JSON in and JSON out.
 
 ```bash
 npm install zygo-sdk

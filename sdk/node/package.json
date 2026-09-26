@@ -1,7 +1,7 @@
 {
   "name": "zygo-sdk",
   "version": "0.1.3",
-  "description": "Node client for Zygo — warm, isolated sandboxes for function-shaped code",
+  "description": "Run untrusted code safely from Node: a client for Zygo, which gives every request a fresh, kernel-isolated sandbox in about a millisecond",
   "license": "Apache-2.0",
   "type": "module",
   "main": "./src/index.js",

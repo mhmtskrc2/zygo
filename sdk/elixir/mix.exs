@@ -13,7 +13,9 @@ defmodule Zygo.MixProject do
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       deps: deps(),
-      description: "Elixir client for Zygo — warm, isolated sandboxes for function-shaped code",
+      description:
+        "Run untrusted code safely from Elixir: a client for Zygo, which gives every " <>
+          "request a fresh, kernel-isolated sandbox in about a millisecond",
       package: package(),
       docs: docs(),
       name: "Zygo",

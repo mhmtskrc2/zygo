@@ -1,15 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 defmodule Zygo do
   @moduledoc """
-  Zygo — warm sandboxes for function-shaped code, from Elixir.
+  Run untrusted code safely from Elixir.
+
+  Zygo keeps a warm sandbox per runtime, forks a fresh process for each
+  request inside namespaces, cgroups and seccomp, and answers in about a
+  millisecond. This module is the Elixir side of that: register a script
+  once, then call it with JSON in and JSON out.
 
       client = Zygo.connect()                          # `zygo api` on loopback
-      {:ok, out} = Zygo.call(client, "resize", %{"url" => "..."})
-      out.result                                       # what the handler returned
+      Zygo.serve_runtime!(client, "py312", %{"image" => "python:3.12-slim", "agent" => "python"})
+      script = Zygo.put_script!(client, "def handler(e):\\n    return len(e[\\"text\\"].split())\\n")
+      {:ok, out} = Zygo.run_script(client, "py312", script.sha256, %{"text" => "the quick brown fox"})
+      out.result                                       #=> 4
 
-  A warm function costs about a millisecond and gets a clean process per
-  request. A one-shot sandbox costs tens of milliseconds and needs nothing
-  declared in advance:
+  A warm function declared in `sandbox.toml` is called by name the same way,
+  with `call/4`. A one-shot sandbox costs tens of milliseconds and needs
+  nothing declared in advance:
 
       {:ok, run} = Zygo.run(client, "python:3.12-slim", ["python3", "-c", "print(6*7)"])
       run.stdout
