@@ -77,8 +77,10 @@ process. The copy is *copy-on-write*: memory is shared until one side changes
 it, so nothing is copied up front. And because each request is a fresh
 process, no state carries over from the last one.
 
-Measured: usually 1.4 ms at 250 requests per
-second, on the machines named in [chapter 25](25-performance.md).
+Measured: usually 1.4 ms, on the machines named in
+[chapter 25](25-performance.md). That is at a steady 250 requests a second,
+the rate the latency test holds so the host is never the limit. The most one
+warm function sustained, with four clients sending, is 1,108 a second.
 
 ```text
   compiled program (warm-exec)            interpreter (agent)

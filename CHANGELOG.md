@@ -116,6 +116,14 @@ break things and will say so here.
   within 30 s, and what to do: `zygo pull IMAGE` builds the layers ahead of
   time, and the build finishes on its own. The budget itself is unchanged
   (chapter 22). Found on a Raspberry Pi 5 with the release's own quick start.
+- Chapter 10 answers the first question an embedder asks, "why not a prefork
+  pool of my own?", and places WebAssembly runtimes next to Zygo; both are in
+  its closing table and the glossary. Its nsjail and kern tables now say at
+  the top, not only at the bottom, that they cannot be repeated from this
+  repository. Chapter 8 says that 1.4 ms is measured at a steady 250 requests
+  a second and that 1,108 a second is the ceiling; chapter 11 says its 29 ms
+  one-shot run from a Mac is `true`, not Python; chapter 26 quotes today's
+  pool cost rather than the ADR's earlier 0.6 ms. The README has badges.
 - Chapter 10 places Sandlock and Zeroboot, two 2026 projects that fork a
   warm process per call, on the map, and chapter 23 lists the
   tenant-against-tenant vectors the escape suite does not attempt yet.

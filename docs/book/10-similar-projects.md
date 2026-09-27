@@ -703,6 +703,60 @@ script, or uses the SDK, and each script run becomes a `fork()` instead of a
 container. [`examples/workflow-engine/`](../../examples/workflow-engine) is
 such a worker.
 
+## A prefork pool of your own
+
+The first question an embedder asks is a fair one: why not fork the warm
+interpreter yourself? Python can. A *prefork pool* loads the code once and
+forks workers from it. Python's `multiprocessing` has a *forkserver* start
+method that imports the modules you name once and forks a child from them
+for each task. `gunicorn --preload --max-requests 1` loads the application in
+its master and replaces each worker after one request. Either gives the speed
+trick `zygo exec` uses: the imports are paid once, and each request runs in a
+fresh copy.
+
+What neither gives is a wall. The child runs as your user, in your file
+system, on your network, with no memory, process or time limit of its own
+unless you add one. For code your own team wrote, that is enough, and simpler
+than Zygo: use it. For code a customer or an agent wrote, the fork is the
+easy half. The hard half is what Zygo puts around the copy before it runs,
+which [chapter 6](06-how-zygo-works.md#the-warm-path) walks through. Node
+cannot fork a running process at all, so there a prefork pool is a pool of
+pre-loaded workers, as Zygo's Node agent keeps
+([chapter 13](13-warm-functions.md)).
+
+```text
+  your own prefork pool                  zygo exec
+  ─────────────────────                  ─────────
+  fork the warm interpreter              fork the warm interpreter
+  the child runs as you                  own user, pid, mount and network namespaces
+  your files, your network               its own root; network off unless allowed
+  limits: whatever you add               a cgroup and a deadline per request
+  no syscall filter                      seccomp allowlist, Landlock
+  right for your own code                right for code others wrote
+```
+
+## WebAssembly runtimes
+
+Wasmtime, Wasmer, Spin and Extism run code compiled to *WebAssembly* (Wasm):
+a portable instruction format that runs inside the runtime's own process.
+A Wasm module can touch only the memory it was given and the host functions
+it was handed, so the wall has no kernel in it at all. A new instance starts
+in well under a millisecond, by their own figures. Tools such as Wizer can
+even run a module's start-up once and save the memory it leaves, which is
+the Wasm form of a zygote.
+
+The price is the compile step. Your code, and every library it imports, must
+be built for Wasm. Pure Python and JavaScript run on interpreters compiled to
+Wasm, but a package with native parts, such as numpy or a database driver,
+needs a Wasm build of its own. Some projects, Pyodide for one, ship builds of
+popular packages; most of PyPI and npm has none. A module sees files and the
+network only as far as the host opens them to it. Zygo makes the opposite
+trade: any program in any OCI image runs unchanged, and the wall is the host
+kernel, with what that costs ([chapter 23](23-security.md)). If your plugins
+are small, self-contained and built with a toolchain you control, Wasm is
+the stronger boundary. If they install whatever they import, that is Zygo's
+column.
+
 ## Measured: Zygo against nsjail and kern
 
 nsjail and kern are the two one-shot runners closest to `zygo run`, so both
@@ -710,7 +764,10 @@ were measured against it under load, on 24 September 2026. Every run happened
 in the same VM: Ubuntu 24.04, kernel 6.8, aarch64, 2 vCPU, 4 GB, on an M1 Max.
 Every binary ran from the VM's own disk. The load generator ran outside the VM,
 so its CPU counts for nobody. "CPU per job" is the CPU of the whole stack being
-measured, divided by the jobs it finished.
+measured, divided by the jobs it finished. Unlike the numbers in
+[chapter 25](25-performance.md), these tables cannot be repeated from this
+repository: the load generator and the raw results were not kept
+([what these numbers are not](#what-these-numbers-are-not)).
 
 ### Inside Windmill, in place of nsjail
 
@@ -888,6 +945,8 @@ A run now starts 4 processes, down from 13 at the worst.
 | E2B, Modal, Daytona, Docker Sandboxes | VM or gVisor, per session | OCI or their templates | the VM's | no (snapshots) | their cloud (or self-host) | an agent's working machine |
 | Kata | VM | OCI | the VM's | no | yes | safer Kubernetes pods |
 | FreeBSD jail | host kernel | no (a folder) | rctl, opt-in | no | yes | long-lived services on FreeBSD |
+| a prefork pool of your own | none: your user, your files | no | whatever you add | **yes**, unconfined | no | your own code, quickly |
+| Wasmtime, Wasmer, Spin, Extism | the Wasm runtime; no kernel in the wall | no: a Wasm module | memory, and CPU by metering (theirs) | a saved start-up (Wizer) | no | small plugins built for Wasm |
 
 ## What Zygo does not do
 
@@ -906,7 +965,9 @@ For long-lived services, use Docker, Podman or Kubernetes. For hostile code
 where 100 ms or more per call is fine, use a VM wall: Firecracker, Kata,
 microsandbox, or Zygo's `vm` backend. For confining a tool you already run,
 look at nono or bubblewrap. For a quick throwaway sandbox around one command,
-nsjail, kern and `zygo run` all do well. For many short calls to code other
+nsjail, kern and `zygo run` all do well. For your own code, a prefork pool is
+enough; for small plugins built for Wasm, a Wasm runtime is the stronger
+wall. For many short calls to code other
 people wrote, where each call must start clean and costs must stay in
 milliseconds, that is the right-hand column of the map, and that is Zygo.
 

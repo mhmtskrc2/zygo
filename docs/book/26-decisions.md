@@ -367,10 +367,10 @@ explains RSS and PSS.
 worth paying once** — an ML model, a large client library. It pays those once
 and about 1.4 ms per call, and costs 11 MB while warm. **A runtime pool is right
 when the script is a few lines over the standard library**, like most such
-scripts. It pays 0.6 ms more per call and *nothing* to stay resident, because
-the script is not kept; it arrives with each request. (Chapter 25 puts the
-pool's cost at +0.47 ms on the Lima VM and +0.46 ms on Docker Desktop's;
-the ADR quotes the 0.6 ms of its own, earlier run.)
+scripts. It pays about 0.5 ms more per call and *nothing* to stay resident,
+because the script is not kept; it arrives with each request. (Chapter 25
+puts the pool's cost at +0.47 ms on the Lima VM and +0.46 ms on Docker
+Desktop's; the ADR quotes 0.6 ms, from its own earlier run.)
 
 ```text
   does the script import something expensive?

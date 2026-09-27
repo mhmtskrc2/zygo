@@ -271,11 +271,14 @@ If the VM cannot be reached, a command exits with status **111**;
 
 ## What the Mac VM costs
 
-A one-shot `zygo run` typed in a Mac shell takes about 29 ms end to end, when
-a supervisor is running in the VM. About 6 ms of that is the sandbox, and
-about 22 ms is the trip into the VM. These are medians of nine runs on the
-Mac that [chapter 25](25-performance.md) names. The same run through Docker
-Desktop on the same Mac took 397 ms.
+A one-shot `zygo run python:3.12-slim true` typed in a Mac shell takes about
+29 ms end to end, when a supervisor is running in the VM. About 6 ms of that
+is the sandbox, and about 22 ms is the trip into the VM. `true` starts no
+interpreter; the 12 ms quoted elsewhere for a one-shot run is
+`python3 -c pass`, with Python's own start inside it. These are medians of
+nine runs on the Mac that
+[chapter 25](25-performance.md#where-a-one-shot-run-from-a-mac-spends-its-time)
+names. The same run through Docker Desktop on the same Mac took 397 ms.
 
 Why does a one-shot run care about a supervisor? For its cgroup. Without one,
 `zygo run` on a systemd login must make a transient scope of its own and

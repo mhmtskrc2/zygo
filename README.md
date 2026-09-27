@@ -1,5 +1,12 @@
 # Zygo — a warm sandbox per request
 
+[![CI](https://github.com/mhmtskrc2/zygo/actions/workflows/ci.yml/badge.svg)](https://github.com/mhmtskrc2/zygo/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/zygo-cli)](https://crates.io/crates/zygo-cli)
+[![PyPI](https://img.shields.io/pypi/v/zygo-sdk)](https://pypi.org/project/zygo-sdk/)
+[![npm](https://img.shields.io/npm/v/zygo-sdk)](https://www.npmjs.com/package/zygo-sdk)
+[![Hex](https://img.shields.io/hexpm/v/zygo_sdk)](https://hex.pm/packages/zygo_sdk)
+[![Licence: Apache-2.0](https://img.shields.io/badge/licence-Apache--2.0-blue)](LICENSE)
+
 **Zygo forks a warm, sandboxed interpreter for every request: 1.4 ms, and
 every request starts from a process that has never served one.**
 Rootless, OCI images, and no daemon to install: the one long-lived process is a

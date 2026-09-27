@@ -54,6 +54,7 @@ One line each. The chapter in brackets explains the term in full; the numbers fo
 | **paused / cold** | A warm function after `idle_timeout` (frozen, still in memory) and after `cold_after` (dropped). [13] |
 | **pid** | A process's number. [1] |
 | **`pivot_root`** | Swapping a mount namespace's root for a new one, so the old root can be removed. [4] |
+| **prefork pool** | Worker processes forked from one that has already loaded the code, such as Python's forkserver or `gunicorn --preload`; fast, with no sandbox of its own. [10] |
 | **PSS / RSS** | Memory a process uses, with shared pages split between sharers (PSS) or counted in full (RSS). [7, 25] |
 | **registry** | A server that stores images, such as Docker Hub or GitHub's. [5, 15] |
 | **rlimit** | An old per-process limit, such as the number of open files. [4] |
@@ -77,6 +78,7 @@ One line each. The chapter in brackets explains the term in full; the numbers fo
 | **uid** | A user's number; `uid_map` translates uids between a user namespace and the host. [1, 2] |
 | **user space** | Everything outside the kernel: all normal programs. [1] |
 | **warm-exec** | Zygo's mode where the sandbox is kept ready and each request is a new process entered into it. [6] |
+| **WebAssembly (Wasm)** | A portable instruction format that runs inside a runtime's own process and can reach only what the runtime hands it; code must be compiled for it. [10] |
 | **workspace** | A folder of files sent in with one request, and optionally returned with the result. [17] |
 | **`zygo.lock`** | The file `zygo up` writes to record which image digests and package versions were used. [20] |
 | **zygote** | A process that has done its start-up and is forked for every request; the name comes from Android. [6] |
