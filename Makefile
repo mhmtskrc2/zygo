@@ -335,9 +335,13 @@ repro-blue-green-linux: tests/linux/bin/zygo-linux-musl
 # The HTTP API end to end, driven by the Python client that ships with it:
 # client -> unix socket -> `zygo api` -> the supervisor -> a real sandbox. The
 # unit tests on either side of that line cannot reach it.
+# ZYGO_ALLOW_SHARED_UID: root in this container has no subordinate uid range,
+# and `POST /tenants` refuses such a host unless told to. The suite is about the
+# API's tenant logic, not uid separation; without it, it stops at the first
+# tenant. CI's unprivileged run sets it for the same reason.
 verify-api-linux: tests/linux/bin/zygo-linux-musl
 	docker run --rm --privileged -v "$(PWD):/src:ro" \
-		-e ZYGO_DATA_HOME=/tmp/zdata-api python:3.12-slim \
+		-e ZYGO_DATA_HOME=/tmp/zdata-api -e ZYGO_ALLOW_SHARED_UID=1 python:3.12-slim \
 		sh /src/tests/linux/verify_api.sh
 
 # The embedder API's exit criterion: a plugin host on the API alone. If it
