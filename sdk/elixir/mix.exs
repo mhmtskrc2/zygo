@@ -2,7 +2,7 @@
 defmodule Zygo.MixProject do
   use Mix.Project
 
-  @version "0.1.4"
+  @version "0.1.5"
   @source "https://github.com/mhmtskrc2/zygo"
 
   def project do

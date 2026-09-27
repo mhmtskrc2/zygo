@@ -7,6 +7,14 @@ break things and will say so here.
 
 ## [Unreleased]
 
+## [0.1.5] — 2026-09-27
+
+The code is v0.1.4's. This release carries the SDK READMEs that say what has
+to be installed and running before their examples work, to the package pages
+on PyPI, npm and Hex, which show the README of the version published. It is
+also the first tag whose workflow fetches `ex_doc` before publishing to Hex;
+v0.1.4's Hex upload failed there and was made by hand.
+
 ### Fixed
 
 - The Python, Node and Elixir clients' READMEs, which are their package pages,
@@ -469,7 +477,8 @@ The first public version.
 - A warm-exec request is created inside its cgroup (`CLONE_INTO_CGROUP`,
   Linux 5.7+) rather than moved there, so it never waits on that lock.
 
-[Unreleased]: https://github.com/mhmtskrc2/zygo/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/mhmtskrc2/zygo/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/mhmtskrc2/zygo/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/mhmtskrc2/zygo/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/mhmtskrc2/zygo/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/mhmtskrc2/zygo/compare/v0.1.1...v0.1.2
