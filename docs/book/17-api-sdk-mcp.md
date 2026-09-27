@@ -1340,11 +1340,22 @@ version — the one a client checks. It moves only when an operation is removed
 or renamed. Adding a route does not move it, because an older client does not
 call a route it has never heard of.
 
-The document is hand-written, and two tests read the router's own source to
-keep it true: one fails when a route is missing from the document, the other
-when the document names a route that is gone. Each SDK has a third test,
-over every operation, so a route added without a client method is a test
-failure rather than something an embedder finds later.
+**What it covers, and what it does not.** It lists every route with its
+path parameters, who may call it (`x-zygo-who`), whether it needs deploy
+rights (`x-zygo-deploy`), the bearer scheme (none for `GET /healthz`) and
+the shape of an error. It does **not** describe request bodies, query
+parameters, headers, or any status but `200`. Those are in the tables at
+the top of this chapter. A client generated from the document gets one
+method per route and no types for what goes in, so write the bodies from
+this chapter, or use one of the SDKs.
+
+The document is hand-written, and three tests read the router's own source
+to keep it true: one fails when a route is missing from the document, one
+when the document names a route that is gone, and one when a route answered
+without a token is not marked so. Each SDK has a test of its own, over every
+operation but `GET /metrics`, which is for a scraper rather than a client. A
+route added without a client method is a test failure rather than something
+an embedder finds later.
 
 ## Versioning
 

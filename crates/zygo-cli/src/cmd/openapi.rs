@@ -318,6 +318,10 @@ pub const ROUTES: &[Route] = &[
     },
 ];
 
+/// Paths the router answers before it checks a token. Held to the router by
+/// `tests::what_needs_no_token_is_what_the_router_answers_first`.
+const UNAUTHENTICATED: &[&str] = &["/healthz"];
+
 /// The OpenAPI 3.1 document for this build.
 pub fn document() -> serde_json::Value {
     let mut paths = serde_json::Map::new();
@@ -325,7 +329,7 @@ pub fn document() -> serde_json::Value {
         let entry = paths
             .entry(route.path.to_string())
             .or_insert_with(|| serde_json::json!({}));
-        let operation = serde_json::json!({
+        let mut operation = serde_json::json!({
             "summary": route.summary,
             "operationId": operation_id(route),
             "x-zygo-who": route.who,
@@ -339,6 +343,12 @@ pub fn document() -> serde_json::Value {
                 },
             },
         });
+        // Answered before the bearer check, so a load balancer can probe it
+        // without the token. An empty list is how OpenAPI says "no auth" for
+        // one operation under a document-wide requirement.
+        if UNAUTHENTICATED.contains(&route.path) {
+            operation["security"] = serde_json::json!([]);
+        }
         entry[route.method] = operation;
     }
 
@@ -447,6 +457,30 @@ mod tests {
             "only {found} routes were found in the source; the parser below \
              has stopped matching the router's shape"
         );
+    }
+
+    /// The operations the document says need no token are exactly the ones
+    /// the router answers above its bearer check — and the rest do need one.
+    #[test]
+    fn what_needs_no_token_is_what_the_router_answers_first() {
+        let source = include_str!("api/mod.rs");
+        let early: BTreeSet<String> = source.lines().filter_map(early_route).collect();
+        assert!(
+            !early.is_empty(),
+            "no route is answered before the bearer check any more"
+        );
+
+        let doc = document();
+        for route in ROUTES {
+            let arm = format!("{} {}", route.method.to_uppercase(), route.path);
+            let open = doc["paths"][route.path][route.method]["security"] == serde_json::json!([]);
+            assert_eq!(
+                open,
+                early.contains(&arm),
+                "`{arm}`: the document says it {} a token, the router says otherwise",
+                if open { "needs no" } else { "needs" }
+            );
+        }
     }
 
     /// Nothing is documented that the router does not answer.

@@ -526,6 +526,7 @@
             "description": "a failure, as JSON with an `error` and often a `code`"
           }
         },
+        "security": [],
         "summary": "Whether this host should be sent work.",
         "x-zygo-deploy": false,
         "x-zygo-who": "any"
