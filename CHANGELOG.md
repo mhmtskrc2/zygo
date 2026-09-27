@@ -72,6 +72,9 @@ break things and will say so here.
 
 ### Fixed
 
+- A runtime pool's warnings and errors name its own table: `runtime.py313.io_read`,
+  not `fn.py313.io_read`, which pointed at a `[fn.py313]` that does not exist.
+  `zygo spec validate` groups the two kinds together.
 - A sandbox whose `setgroups` file could not be written no longer fails one
   line later with "the kernel refused the group namespace mapping"; the error
   now names `setgroups`, the file that was refused.

@@ -293,6 +293,7 @@ fn group_warnings(warnings: &[String]) -> Vec<String> {
         };
         let field = prefix
             .strip_prefix("fn.")
+            .or_else(|| prefix.strip_prefix("runtime."))
             .and_then(|rest| rest.split_once('.'))
             .map(|(name, field)| (name.to_string(), field.to_string()));
 
@@ -382,6 +383,26 @@ mod tests {
         assert_eq!(out.len(), 2, "{out:?}");
         assert_eq!(out[0], "io_read: no disk I/O limit [a, b, c]");
         assert_eq!(out[1], "fn.b.scratch: scratch is over half of mem");
+    }
+
+    #[test]
+    fn a_pool_warning_names_its_own_table_and_groups_with_the_rest() {
+        let spec = Spec::parse("[runtime.py312]\nagent=\"python\"\n", None).unwrap();
+        let pool = spec
+            .resolve_runtime("py312", &Layer::default(), &pool_options())
+            .unwrap();
+        assert!(
+            pool.warnings
+                .iter()
+                .all(|w| w.starts_with("runtime.py312.")),
+            "{:?}",
+            pool.warnings
+        );
+        let out = group_warnings(&[
+            "fn.a.io_read: no disk I/O limit".into(),
+            "runtime.py312.io_read: no disk I/O limit".into(),
+        ]);
+        assert_eq!(out, ["io_read: no disk I/O limit [a, py312]"]);
     }
 
     #[test]

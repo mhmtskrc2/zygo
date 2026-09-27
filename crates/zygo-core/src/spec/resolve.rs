@@ -413,7 +413,10 @@ fn resolve_layer(
     base_dir: &Path,
     opts: &ResolveOptions,
 ) -> Result<ResolvedFn, SpecError> {
-    let field = |suffix: &str| format!("fn.{name}.{suffix}");
+    // Which table the name came from, so a warning or an error points at the
+    // line to change: `[runtime.py313]` used to be reported as `fn.py313`.
+    let table = if opts.pool { "runtime" } else { "fn" };
+    let field = |suffix: &str| format!("{table}.{name}.{suffix}");
     let mut warnings = Vec::new();
 
     // The name before anything else, because everything after this joins it
@@ -425,7 +428,7 @@ fn resolve_layer(
     // every one of them resolves before it builds a path.
     if !is_fn_name(name) {
         return Err(SpecError::invalid_with(
-            format!("fn.{name}"),
+            format!("{table}.{name}"),
             format!("`{name}` is not a usable function name"),
             "use letters, digits, `-`, `_` and `.`, starting with a letter or \
              digit; the name becomes a directory, a socket and a cgroup",
@@ -521,14 +524,14 @@ fn resolve_layer(
     // with the name of the image that let the user down.
     if entry.is_none() && cmd.is_empty() && !opts.one_shot && !opts.pool {
         return Err(SpecError::invalid_with(
-            format!("fn.{name}"),
+            format!("{table}.{name}"),
             "nothing to run",
             "set `entry` for an agent runtime, or `cmd` for warm-exec",
         ));
     }
     if entry.is_some() && !cmd.is_empty() {
         return Err(SpecError::invalid_with(
-            format!("fn.{name}"),
+            format!("{table}.{name}"),
             "`entry` and `cmd` are mutually exclusive",
             "`entry` runs through a runtime agent; `cmd` is warm-exec. Pick one.",
         ));
