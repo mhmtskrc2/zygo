@@ -7,8 +7,8 @@
 [![Hex](https://img.shields.io/hexpm/v/zygo_sdk)](https://hex.pm/packages/zygo_sdk)
 [![Licence: Apache-2.0](https://img.shields.io/badge/licence-Apache--2.0-blue)](LICENSE)
 
-**Zygo forks a warm, sandboxed interpreter for every request: 1.4 ms, and
-every request starts from a process that has never served one.**
+**Zygo forks a warm, sandboxed interpreter for every request: 1.4 ms through
+its API, and every request starts from a process that has never served one.**
 Rootless, OCI images, and no daemon to install: the one long-lived process is a
 supervisor under your own user, not a system service.
 
@@ -63,11 +63,11 @@ and forks it per request.
 | bubblewrap, nsjail | building blocks for one confined process | images, mandatory limits, an egress allowlist — and the warm fork |
 | nono, sandbox-runtime | confinement for a command you were running anyway (Landlock and seccomp, or bubblewrap and Seatbelt) | a sandbox with its own root filesystem and limits, for code you did not write |
 | kern | a daemonless, rootless container per call, in a few ms | a warm interpreter: no interpreter start and no imports on the request path |
-| E2B, Modal, Daytona | a microVM per session, in their cloud | runs on your hardware, and costs a fork rather than a VM per call |
+| E2B, Modal, Daytona | a microVM or gVisor per session, in their cloud | runs on your hardware, and costs a fork rather than a VM per call |
 | Sandlock, Zeroboot | a copy-on-write fork of a Landlock-confined process, or of a Firecracker snapshot | a fork that lands in a sandbox with its own root, pid namespace, cgroup and network — and the tenants, secrets and API around it |
 
-[Similar projects](docs/book/10-similar-projects.md) compares each of them,
-flag by flag, with measurements against nsjail and kern.
+[Similar projects](docs/book/10-similar-projects.md) compares all of them
+but sandbox-runtime, with measurements against nsjail and kern.
 
 ## The boundary
 
@@ -75,13 +75,17 @@ The default backend, `ns`, is the host kernel: namespaces, cgroup v2, a
 seccomp allowlist, Landlock, no capabilities and a read-only root. That is
 the right wall for code that is **semi-trusted** — your customers' scripts,
 an agent's tools. A kernel bug is a way through it, as it is for every
-container. For hostile code the same spec runs on `gvisor` (a kernel in user
-space) or `vm` (libkrun), one-shot only.
+container. The same spec also runs on `gvisor` (a kernel in user space) or
+`vm` (libkrun), one-shot only. Neither is a full wall for hostile code yet.
+Both lack a network. A rootless `gvisor` cannot enforce its limits, and `vm`
+has none inside the guest and a kernel you build yourself. For anonymous
+code, the honest answer today is a separate machine.
 
-Every vector in [the threat model](docs/book/23-security.md) is attempted
-by `make escape-linux` — 21 vectors, 0 escapes — and every syscall number is
-swept against the seccomp profiles. The same chapter says where the boundary
-is weaker than it looks. **No external audit has been done.**
+`make escape-linux` attempts 21 of the vectors in
+[the threat model](docs/book/23-security.md), with 0 escapes, and every
+syscall number is swept against the seccomp profiles. The same chapter lists
+the tenant-against-tenant vectors not attempted yet, and says where the
+boundary is weaker than it looks. **No external audit has been done.**
 [Fork safety, question by question](docs/book/fork-safety.md) covers what
 a fork shares with its parent and what it does not.
 
@@ -109,6 +113,7 @@ zygo doctor                           # can this host run sandboxes? prints the 
 zygo run --mem 128M --timeout 10s python:3.12-slim python3 -c 'print("hello")'   # pulls the image
 echo 'def handler(event): return {"got": event}' > handler.py
 zygo serve ./handler.py --name echo && zygo exec echo '{"n": 1}'   # serve never pulls
+zygo stop --all                       # everything serve started; on a Mac, the VM too
 ```
 
 ## What else is in the box

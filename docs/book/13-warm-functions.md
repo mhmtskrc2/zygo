@@ -84,7 +84,7 @@ zygo serve ./report.py  --name report --secret STRIPE_KEY --idle-timeout 5m
 | `-f PATH` | Read this `sandbox.toml` instead of searching upwards for one. |
 
 Every limit and sandbox flag of `zygo run` works here too: `--mem`, `--cpu`,
-`--pids`, `--timeout`, `--network`, `--allow`, `--mount` and the rest. They
+`--pids`, `--timeout`, `--net`, `--allow`, `--mount` and the rest. They
 are described in [chapter 14](14-limits-network-secrets.md). The same
 settings can live in a `[fn.<name>]` table of `sandbox.toml`
 ([chapter 20](20-sandbox-toml.md)).
@@ -552,6 +552,11 @@ def run(project, script_source, event, secrets):
 
 ## What each line buys
 
+- **`entry` and the mounts are paths on the host Zygo runs on.** A
+  function's code is named by path, never sent, so this shape is for a worker
+  that shares a disk with Zygo. A caller on another machine sends each
+  script with its request instead, to a runtime pool
+  ([chapter 17](17-api-sdk-mcp.md#what-is-not-built)).
 - **`if_changed=True`** makes the `serve` free when the version is already
   warm. The caller does not have to track state: it always asks, and the
   supervisor does nothing when nothing changed.

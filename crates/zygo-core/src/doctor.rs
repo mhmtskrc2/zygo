@@ -196,8 +196,9 @@ pub const MIN_KERNEL: (u32, u32) = (5, 3);
 /// store has to flatten layers instead — slower and heavier on disk, but
 /// correct.
 pub const OVERLAY_KERNEL: (u32, u32) = (5, 11);
-/// Above this every optional kernel feature is present: Landlock networking,
-/// `cgroup.kill`, `memory.peak`.
+/// From this release `cgroup.kill` (5.14) and `memory.peak` (5.19) are both
+/// present. Landlock's network rules need 6.7, which is later than this; below
+/// it a sandbox's sockets are limited by its network namespace and firewall.
 pub const RECOMMENDED_KERNEL: (u32, u32) = (6, 1);
 /// From this release, moving a process into a cgroup waits for an RCU grace
 /// period after a quiet spell, unless cgroup2 is mounted with `favordynmods`.

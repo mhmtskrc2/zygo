@@ -1,6 +1,6 @@
 # Benchmark records
 
-The raw output behind the numbers in
+Raw output of `zygo bench`, kept beside the numbers in
 [chapter 25](../docs/book/25-performance.md), one folder per run, named
 `<date>-<kernel>-<arch>`. Each file is what `zygo bench … --json`
 printed, unedited: the host it ran on (kernel, cores, memory, whether it is a
@@ -17,7 +17,15 @@ The `bench` workflow (`.github/workflows/bench.yml`) makes the same record
 on GitHub's x86_64 and arm64 runners every week, as an artifact; copy one
 here when it is worth keeping.
 
-What is **not** here: the load generator and results behind chapter 10's
+What is **not** here: the run behind chapter 25's headline table (1.44 ms
+for a warm request, 10.5 ms for 1 in 100, 1,108 requests a second), made on
+the Lima VM on 25 September 2026 as an ordinary user under a systemd login.
+Its raw output is not in this repository. The closest record is the first row
+below: the same VM, the same day, inside a privileged container, which
+measured 1.21 ms, 15.4 ms and 1,176 a second. `zygo bench all` prints the
+published figures beside what it measures, so any new record is held to them.
+
+Nor are the load generator and results behind chapter 10's
 Windmill and kern comparisons, which were not kept. Those tables are a
 summary of runs that cannot be repeated from this repository, and the chapter
 says so. `make bench-embed ARGS="--json out.json"` repeats the embedder's

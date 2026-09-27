@@ -182,7 +182,9 @@ Python and the protocol, not the kernel. Without a cgroup per request
 containment costs about a fifth of the median, and most of the slow tail.
 
 What is **not** in the number, because it happens once, when the zygote
-starts (`zygo serve`, about 150 ms):
+starts (`zygo serve`: 34 ms on this VM with a supervisor running, about
+150 ms on a Raspberry Pi 5 counting the supervisor's start;
+[warming up](#warming-up) has both):
 
 - creating the namespaces and mounting the root, `/proc` and `/tmp`;
 - loading the seccomp filter and the Landlock rules — a child inherits both,
@@ -584,10 +586,16 @@ Each command has a *budget*: the number it must beat to print PASS.
 per-request cgroup, and keeps what they printed as JSON in
 [`bench/results/`](../../bench), one folder per run, named after the date, the
 kernel and the architecture. A run that missed a budget is kept as well.
-Records from Linux 6.8 and 5.10, both aarch64, are there now. The `bench`
-workflow makes the same record on GitHub's x86_64 and arm64 runners every
-week; those are shared VMs, so their numbers are noisier than a quiet host's,
-and a run that saw the machine busy says so.
+Records from Linux 6.8 and 5.10 on aarch64, and from GitHub's runners on
+6.17, are there now. The `bench` workflow makes the same record on GitHub's
+x86_64 and arm64 runners every week; those are shared VMs, so their numbers
+are noisier than a quiet host's, and a run that saw the machine busy says so.
+
+The run behind [the short version](#the-short-version), as an ordinary user,
+is **not** among them: its raw output is not in this repository. The Lima
+record there is the same VM on the same day, inside a privileged container. It
+measured a warm request at 1.21 ms usually and 15.4 ms for 1 in 100, and 1,176
+requests a second, against the 1.44 ms, 10.5 ms and 1,108 above.
 
 ## Two things `bench all` does that most benchmarks do not
 

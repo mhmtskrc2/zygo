@@ -201,6 +201,7 @@ syscall named in the tables below is refused.
 | Resource exhaustion | mandatory cgroup limits; `pids.max` always set; `memory.max` and `memory.oom.group` on each request's own cgroup | **attempted** separately by `make verify-linux` (the fork bomb is cut off at `pids.max`; the memory hog is OOM-killed inside its own cgroup and the host loses 0 MB) and `make verify-oom-linux` (in a warm function, the hog dies and the three requests beside it, and the zygote, do not) |
 | Zygote contamination | the zygote never handles a request itself; every request is a fresh process that ends in `_exit` | by construction |
 | A file left in the temp folder for the next request (or tenant) | each request's `TMPDIR` is its own folder under `/work`, which cannot be listed, removed when the request ends; a literal `/tmp/...` path is still shared by the sandbox | **attempted** (case 18, in a runtime pool) |
+| A warm-exec program keeping the namespace descriptors its helper used, to `setns` back out | the helper marks every descriptor it renumbers close-on-exec before `execve`; `setns` is refused by seccomp as well | **attempted** (case 16) |
 
 ## Vectors: the network
 
@@ -225,6 +226,7 @@ phase 5 is that work.
 | Listing or reading another request's workspace in a shared pool | `/work` is a tmpfs of Zygo's own, mode 0311, one folder with a random name per request | **attempted** (case 14b) |
 | A handler leaving a link in its workspace, so that `?out=1` packs the supervisor's files | the workspace is walked by descriptor, `openat` with `O_NOFOLLOW` at every step, and a name is packed only if it is still a folder or a regular file when opened | **tested** by `zygo-core`'s own tests, including a name swapped after the folder was read; not yet in `make escape-linux` |
 | A file left in the temp folder for the next tenant's request | each request's `TMPDIR` is its own folder under `/work` (above) | **attempted** (case 18) |
+| A pooled script rewriting its own file, which the next request will load | `/run/script` is a read-only bind of a folder the supervisor owns on the host, so the answer is `EROFS` on every kernel; the child also checks the digest of the bytes it read | **attempted** (case 17) |
 | Tenant A running or reading tenant B's script in the same pool | scripts are bound read-only under `/run/script/<digest>` | **not yet attempted** |
 | Tenant A reading tenant B's secret file while both requests are in flight | secret files are written per request, mode 0400, and removed after | **not yet attempted** as a cross-tenant case |
 | Tenant A reaching tenant B's process through `/proc/<pid>` in a shared pool | one pid namespace and one uid for the whole pool; what one fork may read of another is what this row would test | **not yet attempted** |
@@ -364,7 +366,8 @@ write.
 ### The seccomp profiles have been run against a sample, not a population
 
 The [compatibility matrix](24-seccomp-profiles.md#the-compatibility-matrix)
-runs seven Python packages and three Node cases under `default` and `strict`.
+runs six Python packages, the standard library's `sqlite3` and three Node cases
+under `default` and `strict`.
 Each round of widening it has found something:
 
 - the filter refusing every thread;
@@ -429,9 +432,9 @@ done without one is in place: the full syscall sweep described above, and the
 kernel-age warning in `zygo doctor`.
 
 Until an audit happens, the strongest honest statement is this: every vector
-listed above is attempted by a suite that runs on every change, none of them
-currently succeed, and the syscall surface they rest on is swept in full
-rather than sampled.
+marked **attempted** above is tried by a suite that runs on every change, none
+of them currently succeeds, the ones not yet attempted are marked as such,
+and the syscall surface they rest on is swept in full rather than sampled.
 
 ## Hardening your deployment
 

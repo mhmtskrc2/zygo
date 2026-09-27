@@ -548,9 +548,12 @@ too.
 
 - **An Ingress.** The API belongs to your control plane, not the internet.
   Put a service of your own in front of it.
-- **Autoscaling.** A warm pool costs memory, not CPU, and the useful signal
-  is `zygo_gate_queued` from `GET /metrics`, not CPU use. Scale on it once
-  you know your workload.
+- **Autoscaling.** A warm pool costs memory, not CPU. The signal that
+  matters is how many requests are waiting, and `GET /metrics` does not
+  publish that yet: it has requests, failures, memory and state per
+  function ([chapter 17](17-api-sdk-mcp.md#metrics-otlp-and-usage-events)).
+  Until it does, scale on memory (`zygo_function_rss_bytes`) and on the
+  `429` answers your callers see.
 - **A PodSecurityPolicy or Gatekeeper rule.** A cluster that enforces one
   will need an exception for this namespace, and that exception is yours to
   write.

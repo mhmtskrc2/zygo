@@ -1,6 +1,6 @@
 # Zygo on Kubernetes.
 #
-#   kubectl apply -f examples/kubernetes/
+#   kubectl apply -f examples/kubernetes/deployment.yaml
 #
 # Read `securityContext` first: it is the whole of what makes this work, and
 # the reasons are in `docs/book/16-production.md` ("Inside a container"). Zygo builds

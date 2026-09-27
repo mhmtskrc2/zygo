@@ -83,7 +83,7 @@ three is refused under every profile, `permissive` included.
 | Profile | What it is | Who it is for |
 |---|---|---|
 | `default` | ~215 syscalls: the set five reference packages exercise their real code paths under — numpy's BLAS threads, Pillow's codecs, pandas' file I/O, pydantic's Rust core, requests' TLS setup. `clone` is allowed only with every `CLONE_NEW*` flag clear, so a sandbox cannot make a namespace; `ioctl` is allowed except for `TIOCSTI` and its relatives. `bpf`, `io_uring_*`, `userfaultfd`, `keyctl`, `perf_event_open`, `ptrace`, `mount` and `unshare` are absent. | Everyone (T1, T2) |
-| `strict` | `default` minus the calls that reach the network — `socket`, `connect`, `bind`, `listen`, `accept4` — and minus `ptrace`, `mount`, `umount2`. In the agent's forked child, additionally minus `execve`, `execveat`, `fork`, `vfork` and any `clone` without `CLONE_THREAD` (see [the child filter](#the-child-filter)). | A `network = "none"` function whose author wants the kernel to refuse a socket, not merely the namespace to have nothing behind it — and **every runtime pool by default**, because a pool's child runs a script that arrived over an API. With `network = "egress"` or `"full"` it is refused, since nothing could be reached |
+| `strict` | `default` minus the calls that reach the network — `socket`, `connect`, `bind`, `listen`, `accept4`. (Its source also names `ptrace`, `mount` and `umount2`, as a guard should `default` ever gain them; today it has none of the three.) In the agent's forked child, additionally minus `execve`, `execveat`, `fork`, `vfork` and any `clone` without `CLONE_THREAD` (see [the child filter](#the-child-filter)). | A `network = "none"` function whose author wants the kernel to refuse a socket, not merely the namespace to have nothing behind it — and **every runtime pool by default**, because a pool's child runs a script that arrived over an API. With `network = "egress"` or `"full"` it is refused, since nothing could be reached |
 | `permissive` | `default` plus `clone3`, `ptrace`, `unshare`, `setns`, `mount`, `pivot_root`, `chroot`, `mknod`, `process_vm_readv`/`writev`, `personality` and the rest of Docker's default profile. Those eight are the *only* appendix-B exclusions it grants, and a test asserts the list. **It is not "no filter"**: a syscall outside all three lists is refused under `permissive` too. | Debugging a package the tighter profiles break, and Zygo's own derived-layer builds, where `dpkg` uses the legacy `chown`/`chmod`/`mknod` calls. **Not a tenant profile.** |
 
 (T1 and T2 are the trust classes from [chapter 23](23-security.md#the-three-trust-classes):
@@ -107,9 +107,10 @@ that has had serious bugs.
 
 ## `strict`
 
-`strict` is `default` without the calls that *open* network connections —
-`socket`, `connect`, `bind`, `listen`, `accept4` — and without `ptrace`,
-`mount` and `umount2`. It is for a `network = "none"` function whose author
+`strict` is `default` without the calls that *open* network connections:
+`socket`, `connect`, `bind`, `listen` and `accept4`. Its list also names
+`ptrace`, `mount` and `umount2`, so that they stay out if `default` ever
+gains them; today `default` has none of the three. It is for a `network = "none"` function whose author
 wants the kernel itself to refuse a socket, not just a namespace with nothing
 behind it. It is also the default for **every runtime pool**, because a pool's
 child runs a script that arrived over an API. In the agent's forked child,

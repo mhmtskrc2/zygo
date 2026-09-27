@@ -4,10 +4,10 @@ Some choices in Zygo look strange until you know the reason: why the `vm`
 backend has no warm functions, why there is no Deno agent, why an upgrade
 throws the warm sandboxes away. Each of these was written down as an
 *Architecture Decision Record* (ADR): a short, dated note of a question, the
-answer, and what would change the answer. This chapter explains the eight ADRs
+answer, and what would change the answer. This chapter explains the nine ADRs
 in plain words; each section links to the full record in [adr/](adr/).
 
-## The eight decisions at a glance
+## The nine decisions at a glance
 
 | ADR | The question | The answer, in one line |
 |---|---|---|
@@ -22,7 +22,7 @@ in plain words; each section links to the full record in [adr/](adr/).
 | [0009](adr/0009-api-private-net.md) | May what the API serves reach a private address? | Only when `zygo api --allow-private-net` says so; never a request body. |
 
 ```text
-  how the eight decisions depend on each other
+  how the nine decisions depend on each other
   ─────────────────────────────────────────────────────────────────
    0001  the product is the warm path, for an embedder
      │
@@ -31,7 +31,9 @@ in plain words; each section links to the full record in [adr/](adr/).
      ├──► 0004  restarts re-warm; keep one copy of the state
      ├──► 0005  how a real embedder should use warm paths
      ├──► 0006  one tenant's request cannot take the others down
-     └──► 0007  an embedder reaches it through an SDK in its own language
+     ├──► 0007  an embedder reaches it through an SDK in its own language
+     ├──► 0008  a function may listen; a pool shared by tenants may not
+     └──► 0009  the operator, never a request, opens private addresses
   ─────────────────────────────────────────────────────────────────
 ```
 

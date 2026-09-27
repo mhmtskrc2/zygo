@@ -12,6 +12,13 @@ zygo api &                                 # 127.0.0.1:7700, bearer auth
 curl -s -H "Authorization: Bearer $ZYGO_API_TOKEN" \
      -d '{"payload": {"kind": "order", "items": [1, 2, 3]}}' \
      http://127.0.0.1:7700/fn/webhook
+# {"status":401,"error":"bad signature"}     the secret is set; this is unsigned
+
+sig=$(python3 -c 'import hmac, hashlib; p = {"kind": "order", "items": [1, 2, 3]}
+print(hmac.new(b"change-me", repr(sorted(p.items())).encode(), hashlib.sha256).hexdigest())')
+curl -s -H "Authorization: Bearer $ZYGO_API_TOKEN" \
+     -d '{"payload": {"kind": "order", "items": [1, 2, 3]}, "signature": "'"$sig"'"}' \
+     http://127.0.0.1:7700/fn/webhook
 # {"status":200,"received":"order","items":3}
 ```
 

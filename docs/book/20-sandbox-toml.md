@@ -213,8 +213,9 @@ above means the same thing here, except these:
 | `seccomp` | `strict` | Unless a layer sets it. |
 | `secrets` | `[]` | Names a request may receive, never values: each request gets the **calling tenant's** values from the tenant store, as `/run/secrets/<NAME>`, and has its zygote to itself while they exist. A tenant without one of the names is refused before anything runs; a pool naming secrets on a host with no store key is refused at `serve`. Never read from a shell. [Chapter 14](14-limits-network-secrets.md#secrets-in-a-runtime-pool). |
 
-`min_warm` and `max_warm` are refused in `[fn.*]`. A pool admits
-`concurrency × max_warm` requests before it answers busy. `zygo up` starts
+`min_warm` and `max_warm` are refused in `[fn.*]`. A pool runs
+`concurrency × max_warm` requests at once, and up to four times as many more
+may wait; past that it answers busy. `zygo up` starts
 only `[fn.*]`; a pool is started by `zygo serve --runtime <name>` or
 `POST /runtimes`, and stopped by `zygo stop <name>` or
 `DELETE /runtimes/{name}`.
@@ -240,7 +241,7 @@ with the flag typed by a person.
 
 | On `run` and `serve` | Only on `run` | Only on `serve` | **No flag: file or API only** |
 |---|---|---|---|
-| `--mem --cpu --pids --timeout --scratch --nofile --isolation --seccomp --net --allow --mount --env --user --workdir` | image (positional), command → `cmd`, `--requirements` | handler → `entry`, `--image`, `--requirements`, `--concurrency`, `--idle-timeout`, `--mode`, `--agent`, `--secret`, `--min-warm`, `--max-warm` | `system`, `nix`, `io_read`, `io_write`, `connections`, `bandwidth`, `cold_after`, `cmd` for a served function |
+| `--mem --cpu --pids --timeout --scratch --nofile --isolation --seccomp --net --allow --mount --env --user --workdir --requirements` | image (positional), command → `cmd` | handler → `entry`, `--image`, `--concurrency`, `--idle-timeout`, `--mode`, `--agent`, `--secret`, `--min-warm`, `--max-warm` | `system`, `nix`, `io_read`, `io_write`, `connections`, `bandwidth`, `cold_after`, `cmd` for a served function |
 
 ## `zygo.lock`
 

@@ -1,19 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
-//! On-disk layout.
+//! On-disk layout. The book's chapter 21 ("Files Zygo writes") is the full
+//! list and the one to keep true; this is the shape.
 //!
 //! ```text
-//! $XDG_DATA_HOME/zygo/
+//! $XDG_DATA_HOME/zygo/            (ZYGO_DATA_HOME)
 //! ├── images/blobs/sha256/…       OCI blobs
 //! ├── images/layers/<digest>/     unpacked layers
 //! ├── images/index.json           reference → manifest digest
-//! ├── cache/venvs/<hash>/         dependency cache
-//! ├── cache/flat/<digest>/        flattened rootfs (overlayfs fallback)
-//! ├── tenants/<name>/data.img     optional persistent tenant space
-//! └── runsc/, krun/               optional backend binaries
-//! $XDG_RUNTIME_DIR/zygo/
+//! ├── cache/venvs/ flat/ system/  dependency, flattened-root and apt-layer caches
+//! ├── scripts/ blobs/ deps/       what the API stores
+//! ├── tenants/ secrets/           one file per tenant; encrypted secrets
+//! ├── tokens.json auth.json       token hashes; registry credentials
+//! ├── agents/ backends/           the shipped agents; runsc and the vm kernel
+//! └── tmp/                        locks, and sandbox roots while they exist
+//! $XDG_RUNTIME_DIR/zygo/          (ZYGO_RUNTIME_DIR)
 //! ├── supervisor.sock             CLI ↔ supervisor
-//! ├── tenants/<name>/agent.sock   supervisor ↔ runtime agent
-//! └── supervisor.pid
+//! ├── supervisor.pid
+//! ├── host-report.json            a short-lived cache of the host checks
+//! └── tenants/<name>/agent.sock   supervisor ↔ runtime agent
 //! ```
 
 use std::path::{Path, PathBuf};

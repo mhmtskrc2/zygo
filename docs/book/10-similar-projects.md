@@ -48,9 +48,12 @@ call, on the right the program is already loaded and only copied.
 | **Host kernel** | Docker, Podman, runc, nsjail, bubblewrap, firejail, minijail, kern, Zygo `run` | `docker exec` (state is shared), Zygo warm-exec | **Zygo `exec`** |
 | **Process confinement only** | nono, Landlock-based tools: they confine a process you already run | | Sandlock (a copy-on-write fork of a confined Python process) |
 
-The right-hand column was empty when Zygo started, and it is the space Zygo
-was built for. Since 2026 two more projects fork there, each from a different
-row: [Sandlock and Zeroboot](#sandlock-and-zeroboot-two-other-forks), below.
+The right-hand column held research when Zygo started, not a product:
+SOCK (USENIX ATC 2018), built into the OpenLambda research platform, forks
+Python handlers from a zygote on the host kernel
+([chapter 6](06-how-zygo-works.md#the-idea-of-a-zygote)). That column is the
+space Zygo was built for. Since 2026 two more projects fork there, each
+from a different row: [Sandlock and Zeroboot](#sandlock-and-zeroboot-two-other-forks), below.
 Everything else on this page is a good tool for a nearby job.
 
 ## What one call costs, tool by tool

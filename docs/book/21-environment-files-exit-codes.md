@@ -47,6 +47,8 @@ else from your shell crosses.
 | `TMPDIR`, `TMP`, `TEMP` | the agent, per request | The request's own temporary folder: the workspace if one was sent, otherwise `/work/tmp-<random>`. Removed when the request ends. |
 | `ZYGO_AGENT_TMP_PARENT` | you, for an agent's tests | Where the reference agents make those folders instead of `/work`. Nothing in Zygo sets it. |
 | `ZYGO_WORKSPACE` | the agent, per request | The request's workspace folder, when one was sent; the handler starts in it. |
+| `ZYGO_CHILD_SECCOMP` | Zygo, under `seccomp = "strict"` | The filter each forked child installs after `GO`, as base64 of a raw seccomp program. For the agent; a handler never needs it ([chapter 24](24-seccomp-profiles.md#the-child-filter)). |
+| `ZYGO_CHILD_SECCOMP_HELPER` | you, for the Node agent | The path of the small shared object that lets a Node worker install that filter. Without it, the agent looks for `zygo_child_seccomp.so` beside itself, then falls back to Node's permission model ([chapter 18](18-writing-an-agent.md)). |
 | your `env` | you | Everything in `env` / `--env`. |
 
 Secrets are **not** environment variables: they are files in
@@ -83,9 +85,12 @@ $XDG_RUNTIME_DIR/zygo/                  the runtime folder (ZYGO_RUNTIME_DIR), m
 
 Beside your project, `zygo up` writes `zygo.lock`, which you should commit.
 `zygo doctor --fix` may write `~/.config/systemd/user/user@.service.d/delegate.conf`,
-`/etc/sysctl.d/60-zygo-userns.conf` and
+`/etc/sysctl.d/60-zygo-userns.conf`, `/etc/apparmor.d/zygo` (the profile that
+lets this binary use user namespaces) and
 `/etc/systemd/system/zygo-cgroup-favordynmods.service`, and prints each one
-before it does. On a
+before it does. Putting `pasta`'s profile in complain mode runs `aa-complain`,
+which edits `/etc/apparmor.d/usr.bin.passt` or leaves a marker in
+`/etc/apparmor.d/force-complain/`. On a
 Mac, the VM lives in `~/.lima/zygo/`. There is no Zygo config file: the spec
 and the lock are the only configuration.
 

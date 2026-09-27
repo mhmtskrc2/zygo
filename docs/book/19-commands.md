@@ -227,7 +227,7 @@ need two samples, so the first frame shows `—`.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `-i`, `--interval SECONDS` | `2.0` | Time between frames. |
+| `-i`, `--interval SECONDS` | `2` | Time between frames. |
 | `--once` | off | One frame, then exit — for scripts. `--json` implies it. |
 
 ## `zygo stats` — latency and outcome summary

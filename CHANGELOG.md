@@ -110,6 +110,19 @@ break things and will say so here.
   and the `cgroup moves` check says a request "waits several ms", where a
   number was missing.
 - The Node client's type for `version()` has `private_net`.
+- The README, the book and the examples agree with the code again. Landlock's
+  network rules need Linux 6.7, not the recommended 6.1 (chapter 11); `zygo
+  serve` takes `--net`, not `--network` (chapter 13); `GET /metrics` has no
+  `zygo_gate_queued` series to scale on (chapter 16, the Kubernetes example);
+  a pool lets four times its running requests wait before it answers busy
+  (chapter 20); `strict` differs from `default` by the five socket calls
+  (chapter 24); a warm function's code is named by path on the Zygo host, so
+  one zygote per script version needs a shared disk (chapters 13, 17); the
+  headline benchmark run's raw output is not in `bench/results/`, and the
+  record that is says so (chapter 25); chapter 26 counts nine ADRs; escape
+  cases 16 and 17 have rows in the threat model. The README's `vm` and
+  `gvisor` sentence now says why neither is a wall for hostile code yet, and
+  the quick start ends with `zygo stop --all`.
 - A runtime pool's warnings and errors name its own table: `runtime.py313.io_read`,
   not `fn.py313.io_read`, which pointed at a `[fn.py313]` that does not exist.
   `zygo spec validate` groups the two kinds together.

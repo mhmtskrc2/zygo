@@ -73,9 +73,10 @@ Two alternatives, both fine:
 
 * **An Ingress.** The API is your control plane's, not the internet's; what
   belongs in front of it is a service of yours.
-* **Autoscaling.** A warm pool is memory, not CPU, and the useful signal is
-  `zygo_gate_queued` rather than utilisation. `GET /metrics` is Prometheus
-  text; scale on what it says once you know what your workload does.
+* **Autoscaling.** A warm pool is memory, not CPU. The useful signal is how
+  many requests wait, and `GET /metrics` does not publish that yet; until it
+  does, scale on `zygo_function_rss_bytes` and on the `429` answers your
+  callers see.
 * **A PodSecurityPolicy or a Gatekeeper constraint.** A cluster that enforces
   one will need an exception for this namespace, and writing somebody else's
   exception for them is how a manifest becomes wrong.

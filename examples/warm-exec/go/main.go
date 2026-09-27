@@ -10,13 +10,13 @@
 //
 // Build it statically, so the image needs nothing:
 //
-//	CGO_ENABLED=0 go build -o parse .
+//	CGO_ENABLED=0 go build -o bin/parse .
 //
 // and point a function at it:
 //
 //	[fn.parse]
 //	image = "alpine:3"
-//	mounts = ["./parse:/app/parse:ro"]
+//	mounts = ["./bin/parse:/app/parse:ro"]
 //	cmd = ["/app/parse"]
 package main
 
