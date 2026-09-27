@@ -330,9 +330,11 @@ or cannot do.
 ```
 
 A function that must reach a service on its own host is given that service
-on an address the host really has — its LAN address, or one on a dummy
-interface — with an `allow` rule naming it and `--allow-private-net` typed by
-a person. A service on loopback only stays loopback only. Before 0.1.4
+on a second address the host has — a Docker bridge's `172.17.0.1`, or one on
+a dummy interface — with an `allow` rule naming it and `--allow-private-net`
+typed by a person. Not the host's main address: `pasta` gives that same
+address to the sandbox's own network card, so a sandbox dialling it reaches
+itself and is refused. A service on loopback only stays loopback only. Before 0.1.4
 this was not so: an `allow` rule for any name on port 5432 also opened the
 host's own `127.0.0.1:5432`, and on a kernel without Landlock's network
 rules (below 6.7) every port the host had bound on loopback was open.

@@ -19,8 +19,9 @@ break things and will say so here.
   reached the host's `127.0.0.1:8443`; below 6.7 every loopback port the
   host had bound was open. `pasta` now runs with `--tcp-ns none --udp-ns
   none --no-map-gw`. A service on the host that a sandbox should reach must
-  listen on an address the host really has, and be allowed with
-  `--allow-private-net` (chapter 14). Escape case 19 attempts it three ways.
+  listen on a second address the host has, such as a Docker bridge's, and be
+  allowed with `--allow-private-net`; not the host's main address, which
+  `pasta` gives the sandbox too (chapter 14). Escape case 19 attempts it three ways.
   Found by the n8n task-runner round.
 - A host whose user has no subordinate uid range no longer becomes
   multi-tenant quietly: `POST /tenants` is refused there, with the fix in
