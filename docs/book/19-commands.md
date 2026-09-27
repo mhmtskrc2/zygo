@@ -207,7 +207,8 @@ is an error (`125`), and a name that is neither a function nor a pool is
 also stops the Linux VM afterwards.
 
 **Output:** one line per thing stopped — `stopped NAME` for a function,
-`stopped runtime.NAME` for a pool — so you can see which kind went. A name
+`stopped runtime.NAME` for a pool, and `stopped the supervisor` when `--all`
+ended it — so you can see which kind went. `nothing to stop` means just that. A name
 that is **both** a function and a pool stops both: `stop` means "forget this
 name". To stop only one of the pair, use the API, which keeps them apart:
 `DELETE /fn/{name}` never reaches a pool, and `DELETE /runtimes/{name}`

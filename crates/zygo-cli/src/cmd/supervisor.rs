@@ -1017,17 +1017,20 @@ pub fn stop(cli: &Cli, name: Option<&str>, all: bool) -> anyhow::Result<u8> {
     };
 
     // Stopping the last function leaves a supervisor with nothing to hold open.
-    if all {
-        let _ = client.send(&Request::Shutdown);
-    }
+    // Said when it happens: a supervisor with no functions is still a process
+    // someone started, and "nothing to stop" over its exit was untrue.
+    let supervisor_stopped = all && client.send(&Request::Shutdown).is_ok();
 
     if cli.json {
         output::json(&serde_json::json!({ "stopped": stopped }))?;
-    } else if stopped.is_empty() {
+    } else if stopped.is_empty() && !supervisor_stopped {
         println!("{}", Style::stdout().dim("nothing to stop"));
     } else {
         for name in &stopped {
             println!("stopped {name}");
+        }
+        if supervisor_stopped {
+            println!("stopped the supervisor");
         }
     }
     Ok(0)

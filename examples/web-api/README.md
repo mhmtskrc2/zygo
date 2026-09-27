@@ -115,9 +115,9 @@ zygo down         # the function `lower`
 zygo stop --all   # everything else, including the pool, and the supervisor
 ```
 
-`zygo stop py312` does not work: `zygo stop NAME` knows functions, not pools.
-`zygo stop --all` does end the pool — it may still print "nothing to stop",
-because it counts only functions.
+To end only the pool, `zygo stop py312` does it and prints
+`stopped runtime.py312`. `zygo stop --all` prints a line for each thing it
+stopped, the supervisor last.
 
 ## Where to read more
 

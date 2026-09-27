@@ -99,6 +99,9 @@ break things and will say so here.
 
 ### Fixed
 
+- `zygo stop --all` says `stopped the supervisor` when it stops one. With no
+  function running it printed "nothing to stop" and stopped the supervisor
+  anyway. The JSON output is unchanged.
 - `spec/openapi.json` no longer says `GET /healthz` needs a token; the router
   answers it before the bearer check, and a test now holds the two together.
   Chapter 17 says what the document leaves out: request bodies, query
