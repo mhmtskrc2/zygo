@@ -347,7 +347,15 @@ jobs:
         working-directory: sdk/elixir
         run: |
           mix local.hex --force
+          # Every environment's dependencies, not only the test ones `make
+          # test-sdk` fetched: `hex.publish` builds the docs with ex_doc, a
+          # :dev dependency, and without it v0.1.4's publish stopped at
+          # "Unchecked dependencies for environment dev".
+          mix deps.get
           mix hex.build
+          # The docs `hex.publish` uploads, built here too, so a rehearsal
+          # fails where a real release would.
+          mix docs
 
       - name: Publish to PyPI
         if: needs.what.outputs.publish == 'true' && env.PYPI_TRUSTED_PUBLISHING == 'true'
