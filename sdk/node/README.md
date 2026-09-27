@@ -7,6 +7,29 @@ namespaces, cgroups and seccomp, and answers in about a millisecond.
 This package is the Node side of that: register a script once, then call it
 with JSON in and JSON out.
 
+## Before you start
+
+This package is a client. The sandboxes are run by `zygo`, one static binary
+for Linux; on macOS it runs everything in a Linux VM it manages, and the API
+it starts there answers on the Mac at the same address. Install it as
+[the project's README](https://github.com/mhmtskrc2/zygo#install) shows, then:
+
+```bash
+zygo doctor                                    # can this host run sandboxes?
+zygo pull node:22-slim                         # the API never pulls an image itself
+export ZYGO_API_TOKEN=$(openssl rand -hex 16)  # `zygo api` will not start without one
+zygo api --allow-deploy                        # 127.0.0.1:7700; leave it running
+```
+
+`--allow-deploy` lets a client start functions and one-shot sandboxes.
+The first example calls a function named `resize` that a `sandbox.toml`
+declares and `zygo up` starts; [chapter 11 of the Zygo book](https://github.com/mhmtskrc2/zygo/blob/main/docs/book/11-getting-started.md)
+walks through one. `connect()` finds the API at `ZYGO_API_URL`, or
+`http://127.0.0.1:7700`, and sends `ZYGO_API_TOKEN`, so a program started
+from the same shell needs no settings.
+
+## Using it
+
 ```bash
 npm install zygo-sdk
 ```

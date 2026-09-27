@@ -7,6 +7,15 @@ break things and will say so here.
 
 ## [Unreleased]
 
+### Fixed
+
+- The Python, Node and Elixir clients' READMEs, which are their package pages,
+  now say the package is only a client and what has to be done before the
+  first example runs: install `zygo`, pull the image (the API never pulls
+  one), set `ZYGO_API_TOKEN` (`zygo api` will not start without it) and start
+  the API with `--allow-deploy`. On a Mac, the API started in the VM answers
+  on the Mac at the same address.
+
 ## [0.1.4] — 2026-09-27
 
 Four security fixes are the reason to upgrade: a request can no longer write
