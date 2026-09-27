@@ -18,6 +18,14 @@ break things and will say so here.
   agent's workers never had it. The rule is now §3.13 of `spec/protocol.md`
   and a question in "Fork safety", and the agent's tests try a forged
   `DONE` from a handler.
+- A workspace sent back with `?out=1` can no longer carry the supervisor's own
+  files. It was packed by path through `/proc/<pid>/root`, where an absolute
+  symlink resolves against the supervisor's root, not the sandbox's: a
+  handler that left a process running could swap a folder, or the workspace
+  itself, for a link between the check and the read. The workspace is now
+  walked by descriptor with `O_NOFOLLOW` at every step, a name is packed
+  only if it is still a folder or a regular file when opened, and a file
+  contributes no more bytes than were counted against the cap (chapter 17).
 - An `egress` or `full` sandbox can no longer reach a service its host
   bound to `127.0.0.1` only. `pasta`, at its defaults, forwarded a connection
   to the sandbox's own loopback on to the same port on the host's loopback,

@@ -223,6 +223,7 @@ phase 5 is that work.
 | Vector | Control | Status |
 |---|---|---|
 | Listing or reading another request's workspace in a shared pool | `/work` is a tmpfs of Zygo's own, mode 0311, one folder with a random name per request | **attempted** (case 14b) |
+| A handler leaving a link in its workspace, so that `?out=1` packs the supervisor's files | the workspace is walked by descriptor, `openat` with `O_NOFOLLOW` at every step, and a name is packed only if it is still a folder or a regular file when opened | **tested** by `zygo-core`'s own tests, including a name swapped after the folder was read; not yet in `make escape-linux` |
 | A file left in the temp folder for the next tenant's request | each request's `TMPDIR` is its own folder under `/work` (above) | **attempted** (case 18) |
 | Tenant A running or reading tenant B's script in the same pool | scripts are bound read-only under `/run/script/<digest>` | **not yet attempted** |
 | Tenant A reading tenant B's secret file while both requests are in flight | secret files are written per request, mode 0400, and removed after | **not yet attempted** as a cross-tenant case |

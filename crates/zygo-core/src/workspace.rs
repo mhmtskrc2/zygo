@@ -48,6 +48,7 @@
 //!   than from the header, which an archive is free to lie in.
 
 use std::io::Read;
+use std::os::fd::{AsFd, BorrowedFd};
 use std::path::{Component, Path, PathBuf};
 
 use crate::error::{Error, IoContext, Result};
@@ -162,60 +163,151 @@ pub fn unpack(tar: &[u8], dir: &Path) -> Result<u64> {
 /// Directories and regular files, like the way in — a handler that left a
 /// symlink gets it skipped rather than the request failed, because by then the
 /// work is done and losing the answer over a link is the wrong trade.
+///
+/// **Walked by descriptor, never by path.** `dir` is reached through
+/// `/proc/<pid>/root`, and everything under it belongs to the handler — which
+/// may have left a process running that is still changing it. A path would be
+/// resolved again at every step, and an absolute symlink met on the way is
+/// resolved against *this* process's root, not the sandbox's: a folder
+/// swapped for `-> /home` between a check and a `read_dir` would pack the
+/// supervisor's own files. So each step is `openat` on the folder already
+/// open, with `O_NOFOLLOW`, and a name is packed only if what was opened is
+/// still the kind of thing it was when the folder was read. The workspace
+/// folder itself is opened the same way.
 pub fn pack(dir: &Path) -> Result<Vec<u8>> {
+    let root = rustix::fs::open(dir, entry_flags(true), rustix::fs::Mode::empty())
+        .map_err(|e| Error::io(dir, e.into()))?;
     let mut builder = tar::Builder::new(Vec::new());
     let mut total = 0u64;
-    pack_into(&mut builder, dir, Path::new(""), &mut total)?;
+    pack_into(&mut builder, root.as_fd(), dir, Path::new(""), &mut total)?;
     builder
         .into_inner()
         .map_err(|e| Error::primitive("pack", "the workspace", e))
 }
 
+fn entry_flags(directory: bool) -> rustix::fs::OFlags {
+    use rustix::fs::OFlags;
+    // `NONBLOCK` so that a name swapped for a FIFO after it was looked at
+    // opens at once, to be found out by the check below, rather than hang.
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY;
+    if directory {
+        flags | OFlags::DIRECTORY | OFlags::CLOEXEC
+    } else {
+        flags | OFlags::CLOEXEC
+    }
+}
+
+/// Open `name` in `parent` as a directory or a regular file, or `None` when it
+/// is no longer one: replaced by a symlink, a socket, a FIFO or nothing since
+/// the folder was read.
+fn open_entry(
+    parent: BorrowedFd<'_>,
+    name: &std::ffi::CStr,
+    directory: bool,
+) -> std::io::Result<Option<(std::fs::File, std::fs::Metadata)>> {
+    use rustix::io::Errno;
+    let fd = match rustix::fs::openat(
+        parent,
+        name,
+        entry_flags(directory),
+        rustix::fs::Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(e)
+            if e == Errno::LOOP
+                || e == Errno::NXIO
+                || e == Errno::NOTDIR
+                || e == Errno::NOENT
+                || e == Errno::OPNOTSUPP =>
+        {
+            return Ok(None);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let file = std::fs::File::from(fd);
+    let meta = file.metadata()?;
+    let still = if directory {
+        meta.is_dir()
+    } else {
+        meta.is_file()
+    };
+    Ok(still.then_some((file, meta)))
+}
+
 fn pack_into(
     builder: &mut tar::Builder<Vec<u8>>,
-    dir: &Path,
+    dir: BorrowedFd<'_>,
+    shown: &Path,
     prefix: &Path,
     total: &mut u64,
 ) -> Result<()> {
-    let mut entries: Vec<_> = std::fs::read_dir(dir)
-        .at(dir)?
-        .flatten()
-        .map(|e| e.path())
-        .collect();
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut names = Vec::new();
+    for entry in rustix::fs::Dir::read_from(dir).map_err(|e| Error::io(shown, e.into()))? {
+        let entry = entry.map_err(|e| Error::io(shown, e.into()))?;
+        let name = entry.file_name();
+        if name != c"." && name != c".." {
+            names.push(name.to_owned());
+        }
+    }
     // Sorted, so the same workspace packs to the same bytes twice. A caller
     // that hashes what it got back should not see it change because a
     // directory read came out in a different order.
-    entries.sort();
+    names.sort();
 
-    for path in entries {
-        let Some(name) = path.file_name() else {
-            continue;
+    for name in names {
+        let leaf = std::ffi::OsStr::from_bytes(name.to_bytes());
+        let inside = prefix.join(leaf);
+        let path = shown.join(leaf);
+        let stat = match rustix::fs::statat(dir, &name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => stat,
+            // Gone since the folder was read: nothing to pack.
+            Err(rustix::io::Errno::NOENT) => continue,
+            Err(e) => return Err(Error::io(&path, e.into())),
         };
-        let inside = prefix.join(name);
-        let meta = std::fs::symlink_metadata(&path).at(&path)?;
-        if meta.is_dir() {
-            builder
-                .append_dir(&inside, &path)
-                .map_err(|e| Error::io(&path, e))?;
-            pack_into(builder, &path, &inside, total)?;
-        } else if meta.is_file() {
-            *total += meta.len();
-            if *total > MAX_WORKSPACE_BYTES {
-                return Err(refused(
-                    format!(
-                        "the handler left more than {} MiB in its workspace",
-                        MAX_WORKSPACE_BYTES / (1024 * 1024)
-                    ),
-                    std::io::Error::other("workspace too large"),
-                ));
+        match rustix::fs::FileType::from_raw_mode(stat.st_mode) {
+            rustix::fs::FileType::Directory => {
+                let Some((sub, meta)) = open_entry(dir, &name, true).at(&path)? else {
+                    continue;
+                };
+                let mut header = tar::Header::new_gnu();
+                header.set_metadata_in_mode(&meta, tar::HeaderMode::Complete);
+                builder
+                    .append_data(&mut header, &inside, std::io::empty())
+                    .map_err(|e| Error::io(&path, e))?;
+                pack_into(builder, sub.as_fd(), &path, &inside, total)?;
             }
-            let mut file = std::fs::File::open(&path).at(&path)?;
-            builder
-                .append_file(&inside, &mut file)
-                .map_err(|e| Error::io(&path, e))?;
+            rustix::fs::FileType::RegularFile => {
+                let Some((file, meta)) = open_entry(dir, &name, false).at(&path)? else {
+                    continue;
+                };
+                *total += meta.len();
+                if *total > MAX_WORKSPACE_BYTES {
+                    return Err(refused(
+                        format!(
+                            "the handler left more than {} MiB in its workspace",
+                            MAX_WORKSPACE_BYTES / (1024 * 1024)
+                        ),
+                        std::io::Error::other("workspace too large"),
+                    ));
+                }
+                // No more than the size that was counted: a process still
+                // writing to the file cannot push the answer past the cap,
+                // and the header always says how many bytes follow it.
+                let mut bytes = Vec::new();
+                (&file).take(meta.len()).read_to_end(&mut bytes).at(&path)?;
+                let mut header = tar::Header::new_gnu();
+                header.set_metadata_in_mode(&meta, tar::HeaderMode::Complete);
+                header.set_size(bytes.len() as u64);
+                builder
+                    .append_data(&mut header, &inside, bytes.as_slice())
+                    .map_err(|e| Error::io(&path, e))?;
+            }
+            // Anything else — a symlink, a socket a handler happened to leave —
+            // is skipped. See the note on `pack`.
+            _ => {}
         }
-        // Anything else — a symlink, a socket a handler happened to leave —
-        // is skipped. See the note on `pack`.
     }
     Ok(())
 }
@@ -344,6 +436,72 @@ mod tests {
             std::fs::read_to_string(back.path().join("sub/deep.txt")).expect("read"),
             "there"
         );
+    }
+
+    /// The answer to `?out=1` is read through `/proc/<pid>/root`, where an
+    /// absolute symlink resolves against the supervisor's root. A handler that
+    /// swaps its own workspace folder for a link must get nothing, not the
+    /// folder the link names.
+    #[test]
+    fn a_workspace_folder_replaced_by_a_symlink_is_not_packed() {
+        let host = tempfile::tempdir().expect("tempdir");
+        let secret = host.path().join("operator");
+        std::fs::create_dir(&secret).expect("mkdir");
+        std::fs::write(secret.join("id_rsa"), b"not for tenants").expect("write");
+        let workspace = host.path().join("work");
+        std::os::unix::fs::symlink(&secret, &workspace).expect("symlink");
+
+        assert!(pack(&workspace).is_err(), "a linked workspace was packed");
+    }
+
+    /// The race itself: a name that was a folder or a file when the folder was
+    /// read, and is something else by the time it is opened.
+    #[test]
+    fn a_name_swapped_after_it_was_looked_at_is_not_followed() {
+        let host = tempfile::tempdir().expect("tempdir");
+        let outside = host.path().join("outside");
+        std::fs::create_dir(&outside).expect("mkdir");
+        std::fs::write(outside.join("secret"), b"x").expect("write");
+        let work = host.path().join("work");
+        std::fs::create_dir(&work).expect("mkdir");
+        std::os::unix::fs::symlink(&outside, work.join("was-a-folder")).expect("symlink");
+        std::os::unix::fs::symlink(outside.join("secret"), work.join("was-a-file"))
+            .expect("symlink");
+        let fifo = std::ffi::CString::new(
+            work.join("was-a-file-too")
+                .into_os_string()
+                .into_encoded_bytes(),
+        )
+        .expect("path");
+        // SAFETY: a NUL-terminated path this test owns.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0, "mkfifo");
+
+        let dir = rustix::fs::open(&work, entry_flags(true), rustix::fs::Mode::empty())
+            .expect("open work");
+        for (name, directory) in [
+            (c"was-a-folder", true),
+            (c"was-a-file", false),
+            (c"was-a-file-too", false),
+        ] {
+            let opened = open_entry(dir.as_fd(), name, directory).expect("open_entry");
+            assert!(
+                opened.is_none(),
+                "{name:?} was opened as a {}",
+                if directory { "folder" } else { "file" }
+            );
+        }
+
+        // And the whole walk: the links and the FIFO are skipped, not followed.
+        std::fs::write(work.join("kept.txt"), b"mine").expect("write");
+        let back = tempfile::tempdir().expect("tempdir");
+        unpack(&pack(&work).expect("pack"), back.path()).expect("unpack");
+        let mut got: Vec<_> = std::fs::read_dir(back.path())
+            .expect("read_dir")
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        got.sort();
+        assert_eq!(got, ["kept.txt"]);
     }
 
     /// The one thing this module exists to get right.

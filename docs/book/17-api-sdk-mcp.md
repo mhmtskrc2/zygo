@@ -929,6 +929,14 @@ absolute paths. File modes are Zygo's, not the archive's. Entries and bytes
 are capped, and counted as they are written, not read from a header an
 archive is free to lie in.
 
+The way out is careful too. `?out=1` packs what the handler left, and the
+handler may leave a process running that keeps changing it. So Zygo never
+follows a path into the folder. It opens each folder it has already opened,
+one name at a time, and never follows a link. A name that has become a link,
+a pipe or a socket since the folder was read is skipped. A workspace folder
+swapped for a link is not packed at all. Only files and folders come back,
+and never more bytes than the cap.
+
 ## Watching a request
 
 A call that takes a minute has something to say before it finishes:
