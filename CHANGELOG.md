@@ -7,6 +7,16 @@ break things and will say so here.
 
 ## [Unreleased]
 
+## [0.1.4] — 2026-09-27
+
+Four security fixes are the reason to upgrade: a request can no longer write
+to the supervisor as its agent, a workspace sent back can no longer carry the
+supervisor's files, a sandbox can no longer reach a service the host bound to
+loopback only, and a host without uid separation no longer becomes
+multi-tenant quietly. The Elixir client, `zygo_sdk`, is released from a tag
+for the first time; the 0.1.3 on Hex was published by hand before its code
+was committed.
+
 ### Security
 
 - A request's own code can no longer write to the supervisor. The Python
@@ -450,7 +460,8 @@ The first public version.
 - A warm-exec request is created inside its cgroup (`CLONE_INTO_CGROUP`,
   Linux 5.7+) rather than moved there, so it never waits on that lock.
 
-[Unreleased]: https://github.com/mhmtskrc2/zygo/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/mhmtskrc2/zygo/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/mhmtskrc2/zygo/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/mhmtskrc2/zygo/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/mhmtskrc2/zygo/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/mhmtskrc2/zygo/compare/v0.1.0...v0.1.1

@@ -1370,7 +1370,7 @@ an embedder finds later.
 | `deploy` | Whether *this caller* has deploy rights — the truth about your own token, not just the flag. |
 | `private_net` | Whether what *this caller* deploys may allow private addresses: `zygo api --allow-private-net`, and deploy rights. |
 
-All three packages are `0.1.3` and follow the repository's `0.x` policy:
+All three packages are `0.1.4` and follow the repository's `0.x` policy:
 the shape may change with a release note. After `1.0` it will not change
 without a major version.
 

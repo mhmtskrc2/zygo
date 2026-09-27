@@ -61,7 +61,7 @@ plane.
 ## Verifying a published image
 
 ```bash
-cosign verify ghcr.io/mhmtskrc2/zygo:0.1.3 \
+cosign verify ghcr.io/mhmtskrc2/zygo:0.1.4 \
   --certificate-identity-regexp '^https://github\.com/.*/\.github/workflows/release\.yml@refs/tags/' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
