@@ -183,6 +183,8 @@ class FdHarness:
 
         ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         theirs.set_inheritable(True)
+        #: The descriptor number the agent holds its end on; `pass_fds` keeps it.
+        self.agent_fd = theirs.fileno()
         self.proc = subprocess.Popen(
             [sys.executable, str(AGENT), "--fd", str(theirs.fileno()),
              str(self.handler_path)],
@@ -869,6 +871,45 @@ class InheritedSocketTests(unittest.TestCase):
         done = h.wire.recv()
         self.assertEqual(done["type"], "DONE")
         self.assertEqual(done["result"], {"doubled": 42})
+
+    def test_a_forked_child_cannot_write_to_the_supervisor(self):
+        """Handler code must not hold the agent's end of the control socket.
+
+        With it, a request could write frames of its own to the supervisor: a
+        `DONE` for another request's id, answered with whatever it liked, or a
+        broken frame that takes the whole agent down. In a runtime pool the
+        other request can be another tenant's. The child closes its copy
+        before anything else runs; the agent's own copy is untouched.
+        """
+        h = FdHarness("""
+            import json, os, stat, struct
+
+            def handler(event):
+                fd = event["fd"]
+                try:
+                    is_socket = stat.S_ISSOCK(os.fstat(fd).st_mode)
+                except OSError:
+                    is_socket = False
+                if is_socket:
+                    body = json.dumps({"type": "DONE", "id": "victim",
+                                       "exit_code": 0, "result": "forged"}).encode()
+                    os.write(fd, struct.pack(">I", len(body)) + body)
+                return {"socket": is_socket}
+            """)
+        self.addCleanup(h.close)
+        self.assertEqual(h.wire.recv()["type"], "READY")
+
+        h.wire.send({"type": "EXEC", "id": "r", "event": {"fd": h.agent_fd},
+                     "timeout_ms": 30000})
+        self.assertEqual(h.wire.recv()["type"], "FORKED")
+        h.wire.send({"type": "GO", "id": "r"})
+        done = h.wire.recv()
+        self.assertEqual(done.get("id"), "r", f"a frame the agent did not send: {done}")
+        self.assertEqual(done["result"], {"socket": False})
+
+        # The agent's own end still works after the child has gone.
+        h.wire.send({"type": "PING", "seq": 7})
+        self.assertEqual(h.wire.recv(), {"type": "PONG", "seq": 7})
 
 
 class ForkFallbackTests(unittest.TestCase):

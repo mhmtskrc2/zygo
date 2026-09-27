@@ -98,6 +98,16 @@ detect this. Build the *client* at import time, which is where the cost is,
 and let it connect on first use in the child. Most clients, `boto3` and
 `requests.Session` among them, connect lazily.
 
+## Can a request talk to the supervisor?
+
+No. The zygote reaches the supervisor over one socket, and a forked child
+starts with a copy of it. The agent closes that copy in the child before any
+of your code runs, so a request cannot send messages as the agent. Without
+this, a request could answer for another request, which in a runtime pool
+may be another tenant's. The Node agent's workers never get the socket at
+all. The rule is in [the protocol](../../spec/protocol.md#3-required-agent-behaviour),
+and the agent's tests try to break it.
+
 ## Do `atexit` handlers run?
 
 No. A child leaves with `os._exit`: no `atexit` handlers, no interpreter

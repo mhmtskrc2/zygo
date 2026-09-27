@@ -9,6 +9,15 @@ break things and will say so here.
 
 ### Security
 
+- A request's own code can no longer write to the supervisor. The Python
+  agent forked each child with a copy of its control socket still open, so
+  handler code could send a `DONE` of its own for another request's id — in
+  a runtime pool, another tenant's — or a broken frame that ended the agent
+  and every request in it. The child now closes its copy before anything
+  else runs; the example `sh` agent closes it for the handler too. The Node
+  agent's workers never had it. The rule is now §3.13 of `spec/protocol.md`
+  and a question in "Fork safety", and the agent's tests try a forged
+  `DONE` from a handler.
 - An `egress` or `full` sandbox can no longer reach a service its host
   bound to `127.0.0.1` only. `pasta`, at its defaults, forwarded a connection
   to the sandbox's own loopback on to the same port on the host's loopback,

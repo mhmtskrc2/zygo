@@ -236,6 +236,7 @@ phase 5 is that work.
 |---|---|---|
 | Secrets | never in `EXEC`, never in the zygote: written by the supervisor from *outside* the sandbox to `/run/secrets/<name>` (0400) between `FORKED` and `GO`, removed when the last request in flight finishes. A warm-exec sandbox is reached through a directory descriptor its own init hands out before it hardens, not through `/proc` — which a non-dumpable process does not offer an unprivileged supervisor at all | **attempted** — the file is absent between requests, the value is absent from the agent's `environ`, and both paths are exercised as an ordinary user |
 | The supervisor's socket | unix socket 0600 inside a 0700 directory, plus an `SO_PEERCRED` uid check | **attempted** |
+| A request writing to the supervisor as its agent: a `DONE` for another request's id, in a pool another tenant's | the agent closes the child's copy of its control socket before any request code runs ([protocol §3](../../spec/protocol.md#3-required-agent-behaviour), rule 13); a Node worker never holds it | **tested** by the Python agent's own suite, which has a handler write a forged `DONE`; not yet in `make escape-linux` |
 | The HTTP API | bearer token from the environment only, compared in constant time; refuses to start unauthenticated on a reachable address | **attempted** |
 
 ## Out of scope

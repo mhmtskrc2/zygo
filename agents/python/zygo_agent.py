@@ -144,6 +144,19 @@ class Framing:
     def fileno(self) -> int:
         return self._sock.fileno()
 
+    def drop_in_child(self) -> None:
+        """Close this process's copy of the descriptor, and nothing else.
+
+        For a forked child, before any request code runs. The child has a copy
+        of the agent's end of the control socket, and a copy is a whole
+        connection: with it, handler code could write frames to the
+        supervisor — a `DONE` for another request's id, or a broken frame that
+        ends the agent. Closing it here ends nothing for the agent, whose own
+        descriptor is separate. `detach` first, so the socket object does not
+        close a number that has since been given to something else.
+        """
+        os.close(self._sock.detach())
+
     def send(self, message: dict) -> None:
         body = json.dumps(message, separators=(",", ":")).encode()
         if len(body) > MAX_FRAME_BYTES:
@@ -1280,6 +1293,9 @@ class Agent:
             return
 
         if pid == 0:
+            # The control socket first: from here on nothing in this process
+            # may speak for the agent (`Framing.drop_in_child`).
+            self._wire.drop_in_child()
             os.close(result_r)
             os.close(go_w)
             # Another request's pipes, inherited by accident. Holding the write

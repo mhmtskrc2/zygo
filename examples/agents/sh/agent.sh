@@ -127,7 +127,9 @@ while frame=$(read_frame); do
         # allocates is billed to the agent and escapes the request's limits.
         (
             read -r _ <"$go"
-            printf '%s' "$event" | handler >"$out" 2>"$err" 4>"$res"
+            # `3>&-`: the handler gets no copy of the control socket, so it
+            # cannot write frames of its own to the supervisor.
+            printf '%s' "$event" | handler >"$out" 2>"$err" 4>"$res" 3>&-
             echo $? >"$res.code"
         ) &
         child=$!

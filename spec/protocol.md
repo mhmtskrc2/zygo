@@ -517,6 +517,15 @@ child filter, and nothing about the warmed-handler path exercises that.
    Hash *what was read*, not the file again: reading twice is a window for the
    tenant to change it in between. An agent that does not implement `script`
    at all is unaffected — it never loads anything a digest describes.
+13. **The child holds no copy of the control socket.** The agent closes the
+    child's copy of descriptor 3 (or wherever its connection lives) before any
+    handler code runs, and hands it to nothing it starts. A copy is a whole
+    connection: with it, handler code could write a `DONE` for another
+    request's id — in a runtime pool, another tenant's — or a broken frame
+    that ends the agent and every request in it. Closing the child's copy
+    ends nothing for the agent, whose own descriptor is separate. `zygo agent
+    test` does not check this yet; the Python agent's own tests do, by trying
+    to write a forged `DONE` from a handler.
 
 ### Strongly recommended
 - **Import nothing lazily on the request path.** Every module the child touches
