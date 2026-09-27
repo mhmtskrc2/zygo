@@ -1196,7 +1196,7 @@ mod probe {
             ),
             Some(false) => Check::degraded(
                 NAME,
-                "no favordynmods: ~1 warm request in 100 waits ms to enter its cgroup",
+                "no favordynmods: ~1 warm request in 100 waits several ms to enter its cgroup",
                 if in_a_container() {
                     "this is the host's setting: on the host, run `mount -o \
                      remount,favordynmods /sys/fs/cgroup` (and make it survive a \

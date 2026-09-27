@@ -184,8 +184,9 @@ pub enum Command {
         ///
         /// Only the ones that really are one command: the AppArmor
         /// restriction on unprivileged user namespaces, the AppArmor profile
-        /// confining `pasta`, cgroup delegation for your user session, and
-        /// the two egress packages. A kernel that is too old is not a fix.
+        /// confining `pasta`, cgroup delegation for your user session, the
+        /// two egress packages, and cgroup2's `favordynmods` option (on the
+        /// host, never in a container). A kernel that is too old is not a fix.
         ///
         /// Every command is printed before anything runs, with what it costs
         /// — two of them turn off a kernel protection for every process on

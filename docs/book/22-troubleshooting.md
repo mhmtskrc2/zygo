@@ -525,7 +525,7 @@ time goes, and says it: `admit` owns most of the slow request, followed by
 `cgroup2 here has no favordynmods`. `zygo doctor` reports the same thing as
 
 ```text
-cgroup moves   no favordynmods: ~1 warm request in 100 waits ms to enter its cgroup   degraded
+cgroup moves   no favordynmods: ~1 warm request in 100 waits several ms to enter its cgroup   degraded
 ```
 
 On Linux 6.0 and later, moving a process into a cgroup sometimes waits for the
