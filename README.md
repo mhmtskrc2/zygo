@@ -15,6 +15,15 @@ supervisor under your own user, not a system service.
 *This page is the first page of [the Zygo book](docs/book/README.md), also on
 the web at [mhmtskrc2.github.io/zygo](https://mhmtskrc2.github.io/zygo/).*
 
+Try it now, once Zygo is [installed](#install) — one program in a fresh
+sandbox, thrown away when it exits:
+
+```bash
+zygo run python:3.12-slim python3 -c 'print("hello")'   # pulls the image the first time
+```
+
+And what Zygo is for — a warm function, forked for every request:
+
 ```bash
 zygo serve ./handler.py --name resize        # a warm zygote: ~150 ms, once
 zygo exec resize '{"url": "..."}'            # a fresh, sandboxed process: 2.8 ms (1.4 by API)
