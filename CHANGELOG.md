@@ -109,6 +109,7 @@ break things and will say so here.
 - `zygo doctor --fix --help` names the `favordynmods` repair it already made,
   and the `cgroup moves` check says a request "waits several ms", where a
   number was missing.
+- The Node client's type for `version()` has `private_net`.
 - A runtime pool's warnings and errors name its own table: `runtime.py313.io_read`,
   not `fn.py313.io_read`, which pointed at a `[fn.py313]` that does not exist.
   `zygo spec validate` groups the two kinds together.

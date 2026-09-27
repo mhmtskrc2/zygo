@@ -339,11 +339,11 @@ for ev in client.stream("resize", {"url": "…"}):       # live output
     print(ev.kind, ev.data)
 ```
 
-The client covers every route: `call`, `batch`, `stream`, `cancel`, `logs`,
-`stats`, `warm`, `serve`, `stop`, `run`, `functions`; pools with
-`serve_runtime`, `run_script`, `stream_script`, `put_script`; `put_deps`,
-`put_blob`; tenants, secrets, limits and tokens; `for_tenant(id)`; `health`,
-`version`, `drain`. [What the clients can do](#what-the-clients-can-do) lists
+The client covers every route but `GET /metrics`, which is for a scraper:
+`call`, `batch`, `stream`, `cancel`, `logs`, `stats`, `warm`, `serve`,
+`stop`, `run`, `functions`; pools with `serve_runtime`, `run_script`,
+`stream_script`, `put_script`; `put_deps`, `put_blob`; tenants, secrets,
+limits and tokens; `for_tenant(id)`; `health`, `version`, `drain`. [What the clients can do](#what-the-clients-can-do) lists
 every method.
 
 ### The async Python client
@@ -405,9 +405,10 @@ a declaration fails the suite rather than shipping untyped.
 
 Elixir 1.18 or newer, for the JSON module in the standard library. The same
 methods as Python, with the same snake_case names, as functions in the `Zygo`
-module that take the client first. Every one returns `{:ok, value}` or
-`{:error, %Zygo.Error{}}`, and has a `!` twin that returns the value or
-raises. Durations — `timeout:`, `backoff:`, `retry_after` — are milliseconds,
+module that take the client first. Every call to the API returns
+`{:ok, value}` or `{:error, %Zygo.Error{}}`, and has a `!` twin that returns
+the value or raises. The two streams yield an error as an element instead,
+and their `!` twins raise it. Durations — `timeout:`, `backoff:`, `retry_after` — are milliseconds,
 as is usual in Elixir.
 
 ```elixir

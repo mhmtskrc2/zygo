@@ -21,8 +21,10 @@ defmodule Zygo do
       {:ok, run} = Zygo.run(client, "python:3.12-slim", ["python3", "-c", "print(6*7)"])
       run.stdout
 
-  Every function returns `{:ok, value}` or `{:error, %Zygo.Error{}}`, and has
-  a `!` twin that returns the value or raises the error. `Zygo.Error` has a
+  Every call to the API returns `{:ok, value}` or `{:error, %Zygo.Error{}}`,
+  and has a `!` twin that returns the value or raises the error. The streams,
+  `stream/4` and `stream_script/5`, yield an error as an element instead, and
+  their `!` twins raise it. `Zygo.Error` has a
   `kind` to branch on — `:busy`, `:handler`, `:timeout` and the rest.
 
   A refused request — `:busy`, or `:unavailable` while the host is still

@@ -395,7 +395,7 @@ export declare class Client {
 
   close(): void;
 
-  version(): Promise<{ version: string; api: number; control: number; deploy: boolean }>;
+  version(): Promise<{ version: string; api: number; control: number; deploy: boolean; private_net: boolean }>;
   /** Needs no token. Throws {@link Unavailable} once the API is stopping. */
   health(): Promise<Health>;
   /**

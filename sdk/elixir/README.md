@@ -36,8 +36,11 @@ your network or the other requests. What it does wrong stays there:
 #=> the sandbox reports a PermissionError; your host never noticed
 ```
 
-Every function returns `{:ok, value}` or `{:error, %Zygo.Error{}}`, and has a
-`!` twin that returns the value or raises. The error has a `kind` to branch
+Every call to the API returns `{:ok, value}` or `{:error, %Zygo.Error{}}`,
+and has a `!` twin that returns the value or raises. The streams are the
+exception: `stream` and `stream_script` return a lazy stream in which an error
+arrives as an `{:error, %Zygo.Error{}}` element, and their `!` twins raise it
+instead. The error has a `kind` to branch
 on — `:busy` means the request never ran and is worth sending again,
 `:handler` means the script raised, `:timeout` means it ran out of time:
 
