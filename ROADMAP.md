@@ -53,7 +53,10 @@ Zygo in production for user scripts and says so.
 
 - Windmill (a worker backend; today it uses nsjail), n8n (a Code-node
   runner), Temporal (an activity worker), and an adapter for the agent
-  frameworks that let you bring your own execution.
+  frameworks that let you bring your own execution. The n8n runner exists as
+  an example, [`examples/n8n-runner/`](examples/n8n-runner), measured against
+  n8n's own runners; it lacks n8n's RPC helpers and binary data, and nobody
+  runs it in production.
 - An embedding guide in the order an embedder meets things: install in a
   worker image, create a runtime, register a tenant, run, stream, cancel,
   bill, upgrade.

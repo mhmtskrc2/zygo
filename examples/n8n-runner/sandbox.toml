@@ -1,0 +1,22 @@
+# Two runtime pools for n8n's Code nodes, and the API the runner calls.
+# Nothing of anyone's is warmed: every task brings its own script.
+
+[defaults]
+timeout = "60s"              # n8n's own task timeout, N8N_RUNNERS_TASK_TIMEOUT
+network = "none"
+
+[runtime.py313]
+agent = "python"
+image = "python:3.13-slim"   # the Python that n8nio/runners ships
+min_warm = 1
+max_warm = 2
+
+[runtime.node26]
+agent = "node"
+image = "node:26-slim"       # the Node that n8nio/runners ships
+min_warm = 1
+max_warm = 2
+
+[api]
+listen = "127.0.0.1:7700"
+auth = "none"                # loopback only; anywhere else, set ZYGO_API_TOKEN and drop this

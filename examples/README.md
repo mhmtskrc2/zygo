@@ -17,4 +17,5 @@ validated with `zygo spec validate` in the same run.
 | [`plugin-host-node/`](plugin-host-node) | The same host from the Node SDK, as an HTTP server: `node:http` in front, one operator client and `forTenant` behind, Zygo's errors mapped to status codes. Tested against a fake Zygo with `node --test`, and end to end. |
 | [`kubernetes/`](kubernetes) | `zygo api` as a Deployment: two replicas, an `emptyDir` image store, a readiness probe, a `preStop` drain and a rolling update that drops no request. |
 | [`workflow-engine/`](workflow-engine) | The embedder Zygo is built for: a worker draining a queue of other people's scripts, warm per script version and one fork per run. Maps onto Windmill and n8n. |
+| [`n8n-runner/`](n8n-runner) | n8n's Code node, both languages, run by Zygo pools instead of n8n's own runners — and the harness that measures the two side by side. |
 | [`agents/`](agents) | Writing an agent for a runtime that is expensive to start: the guide and a complete agent in POSIX sh. The Python and Node agents Zygo ships are in [`agents/`](../agents). |

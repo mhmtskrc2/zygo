@@ -47,6 +47,15 @@ break things and will say so here.
 
 ### Added
 
+- **An n8n Code-node runner**, [`examples/n8n-runner`](examples/n8n-runner):
+  it speaks n8n's task-runner protocol for JavaScript and Python and runs each
+  task as a fork in a Zygo runtime pool. Beside it, the harness that measures
+  it against n8n's own runners behind the same n8n — latency, bursts, CPU and
+  memory per part, the first run after idle, and six hostile Code nodes — so
+  the tables in chapter 25 can be repeated with `sh run.sh`. `make test` runs
+  the runner's script wrapping for real. It lacks n8n's RPC helpers and
+  binary data, and says so.
+
 - `zygo doctor` has a `systemd OOM policy` check, and `zygo api` warns at
   start, when the systemd unit holding the sandboxes has `OOMPolicy=stop`
   (systemd's default): one request over its `mem` limit, killed by the kernel

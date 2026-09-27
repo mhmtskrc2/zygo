@@ -1,4 +1,4 @@
-.PHONY: help build test test-rust test-agent test-sdk test-sdk-python test-sdk-node test-sdk-elixir lint-linux \
+.PHONY: help build test test-rust test-agent test-examples test-sdk test-sdk-python test-sdk-node test-sdk-elixir lint-linux \
         verify-mcp check check-linux test-linux \
         verify-linux verify-supervisor-linux verify-oom-linux escape-linux dist-linux \
         fuzz-linux gvisor-linux verify-login-linux verify-shim verify-deps-linux \
@@ -12,6 +12,7 @@ help:
 	@echo "build        build the zygo binary"
 	@echo "test         run every test suite"
 	@echo "test-sdk     the Python, Node and Elixir clients, against a stand-in API"
+	@echo "test-examples  the n8n runner's script wrapping, run for real in-process"
 	@echo "verify-mcp   drive the MCP server over a pipe, as an agent host does"
 	@echo "verify-api-linux  the HTTP API end to end, through the Python client"
 	@echo "verify-plugin-host  a plugin host on the API alone — the embedder exit criterion"
@@ -60,7 +61,7 @@ help:
 build:
 	cargo build --release
 
-test: test-rust test-agent test-sdk
+test: test-rust test-agent test-examples test-sdk
 
 test-rust:
 	cargo test --workspace
@@ -68,6 +69,12 @@ test-rust:
 test-agent:
 	python3 -W error::ResourceWarning -m unittest discover -s agents/python
 	node --test 'agents/node/*.test.js'
+
+# Examples whose logic can be tested without a kernel or a sandbox. The n8n
+# runner's script wrapping is the part a mistake hides best in: the tests run
+# the generated scripts (Python in-process, JavaScript under node if present).
+test-examples:
+	PYTHONPATH=sdk/python/src python3 -W error::ResourceWarning -m unittest discover -s examples/n8n-runner
 
 # The three clients. None needs Linux, a kernel or a sandbox: what is under
 # test is the client — the transport, the error mapping, the connection pool.

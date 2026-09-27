@@ -70,6 +70,7 @@ One line each. The chapter in brackets explains the term in full; the numbers fo
 | **supervisor** | Zygo's process that keeps zygotes, hands out requests and enforces deadlines, under your user. [6] |
 | **syscall** | A request from a program to the kernel. [1] |
 | **tap** | A GitHub repository of Homebrew formulas; `brew install mhmtskrc2/zygo/zygo` installs Zygo from one. [11] |
+| **task runner** | n8n's name for the process that runs a Code node's code apart from n8n itself; n8n's *task broker* hands it the tasks. [10, 25] |
 | **tenant** | One customer of whoever embeds Zygo; has its own scripts, secrets, limits and tokens. [14, 17] |
 | **tmpfs** | A file system in memory that disappears when no longer used. [4] |
 | **token** | A secret a caller sends to the API to prove who it is: operator or tenant. [17] |

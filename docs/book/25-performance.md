@@ -1160,6 +1160,122 @@ Neither of them is in the warm path:
 Both are in the one-shot path. An embedder does not use that path; a developer
 at a terminal does.
 
+## Behind n8n's Code node
+
+n8n runs a Code node through a *task runner*, a process apart from n8n that
+its task broker hands the code to. [`examples/n8n-runner`](../../examples/n8n-runner)
+is a runner that sends each task to a Zygo runtime pool instead. This section
+runs the same workflows through three stacks behind the same n8n, and reads
+every part's cgroup for CPU and memory.
+
+```text
+  n8n 2.38.7 ── broker ──┬─ stock:  n8nio/runners, its own sidecar
+                         ├─ Zygo:   zygo_runner.py → a pool fork per task
+                         └─ box:    n8nio/runners unchanged, in one Zygo sandbox
+```
+
+Measured on the Lima VM — 2 vCPU, 4 GB, Ubuntu 24.04, Linux 6.8, aarch64, on
+an M1 Max — on 27 September 2026, Zygo at `970ccba`, the kernel as it comes.
+Every stack ran twice, the second round in the opposite order; the figures
+are the mean of the two, and the widest gap between rounds was 18 ms. The
+load came from inside the VM, from a cgroup of its own. Each Code node ran in
+Python and in JavaScript: `trivial` returns a count, `cpu` loops, `items`
+transforms 1,000 items, `deps` hashes with `hashlib` or `crypto`. n8n alone,
+with no Code node, took 23 ms (1 in 100: 55 ms), so every figure below starts
+there. `sh run.sh` in [`bench/`](../../examples/n8n-runner/bench) repeats all of it.
+
+## n8n: the two languages go opposite ways
+
+One request at a time, the whole workflow, usually · 1 in 100:
+
+| work | stock, Python | Zygo, Python | stock, JS | Zygo, JS |
+|---|---|---|---|---|
+| trivial | 213 · 277 ms | **36 · 65 ms** | **27 · 73 ms** | 49 · 77 ms |
+| cpu | 230 · 305 ms | **55 · 73 ms** | **34 · 110 ms** | 55 · 71 ms |
+| items | 233 · 284 ms | **74 · 95 ms** | **50 · 117 ms** | 84 · 109 ms |
+| deps | 214 · 248 ms | **37 · 63 ms** | **29 · 69 ms** | 45 · 72 ms |
+
+200 requests at once from 32 connections, finished per second, and CPU per
+task for the whole machine's share of it (n8n included):
+
+| work | stock, Python | Zygo, Python | stock, JS | Zygo, JS |
+|---|---|---|---|---|
+| trivial, per second | 7.6 | **32.1** | **26.5** | 23.6 |
+| items, per second | 6.8 | **18.1** | **20.6** | 15.5 |
+| trivial, CPU per task | 254 ms | **54 ms** | **64 ms** | 78 ms |
+| trivial, CPU on the runner side | 199 ms | **4.8 ms** | **7.3 ms** | 28 ms |
+
+In Python, Zygo is about six times faster one at a time, four times faster
+under a burst, and uses a fifth of the CPU. In JavaScript it is slower: 22 ms
+more per request and 11% fewer requests a second in a burst. None of the
+16,800 requests failed.
+
+## n8n: why
+
+- **Stock Python pays about 200 ms of CPU per task.** Its runner starts a
+  fresh process per task from a fork server and sets up its language-level
+  sandbox there; its own log says 98 ms for the one-line node, and its task
+  executor alone, measured apart, takes 3–7 ms. Where the rest goes was not
+  found. A Zygo fork of a warm interpreter costs 4.8 ms of CPU.
+- **Stock JavaScript pays almost nothing per task.** Every task runs in one
+  Node process, in a `vm` context of its own: no process is made.
+- **Zygo's JavaScript pays for a process per task.** Node cannot be forked,
+  so the agent starts a fresh Node worker for each request
+  ([chapter 13](13-warm-functions.md#a-node-handler)): about 25 ms of CPU,
+  which on two cores is what limits the burst.
+- **n8n itself costs about 50 ms of CPU per task** in every stack. On two
+  cores it is the ceiling Zygo's Python meets.
+- **The box, n8n's runners inside one Zygo sandbox,** is 35% faster than the
+  stock sidecar in Python and level in JavaScript. Modules load about 20%
+  faster from Zygo's root than from Docker's overlay2 (44 ms against 55 ms
+  for the runner's own); the rest of the Python gap was not traced.
+
+## n8n: the first run, memory, and hostile code
+
+The first run after the runner side restarts, and after 30 s idle, trivial
+JavaScript · Python, usually:
+
+| | stock | Zygo | box |
+|---|---|---|---|
+| after a restart | 986 · 506 ms | **61 · 45 ms** | 1,007 · 353 ms |
+| after 30 s idle | 975 · 496 ms | **56 · 38 ms** | 1,011 · 352 ms |
+
+n8n's launcher stops a runner that has been idle for 15 s, so a workflow run
+now and then pays the second row on nearly every run. The same launcher
+inside the box does the same. It is also why the stock runner side holds
+**2 MB** at idle, against **74 MB** for Zygo's two warm pools, API and runner;
+under a Python burst, the other way round: 222 MB against 85 MB.
+
+Six hostile Code nodes, once each ([`probes.sh`](../../examples/n8n-runner/bench/probes.sh)):
+
+| | stock, as shipped | stock, modules allowed | Zygo | box |
+|---|---|---|---|---|
+| network: n8n, broker, LAN, internet | blocked (module refused) | **all reached** | blocked | blocked (module refused) |
+| 2 GB allocated | no limit: succeeds, or the kernel kills the whole runner | succeeded | the task dies alone | the whole box dies |
+| … with three tasks beside it | JS: all three died with the runner | all three finished | **all three finished** | all three died |
+| 1 GB written to `/tmp` | refused (`fs`, `open`) | Python: `open` still refused | stopped at 64 MB | refused (`fs`, `open`) |
+| JavaScript loop forever | other JS tasks wait 55–60 s | same | **nothing else waits** | same as stock |
+
+"Modules allowed" is n8n's own runner with `NODE_FUNCTION_ALLOW_BUILTIN=*`
+and `N8N_RUNNERS_STDLIB_ALLOW=*`, which is how most users get a library into a
+Code node. The box ran n8n's runner config as shipped; with modules allowed,
+an earlier round's box reached the broker and nothing else. Whether stock's
+2 GB succeeds depends on what the machine has free: in an earlier round it
+did; in this one the kernel killed the JS runner and every task in it.
+
+## n8n: what these numbers are not
+
+- **Not a server.** Two virtual CPUs are shared by n8n, its database writes
+  and the runner, and a vCPU that sleeps between requests takes time to wake:
+  a pool call spaced 0.1 s apart took 11 ms where back-to-back ones took
+  3 ms. Zygo's path has more hand-offs between processes, so it pays that
+  more often. x86_64 and bare metal were not measured.
+- **Not the whole Code node.** The Zygo runner lacks `this.helpers` (HTTP and
+  binary data), `$node`, `$workflow`, `$env` and static data; see the
+  [example's README](../../examples/n8n-runner/README.md).
+- **One n8n version.** n8n 2.38.7 and `n8nio/runners:2.38.7`, Node 26.7 and
+  Python 3.13.15 in both; the numbers age with each n8n release.
+
 <!-- nav: generated by docs/nav.py, do not edit by hand -->
 
 ---

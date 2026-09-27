@@ -772,6 +772,31 @@ Running it found three defects in Zygo, all fixed:
   on a file is now narrowed to the file rights.
 - **The stand-in script itself cost 4 ms a job**, as described above.
 
+### Inside n8n, as its Code-node runner
+
+n8n runs a Code node through a *task runner*, a process apart from n8n.
+[`examples/n8n-runner`](../../examples/n8n-runner) is one that sends each task
+to a Zygo runtime pool, and was measured against n8n 2.38.7's own runners
+behind the same n8n ([chapter 25](25-performance.md#behind-n8ns-code-node)
+has the method and every table).
+
+| | n8n's runner | Zygo's runner |
+|---|---|---|
+| Python, one request, usually | 213 ms | **36 ms** |
+| Python, 200 at once, per second | 7.6 | **32.1** |
+| JavaScript, one request, usually | **27 ms** | 49 ms |
+| JavaScript, 200 at once, per second | **26.5** | 23.6 |
+| first run after 30 s idle, JS · Python | 975 · 496 ms | **56 · 38 ms** |
+| Code node with modules allowed reaches n8n, the LAN, the internet | yes | no |
+| a task over its memory limit | no limit | dies alone |
+
+The two languages go opposite ways for one reason. n8n's JavaScript runner
+runs every task in one Node process, which is cheap and shares everything;
+its Python runner starts a process per task and pays about 200 ms of CPU for
+it. Zygo pays for a process per task in both, about 5 ms in Python and 25 ms
+in Node, which cannot be forked. The Zygo runner covers the Code node's items
+and both run modes, not n8n's RPC helpers or binary data.
+
 ### An embedder's harness, against kern
 
 The workload was a real embedder's Python harness: it reads an event, runs a
