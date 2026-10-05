@@ -719,6 +719,75 @@ jobs:
           kubectl -n zygo describe pods
           kubectl -n zygo logs deploy/zygo --tail=100 || true
 
+  # The same deployment without `privileged: true`: `hostUsers: false` and a
+  # RuntimeClass whose containerd handler mounts the pod's cgroup read-write
+  # (examples/kubernetes/node/). k3s rather than kind, because the handler is a
+  # node setting and k3s is a node on the runner itself: containerd 2.x, runc
+  # and the systemd cgroup driver, which is what runc needs before it hands a
+  # pod its cgroup. The version is the one the manifest was checked on.
+  #
+  # The check is a script so that it runs the same way anywhere there is a
+  # cluster: tests/linux/verify_k8s_unprivileged.sh.
+  kubernetes-unprivileged:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    name: kubernetes, unprivileged (k3s)
+    env:
+      K3S_VERSION: v1.36.5+k3s1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Let unprivileged user namespaces mount
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
+      - run: cargo build --release --target x86_64-unknown-linux-musl || cargo build --release
+      - name: The image, from the binary this job built
+        run: |
+          binary=target/x86_64-unknown-linux-musl/release/zygo
+          [ -f "$binary" ] || binary=target/release/zygo
+          install -m 0755 "$binary" packaging/oci/zygo
+          docker build -f packaging/oci/Dockerfile -t zygo:ci packaging/oci
+
+      - name: A one-node cluster
+        run: |
+          curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="$K3S_VERSION" \
+            INSTALL_K3S_EXEC="--disable traefik --disable metrics-server --disable servicelb --write-kubeconfig-mode 644" sh -
+          for _ in $(seq 60); do sudo k3s kubectl get nodes 2>/dev/null | grep -q ' Ready' && break; sleep 2; done
+
+      # Exactly what examples/kubernetes/node/zygo-runtime.toml tells an
+      # operator to do, with k3s's paths.
+      - name: The zygo runtime handler
+        run: |
+          sudo modprobe tun || true
+          d=/var/lib/rancher/k3s/agent/etc/containerd
+          sudo mkdir -p "$d/config-v3.toml.d"
+          sudo env CTR="k3s ctr" sh examples/kubernetes/node/base-spec.sh \
+            | sudo tee "$d/zygo-base-spec.json" >/dev/null
+          sed "s|/etc/containerd/zygo-base-spec.json|$d/zygo-base-spec.json|" \
+            examples/kubernetes/node/zygo-runtime.toml | sudo tee "$d/config-v3.toml.d/zygo.toml" >/dev/null
+          sudo systemctl restart k3s
+          for _ in $(seq 60); do sudo k3s kubectl get --raw /readyz >/dev/null 2>&1 && break; sleep 2; done
+          docker save zygo:ci | sudo k3s ctr images import -
+
+      - name: Zygo in an unprivileged pod
+        run: KUBECTL="sudo k3s kubectl" IMAGE=zygo:ci sh tests/linux/verify_k8s_unprivileged.sh
+
+      - name: What happened, if anything did not
+        if: failure()
+        run: |
+          sudo k3s kubectl -n zygo get pods -o wide || true
+          sudo k3s kubectl -n zygo describe pods || true
+          sudo k3s kubectl -n zygo logs deploy/zygo --tail=100 || true
+          sudo journalctl -u k3s --no-pager -n 60 || true
+
   # The seccomp syscall numbers are generated from each architecture's headers.
   # A profile that gained a syscall without regenerating them would silently
   # drop it from the filter, so the committed tables are checked against a

@@ -351,9 +351,9 @@ the parent must be a slice: `--cgroup-parent=zygo.slice` and
 |---|---|---|
 | A seccomp profile that allows `unshare(CLONE_NEWUSER)` | Docker's default profile denies it, and it is the first thing a sandbox does | `securityContext.seccompProfile: {type: Unconfined}` |
 | An unmasked `/proc` | runtimes cover parts of `/proc` (`kcore`, `acpi` …); the kernel then refuses a new `proc` mount inside a user namespace, because the old one is not *fully visible*. Sandboxes die on "mounting /proc failed: Operation not permitted" | `privileged: true` gives one. `securityContext.procMount: Unmasked` is accepted only with `hostUsers: false` |
-| A writable cgroup v2 subtree of its own | every sandbox goes in a cgroup, and the container's `/sys/fs/cgroup` is read-only | no field exists; see below |
+| A writable cgroup v2 subtree of its own | every sandbox goes in a cgroup, and the container's `/sys/fs/cgroup` is read-only | no pod field; a RuntimeClass whose containerd handler sets `cgroup_writable`, with `hostUsers: false` — [below](#in-kubernetes-without-privileged) |
 | No AppArmor profile, on AppArmor hosts | Docker's `docker-default` profile denies `mount`; `zygo doctor` reports "the mount tree could not be made private" | `securityContext.appArmorProfile: {type: Unconfined}` |
-| `/dev/net/tun`, for `egress` and `full` | `pasta` gives a sandbox its network card through it, and runtimes leave the device node out | a `hostPath` of type `CharDevice` |
+| `/dev/net/tun`, for `egress` and `full` | `pasta` gives a sandbox its network card through it, and runtimes leave the device node out | a `hostPath` of type `CharDevice`; with `hostUsers: false`, the runtime handler's base spec instead |
 
 ## Give it its own cgroup, not the host's
 
@@ -363,6 +363,41 @@ change limits on any cgroup on the machine, including other containers'.
 That is worse than the privilege you were trying to avoid. Give Zygo a
 subtree of its own instead, as the command above does with `/zygo`. Sealed
 sandboxes — `network = "none"`, the default — do not need `/dev/net/tun`.
+
+## In Kubernetes, without `privileged`
+
+A pod cannot be given a cgroup subtree the way `docker run` can: there is no
+pod field for it, and every container that is not privileged gets
+`/sys/fs/cgroup` read-only. Since containerd 2.1 a **runtime handler** can mount
+it read-write (`cgroup_writable = true`), and in a pod with
+`hostUsers: false` runc then hands the pod its own cgroup — the files the
+kernel names in `/sys/kernel/cgroup/delegate`, and not the pod's own
+`memory.max`. That is the same delegation systemd gives a unit with
+`Delegate=yes`: the pod builds below its cgroup and cannot raise its own
+limits. A RuntimeClass names the handler, and the pod asks for it.
+
+```text
+  node: containerd ── handler "zygo": runc, cgroup_writable, /dev/net/tun in its base spec
+  pod:  runtimeClassName: zygo
+        hostUsers: false         ← runc hands the cgroup over only in a user namespace
+        procMount: Unmasked      ← accepted only with hostUsers: false
+        runAsUser: 0             ← the pod's root, an unprivileged uid on the node
+```
+
+Two things differ from `docker run`. The handler needs the systemd cgroup
+driver, because that is where runc does the handing over; with `cgroupfs`
+the cgroup stays root's and `zygo doctor` says so. And `/dev/net/tun` cannot
+be a `hostPath` volume in a pod with its own user namespace — the kubelet asks
+for an idmapped mount, and a device node refuses one — so the handler's base
+spec carries it.
+
+[`examples/kubernetes/unprivileged.yaml`](../../examples/kubernetes/unprivileged.yaml)
+is the pod, [`examples/kubernetes/node/`](../../examples/kubernetes/node/) the
+handler, and the README beside them what was checked and how. It needs
+Kubernetes 1.33 or newer, containerd 2.1 or newer and Linux 6.3 or newer.
+Never point a pod without `hostUsers: false` at the handler: outside a user
+namespace runc hands nothing over, and a pod that is root on the node with a
+writable cgroupfs could rewrite its own limits.
 
 ## The host's AppArmor still applies
 

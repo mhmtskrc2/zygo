@@ -1,0 +1,44 @@
+# A containerd runtime handler for Zygo pods (containerd 2.1 or newer).
+#
+# The same runc as the default handler, with two differences, and each is one
+# of the things `privileged: true` was buying:
+#
+#   cgroup_writable    the container's /sys/fs/cgroup is mounted read-write.
+#                      In a pod with `hostUsers: false`, and with the systemd
+#                      cgroup driver, runc then hands the pod's own cgroup to
+#                      the pod's root: it may build below it — a cgroup per
+#                      request — and may not raise its own limits, which stay
+#                      the kubelet's. Without a user namespace runc hands over
+#                      nothing, and a pod that is root on the node could
+#                      rewrite its own limits: use this handler only from pods
+#                      with `hostUsers: false`.
+#   base_runtime_spec  containerd's own default spec plus the node's
+#                      /dev/net/tun, which `network = "egress"` needs. A pod
+#                      with its own user namespace cannot take the device as a
+#                      hostPath volume (the kubelet asks for an idmapped mount,
+#                      which a device node refuses); a device in the spec is
+#                      bound in by runc instead. Leave the line out if every
+#                      sandbox runs with `network = "none"`.
+#
+# Install, on every node that runs Zygo, as root:
+#
+#   sh base-spec.sh > /etc/containerd/zygo-base-spec.json
+#   cp zygo-runtime.toml /etc/containerd/conf.d/zygo.toml
+#   # config.toml has to import that directory; add, if it imports nothing:
+#   #   imports = ["/etc/containerd/conf.d/*.toml"]
+#   systemctl restart containerd
+#
+# On k3s the paths are /var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.d/
+# and, for the spec, anywhere — change `base_runtime_spec` to match — with
+# `CTR="k3s ctr" sh base-spec.sh`. Then `kubectl apply -f ../unprivileged.yaml`,
+# whose RuntimeClass names this handler.
+
+[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.zygo]
+  runtime_type = "io.containerd.runc.v2"
+  cgroup_writable = true
+  base_runtime_spec = "/etc/containerd/zygo-base-spec.json"
+
+[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.zygo.options]
+  # runc hands a cgroup over only with the systemd driver; with cgroupfs the
+  # pod's cgroup stays root's and `zygo doctor` says so.
+  SystemdCgroup = true

@@ -11,6 +11,18 @@ CI job `kubernetes` applies exactly this file to a fresh kind cluster on every
 change and then runs a sandbox in it — the manifest is checked rather than
 illustrated.
 
+There are two manifests, and they differ in one thing: where the writable
+cgroup a sandbox needs comes from.
+
+| | `deployment.yaml` | `unprivileged.yaml` |
+|---|---|---|
+| the pod | `privileged: true`, root on the node | `hostUsers: false`: root of its own user namespace, an unprivileged uid on the node |
+| the writable cgroup | from `privileged` | from a RuntimeClass whose containerd handler mounts it read-write; runc hands the pod its own cgroup and nothing else |
+| the cluster needs | nothing beyond cgroup v2 | Kubernetes 1.33+, containerd 2.1+ with runc and the systemd cgroup driver, Linux 6.3+, and the handler on the nodes ([below](#without-privileged-true)) |
+| checked by | the CI job `kubernetes` (kind) | the CI job `kubernetes-unprivileged` (k3s), `tests/linux/verify_k8s_unprivileged.sh` |
+
+Use `unprivileged.yaml` wherever the cluster can have the handler.
+
 ## What `securityContext` is for
 
 Zygo builds sandboxes, so the pod it runs in has to let it. Four things:
@@ -19,7 +31,7 @@ Zygo builds sandboxes, so the pod it runs in has to let it. Four things:
 |---|---|
 | `seccompProfile: Unconfined` | the default profile denies `unshare(CLONE_NEWUSER)`, which is what a sandbox does first |
 | an unmasked `/proc` | a masked `/proc` is not *fully visible*, and the kernel then refuses a fresh `proc` mount inside a user namespace. `privileged: true` gives one; Kubernetes accepts `procMount: Unmasked` only with `hostUsers: false` |
-| a writable cgroup v2 subtree | **no field expresses this**, which is the whole reason `privileged: true` and `runAsUser: 0` are here |
+| a writable cgroup v2 subtree | **no pod field expresses this**. A RuntimeClass can, since containerd 2.1 — `unprivileged.yaml`, [below](#without-privileged-true). Without one, it is the whole reason `privileged: true` and `runAsUser: 0` are in `deployment.yaml` |
 | a kernel that allows unprivileged user namespaces | a node setting (`kernel.unprivileged_userns_clone`, AppArmor on Ubuntu), not a pod one |
 
 `zygo doctor` names each one when it is missing, so a pod that will not build
@@ -37,8 +49,80 @@ proposition from a privileged pod whose whole job is building boundaries
 around it. Run it on nodes of its own, and read
 [the threat model](../../docs/book/23-security.md).
 
-The day Kubernetes can say "give this pod a delegated cgroup subtree", the
-line goes. Nothing else in the manifest changes.
+The day Kubernetes could say "give this pod a delegated cgroup subtree", the
+line was going to go. That day came from containerd rather than from a pod
+field, and `unprivileged.yaml` is the manifest without it.
+
+## Without `privileged: true`
+
+```bash
+# on every node that runs Zygo, as root
+sh examples/kubernetes/node/base-spec.sh > /etc/containerd/zygo-base-spec.json
+cp examples/kubernetes/node/zygo-runtime.toml /etc/containerd/conf.d/zygo.toml
+systemctl restart containerd
+```
+
+```bash
+kubectl apply -f examples/kubernetes/unprivileged.yaml
+```
+
+The node half is a containerd runtime handler, `zygo`: the default runc,
+with two settings.
+
+* **`cgroup_writable = true`** (containerd 2.1+). The pod's `/sys/fs/cgroup`
+  is mounted read-write instead of read-only. In a pod with
+  `hostUsers: false`, and with the systemd cgroup driver, runc then hands the
+  pod's own cgroup to the uid the pod starts as — `cgroup.procs`,
+  `cgroup.subtree_control`, `cgroup.threads` and `memory.oom.group`, the
+  files the kernel lists in `/sys/kernel/cgroup/delegate`, and not
+  `memory.max`. The pod can make a cgroup per request below its own and
+  cannot raise its own limits, which stay the kubelet's. That is systemd's
+  `Delegate=yes`, for a pod. **Never use the handler without
+  `hostUsers: false`**: outside a user namespace runc hands nothing over, and a
+  pod that is root on the node, with a writable cgroupfs, could rewrite its
+  own limits.
+* **`base_runtime_spec`**, for `/dev/net/tun`. `network = "egress"` needs the
+  device, and a pod with its own user namespace cannot take it as a
+  `hostPath` volume: the kubelet asks for an idmapped mount, and a device node
+  refuses one (`failed to set MOUNT_ATTR_IDMAP on /dev/net/tun`). A device in
+  the runtime's base spec is bound in by runc instead. `base-spec.sh` makes
+  that spec from the installed containerd's own default, so run it again
+  after upgrading containerd. Leave the line out of the handler if every
+  sandbox runs with `network = "none"`.
+
+The pod half, in `unprivileged.yaml`, against `deployment.yaml`:
+
+| | |
+|---|---|
+| `runtimeClassName: zygo`, `hostUsers: false` | the cgroup, as above |
+| `runAsUser: 0` | root of the pod's user namespace, not of the node: the cgroup is handed to the uid the container starts as, and writing a range of ids into each sandbox's user namespace takes `CAP_SETUID` in this one |
+| `procMount: Unmasked` | the unmasked `/proc` that `privileged` used to bring; accepted only with `hostUsers: false` |
+| `seccompProfile` and `appArmorProfile: Unconfined` | as in `deployment.yaml` |
+| `capabilities.drop`, `allowPrivilegeEscalation: false`, `readOnlyRootFilesystem: true` | what `privileged` made pointless to say: the default capabilities without raw sockets, device nodes, low ports and audit records, and a root filesystem nothing writes to (`/tmp` is an `emptyDir`) |
+
+Checked on k3s 1.36.5 (containerd 2.3.4, runc 1.4.2) on Linux 6.8, by
+`tests/linux/verify_k8s_unprivileged.sh`, which the CI job
+`kubernetes-unprivileged` runs: the pod is not privileged and its root is an
+unprivileged uid on the node; `zygo doctor` finds the cgroup delegated and
+egress possible; a sandbox runs; a request over its memory limit is killed
+and the next one is served; an egress allowlist reaches what it names and
+nothing else; the pod cannot write its own `memory.max`; an `exec` — the
+liveness probe — still gets in after Zygo has built its tree. A Python
+runtime pool, the kind an embedder serves, forks a fresh process per request
+there with its CPU and peak memory reported.
+
+What `zygo doctor` says when a piece is missing is written for a pod: a
+read-only cgroupfs names the RuntimeClass and `hostUsers: false`, a writable
+one that was not handed over names the systemd driver, and a missing
+`/dev/net/tun` in a pod with its own user namespace names the base spec rather
+than a `hostPath` it could not start with.
+
+To run the check against a cluster of your own:
+
+```bash
+KUBECTL=kubectl IMAGE=ghcr.io/mhmtskrc2/zygo:latest PULL=IfNotPresent \
+  sh tests/linux/verify_k8s_unprivileged.sh
+```
 
 ## Rolling without dropping a request
 

@@ -1314,16 +1314,10 @@ mod probe {
                 Err(_) if in_a_container() => Check::failed(
                     "cgroup v2",
                     reason,
-                    format!(
-                        "this container's own cgroup is not writable by uid {}: give it a \
-                         cgroup v2 subtree of its own, read-write and owned by that uid — \
-                         docker run --cgroupns=host --cgroup-parent=/zygo \
-                         -v /sys/fs/cgroup/zygo:/sys/fs/cgroup/zygo:rw. Binding the whole \
-                         of /sys/fs/cgroup read-write also works and hands the container \
-                         every cgroup on the host, which is worse than the privilege it \
-                         was avoiding",
+                    super::container_cgroup_remedy(
+                        &crate::container::Surroundings::here(),
                         // SAFETY: no arguments, cannot fail.
-                        unsafe { libc::getuid() }
+                        unsafe { libc::getuid() },
                     ),
                 ),
                 Err(scope_reason) => Check::failed(
@@ -1646,6 +1640,60 @@ mod probe {
     }
 }
 
+/// What to do about a container whose own cgroup will not take a child.
+///
+/// Three different containers fail this check, and each has a different fix.
+///
+/// * **A Kubernetes pod**, whose runtime mounts `/sys/fs/cgroup` read-only for
+///   every container that is not privileged. Since containerd 2.1 a runtime
+///   handler can say otherwise (`cgroup_writable = true`), and runc then hands
+///   the pod's cgroup to the pod's root — with the systemd cgroup driver, and
+///   only when the pod has a user namespace of its own, so the pod can build
+///   below its cgroup but not raise its own limits. That was measured on k3s
+///   1.36 with containerd 2.3: `cgroup.procs`, `cgroup.subtree_control`,
+///   `cgroup.threads` and `memory.oom.group` belonged to the pod's root, and
+///   its own `memory.max` did not.
+/// * **The same handler without the systemd driver**, or a pod that starts
+///   as another uid than the one it asked for: writable, and not owned.
+/// * **`docker run`**, where a writable subtree is a bind mount.
+pub(crate) fn container_cgroup_remedy(at: &crate::container::Surroundings, uid: u32) -> String {
+    const EXAMPLE: &str = "examples/kubernetes/unprivileged.yaml";
+    if at.kubernetes && at.cgroupfs_read_only {
+        let namespace = if at.user_namespace {
+            "which this pod has"
+        } else {
+            "which this pod does not have yet: add `hostUsers: false` (Kubernetes 1.33+)"
+        };
+        format!(
+            "Kubernetes mounts /sys/fs/cgroup read-only in every container that is not \
+             privileged. Run this pod on a RuntimeClass whose containerd handler sets \
+             `cgroup_writable = true` (containerd 2.1+, `SystemdCgroup = true`): runc then \
+             hands the pod's own cgroup to its root, and only inside a user namespace, \
+             {namespace}. {EXAMPLE} has the pod, and examples/kubernetes/node/ the \
+             handler. `privileged: true` also works and gives the pod far more than a \
+             cgroup"
+        )
+    } else if at.kubernetes {
+        format!(
+            "this pod's /sys/fs/cgroup is writable but its cgroup does not belong to uid \
+             {uid}. runc hands it over only with the systemd cgroup driver \
+             (`SystemdCgroup = true` on the runtime handler), only in a pod with \
+             `hostUsers: false`, and to the uid the container starts as — check all \
+             three; {EXAMPLE} has a pod that meets them"
+        )
+    } else {
+        format!(
+            "this container's own cgroup is not writable by uid {uid}: give it a \
+             cgroup v2 subtree of its own, read-write and owned by that uid — \
+             docker run --cgroupns=host --cgroup-parent=/zygo \
+             -v /sys/fs/cgroup/zygo:/sys/fs/cgroup/zygo:rw. Binding the whole \
+             of /sys/fs/cgroup read-write also works and hands the container \
+             every cgroup on the host, which is worse than the privilege it \
+             was avoiding"
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1726,6 +1774,44 @@ mod tests {
             .systemctl(),
             "systemctl --user"
         );
+    }
+
+    /// The advice a pod gets is the pod's, not `docker run`'s: the line that
+    /// pointed a Kubernetes user at `--cgroup-parent` was advice nobody there
+    /// could take.
+    #[test]
+    fn a_pod_is_sent_to_a_runtime_class_not_to_docker() {
+        use crate::container::Surroundings;
+        let pod = Surroundings {
+            container: true,
+            kubernetes: true,
+            user_namespace: true,
+            cgroupfs_read_only: true,
+        };
+        let text = container_cgroup_remedy(&pod, 0);
+        assert!(text.contains("cgroup_writable = true"), "{text}");
+        assert!(text.contains("which this pod has"), "{text}");
+        assert!(!text.contains("docker run"), "{text}");
+
+        let host_users = Surroundings {
+            user_namespace: false,
+            ..pod
+        };
+        assert!(container_cgroup_remedy(&host_users, 0).contains("hostUsers: false"));
+
+        let not_owned = Surroundings {
+            cgroupfs_read_only: false,
+            ..pod
+        };
+        let text = container_cgroup_remedy(&not_owned, 0);
+        assert!(text.contains("SystemdCgroup"), "{text}");
+        assert!(text.contains("uid 0"), "{text}");
+
+        let docker = Surroundings {
+            container: true,
+            ..Surroundings::default()
+        };
+        assert!(container_cgroup_remedy(&docker, 0).contains("--cgroup-parent"));
     }
 
     #[test]

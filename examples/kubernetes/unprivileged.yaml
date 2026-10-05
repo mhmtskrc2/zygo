@@ -1,0 +1,213 @@
+# Zygo on Kubernetes, without `privileged: true`.
+#
+#   kubectl apply -f examples/kubernetes/unprivileged.yaml
+#
+# The same deployment as `deployment.yaml` beside this file, with one thing
+# moved: the writable cgroup that `privileged` was buying now comes from the
+# node's container runtime, through a RuntimeClass, and the pod runs in a user
+# namespace of its own. Its root is not the node's root, it has the default
+# capabilities minus four, and it cannot raise its own limits.
+#
+# What the cluster needs, once, and `zygo doctor` names any of it that is
+# missing:
+#
+#   * Kubernetes 1.33 or newer: user namespaces (`hostUsers: false`) and
+#     `procMount: Unmasked` are on by default from there;
+#   * containerd 2.1 or newer with runc and the systemd cgroup driver, a Linux
+#     kernel with idmapped mounts on tmpfs (6.3+);
+#   * the `zygo` runtime handler on the nodes that run this, from
+#     `node/zygo-runtime.toml` and `node/base-spec.sh` — README.md says how.
+#
+# Checked on k3s 1.36.5 with containerd 2.3.4 and runc 1.4.2, on Linux 6.8:
+# a sandbox per request, a request over its memory limit killed alone, an
+# egress allowlist enforced, and the pod refused when it wrote its own
+# `memory.max`. `tests/linux/verify_k8s_unprivileged.sh` is that check.
+---
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: zygo
+# The handler's name in the node's containerd config (`node/zygo-runtime.toml`).
+handler: zygo
+# On a cluster where only some nodes have the handler, label them and say so
+# here; the scheduler then sends these pods nowhere else.
+# scheduling:
+#   nodeSelector:
+#     zygo.dev/runtime: "true"
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: zygo
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: zygo
+  namespace: zygo
+stringData:
+  # The operator's token. Everything a customer can do comes from a token
+  # minted *from* this one (`zygo token mint --tenant acme`), so this is the
+  # only secret the platform holds.
+  api-token: "replace-me-with-32-random-bytes"
+  # What per-tenant secrets are sealed with. Without it Zygo refuses to store
+  # a secret rather than keeping it in the clear.
+  secrets-key: "replace-me-with-zygo-secrets-keygen"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: zygo
+  namespace: zygo
+spec:
+  selector:
+    app: zygo
+  ports:
+    - name: http
+      port: 7700
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zygo
+  namespace: zygo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: zygo
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # As in `deployment.yaml`: no pod goes before its replacement is warm.
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: zygo
+    spec:
+      # ---- what replaces `privileged: true` ------------------------------
+      #
+      # The handler mounts this pod's /sys/fs/cgroup read-write; runc hands
+      # the pod's own cgroup to the pod's root because of the next line, and
+      # only because of it. Without `hostUsers: false` this RuntimeClass would
+      # give a pod that is root on the node a cgroup it could raise its own
+      # limits in — never use one without the other.
+      runtimeClassName: zygo
+      hostUsers: false
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: zygo
+          image: ghcr.io/mhmtskrc2/zygo:latest
+          args:
+            - api
+            - --listen
+            - 0.0.0.0:7700
+            # Deploy rights over HTTP, as in `deployment.yaml`: the thing in
+            # front of this API is your control plane. Drop it for call-only.
+            - --allow-deploy
+          ports:
+            - name: http
+              containerPort: 7700
+          env:
+            - name: ZYGO_API_TOKEN
+              valueFrom:
+                secretKeyRef: { name: zygo, key: api-token }
+            - name: ZYGO_SECRETS_KEY
+              valueFrom:
+                secretKeyRef: { name: zygo, key: secrets-key }
+            - name: ZYGO_DATA_HOME
+              value: /var/lib/zygo
+          securityContext:
+            privileged: false
+            # Root of the pod's own user namespace: uid 0 here is an
+            # unprivileged uid on the node, a different range for every pod
+            # (1653276672 for one on the k3s it was checked on). It is root here because the cgroup runc hands over
+            # belongs to the uid the container starts as, and because writing
+            # a range of ids into a sandbox's user namespace takes CAP_SETUID
+            # in this one. Each sandbox maps ids of its own below it.
+            runAsUser: 0
+            runAsGroup: 0
+            # A fresh `proc` mount inside a user namespace needs a fully
+            # visible one to copy from. Accepted only with `hostUsers: false`.
+            procMount: Unmasked
+            # The runtime's default profile refuses `unshare(CLONE_NEWUSER)`,
+            # which is what a sandbox does first. Zygo installs its own
+            # seccomp filter on every sandbox it builds.
+            seccompProfile:
+              type: Unconfined
+            # The runtime's AppArmor profile refuses the mounts a sandbox makes
+            # for itself; on nodes without AppArmor this line changes nothing.
+            appArmorProfile:
+              type: Unconfined
+            # The default set without what nothing here uses: no raw sockets,
+            # no device nodes, no low ports, no audit records.
+            capabilities:
+              drop: [NET_RAW, MKNOD, NET_BIND_SERVICE, AUDIT_WRITE]
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+
+          # ---- is it alive, and should it be sent work -------------------
+          # As in `deployment.yaml`; the reasons are written there.
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+            failureThreshold: 2
+          livenessProbe:
+            exec:
+              command: ["zygo", "doctor", "--json"]
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 2
+            failureThreshold: 30
+
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - sh
+                  - -c
+                  - >-
+                    wget -q -O- --post-data=''
+                    --header="Authorization: Bearer $ZYGO_API_TOKEN"
+                    http://127.0.0.1:7700/drain?grace_ms=60000 || true
+
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              # The pod's own ceiling, which the kubelet keeps and the pod
+              # cannot raise: its `memory.max` is the one cgroup file runc
+              # does not hand over. Every tenant budget and per-request limit
+              # Zygo writes sits below it.
+              memory: 8Gi
+
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/zygo
+            - name: run
+              mountPath: /run/zygo
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        # As in `deployment.yaml`: a cache, re-pulled on reschedule.
+        - name: data
+          emptyDir:
+            sizeLimit: 20Gi
+        - name: run
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+        # The root filesystem is read-only; this is the one other place a
+        # process here writes.
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi

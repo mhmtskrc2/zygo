@@ -25,7 +25,7 @@ What an embedder asks for, in the order they ask:
 | 1 Runtime zygotes | thousands of scripts per host | done — [ADR 0005](docs/book/adr/0005-one-warm-zygote-per-script-version.md) |
 | 2 The embedder API | building on Zygo without touching its disk | done — [chapter 17](docs/book/17-api-sdk-mcp.md), [`examples/plugin-host`](examples/plugin-host) |
 | 3 Runtimes people embed | JavaScript embedders | done — Node agent; [ADR 0003](docs/book/adr/0003-no-deno-or-bun-agent.md) |
-| 4 Runs where embedders deploy | running inside a worker pod | done, with one caveat — [`packaging/oci`](packaging/oci), [`examples/kubernetes`](examples/kubernetes), [ADR 0004](docs/book/adr/0004-no-supervisor-reexec.md). In Docker no `--privileged` is needed ([chapter 16](docs/book/16-production.md#running-zygo-inside-a-container)); on Kubernetes the pod is still `privileged: true`, because no pod field delegates a cgroup subtree |
+| 4 Runs where embedders deploy | running inside a worker pod | done — [`packaging/oci`](packaging/oci), [`examples/kubernetes`](examples/kubernetes), [ADR 0004](docs/book/adr/0004-no-supervisor-reexec.md). In Docker no `--privileged` is needed ([chapter 16](docs/book/16-production.md#running-zygo-inside-a-container)); on Kubernetes neither, where the nodes can have a containerd 2.1+ runtime handler that delegates the pod's cgroup ([`unprivileged.yaml`](examples/kubernetes/unprivileged.yaml)). Without one the pod is `privileged: true` |
 | 5 Multi-tenant hardening | passing a customer's security review | next |
 | 6 Reference integrations | the first external production user | next |
 

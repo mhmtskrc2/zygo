@@ -413,13 +413,43 @@ pub const TUN_DEVICE: &str = "/dev/net/tun";
 /// Why a host with no tun device cannot give a sandbox a network, and what to
 /// do about it. Shared with `zygo doctor`, which asks the same question.
 pub fn tun_remedy() -> String {
-    format!(
-        "`pasta` needs {TUN_DEVICE}. A container runtime does not create it: \
-         docker run --device {TUN_DEVICE}, or in Kubernetes mount the node's \
-         {TUN_DEVICE} as a hostPath volume of type CharDevice (runc and crun allow \
-         the device by default; they only leave the node out). On a host, \
-         `sudo modprobe tun`. Or use `network = \"none\"`, which needs none of it"
-    )
+    tun_remedy_for(&crate::container::Surroundings::here())
+}
+
+/// [`tun_remedy`] for given surroundings: the fix differs between a host, a
+/// `docker run`, a pod and a pod with a user namespace of its own.
+///
+/// The last is the one that is easy to get wrong. A hostPath volume is how
+/// any other pod gets the node's device, and a pod with `hostUsers: false`
+/// does not start with one: the kubelet asks for an idmapped mount, and a
+/// device node on `devtmpfs` refuses it (`failed to set MOUNT_ATTR_IDMAP on
+/// /dev/net/tun: invalid argument`, k3s 1.36). The runtime has to put the
+/// device in the container itself, which runc then binds in without an id
+/// map.
+pub fn tun_remedy_for(at: &crate::container::Surroundings) -> String {
+    let none = "Or use `network = \"none\"`, which needs none of it";
+    if at.kubernetes && at.user_namespace {
+        format!(
+            "`pasta` needs {TUN_DEVICE}, and a pod with `hostUsers: false` cannot take it \
+             as a hostPath volume: the kubelet asks for an idmapped mount, which a device \
+             node refuses. Let the runtime add it instead — `base_runtime_spec` on the \
+             RuntimeClass's containerd handler, with {TUN_DEVICE} in `linux.devices` \
+             (examples/kubernetes/node/) — or hand it out with a device plugin. {none}"
+        )
+    } else if at.kubernetes {
+        format!(
+            "`pasta` needs {TUN_DEVICE}. A container runtime does not create it: mount the \
+             node's {TUN_DEVICE} as a hostPath volume of type CharDevice (runc and crun \
+             allow the device by default; they only leave the node out). {none}"
+        )
+    } else if at.container {
+        format!(
+            "`pasta` needs {TUN_DEVICE}. A container runtime does not create it: \
+             docker run --device {TUN_DEVICE}. {none}"
+        )
+    } else {
+        format!("`pasta` needs {TUN_DEVICE}: `sudo modprobe tun`. {none}")
+    }
 }
 
 /// The programs on `PATH`, with the reason when one is not.
@@ -1699,9 +1729,13 @@ mod tests {
         assert!(no_device.contains("/dev/net/tun"), "{no_device}");
 
         // The shape a tun-less container actually produces, which names the
-        // tap device rather than the tun one.
+        // tap device rather than the tun one. Which way to get the device in
+        // depends on where this runs — `docker run`, a pod, a pod with its
+        // own user namespace, a host — and is
+        // `a_user_namespaced_pod_is_not_told_to_use_host_path`'s to check;
+        // here it is enough that the device is named.
         let no_tap = pasta_remedy("Failed to set up tap device in namespace");
-        assert!(no_tap.contains("--device /dev/net/tun"), "{no_tap}");
+        assert!(no_tap.contains("needs /dev/net/tun"), "{no_tap}");
 
         // Ubuntu's `passt` profile, attached by path inside a container.
         let pid_file = pasta_remedy(
@@ -1715,5 +1749,38 @@ mod tests {
         let unknown = pasta_remedy("something nobody has seen before");
         assert!(unknown.contains("doctor"), "{unknown}");
         assert!(!unknown.contains("AppArmor"), "{unknown}");
+    }
+
+    /// A pod with its own user namespace is the one place the hostPath advice
+    /// is wrong, and was printed anyway: such a pod does not start with it.
+    #[test]
+    fn a_user_namespaced_pod_is_not_told_to_use_host_path() {
+        use crate::container::Surroundings;
+        let pod = Surroundings {
+            container: true,
+            kubernetes: true,
+            user_namespace: true,
+            cgroupfs_read_only: true,
+        };
+        let text = tun_remedy_for(&pod);
+        assert!(text.contains("base_runtime_spec"), "{text}");
+        assert!(text.contains("cannot take it"), "{text}");
+
+        let host_users = Surroundings {
+            user_namespace: false,
+            ..pod
+        };
+        assert!(tun_remedy_for(&host_users).contains("hostPath volume of type CharDevice"));
+
+        let docker = Surroundings {
+            container: true,
+            ..Surroundings::default()
+        };
+        assert!(tun_remedy_for(&docker).contains("--device /dev/net/tun"));
+
+        let host = Surroundings::default();
+        let text = tun_remedy_for(&host);
+        assert!(text.contains("modprobe tun"), "{text}");
+        assert!(!text.contains("hostPath"), "{text}");
     }
 }

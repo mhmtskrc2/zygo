@@ -49,6 +49,7 @@ pub mod backend;
 pub mod blobs;
 pub mod bytecode;
 pub mod cgroup;
+pub mod container;
 pub mod deps;
 pub mod derive;
 pub mod doctor;

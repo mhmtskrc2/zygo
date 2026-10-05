@@ -7,7 +7,26 @@ break things and will say so here.
 
 ## [Unreleased]
 
+### Added
+
+- Zygo on Kubernetes without `privileged: true`:
+  `examples/kubernetes/unprivileged.yaml`, a pod with `hostUsers: false` on a
+  RuntimeClass whose containerd handler (`examples/kubernetes/node/`, containerd
+  2.1+) mounts its cgroup read-write and carries `/dev/net/tun`. runc then
+  hands the pod its own cgroup and not its limits. Checked on k3s 1.36 by
+  `tests/linux/verify_k8s_unprivileged.sh` — sandboxes, per-request memory
+  limits, an egress allowlist, and a pod that cannot raise its own
+  `memory.max` — which a new CI job, `kubernetes-unprivileged`, runs.
+
 ### Fixed
+
+- `zygo doctor` gives a pod a pod's advice. A Kubernetes pod whose cgroup was
+  read-only was told to `docker run --cgroup-parent`; it is now told about the
+  RuntimeClass and `hostUsers: false`, or about the systemd cgroup driver when
+  the cgroup is writable and was not handed over. A pod with its own user
+  namespace and no `/dev/net/tun` was told to mount the device as a `hostPath`
+  volume, which such a pod does not start with; it is now told to put the
+  device in the runtime handler's base spec.
 
 - `zygo mcp`'s `run_code` works. It mounted its workspace at `/work`, which
   every sandbox keeps for per-request files, so every call was refused with

@@ -101,9 +101,12 @@ spec:
           # ---- what makes a sandbox possible -----------------------------
           #
           # `privileged` is buying **one** thing here, and it is worth naming
-          # which: a cgroup this pod can write. Kubernetes has no field for
-          # "give this pod a delegated cgroup subtree", so the only way to get
-          # one today is this. `zygo doctor` says so if you try without it.
+          # which: a cgroup this pod can write. Kubernetes has no pod field for
+          # "give this pod a delegated cgroup subtree"; a containerd 2.1+
+          # runtime handler can do it for a pod with `hostUsers: false`, and
+          # `unprivileged.yaml` beside this file is this deployment that way.
+          # Where the nodes cannot have that handler, this is the way. `zygo
+          # doctor` says which applies if you try without either.
           #
           # What that costs is smaller than it looks, and the reason is the
           # product: the boundary Zygo enforces is the sandbox it builds
