@@ -12,6 +12,19 @@ its API, and every request starts from a process that has never served one.**
 Rootless, OCI images, and no daemon to install: the one long-lived process is a
 supervisor under your own user, not a system service.
 
+**Running an agent?** `zygo mcp` is an MCP server for Claude Code, Claude
+Desktop, Cursor and Codex. Every `run_code` call gets a fresh sandbox on your
+own machine, with no network unless you allow a host, and the model cannot
+widen what it was given: the image, the mounts, the network and the limits
+belong to whoever installed the server, and a test keeps every tool that way.
+A function you declared in `sandbox.toml` answers warm, in about a millisecond.
+[Chapter 17, part three](docs/book/17-api-sdk-mcp.md#part-three-the-mcp-server)
+has the tools and the flags.
+
+```bash
+claude mcp add zygo -- zygo mcp --mem 512M --timeout 60s --net egress --allow api.github.com:443
+```
+
 *This page is the first page of [the Zygo book](docs/book/README.md), also on
 the web at [mhmtskrc2.github.io/zygo](https://mhmtskrc2.github.io/zygo/).*
 
