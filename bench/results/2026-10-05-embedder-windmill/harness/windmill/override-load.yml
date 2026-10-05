@@ -1,0 +1,18 @@
+# Load test: every Windmill container on CPUs 0 and 1, under one cgroup parent.
+services:
+  windmill_server:
+    cpuset: "0,1"
+    cgroup_parent: /windmill
+    ports:
+      - "8088:8000"
+    environment:
+      - SUPERADMIN_SECRET=replace-me
+  db:
+    cpuset: "0,1"
+    cgroup_parent: /windmill
+  windmill_worker:
+    cpuset: "0,1"
+    cgroup_parent: /windmill
+  windmill_worker_native:
+    cpuset: "0,1"
+    cgroup_parent: /windmill

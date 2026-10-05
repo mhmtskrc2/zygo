@@ -1,0 +1,6 @@
+[admission window] embedder hello, burst of 200 from 32 connections: 200/200 ok in 6.4 s (31.3 done/s) | latency p50 2805 p95 3890 p99 4077 max 4124 ms | CPU 42.9 ms/event | peak anon +50 MB (idle 94 MB)
+[admission window] embedder cpu, burst of 200 from 32 connections: 200/200 ok in 7.44 s (26.9 done/s) | latency p50 3398 p95 5272 p99 5374 max 5408 ms | CPU 53.4 ms/event | peak anon +15 MB (idle 126 MB)
+[admission window] embedder hello, 20/s for 20 s: 400/400 ok in 20.13 s (19.9 done/s) | latency p50 179 p95 257 p99 296 max 338 ms | CPU 61.5 ms/event | peak anon +20 MB (idle 125 MB)
+[admission window] embedder hello, 30/s for 20 s: 600/600 ok in 22.32 s (26.9 done/s) | latency p50 1211 p95 2404 p99 2716 max 2845 ms | CPU 50.6 ms/event | peak anon +17 MB (idle 127 MB)
+[admission window] embedder hello, 40/s for 20 s: 800/800 ok in 26.95 s (29.7 done/s) | latency p50 3730 p95 6673 p99 7021 max 7202 ms | CPU 48.0 ms/event | peak anon +15 MB (idle 129 MB)
+[admission window] embedder hello, 50/s for 20 s: 1000/1000 ok in 31.95 s (31.3 done/s) | latency p50 7347 p95 11911 p99 12148 max 12304 ms | CPU 45.8 ms/event | peak anon +16 MB (idle 128 MB)

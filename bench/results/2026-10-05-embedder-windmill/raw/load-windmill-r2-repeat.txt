@@ -1,0 +1,6 @@
+[windmill r2 repeat] windmill hello, 20/s for 20 s: 400/400 ok in 20.09 s (19.9 done/s) | latency p50 59 p95 92 p99 103 max 141 ms | CPU 39.2 ms/event | peak anon +8 MB (idle 530 MB)
+[windmill r2 repeat] windmill hello, 20/s for 20 s: 400/400 ok in 20.07 s (19.9 done/s) | latency p50 59 p95 92 p99 100 max 102 ms | CPU 40.2 ms/event | peak anon +24 MB (idle 440 MB)
+[windmill r2 repeat] windmill hello, 40/s for 20 s: 800/800 ok in 20.09 s (39.8 done/s) | latency p50 68 p95 101 p99 122 max 149 ms | CPU 35.9 ms/event | peak anon +78 MB (idle 453 MB)
+[windmill r2 repeat] windmill hello, 50/s for 20 s: 1000/1000 ok in 21.96 s (45.5 done/s) | latency p50 681 p95 1882 p99 1976 max 2022 ms | CPU 36.6 ms/event | peak anon +88 MB (idle 537 MB)
+[windmill r2 repeat] windmill hello, 50/s for 20 s: 1000/1000 ok in 26.69 s (37.5 done/s) | latency p50 2792 p95 7082 p99 9555 max 9636 ms | CPU 41.6 ms/event | peak anon +15 MB (idle 509 MB)
+[windmill r2 repeat] windmill hello, 50/s for 20 s: 1000/1000 ok in 24.72 s (40.4 done/s) | latency p50 568 p95 4409 p99 4709 max 4778 ms | CPU 39.4 ms/event | peak anon +27 MB (idle 502 MB)

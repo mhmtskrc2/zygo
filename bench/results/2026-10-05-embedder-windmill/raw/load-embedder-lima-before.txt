@@ -1,0 +1,7 @@
+embedder hello, burst of 200 from 32 connections: 200/200 ok in 5.91 s (33.8 done/s) | latency p50 2748 p95 3849 p99 3962 max 3998 ms | CPU 40.4 ms/event | peak anon +43 MB (idle 98 MB)
+embedder cpu, burst of 200 from 32 connections: 200/200 ok in 7.39 s (27.1 done/s) | latency p50 3286 p95 5258 p99 5390 max 5429 ms | CPU 53.6 ms/event | peak anon +27 MB (idle 122 MB)
+embedder hello, 10/s for 20 s: 200/200 ok in 20.12 s (9.9 done/s) | latency p50 119 p95 136 p99 267 max 307 ms | CPU 86.0 ms/event | peak anon +9 MB (idle 128 MB)
+embedder hello, 20/s for 20 s: 400/400 ok in 20.14 s (19.9 done/s) | latency p50 168 p95 218 p99 253 max 280 ms | CPU 61.7 ms/event | peak anon +15 MB (idle 127 MB)
+embedder hello, 30/s for 20 s: 600/600 ok in 21.02 s (28.5 done/s) | latency p50 701 p95 1288 p99 1429 max 1560 ms | CPU 49.4 ms/event | peak anon +16 MB (idle 127 MB)
+embedder hello, 40/s for 20 s: 402/800 ok in 300.0 s (1.3 done/s) | latency p50 1857 p95 3201 p99 3422 max 3651 ms | CPU 67.7 ms/event | peak anon +15 MB (idle 126 MB)
+    /Users/m/windmill-bench/load.exs:164: (file)

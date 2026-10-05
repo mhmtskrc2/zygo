@@ -1,0 +1,6 @@
+[nsjail, night] windmill hello, burst of 200 from 32 connections: 200/200 ok in 3.95 s (50.6 done/s) | latency p50 1608 p95 2903 p99 3001 max 3025 ms | CPU 33.3 ms/event | peak anon +57 MB (idle 489 MB)
+[nsjail, night] windmill cpu, burst of 200 from 32 connections: 200/200 ok in 7.33 s (27.3 done/s) | latency p50 2278 p95 5158 p99 5521 max 5533 ms | CPU 51.3 ms/event | peak anon +28 MB (idle 557 MB)
+[nsjail, night] windmill hello, 20/s for 20 s: 400/400 ok in 20.06 s (19.9 done/s) | latency p50 58 p95 89 p99 109 max 191 ms | CPU 39.3 ms/event | peak anon +20 MB (idle 450 MB)
+[nsjail, night] windmill hello, 40/s for 20 s: 800/800 ok in 20.08 s (39.8 done/s) | latency p50 63 p95 96 p99 132 max 186 ms | CPU 35.1 ms/event | peak anon +26 MB (idle 459 MB)
+[nsjail, night] windmill hello, 50/s for 20 s: 1000/1000 ok in 21.04 s (47.5 done/s) | latency p50 518 p95 1012 p99 1045 max 1082 ms | CPU 35.2 ms/event | peak anon +105 MB (idle 471 MB)
+[nsjail, night] windmill hello, 60/s for 20 s: 1200/1200 ok in 25.32 s (47.4 done/s) | latency p50 2816 p95 5088 p99 5261 max 5313 ms | CPU 35.4 ms/event | peak anon +40 MB (idle 580 MB)

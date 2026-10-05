@@ -1,0 +1,187 @@
+# One load generator for both systems, run on the Mac so its own CPU is nobody's:
+#
+#   cd <the embedder's checkout> && mix run --no-start ~/windmill-bench/load.exs SYSTEM SCRIPT MODE ...
+#     SYSTEM  embedder | windmill
+#     SCRIPT  hello | cpu
+#     MODE    burst N [POSTERS]      N events at once, from POSTERS connections (default 32)
+#             rate R SECONDS         an open-loop stream of R events a second
+#
+# Latency is client side for both: from just before the request is sent to the moment a
+# batched poll (every 10 ms) sees the event finished. CPU is the stack's cgroup
+# (`/zygo` holds the embedder, its Postgres and every sandbox; `/windmill` holds Windmill's server,
+# workers and Postgres), read before and after. Memory is the peak of the cgroup's
+# anonymous memory above where it started, sampled every 20 ms by the `cgmon` container.
+Application.ensure_all_started(:inets)
+Application.ensure_all_started(:postgrex)
+Application.ensure_all_started(:jason)
+
+[system, script, mode | rest] = System.argv()
+
+target =
+  case system do
+    "embedder" ->
+      t = Jason.decode!(File.read!(Path.expand("~/windmill-bench/embedder-target.json")))["targets"][script]
+      {:ok, pg} = Postgrex.start_link(hostname: "localhost", port: 5433, username: "postgres",
+                    password: "postgres", database: "embedder_bench")
+      %{url: ~c"http://localhost:4100" ++ String.to_charlist(t["url"]), pg: pg, cgroup: if(System.get_env("ENV") == "lima", do: "bench", else: "zygo")}
+
+    "windmill" ->
+      token = String.trim(File.read!(Path.expand("~/windmill-bench/.superadmin")))
+      auth = [{~c"authorization", String.to_charlist("Bearer " <> token)}]
+      {:ok, {_, _, body}} = :httpc.request(:get, {~c"http://localhost:8088/api/w/bench/scripts/list?per_page=200", auth}, [], body_format: :binary)
+      path = body |> Jason.decode!() |> Enum.map(& &1["path"]) |> Enum.filter(&String.starts_with?(&1, "f/bench/#{script}_")) |> Enum.max()
+      %{path: path, auth: auth, cgroup: "windmill"}
+  end
+
+:httpc.set_options(max_sessions: 64, max_keep_alive_length: 64)
+
+# Where the stacks run: Docker Desktop (the `cgmon` container) or the Lima VM (ENV=lima).
+lima? = System.get_env("ENV") == "lima"
+cg = fn cmd ->
+  {out, 0} =
+    if lima?,
+      do: System.cmd("limactl", ["shell", "zygo", "--", "sh", "-c", cmd]),
+      else: System.cmd("docker", ["exec", "cgmon", "sh", "-c", cmd])
+  String.trim(out)
+end
+cgroup_dir = if lima?, do: "/sys/fs/cgroup/#{target.cgroup}.slice", else: "/cg/#{target.cgroup}"
+state = fn name -> if lima?, do: "/tmp/cgm/#{name}_#{target.cgroup}.slice", else: "/tmp/#{name}_#{target.cgroup}" end
+cpu_usec = fn -> cg.("awk '$1==\"usage_usec\"{print $2}' #{cgroup_dir}/cpu.stat") |> String.to_integer() end
+
+submit =
+  case system do
+    "embedder" ->
+      fn i ->
+        body = Jason.encode!(%{"title" => "e#{i}"})
+        {:ok, {{_, 202, _}, _, resp}} = :httpc.request(:post, {target.url, [], ~c"application/json", body}, [], body_format: :binary)
+        Jason.decode!(resp)["id"]
+      end
+
+    "windmill" ->
+      url = String.to_charlist("http://localhost:8088/api/w/bench/jobs/run/p/#{target.path}")
+      fn i ->
+        body = Jason.encode!(%{"title" => "e#{i}"})
+        {:ok, {{_, 201, _}, _, resp}} = :httpc.request(:post, {url, target.auth, ~c"application/json", body}, [], body_format: :binary)
+        String.trim(resp, "\"")
+      end
+  end
+
+# Which of `ids` are finished now: a set of {id, ok?}.
+finished =
+  case system do
+    "embedder" ->
+      fn ids ->
+        %{rows: rows} = Postgrex.query!(target.pg,
+          "select id, status from script_events where id = any($1) and status not in ('pending','running')", [ids])
+        Map.new(rows, fn [id, status] -> {id, status == "ok"} end)
+      end
+
+    "windmill" ->
+      since = DateTime.utc_now() |> DateTime.add(-5, :second) |> DateTime.to_iso8601() |> URI.encode_www_form()
+      fn _ids ->
+        url = String.to_charlist("http://localhost:8088/api/w/bench/jobs/completed/list?per_page=2000&script_path_exact=#{target.path}&created_after=#{since}")
+        {:ok, {_, _, body}} = :httpc.request(:get, {url, target.auth}, [], body_format: :binary)
+        body |> Jason.decode!() |> Map.new(fn j -> {j["id"], j["success"] == true} end)
+      end
+  end
+
+pct = fn xs, p -> s = Enum.sort(xs); Enum.at(s, min(length(s) - 1, round(p / 100 * (length(s) - 1)))) end
+now = fn -> System.monotonic_time(:microsecond) end
+
+# Every submission reports {id, sent_at} to the collector; the collector polls.
+collector = self()
+
+# A request that was refused or failed is counted by its answer, not crashed on: a
+# crashed poster was an event that silently never existed.
+send_one = fn i ->
+  t = now.()
+  try do
+    id = submit.(i)
+    send(collector, {:sent, id, t})
+  rescue
+    e in MatchError ->
+      reason =
+        case e.term do
+          {:ok, {{_, status, _}, _, _}} -> "HTTP #{status}"
+          {:error, r} -> inspect(r) |> String.slice(0, 40)
+          other -> inspect(other) |> String.slice(0, 40)
+        end
+      send(collector, {:refused, reason})
+  end
+end
+
+cg.("touch #{state.("reset")}")
+Process.sleep(100)
+cpu0 = cpu_usec.()
+t_start = now.()
+
+{planned, label} =
+  case {mode, rest} do
+    {"burst", [n | more]} ->
+      n = String.to_integer(n)
+      posters = String.to_integer(List.first(more) || "32")
+      spawn(fn ->
+        1..n |> Task.async_stream(send_one, max_concurrency: posters, timeout: 60_000) |> Stream.run()
+      end)
+      {n, "burst of #{n} from #{posters} connections"}
+
+    {"rate", [r, secs]} ->
+      {r, secs} = {String.to_integer(r), String.to_integer(secs)}
+      n = r * secs
+      spawn(fn ->
+        interval = 1_000_000 / r
+        for i <- 1..n do
+          due = t_start + round(i * interval)
+          wait = div(due - now.(), 1000)
+          if wait > 0, do: Process.sleep(wait)
+          spawn(fn -> send_one.(i) end)
+        end
+      end)
+      {n, "#{r}/s for #{secs} s"}
+  end
+
+# Collect: sent times from the posters, finish times from a 10 ms poll.
+loop = fn loop, sent, done, deadline ->
+  sent =
+    Enum.reduce(Stream.repeatedly(fn -> receive do {:sent, id, t} -> {id, t}; {:refused, r} -> {:refused, r} after 0 -> nil end end)
+                |> Enum.take_while(& &1), sent, fn
+                  {:refused, r}, acc -> Process.put(:refused, [r | Process.get(:refused, [])]); acc
+                  {id, t}, acc -> Map.put(acc, id, t)
+                end)
+  pending = Map.keys(sent) -- Map.keys(done)
+  done =
+    if pending == [] do
+      done
+    else
+      at = now.()
+      finished.(pending) |> Enum.reduce(done, fn {id, ok}, acc ->
+        if Map.has_key?(sent, id) and not Map.has_key?(acc, id), do: Map.put(acc, id, {at, ok}), else: acc
+      end)
+    end
+  cond do
+    map_size(done) + length(Process.get(:refused, [])) >= planned -> {sent, done}
+    now.() > deadline -> {sent, done}
+    true -> Process.sleep(10); loop.(loop, sent, done, deadline)
+  end
+end
+
+{sent, done} = loop.(loop, %{}, %{}, t_start + 300_000_000)
+t_end = now.()
+cpu1 = cpu_usec.()
+base = String.to_integer(cg.("cat #{state.("base")}"))
+peak = String.to_integer(cg.("cat #{state.("max")}"))
+
+lat = for {id, {at, _}} <- done, t = sent[id], do: (at - t) / 1000
+lat = if lat == [], do: [0.0], else: lat
+refused = Process.get(:refused, []) |> Enum.frequencies() |> Enum.map_join(", ", fn {r, n} -> "#{n}× #{r}" end)
+ok = Enum.count(done, fn {_, {_, ok}} -> ok end)
+wall = (t_end - t_start) / 1_000_000
+
+IO.puts(
+  "#{system} #{script}, #{label}: #{ok}/#{planned} ok in #{Float.round(wall, 2)} s " <>
+    "(#{Float.round(map_size(done) / wall, 1)} done/s) | latency p50 #{round(pct.(lat, 50))} " <>
+    "p95 #{round(pct.(lat, 95))} p99 #{round(pct.(lat, 99))} max #{round(Enum.max(lat))} ms | " <>
+    "CPU #{Float.round((cpu1 - cpu0) / 1000 / max(map_size(done), 1), 1)} ms/event | " <>
+    "peak anon +#{round((peak - base) / 1_048_576)} MB (idle #{round(base / 1_048_576)} MB)" <>
+    if(refused == "", do: "", else: " | REFUSED: #{refused}")
+)

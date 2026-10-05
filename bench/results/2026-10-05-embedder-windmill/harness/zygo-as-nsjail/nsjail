@@ -1,0 +1,67 @@
+#!/bin/sh
+# nsjail, as Windmill's worker calls it, run with Zygo instead:
+#
+#   nsjail --config run.config.proto -- <program> <args...>     (cwd: the job's directory)
+#
+# The config's host binds (/usr, /lib, /bin, /etc, the Python runtime, site-packages)
+# become --mount; the job directory, whose files nsjail binds one by one into a tmpfs
+# /tmp, is mounted at /job and becomes the working directory (Zygo keeps /tmp as its own
+# scratch tmpfs); the job's environment passes through, as nsjail's
+# keep_env does; time_limit becomes --timeout. ZYGO_NET picks the network (default full).
+# Windmill clears the environment of what it runs, so the stand-in's own settings come
+# from a file mounted into the worker rather than from the worker's environment.
+[ -f /etc/zygo-nsjail.env ] && . /etc/zygo-nsjail.env
+export ZYGO_DATA_HOME=${ZYGO_DATA_HOME:-/zygo-data}
+cfg=
+while [ $# -gt 0 ]; do
+  case $1 in --config) cfg=$2; shift 2 ;; --) shift; break ;; *) shift ;; esac
+done
+job=$(pwd)
+n=$#   # the program and its arguments, left untouched at the front of "$@"
+
+sep=$(printf '\036')
+set_args=
+add() { for a in "$@"; do set_args="$set_args$a$sep"; done; }
+
+add --quiet --user 0 --mem "${ZYGO_MEM:-2G}" --pids 1024 --scratch "${ZYGO_SCRATCH:-256M}" --workdir /job --mount "$job:/job:rw" \
+    --net "${ZYGO_NET:-full}"
+[ -n "${ZYGO_ALLOW_PRIVATE:-}" ] && add --allow-private-net
+
+# Host binds that are not the job's own files, /dev entries or tmpfs mounts.
+nl='
+'
+lines=$(awk -v job="$job" '
+  /mount \{/ { m=1; s=""; d=""; rw="ro"; fs="" }
+  m && /src:/ { gsub(/"/, "", $2); s=$2 }
+  m && /dst:/ { gsub(/"/, "", $2); d=$2 }
+  m && /rw: true/ { rw="rw" }
+  m && /fstype:/ { fs=$2 }
+  m && /^[ \t]*}/ {
+    if (fs == "" && s != "" && index(s, job) != 1 && d !~ /^\/dev\//) print "M " s ":" d ":" rw
+    m=0
+  }
+  /^time_limit:/ { print "T " $2 }
+  /^envar:/ { sub(/^envar: *"/, ""); sub(/"$/, ""); print "E " $0 }
+' "$cfg")
+IFS=$nl
+for l in $lines; do
+  case $l in
+    "M "*) b=${l#M }; [ -e "${b%%:*}" ] && add --mount "$b" ;;
+    "T "*) add --timeout "${l#T }s" ;;
+    "E "*) v=$(eval "printf '%s' \"${l#E }\""); add --env "$v" ;;
+  esac
+done
+for e in $(env | grep -E '^[A-Za-z_][A-Za-z0-9_]*=' | grep -vE '^(PWD|OLDPWD|SHLVL|_|ZYGO_[A-Z_]*)='); do
+  add --env "$e"
+done
+unset IFS
+add "${ZYGO_IMAGE:-debian:trixie-slim}"
+
+# "$@" is the program; append the flags and image after it, then rotate the program to
+# the end: zygo run <flags> <image> <program> <args...>
+IFS=$sep
+for a in $set_args; do set -- "$@" "$a"; done
+unset IFS
+i=0
+while [ $i -lt $n ]; do set -- "$@" "$1"; shift; i=$((i + 1)); done
+exec /usr/local/bin/zygo run "$@"

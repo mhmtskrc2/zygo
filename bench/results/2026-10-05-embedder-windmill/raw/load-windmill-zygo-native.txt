@@ -1,0 +1,5 @@
+[zygo-native] windmill hello, burst of 200 from 32 connections: 200/200 ok in 4.0 s (50.0 done/s) | latency p50 1729 p95 2943 p99 3062 max 3075 ms | CPU 33.2 ms/event | peak anon +26 MB (idle 574 MB)
+[zygo-native] windmill cpu, burst of 200 from 32 connections: 200/200 ok in 5.41 s (37.0 done/s) | latency p50 2552 p95 4578 p99 4758 max 4785 ms | CPU 46.2 ms/event | peak anon +22 MB (idle 590 MB)
+[zygo-native] windmill hello, 20/s for 20 s: 400/400 ok in 20.05 s (20.0 done/s) | latency p50 56 p95 87 p99 94 max 97 ms | CPU 37.9 ms/event | peak anon +0 MB (idle 564 MB)
+[zygo-native] windmill hello, 40/s for 20 s: 800/800 ok in 20.07 s (39.9 done/s) | latency p50 65 p95 91 p99 112 max 138 ms | CPU 35.0 ms/event | peak anon +30 MB (idle 534 MB)
+[zygo-native] windmill hello, 50/s for 20 s: 1000/1000 ok in 21.38 s (46.8 done/s) | latency p50 390 p95 1331 p99 1375 max 1396 ms | CPU 35.7 ms/event | peak anon +28 MB (idle 550 MB)

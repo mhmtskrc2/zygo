@@ -1,0 +1,8 @@
+[embedder r2, RUNNER_CONCURRENCY=4] embedder hello, burst of 200 from 32 connections: 200/200 ok in 2.47 s (81.0 done/s) | latency p50 999 p95 1564 p99 1607 max 1609 ms | CPU 14.9 ms/event | peak anon +41 MB (idle 119 MB)
+[embedder r2, RUNNER_CONCURRENCY=4] embedder hello, burst of 200 from 32 connections: 200/200 ok in 1.92 s (104.4 done/s) | latency p50 850 p95 1455 p99 1515 max 1521 ms | CPU 11.6 ms/event | peak anon +17 MB (idle 144 MB)
+[embedder r2, RUNNER_CONCURRENCY=4] embedder hello, burst of 200 from 32 connections: 200/200 ok in 1.87 s (106.7 done/s) | latency p50 837 p95 1438 p99 1483 max 1487 ms | CPU 11.0 ms/event | peak anon +17 MB (idle 145 MB)
+[embedder r2, RUNNER_CONCURRENCY=4] embedder cpu, burst of 200 from 32 connections: 200/200 ok in 4.81 s (41.6 done/s) | latency p50 2507 p95 4169 p99 4346 max 4361 ms | CPU 26.6 ms/event | peak anon +18 MB (idle 146 MB)
+[embedder r2, RUNNER_CONCURRENCY=4] embedder hello, 50/s for 20 s: 1000/1000 ok in 20.04 s (49.9 done/s) | latency p50 55 p95 2409 p99 2617 max 2790 ms | CPU 18.9 ms/event | peak anon +17 MB (idle 147 MB)
+[embedder r2, RUNNER_CONCURRENCY=4] embedder hello, 100/s for 20 s: 2000/2000 ok in 20.04 s (99.8 done/s) | latency p50 43 p95 61 p99 75 max 137 ms | CPU 12.9 ms/event | peak anon +26 MB (idle 148 MB)
+[embedder r2, RUNNER_CONCURRENCY=4] embedder hello, 120/s for 20 s: 2400/2400 ok in 23.92 s (100.3 done/s) | latency p50 205 p95 2766 p99 3700 max 3931 ms | CPU 14.1 ms/event | peak anon +17 MB (idle 150 MB)
+[embedder r2, RUNNER_CONCURRENCY=4] embedder hello, 150/s for 20 s: 3000/3000 ok in 26.08 s (115.0 done/s) | latency p50 3963 p95 5907 p99 6056 max 6096 ms | CPU 12.7 ms/event | peak anon +28 MB (idle 150 MB)

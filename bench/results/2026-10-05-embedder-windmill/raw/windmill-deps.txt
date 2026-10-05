@@ -1,0 +1,5 @@
+Windmill: script=deps path=f/bench/deps_1790240536 (created and locked in 1.7 s)
+first run: 168 ms -> {"title": "warmup", "requests": "2.34.2"}
+sequential n=10: end-to-end p50=167 p95=188 max=188 ms
+burst n=20: all accepted in 48 ms, all done in 1927 ms (10.38 jobs/s), ok=20/20
+  queue wait p50=913 p95=1631 ms; execution (duration_ms) p50=265 p95=349 ms

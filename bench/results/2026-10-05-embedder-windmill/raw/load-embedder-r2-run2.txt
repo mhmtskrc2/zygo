@@ -1,0 +1,7 @@
+[embedder r2, zygo api 0.1.5 warm pools] embedder hello, burst of 200 from 32 connections: 200/200 ok in 2.12 s (94.4 done/s) | latency p50 976 p95 1617 p99 1692 max 1714 ms | CPU 11.6 ms/event | peak anon +11 MB (idle 148 MB)
+[embedder r2, zygo api 0.1.5 warm pools] embedder hello, burst of 200 from 32 connections: 200/200 ok in 2.25 s (88.9 done/s) | latency p50 1075 p95 1803 p99 1880 max 1889 ms | CPU 11.9 ms/event | peak anon +10 MB (idle 150 MB)
+[embedder r2, zygo api 0.1.5 warm pools] embedder cpu, burst of 200 from 32 connections: 200/200 ok in 4.69 s (42.6 done/s) | latency p50 2225 p95 4077 p99 4266 max 4295 ms | CPU 26.3 ms/event | peak anon +14 MB (idle 151 MB)
+[embedder r2, zygo api 0.1.5 warm pools] embedder hello, 120/s for 20 s: 2400/2400 ok in 23.51 s (102.1 done/s) | latency p50 1948 p95 3422 p99 3483 max 3511 ms | CPU 12.5 ms/event | peak anon +9 MB (idle 150 MB)
+[embedder r2, zygo api 0.1.5 warm pools] embedder hello, 150/s for 20 s: 3000/3000 ok in 30.24 s (99.2 done/s) | latency p50 5555 p95 9815 p99 10180 max 10247 ms | CPU 12.9 ms/event | peak anon +13 MB (idle 149 MB)
+[embedder r2, zygo api 0.1.5 warm pools] embedder hello, 200/s for 20 s: 4000/4000 ok in 40.92 s (97.7 done/s) | latency p50 11949 p95 20133 p99 20760 max 20927 ms | CPU 13.2 ms/event | peak anon +10 MB (idle 149 MB)
+[embedder r2, zygo api 0.1.5 warm pools] embedder hello, 20/s for 20 s: 400/400 ok in 20.03 s (20.0 done/s) | latency p50 27 p95 35 p99 57 max 110 ms | CPU 16.8 ms/event | peak anon +8 MB (idle 149 MB)

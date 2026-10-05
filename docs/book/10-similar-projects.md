@@ -818,7 +818,9 @@ cost at saturation is the cgroup Zygo creates and removes per job:
 told apart. Through a shell script, the same swap costs about 15% of
 throughput, because the script's `sh`, `awk`, `grep` and `env` add about 4 ms
 to every job. Idle memory does not move, because neither sandbox stays resident
-between jobs.
+between jobs. On the warm path it does: the embedder measured in chapter 25
+kept two runtime pools warm for about 30 MB, against the 400–600 MB Windmill's
+servers and workers hold while idle.
 
 Running it found three defects in Zygo, all fixed:
 
@@ -918,14 +920,20 @@ A run now starts 4 processes, down from 13 at the worst.
 - **They are all cold.** Every job started a fresh interpreter. Zygo's warm
   path, a fork into a zygote that has already imported everything, was not part
   of either comparison. Neither nsjail nor kern has one to compare it with.
+  An embedder on the warm path, under load, beside the same Windmill on the
+  same VM, is in
+  [chapter 25](25-performance.md#the-warm-path-inside-an-embedder-under-load).
 - **One VM, one kernel.** On kernel 5.10, in Docker Desktop's VM, the same
   sandbox made Python about twice as slow as a plain container did. That cost
   belongs to the old kernel, and it would have been measured against every
   namespace-based runner alike.
-- **The raw results and the load generator were not kept.** The tables here
-  are their summary, and they cannot be repeated from this repository. The
-  numbers in [chapter 25](25-performance.md) can: `make bench-record` writes
-  them as JSON, and [`bench/`](../../bench) holds the records so far.
+- **The raw results and the load generator are kept, outside `zygo bench`.**
+  [`bench/results/2026-10-05-embedder-windmill/`](../../bench/results/2026-10-05-embedder-windmill)
+  has the load generator, the `nsjail` stand-in, the kern harness and every
+  result line behind these tables, with a README naming each. They need the
+  embedder's own checkout to run again, so they are a record rather than a
+  `make` target; the numbers in [chapter 25](25-performance.md) are the latter:
+  `make bench-record` writes them as JSON into the same [`bench/`](../../bench).
 
 ## Everything in one table
 

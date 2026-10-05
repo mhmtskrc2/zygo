@@ -1,0 +1,3 @@
+[embedder r2 confirm 2] embedder hello, 50/s for 20 s: 1000/1000 ok in 20.03 s (49.9 done/s) | latency p50 40 p95 1223 p99 1468 max 1577 ms | CPU 18.0 ms/event | peak anon +9 MB (idle 145 MB)
+[embedder r2 confirm 2] embedder hello, 50/s for 20 s: 1000/1000 ok in 20.03 s (49.9 done/s) | latency p50 36 p95 582 p99 730 max 850 ms | CPU 17.3 ms/event | peak anon +14 MB (idle 145 MB)
+[embedder r2 confirm 2] embedder hello, 100/s for 20 s: 2000/2000 ok in 22.42 s (89.2 done/s) | latency p50 250 p95 2310 p99 2348 max 2398 ms | CPU 13.8 ms/event | peak anon +10 MB (idle 146 MB)

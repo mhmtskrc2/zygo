@@ -1,0 +1,5 @@
+[embedder r2 after windmill, fresh start] embedder hello, burst of 200 from 32 connections: 200/200 ok in 2.42 s (82.5 done/s) | latency p50 1041 p95 1747 p99 1797 max 1811 ms | CPU 13.5 ms/event | peak anon +30 MB (idle 120 MB)
+[embedder r2 after windmill, fresh start] embedder hello, burst of 200 from 32 connections: 200/200 ok in 2.14 s (93.5 done/s) | latency p50 1027 p95 1717 p99 1786 max 1790 ms | CPU 11.7 ms/event | peak anon +10 MB (idle 142 MB)
+[embedder r2 after windmill, fresh start] embedder hello, burst of 200 from 32 connections: 200/200 ok in 2.3 s (86.9 done/s) | latency p50 1047 p95 1825 p99 1887 max 1904 ms | CPU 12.8 ms/event | peak anon +10 MB (idle 144 MB)
+[embedder r2 after windmill, fresh start] embedder hello, 50/s for 20 s: 1000/1000 ok in 20.03 s (49.9 done/s) | latency p50 534 p95 3380 p99 3622 max 3666 ms | CPU 18.6 ms/event | peak anon +9 MB (idle 145 MB)
+[embedder r2 after windmill, fresh start] embedder hello, 100/s for 20 s: 2000/2000 ok in 23.53 s (85.0 done/s) | latency p50 468 p95 3489 p99 3539 max 3559 ms | CPU 14.5 ms/event | peak anon +15 MB (idle 143 MB)

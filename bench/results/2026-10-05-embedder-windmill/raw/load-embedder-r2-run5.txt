@@ -1,0 +1,6 @@
+[embedder r2 repeat] embedder hello, 20/s for 20 s: 400/400 ok in 20.04 s (20.0 done/s) | latency p50 32 p95 674 p99 734 max 755 ms | CPU 26.2 ms/event | peak anon +8 MB (idle 146 MB)
+[embedder r2 repeat] embedder hello, 50/s for 20 s: 1000/1000 ok in 20.03 s (49.9 done/s) | latency p50 31 p95 47 p99 66 max 111 ms | CPU 15.6 ms/event | peak anon +9 MB (idle 146 MB)
+[embedder r2 repeat] embedder hello, 50/s for 20 s: 1000/1000 ok in 23.14 s (43.2 done/s) | latency p50 2295 p95 3359 p99 3565 max 3649 ms | CPU 26.0 ms/event | peak anon +9 MB (idle 147 MB)
+[embedder r2 repeat] embedder hello, 50/s for 20 s: 1000/1000 ok in 20.04 s (49.9 done/s) | latency p50 36 p95 224 p99 381 max 435 ms | CPU 17.4 ms/event | peak anon +15 MB (idle 147 MB)
+[embedder r2 repeat] embedder hello, 80/s for 20 s: 1600/1600 ok in 20.04 s (79.9 done/s) | latency p50 46 p95 574 p99 737 max 804 ms | CPU 13.8 ms/event | peak anon +9 MB (idle 147 MB)
+[embedder r2 repeat] embedder hello, 80/s for 20 s: 1600/1600 ok in 21.67 s (73.8 done/s) | latency p50 98 p95 800 p99 1256 max 1675 ms | CPU 15.6 ms/event | peak anon +15 MB (idle 148 MB)

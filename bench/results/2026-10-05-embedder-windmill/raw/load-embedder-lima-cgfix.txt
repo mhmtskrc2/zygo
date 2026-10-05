@@ -1,0 +1,8 @@
+[embedder, after cgroup fix] embedder hello, burst of 200 from 32 connections: 200/200 ok in 4.71 s (42.4 done/s) | latency p50 2251 p95 3661 p99 3798 max 3800 ms | CPU 36.5 ms/event | peak anon +49 MB (idle 88 MB)
+[embedder, after cgroup fix] embedder hello, burst of 200 from 32 connections: 200/200 ok in 4.22 s (47.4 done/s) | latency p50 2047 p95 3637 p99 3764 max 3777 ms | CPU 32.2 ms/event | peak anon +29 MB (idle 111 MB)
+[embedder, after cgroup fix] embedder cpu, burst of 200 from 32 connections: 200/200 ok in 5.77 s (34.6 done/s) | latency p50 2885 p95 5141 p99 5314 max 5337 ms | CPU 46.8 ms/event | peak anon +28 MB (idle 113 MB)
+[embedder, after cgroup fix] embedder hello, 20/s for 20 s: 400/400 ok in 20.03 s (20.0 done/s) | latency p50 42 p95 50 p99 57 max 113 ms | CPU 34.8 ms/event | peak anon +8 MB (idle 116 MB)
+[embedder, after cgroup fix] embedder hello, 40/s for 20 s: 800/800 ok in 20.06 s (39.9 done/s) | latency p50 60 p95 79 p99 96 max 193 ms | CPU 31.2 ms/event | peak anon +22 MB (idle 117 MB)
+[embedder, after cgroup fix] embedder hello, 50/s for 20 s: 1000/1000 ok in 20.06 s (49.8 done/s) | latency p50 69 p95 124 p99 169 max 191 ms | CPU 30.2 ms/event | peak anon +25 MB (idle 117 MB)
+[embedder, after cgroup fix] embedder hello, 60/s for 20 s: 1200/1200 ok in 22.45 s (53.5 done/s) | latency p50 1372 p95 2436 p99 2465 max 2497 ms | CPU 31.2 ms/event | peak anon +26 MB (idle 117 MB)
+[embedder, after cgroup fix] embedder hello, 70/s for 20 s: 1400/1400 ok in 27.35 s (51.2 done/s) | latency p50 3583 p95 7176 p99 7335 max 7385 ms | CPU 32.5 ms/event | peak anon +26 MB (idle 117 MB)

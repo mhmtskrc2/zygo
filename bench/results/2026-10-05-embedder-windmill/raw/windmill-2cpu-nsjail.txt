@@ -1,0 +1,10 @@
+first run: 115 ms -> {"title": "warmup"}
+sequential n=30: end-to-end p50=114 p95=137 max=207 ms
+burst n=100: all accepted in 206 ms, all done in 4814 ms (20.77 jobs/s), ok=100/100
+  queue wait p50=2385 p95=4304 ms; execution (duration_ms) p50=129 p95=195 ms
+
+first run: 117 ms -> {"title": "warmup0"}
+sequential n=30: end-to-end p50=128 p95=194 max=196 ms
+burst n=100: all accepted in 251 ms, all done in 5983 ms (16.71 jobs/s), ok=100/100
+  queue wait p50=2880 p95=5390 ms; execution (duration_ms) p50=170 p95=242 ms
+

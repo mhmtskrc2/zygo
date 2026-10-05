@@ -1,0 +1,7 @@
+embedder cpu, burst of 200 from 32 connections: 200/200 ok in 5.61 s (35.7 done/s) | latency p50 2798 p95 5065 p99 5250 max 5288 ms | CPU 46.0 ms/event | peak anon +28 MB (idle 111 MB)
+embedder hello, 20/s for 20 s: 400/400 ok in 20.05 s (20.0 done/s) | latency p50 47 p95 51 p99 61 max 103 ms | CPU 35.7 ms/event | peak anon +7 MB (idle 113 MB)
+embedder hello, 30/s for 20 s: 600/600 ok in 20.06 s (29.9 done/s) | latency p50 63 p95 84 p99 91 max 137 ms | CPU 33.8 ms/event | peak anon +13 MB (idle 114 MB)
+embedder hello, 40/s for 20 s: 800/800 ok in 20.06 s (39.9 done/s) | latency p50 64 p95 88 p99 125 max 200 ms | CPU 31.6 ms/event | peak anon +24 MB (idle 114 MB)
+embedder hello, 50/s for 20 s: 1000/1000 ok in 20.09 s (49.8 done/s) | latency p50 89 p95 152 p99 187 max 206 ms | CPU 30.4 ms/event | peak anon +26 MB (idle 114 MB)
+embedder hello, 60/s for 20 s: 1200/1200 ok in 23.62 s (50.8 done/s) | latency p50 2054 p95 3565 p99 3621 max 3663 ms | CPU 32.2 ms/event | peak anon +25 MB (idle 114 MB)
+embedder hello, 70/s for 20 s: 1400/1400 ok in 27.67 s (50.6 done/s) | latency p50 4255 p95 7410 p99 7633 max 7701 ms | CPU 32.3 ms/event | peak anon +26 MB (idle 114 MB)

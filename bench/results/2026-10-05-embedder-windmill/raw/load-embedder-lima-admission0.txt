@@ -1,0 +1,4 @@
+[count every time] embedder hello, burst of 200 from 32 connections: 200/200 ok in 7.89 s (25.3 done/s) | latency p50 3834 p95 4225 p99 4289 max 4303 ms | CPU 59.0 ms/event | peak anon +41 MB (idle 108 MB)
+[count every time] embedder hello, 20/s for 20 s: 400/400 ok in 20.26 s (19.7 done/s) | latency p50 286 p95 460 p99 593 max 732 ms | CPU 73.1 ms/event | peak anon +17 MB (idle 134 MB)
+[count every time] embedder hello, 30/s for 20 s: 600/600 ok in 26.78 s (22.4 done/s) | latency p50 3341 p95 6477 p99 6791 max 7071 ms | CPU 68.3 ms/event | peak anon +15 MB (idle 137 MB)
+[count every time] embedder hello, 40/s for 20 s: 800/800 ok in 33.28 s (24.0 done/s) | latency p50 7255 p95 13225 p99 13610 max 14012 ms | CPU 65.3 ms/event | peak anon +14 MB (idle 137 MB)

@@ -1,0 +1,14 @@
+# Load test in the Lima VM (2 vCPU, kernel 6.8): Windmill under windmill.slice, its API on :8088.
+services:
+  windmill_server:
+    cgroup_parent: windmill.slice
+    ports:
+      - "8088:8000"
+    environment:
+      - SUPERADMIN_SECRET=replace-me
+  db:
+    cgroup_parent: windmill.slice
+  windmill_worker:
+    cgroup_parent: windmill.slice
+  windmill_worker_native:
+    cgroup_parent: windmill.slice

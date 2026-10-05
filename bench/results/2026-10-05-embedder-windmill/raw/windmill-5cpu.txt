@@ -1,0 +1,12 @@
+Windmill: script=hello path=f/bench/hello_1790240042 (created and locked in 0.3 s)
+first run: 127 ms -> {"title": "warmup"}
+sequential n=30: end-to-end p50=112 p95=143 max=147 ms
+burst n=100: all accepted in 271 ms, all done in 1832 ms (54.57 jobs/s), ok=100/100
+  queue wait p50=835 p95=1445 ms; execution (duration_ms) p50=45 p95=63 ms
+
+Windmill: script=cpu path=f/bench/cpu_1790240065 (created and locked in 0.3 s)
+first run: 120 ms -> {"title": "warmup0"}
+sequential n=30: end-to-end p50=130 p95=195 max=209 ms
+burst n=100: all accepted in 144 ms, all done in 2331 ms (42.89 jobs/s), ok=100/100
+  queue wait p50=1120 p95=2035 ms; execution (duration_ms) p50=60 p95=76 ms
+

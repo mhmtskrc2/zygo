@@ -1168,6 +1168,68 @@ Neither of them is in the warm path:
 Both are in the one-shot path. An embedder does not use that path; a developer
 at a terminal does.
 
+## The warm path inside an embedder, under load
+
+The embedder's benchmark above times one call. This measures a whole
+embedder under load: a platform that runs customer scripts as forks from
+Zygo's runtime pools, through the HTTP API, on Zygo 0.1.5. Windmill CE
+1.817 with nsjail ran beside it on the same VM, one stack at a time, through
+the same load generator and the same two scripts. Measured on 5 October 2026.
+
+Lima VM, 2 vCPU, Linux 6.8. The load generator ran outside the VM. CPU is the
+whole stack's cgroup divided by the events it finished. A *trivial* script
+returns a field of its event; the *CPU* script does about 20 ms of Python.
+
+| | the embedder, on Zygo's runtime pools | Windmill CE + nsjail |
+|---|---|---|
+| highest rate sustained | **98–102 events/s** (two runner slots); 105–115 with four | 48–50 jobs/s |
+| CPU per event, trivial | **12–16 ms** | 33–43 ms |
+| CPU per event, CPU script | 26.0–26.6 ms | 47.2–47.7 ms |
+| 20/s steady, usually / 1 in 100 | **26–32 / 41–57 ms** | 59–62 / 100–122 ms |
+| 50/s steady, usually / 1 in 100 | 28–40 / 48–1468 ms in eight runs of ten; see below | 208–2792 / 764–9555 ms: its ceiling |
+| burst of 200, trivial | 87–94/s | 47.7–50.2/s |
+| burst of 200, CPU script | 42.6/s | 35.5–36.2/s |
+| idle memory of the stack | 120–151 MB, two pools warm | 406–602 MB |
+| failed events | 0 | 0 |
+
+Where the embedder's 12–16 ms per trivial event goes, over three runs at
+50/s:
+
+```text
+  the sandboxes: supervisor, zygotes, forks   ████████▌   8.4–8.6 ms
+  the embedder itself (BEAM) and the API's front  █████    4.8–5.1 ms
+  its PostgreSQL                               ██▌         2.2–2.5 ms
+```
+
+The sandboxes' share is a fork per event into a zygote that has already
+imported everything; the one-shot `zygo run` this embedder used before paid
+about 20 ms there, and the record folder below has that round too.
+
+Three things to read with it:
+
+* **This is not Zygo against Windmill.** Two products, one on its warm path
+  and the other on its cold one; Windmill Enterprise's dedicated workers,
+  its warm equivalent, were not measured. The like-for-like comparison is
+  [chapter 10](10-similar-projects.md#inside-windmill-in-place-of-nsjail)'s,
+  with Zygo in nsjail's place inside Windmill's own workers, where it is level
+  per job. What this table shows is what an embedder gets from the warm path
+  beside a stack that has none.
+* **The ceiling is the embedder's.** At 98–102 events/s it was out of runner
+  slots — two, on two cores, with a run of 16–19 ms each as the embedder
+  times it from its side of the API. Four slots moved it to 105–115/s, where
+  the VM's CPU ran out.
+* **The embedder's steady rates varied between runs.** Eight of ten runs at
+  50/s had a p50 of 28–40 ms, two had 0.5 and 2.3 s. Its own event log shows
+  the runs steady at 16–19 ms while the wait was in its queue; that is open
+  in its report, not here. Windmill's spread at 50/s is a different thing:
+  that is its ceiling.
+
+Everything behind it — the load generator, the harness on both sides and
+every result line — is in
+[`bench/results/2026-10-05-embedder-windmill/`](../../bench/results/2026-10-05-embedder-windmill),
+with a README naming each file. It needs the embedder's own checkout to run
+again, which is why it is a record there rather than a `make` target here.
+
 ## Behind n8n's Code node
 
 n8n runs a Code node through a *task runner*, a process apart from n8n that
