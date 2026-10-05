@@ -1656,6 +1656,9 @@ mod probe {
 /// * **The same handler without the systemd driver**, or a pod that starts
 ///   as another uid than the one it asked for: writable, and not owned.
 /// * **`docker run`**, where a writable subtree is a bind mount.
+// Its one caller is the cgroup check, which only a Linux kernel can run; the
+// text itself is the same everywhere, and tested everywhere.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn container_cgroup_remedy(at: &crate::container::Surroundings, uid: u32) -> String {
     const EXAMPLE: &str = "examples/kubernetes/unprivileged.yaml";
     if at.kubernetes && at.cgroupfs_read_only {

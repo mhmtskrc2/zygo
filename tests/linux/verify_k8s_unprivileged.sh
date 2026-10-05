@@ -48,13 +48,25 @@ trap cleanup EXIT
 echo "Zygo in an unprivileged pod"
 
 token=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
-# `kubectl run -i` hands back stdout and stderr as one stream, and keygen puts
-# its advice on stderr, in whichever order the log arrives: the key is the
-# line that looks like one.
-key=$($K run zygo-keygen -q --rm -i --restart=Never --image="$IMAGE" \
-    --image-pull-policy="$PULL" -- secrets keygen 2>/dev/null | grep -E '^[0-9a-f]{64}$' | head -1)
+
+# A cluster that was just (re)started answers `kubectl` before its node is
+# ready to run anything — k3s does, for a few seconds after a restart — so the
+# first thing that needs a pod is tried for up to a minute, and says what
+# `kubectl` said if it never works. `kubectl run -i` hands back stdout and
+# stderr as one stream, and keygen puts its advice on stderr, in whichever
+# order the log arrives: the key is the line that looks like one.
+key=""
+for _ in $(seq 20); do
+    $K delete pod zygo-keygen --ignore-not-found --wait=true >/dev/null 2>&1
+    said=$($K run zygo-keygen -q --rm -i --restart=Never --image="$IMAGE" \
+        --image-pull-policy="$PULL" -- secrets keygen 2>&1)
+    key=$(echo "$said" | grep -E '^[0-9a-f]{64}$' | head -1)
+    [ -n "$key" ] && break
+    sleep 3
+done
 if [ -z "$key" ]; then
-    echo "  could not run $IMAGE to make a secrets key" >&2
+    echo "  could not run $IMAGE to make a secrets key; kubectl said:" >&2
+    echo "$said" | sed 's/^/    /' >&2
     exit 1
 fi
 

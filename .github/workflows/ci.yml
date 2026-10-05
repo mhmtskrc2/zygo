@@ -774,7 +774,12 @@ jobs:
           sed "s|/etc/containerd/zygo-base-spec.json|$d/zygo-base-spec.json|" \
             examples/kubernetes/node/zygo-runtime.toml | sudo tee "$d/config-v3.toml.d/zygo.toml" >/dev/null
           sudo systemctl restart k3s
-          for _ in $(seq 60); do sudo k3s kubectl get --raw /readyz >/dev/null 2>&1 && break; sleep 2; done
+          # The old API keeps answering for a moment after the restart is asked
+          # for, so wait for the node to have gone away and come back ready.
+          sleep 10
+          for _ in $(seq 60); do
+            sudo k3s kubectl get nodes 2>/dev/null | grep -q ' Ready' && break; sleep 2
+          done
           docker save zygo:ci | sudo k3s ctr images import -
 
       - name: Zygo in an unprivileged pod
