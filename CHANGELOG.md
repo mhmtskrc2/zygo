@@ -7,6 +7,18 @@ break things and will say so here.
 
 ## [Unreleased]
 
+### Fixed
+
+- `zygo mcp`'s `run_code` works. It mounted its workspace at `/work`, which
+  every sandbox keeps for per-request files, so every call was refused with
+  "`/work` is managed by the sandbox". The workspace is now at `/workspace`,
+  which is also the program's working directory.
+- `zygo mcp`'s `run_code` marks a sandbox that never started as `isError`,
+  and says that changing the code will not help. It used to come back as an
+  ordinary result, the launcher's refusal under `--- stderr ---` and
+  "Exit code 1", which reads as the program's own failure. A program that
+  ran and failed is still an ordinary result, as before.
+
 ## [0.1.5] — 2026-09-27
 
 The code is v0.1.4's. This release carries the SDK READMEs that say what has

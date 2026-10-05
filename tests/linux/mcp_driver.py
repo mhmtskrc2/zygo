@@ -269,8 +269,8 @@ def check_running(launcher: str, workspace: str) -> None:
             bad("stdin did not arrive", json.dumps(answer)[:600])
 
         # Two calls, one file: this is what makes a workspace worth having.
-        server.tool("run_code", {"language": "python", "code": "open('/work/note.txt','w').write('kept')"})
-        answer = server.tool("run_code", {"language": "python", "code": "print(open('/work/note.txt').read())"})
+        server.tool("run_code", {"language": "python", "code": "open('/workspace/note.txt','w').write('kept')"})
+        answer = server.tool("run_code", {"language": "python", "code": "print(open('/workspace/note.txt').read())"})
         if text_of(answer).strip() == "kept":
             ok("the workspace persists between calls")
         else:
@@ -297,6 +297,17 @@ def check_running(launcher: str, workspace: str) -> None:
             ok("a silent, successful run still says something")
         else:
             bad("an empty result reads to a model as a broken tool", json.dumps(answer)[:400])
+
+    # A sandbox that cannot be built is the server's failure, not the
+    # program's: `isError`, and no "Exit code" a model would try to fix.
+    with Server(launcher, "--mount", "/nonexistent/zygo-mcp-probe:/probe") as server:
+        server.handshake()
+        answer = server.tool("run_code", {"language": "sh", "code": "echo never"})
+        body = text_of(answer)
+        if is_error(answer) and "did not run" in body and "never" not in body:
+            ok("a sandbox that never started is isError, not the program's failure")
+        else:
+            bad("a sandbox that never started read as the program's result", json.dumps(answer)[:600])
 
 
 def check_boundary(launcher: str) -> None:

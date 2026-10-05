@@ -710,7 +710,7 @@ pub struct McpArgs {
     #[command(flatten)]
     pub spec_file: SpecFileArgs,
 
-    /// Directory the tools may read and write, mounted at `/work`.
+    /// Directory the tools may read and write, mounted at `/workspace`.
     ///
     /// Without it each server gets a scratch directory of its own, removed
     /// when the server exits — so a model can write a file in one call and

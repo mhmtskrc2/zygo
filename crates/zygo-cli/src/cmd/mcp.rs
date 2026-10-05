@@ -63,7 +63,12 @@ const PREFERRED: &str = "2025-06-18";
 const CODE_DIR: &str = "/zygo";
 
 /// Where the workspace is mounted, writable.
-const WORK_DIR: &str = "/work";
+///
+/// Not `/work`: every sandbox's launcher puts a tmpfs of its own there for
+/// per-request files (`sandbox::mount::WORKSPACE_DIR`), and the spec refuses a
+/// mount onto it. This used to be `/work`, and every `run_code` was refused
+/// with "`/work` is managed by the sandbox" once that tmpfs arrived.
+const WORK_DIR: &str = "/workspace";
 
 /// A language the `run_code` tool accepts, and how to run it.
 struct Language {
@@ -102,7 +107,7 @@ struct Server {
     /// defaults where a flag was absent.
     layer: Layer,
     images: Images,
-    /// Where `/work` comes from on the host.
+    /// Where `/workspace` comes from on the host.
     workspace: PathBuf,
     /// Kept alive so a scratch workspace outlives the calls that use it and
     /// is removed when the server exits. `None` when `--workspace` named a
@@ -410,7 +415,7 @@ impl Server {
             stdin.as_bytes(),
             deadline,
         )?;
-        Ok(render(&captured))
+        answer(&captured)
     }
 
     fn list_functions(&self) -> anyhow::Result<String> {
@@ -577,6 +582,32 @@ fn append_stream(out: &mut String, name: &str, text: &str) {
     if !text.trim().is_empty() {
         out.push_str(&format!("\n--- {name} ---\n{text}"));
     }
+}
+
+/// A one-shot run as a tool result: `Ok` when the program ran, however it
+/// ended, and `Err` — `isError` — when it never did.
+///
+/// A non-zero exit, a timeout and an out-of-memory kill are the program's, and
+/// the model is the one that can fix them, so they are results. A sandbox that
+/// could not be built — a refused spec, a missing image, a host that cannot —
+/// or a child abandoned at the outer bound is this server failing, the same
+/// line the API draws between its 200 and its 408. Reported as a result, it
+/// read as the program's own failure, and a model rewrote code that had never
+/// been tried.
+fn answer(captured: &super::oneshot::Captured) -> anyhow::Result<String> {
+    if captured.started && !captured.abandoned {
+        return Ok(render(captured));
+    }
+    let mut out = String::from(if captured.abandoned {
+        "The sandbox did not finish within the server's outer bound and was stopped; \
+         whether the program ran is unknown."
+    } else {
+        "Zygo could not start the sandbox, so the program did not run."
+    });
+    out.push_str(" Changing the code will not help: whoever runs this server has to fix it.\n");
+    append_stream(&mut out, "stdout", &captured.stdout);
+    append_stream(&mut out, "stderr", &captured.stderr);
+    anyhow::bail!("{out}")
 }
 
 /// What a model reads after a one-shot run.
@@ -908,6 +939,50 @@ mod tests {
         };
         let text = render(&starved);
         assert!(text.contains("out of memory"), "{text}");
+        assert!(!text.contains("time limit"), "{text}");
+    }
+
+    /// A program that failed is a result; a sandbox that never started is
+    /// `isError`, with the child's own reason, because no change to the code
+    /// would have made it run.
+    #[test]
+    fn a_sandbox_that_never_started_is_an_error() {
+        let failed = super::super::oneshot::Captured {
+            exit_code: 3,
+            stdout: String::new(),
+            stderr: "boom\n".into(),
+            timed_out: false,
+            abandoned: false,
+            oom_killed: false,
+            peak_rss_kb: 0,
+            wall_ms: 1.0,
+            started: true,
+            phase: "run".into(),
+        };
+        assert!(answer(&failed).expect("a result").contains("Exit code 3"));
+
+        let refused = super::super::oneshot::Captured {
+            exit_code: 1,
+            stderr: "error: fn.run.mounts: `/work` is managed by the sandbox\n".into(),
+            started: false,
+            phase: "plan".into(),
+            ..failed.clone()
+        };
+        let text = format!("{:#}", answer(&refused).expect_err("isError"));
+        assert!(text.contains("did not run"), "{text}");
+        assert!(text.contains("is managed by the sandbox"), "{text}");
+        assert!(!text.contains("Exit code"), "{text}");
+
+        let abandoned = super::super::oneshot::Captured {
+            exit_code: -1,
+            stderr: String::new(),
+            timed_out: true,
+            abandoned: true,
+            phase: String::new(),
+            ..refused.clone()
+        };
+        let text = format!("{:#}", answer(&abandoned).expect_err("isError"));
+        assert!(text.contains("unknown"), "{text}");
         assert!(!text.contains("time limit"), "{text}");
     }
 

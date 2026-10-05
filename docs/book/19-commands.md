@@ -435,7 +435,7 @@ raise: no tool accepts an image, mount, network or limit.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--workspace DIR` | a temporary folder, removed on exit | Mounted read-write at `/work` for every `run_code`. |
+| `--workspace DIR` | a temporary folder, removed on exit | Mounted read-write at `/workspace` for every `run_code`. |
 | `--python-image` | `python:3.12-slim` | Image for `language: "python"`. |
 | `--node-image` | `node:22-slim` | Image for `language: "node"`. |
 | `--sh-image` | `alpine:3` | Image for `language: "sh"`. |

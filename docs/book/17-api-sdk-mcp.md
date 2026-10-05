@@ -1470,7 +1470,7 @@ on its own, which is exactly why it is checked.
 
 | Flag | Default | What it sets |
 |---|---|---|
-| `--workspace DIR` | a scratch folder, removed on exit | the host folder mounted at `/work` |
+| `--workspace DIR` | a scratch folder, removed on exit | the host folder mounted at `/workspace` |
 | `--python-image` | `python:3.12-slim` | the image for `language: python` |
 | `--node-image` | `node:22-slim` | the image for `language: node` |
 | `--sh-image` | `alpine:3` | the image for `language: sh` |
@@ -1482,7 +1482,7 @@ on its own, which is exactly why it is checked.
 
 | Tool | Parameters | What it does |
 |---|---|---|
-| `run_code` | `language` (`python`, `node`, `sh`), `code`, `stdin?` | Runs the code in a fresh sandbox, with `/work` as its folder; returns output and, in words, why it failed. |
+| `run_code` | `language` (`python`, `node`, `sh`), `code`, `stdin?` | Runs the code in a fresh sandbox, with `/workspace` as its folder; returns output and, in words, why it failed. |
 | `list_functions` | — | The warm functions and their state. |
 | `call_function` | `name`, `event?` | Calls one by name with a JSON event (fixed 60 s limit). |
 | `function_logs` | `name`, `limit?` (1–200), `failed?` | Its recent log, or only the failures. |
@@ -1504,9 +1504,9 @@ is the sandbox's `timeout` (30 s by default) plus 300 s, which leaves room for
 an image pull on the first run; the sandbox's own timeout is still enforced on
 the whole process tree.
 
-### `/work` persists between calls
+### `/workspace` persists between calls
 
-`/work` is a writable directory and the program's working directory. It
+`/workspace` is a writable directory and the program's working directory. It
 persists between calls, so a model can write a file in one call and read it in
 the next. Everything else written is thrown away when the call ends. Without
 `--workspace` it is a scratch directory removed when the server exits; naming
@@ -1544,12 +1544,16 @@ written one line at a time, so two cannot mix.
 | A line that is not JSON | JSON-RPC error `-32700` (parse error) |
 | An unknown method | `-32601` |
 | Bad parameters for a method | `-32602` |
-| A tool that ran and failed | a normal result marked `isError` |
+| A program that ran and failed: an exit code, a timeout, out of memory | a normal result, saying why in words |
+| A tool that failed, or a sandbox that could not start | a normal result marked `isError` |
 
 A tool that fails answers with a result marked `isError`, not a JSON-RPC
 error. The difference matters: an error at the protocol layer is handled by
-the host and never reaches the model, and the model is the one that could fix
-a traceback. The three tools that read warm functions connect to an existing
+the host and never reaches the model, and the model is the one that can act on
+it. A program's own failure is not marked: the tool did its job, and the
+traceback is the answer. A sandbox that never started — a missing image, a
+spec the server's flags make invalid — is marked, and says that changing the
+code will not help, so the model does not rewrite a program nobody ran. The three tools that read warm functions connect to an existing
 supervisor and do not start one. There is nothing to read or call unless
 somebody has already served something.
 
