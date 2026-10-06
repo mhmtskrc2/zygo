@@ -25,13 +25,17 @@ below: the same VM, the same day, inside a privileged container, which
 measured 1.21 ms, 15.4 ms and 1,176 a second. `zygo bench all` prints the
 published figures beside what it measures, so any new record is held to them.
 
-The load generator and results behind chapter 10's Windmill and kern
-comparisons were kept after all, and are in
-[2026-10-05-embedder-windmill](results/2026-10-05-embedder-windmill), with
-a second round that measured the same embedder on the warm path. They are
-not `zygo bench` records and need the embedder's own checkout to repeat;
-their README says what each file is. `make bench-embed ARGS="--json out.json"`
-repeats the embedder's benchmark in chapter 25.
+Two folders are not `zygo bench` records.
+[2026-10-05-embedder-windmill](results/2026-10-05-embedder-windmill) has the
+load generator and results behind chapter 25's embedder under load, beside
+Windmill, and chapter 10's kern comparison; it needs the embedder's own
+checkout to repeat.
+[2026-10-06-zygo-in-windmill](results/2026-10-06-zygo-in-windmill) has
+chapter 10's Windmill comparison — Zygo in nsjail's place inside Windmill's
+workers — with the stand-in, the probe and every result line; it needs
+Windmill's compose file and Elixir for the generator. Each README says what
+its files are. `make bench-embed ARGS="--json out.json"` repeats the
+embedder's benchmark in chapter 25.
 
 ## The records
 
@@ -41,4 +45,5 @@ repeats the embedder's benchmark in chapter 25.
 | [2026-09-25-5.10.104-aarch64](results/2026-09-25-5.10.104-aarch64) | Docker Desktop's VM on the same Mac | a 5.10 kernel: no slow tail, but a slower cold start; within budget |
 | [2026-09-26-6.17.0-x86_64](results/2026-09-26-6.17.0-x86_64) | GitHub `ubuntu-24.04` runner: 4 vCPU of an AMD EPYC 9V45, 16 GB, Azure, Linux 6.17 | **the first x86_64 record.** A shared runner, so the verdict is "not a verdict: the host was throttled or busy"; the medians are close to the Lima VM's and the 99th percentiles far under it |
 | [2026-09-26-6.17.0-aarch64](results/2026-09-26-6.17.0-aarch64) | GitHub `ubuntu-24.04-arm` runner: 4 vCPU, 16 GB, Azure, Linux 6.17 | the same run on the arm runner, for the pair |
-| [2026-10-05-embedder-windmill](results/2026-10-05-embedder-windmill) | the Lima VM, 24 September and 5 October | **not a `zygo bench` record**: a real embedder under load, first on `zygo run`, then on the runtime pools, with Windmill CE + nsjail measured beside it both days; the harness, the Windmill stand-in and the kern harness from chapter 10, and every raw result line |
+| [2026-10-05-embedder-windmill](results/2026-10-05-embedder-windmill) | the Lima VM, 24 September and 5 October | **not a `zygo bench` record**: a real embedder under load, first on `zygo run`, then on the runtime pools, with Windmill CE + nsjail measured beside it both days; the load generator, the kern harness from chapter 10, and every raw result line |
+| [2026-10-06-zygo-in-windmill](results/2026-10-06-zygo-in-windmill) | the Lima VM, 6 October | **not a `zygo bench` record**: Zygo 0.1.6 in Windmill's workers in nsjail's place, without and with a network per job, per job and under load, and what a job can reach under each; nsjail measured before and after |

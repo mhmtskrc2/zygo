@@ -1,0 +1,7 @@
+[r3 B1 zygo 0.1.6 stand-in, net none] windmill hello, burst of 200 from 32 connections: 200/200 ok in 8.56 s (23.4 done/s) | latency p50 3231 p95 4799 p99 4920 max 4942 ms | CPU 59.0 ms/event | peak anon +77 MB (idle 500 MB)
+[r3 B1 zygo 0.1.6 stand-in, net none] windmill hello, burst of 200 from 32 connections: 200/200 ok in 7.66 s (26.1 done/s) | latency p50 2998 p95 5734 p99 6160 max 6207 ms | CPU 58.4 ms/event | peak anon +57 MB (idle 599 MB)
+[r3 B1 zygo 0.1.6 stand-in, net none] windmill cpu, burst of 200 from 32 connections: 200/200 ok in 9.84 s (20.3 done/s) | latency p50 4392 p95 8042 p99 8268 max 8289 ms | CPU 74.4 ms/event | peak anon +13 MB (idle 667 MB)
+[r3 B1 zygo 0.1.6 stand-in, net none] windmill cpu, burst of 200 from 32 connections: 200/200 ok in 6.28 s (31.8 done/s) | latency p50 2978 p95 5178 p99 5402 max 5418 ms | CPU 52.0 ms/event | peak anon +14 MB (idle 565 MB)
+[r3 B1 zygo 0.1.6 stand-in, net none] windmill hello, 20/s for 20 s: 400/400 ok in 20.08 s (19.9 done/s) | latency p50 69 p95 227 p99 409 max 484 ms | CPU 42.9 ms/event | peak anon +26 MB (idle 561 MB)
+[r3 B1 zygo 0.1.6 stand-in, net none] windmill hello, 40/s for 20 s: 800/800 ok in 21.15 s (37.8 done/s) | latency p50 965 p95 1278 p99 1330 max 1368 ms | CPU 39.4 ms/event | peak anon +20 MB (idle 570 MB)
+[r3 B1 zygo 0.1.6 stand-in, net none] windmill hello, 50/s for 20 s: 1000/1000 ok in 25.56 s (39.1 done/s) | latency p50 2720 p95 5359 p99 5518 max 5573 ms | CPU 41.4 ms/event | peak anon +32 MB (idle 571 MB)

@@ -1,5 +1,0 @@
-windmill hello, burst of 200 from 32 connections: 200/200 ok in 5.18 s (38.6 done/s) | latency p50 2370 p95 4214 p99 4347 max 4391 ms | CPU 41.5 ms/event | peak anon +27 MB (idle 646 MB)
-windmill cpu, burst of 200 from 32 connections: 200/200 ok in 6.63 s (30.1 done/s) | latency p50 3141 p95 5511 p99 5726 max 5760 ms | CPU 54.9 ms/event | peak anon +27 MB (idle 660 MB)
-windmill hello, 20/s for 20 s: 400/400 ok in 20.06 s (19.9 done/s) | latency p50 63 p95 104 p99 113 max 124 ms | CPU 46.4 ms/event | peak anon +20 MB (idle 672 MB)
-windmill hello, 40/s for 20 s: 800/800 ok in 21.72 s (36.8 done/s) | latency p50 755 p95 1670 p99 1728 max 1762 ms | CPU 43.9 ms/event | peak anon +25 MB (idle 679 MB)
-windmill hello, 50/s for 20 s: 1000/1000 ok in 27.89 s (35.8 done/s) | latency p50 3758 p95 7437 p99 7853 max 7918 ms | CPU 44.9 ms/event | peak anon +17 MB (idle 688 MB)

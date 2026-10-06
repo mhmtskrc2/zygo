@@ -6,10 +6,14 @@ CE beside it, on the same VM:
 
 * **24 September 2026**: the embedder ran every event through `zygo run`, a
   fresh sandbox and a fresh interpreter per event. Windmill ran its jobs
-  through nsjail. [Chapter 10](../../../docs/book/10-similar-projects.md#inside-windmill-in-place-of-nsjail)
-  also put Zygo *inside* Windmill in nsjail's place that day; the stand-in is
-  in `harness/zygo-as-nsjail/`. The kern comparison of the same chapter was
-  run the same way; its harness is in `harness/kern/`.
+  through nsjail. The kern comparison of
+  [chapter 10](../../../docs/book/10-similar-projects.md#an-embedders-harness-against-kern)
+  was run the same day; its harness is in `harness/kern/`. Zygo was also put
+  *inside* Windmill in nsjail's place that day, with the network off and
+  partly through a translation that was never committed; that measurement
+  was redone on 6 October with the release binary and is in
+  [2026-10-06-zygo-in-windmill](../2026-10-06-zygo-in-windmill), and the
+  24 September copy is not kept.
 * **5 October 2026**: the same embedder, now on Zygo 0.1.5's runtime pools
   through the HTTP API — a fork of a warm interpreter per event — and the same
   Windmill, from the same image, beside it.
@@ -41,11 +45,10 @@ general workers and one native worker, `DISABLE_NSJAIL=false`.
 |---|---|
 | `harness/load.exs` | the load generator, both rounds and both systems: `burst N` and `rate R SECONDS`; latency client-side to a 10 ms poll, CPU and peak memory from the stack's cgroup. `load.exs.first-round` is the 24 September copy; the only difference is where the second reads the embedder's database name |
 | `harness/cgmon*.sh` | the 20 ms sampler of each slice's anonymous memory, on the Lima VM and on Docker Desktop |
-| `harness/windmill/` | the compose overrides: Windmill under its slice, nsjail on, and the ones that put Zygo in nsjail's place; the superadmin secret replaced. The compose file itself is Windmill's own at v1.817.0 |
-| `harness/zygo-as-nsjail/` | the `nsjail` stand-in that ran Zygo inside Windmill's workers, and the per-run cost scripts; chapter 10 says this translation is not in Zygo |
+| `harness/windmill/` | the compose overrides: Windmill under its slice, nsjail on, and the earlier rounds' settings; the superadmin secret replaced. The compose file itself is Windmill's own at v1.817.0 |
 | `harness/kern/` | the kern comparison's harness (`bench.py`, `matrix.sh` and the `why*.sh` that chased its tail) — chapter 10's "embedder's harness, against kern" |
 | `harness/first-round-mac/` | the first attempt on Docker Desktop's VM, before the Lima VM: `windmill_bench.py` and the probe script |
-| `raw/` | every result line. First round: `load-embedder-lima-*.txt`, `load-windmill-*.txt`, the Mac files `windmill-*.txt`; Zygo inside Windmill: `load-windmill-zygo*.txt`, `load-windmill-nsjail*.txt`; second round: `load-embedder-r2-*.txt`, `load-windmill-r2*.txt`, and `load-embedder-r2-split.txt` for the CPU of each part of the embedder's stack; kern: `kern-matrix-*.txt` |
+| `raw/` | every result line. First round: `load-embedder-lima-*.txt`, `load-windmill-*.txt` (`load-windmill-nsjail*.txt` with nsjail on, once more at night), the Mac files `windmill-*.txt`; second round: `load-embedder-r2-*.txt`, `load-windmill-r2*.txt`, and `load-embedder-r2-split.txt` for the CPU of each part of the embedder's stack; kern: `kern-matrix-*.txt` |
 
 A result line reads: *system script, scenario: done/planned ok in wall s
 (done/s) | latency p50 p95 p99 max | CPU ms/event | peak anon +MB (idle MB)*.

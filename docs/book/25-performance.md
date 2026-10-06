@@ -1212,8 +1212,9 @@ Three things to read with it:
   its warm equivalent, were not measured. The like-for-like comparison is
   [chapter 10](10-similar-projects.md#inside-windmill-in-place-of-nsjail)'s,
   with Zygo in nsjail's place inside Windmill's own workers, where it is level
-  per job. What this table shows is what an embedder gets from the warm path
-  beside a stack that has none.
+  per job without a network and about 7 ms of CPU behind with one. What this
+  table shows is what an embedder gets from the warm path beside a stack that
+  has none.
 * **The ceiling is the embedder's.** At 98–102 events/s it was out of runner
   slots — two, on two cores, with a run of 16–19 ms each as the embedder
   times it from its side of the API. Four slots moved it to 105–115/s, where

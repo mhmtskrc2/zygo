@@ -7,6 +7,18 @@ break things and will say so here.
 
 ## [Unreleased]
 
+### Changed
+
+- Chapter 10's Windmill comparison is the 6 October 2026 round: Zygo 0.1.6
+  as released in Windmill's workers in nsjail's place, without and with a
+  network per job, per job and under the whole stack, and what a job can see
+  and reach under each — level with nsjail per job without a network, about
+  7 ms of CPU more with one, and a cgroup, seccomp, Landlock and a root of its
+  own for every job either way. The 24 September round it replaces ran with
+  the network off and the chapter did not say so; its stand-in copy and
+  results are no longer kept. The stand-in, the probe, the per-job scripts
+  and every result line are in `bench/results/2026-10-06-zygo-in-windmill/`.
+
 ## [0.1.6] — 2026-10-06
 
 The first release in which `zygo mcp`'s `run_code` runs: every earlier tag

@@ -81,7 +81,8 @@ path's median, and `zygo run` the median of `python3 -c pass` with the image
 already pulled ([chapter 25](25-performance.md)). The one-shot row is one
 cluster on purpose. `zygo run` is not drawn faster than nsjail or kern,
 because it is not: inside Windmill, nsjail and Zygo in its place cost the
-same 19–20 ms per job ([measured below](#measured-zygo-against-nsjail-and-kern)),
+same 20–22 ms of CPU per job when the job has no network
+([measured below](#measured-zygo-against-nsjail-and-kern)),
 and on the Raspberry Pi `kern box` and `zygo run` tied
 ([chapter 25](25-performance.md#a-second-host-with-kern-in-it)).
 The light part of that bar is where the same tools land with a heavier
@@ -407,8 +408,8 @@ has no images — you give it a folder or bind-mount the host's — and no warm
 path: every run starts the program from nothing. Choose it when you want a
 battle-tested, very configurable jail around a command and you manage the
 root file system yourself. Zygo in nsjail's place inside Windmill's workers
-cost the same per job; [the measurement](#measured-zygo-against-nsjail-and-kern)
-is further down.
+cost the same per job without a network and about 7 ms more with one;
+[the measurement](#measured-zygo-against-nsjail-and-kern) is further down.
 
 ## bubblewrap
 
@@ -704,7 +705,9 @@ job. These engines are exactly the *embedder* Zygo is designed for — the
 program that builds Zygo into itself. A worker calls `zygo serve` once per
 script, or uses the SDK, and each script run becomes a `fork()` instead of a
 container. [`examples/workflow-engine/`](../../examples/workflow-engine) is
-such a worker.
+such a worker. What Zygo costs in nsjail's place inside Windmill's own
+workers, and what a job there gets for it, is
+[measured below](#inside-windmill-in-place-of-nsjail).
 
 ## A prefork pool of your own
 
@@ -763,76 +766,122 @@ column.
 ## Measured: Zygo against nsjail and kern
 
 nsjail and kern are the two one-shot runners closest to `zygo run`, so both
-were measured against it under load, on 24 September 2026. Every run happened
-in the same VM: Ubuntu 24.04, kernel 6.8, aarch64, 2 vCPU, 4 GB, on an M1 Max.
-Every binary ran from the VM's own disk. The load generator ran outside the VM,
-so its CPU counts for nobody. "CPU per job" is the CPU of the whole stack being
-measured, divided by the jobs it finished. Unlike the numbers in
-[chapter 25](25-performance.md), these tables cannot be repeated from this
-repository: the load generator and the raw results were not kept
+were measured against it under load. Every run happened in the same VM:
+Ubuntu 24.04, kernel 6.8, aarch64, 2 vCPU, 4 GB, on an M1 Max. Every binary
+ran from the VM's own disk. The load generator ran outside the VM, so its CPU
+counts for nobody. "CPU per job" is the CPU of the whole stack being measured,
+divided by the jobs it finished. The kern comparison was run on 24 September
+2026; the Windmill one on 6 October 2026, with Zygo 0.1.6 as released. The
+harness on each side and every result line are kept under `bench/results/`
 ([what these numbers are not](#what-these-numbers-are-not)).
 
 ### Inside Windmill, in place of nsjail
 
-Windmill CE v1.817 with three general workers ran a trivial Python script and a
-CPU-bound one (about 20 ms of Python) through nsjail, using Windmill's own nsjail
-config. Then the same workers ran them through Zygo in nsjail's place, and
-nothing else changed. Zygo ran two ways:
+Windmill CE v1.817.0, three general workers, `DISABLE_NSJAIL=false`: every
+job runs through nsjail with Windmill's own config, which for a Python job
+binds the worker's `/usr`, `/lib`, the Python runtime and the job's directory,
+sets `rlimit_as` to 4 GB per process, and leaves the job on the worker's
+network (`clone_newnet: false`) with no cgroup, no seccomp filter and no
+process limit. Then `nsjail` on the workers' `PATH` was replaced with
+[a shell stand-in](../../bench/results/2026-10-06-zygo-in-windmill/harness/zygo-worker/nsjail)
+that reads that config and calls `zygo run` — the binds become `--mount`,
+`time_limit` becomes `--timeout`, the job directory is mounted read-write —
+and nothing else changed. Zygo ran two ways: with **no network** per job
+(`--net none`), and with **a network** per job (`--net full`: a namespace of
+its own and a `pasta`, on a worker image that adds `pasta` and `nftables`).
+The first is what Windmill's config does *not* give a job; the second is the
+one in which a job reaches the internet, as an nsjail job does.
 
-- **Zygo as `nsjail`**: the `zygo` binary, installed under the name `nsjail`,
-  read nsjail's command line and config itself. This translation was built for
-  the benchmark only and is **not in Zygo today**.
-- **Zygo through a script**: a shell stand-in translated the config and called
-  `zygo run`. This is what works with Zygo as it ships.
+**Per job**, one worker, nothing else running: the same job from a kept job
+directory, 50 runs per mode, modes interleaved over three rounds. CPU is the
+worker container's whole cgroup divided by runs
+([`percost2.sh`](../../bench/results/2026-10-06-zygo-in-windmill/harness/zygo-worker/percost2.sh)).
+*`zygo run`* is Zygo called with the arguments the stand-in built, to separate
+Zygo's cost from the script's:
 
-Per job, 40 runs in a row inside a worker:
-
-| | nsjail | Zygo as `nsjail` |
+| | wall per run | CPU per run |
 |---|---|---|
-| wall time | 19–20 ms | 20 ms |
-| CPU | 18.8–19.0 ms | 18.8–19.3 ms |
+| nsjail | 21.0–23.5 ms | 20.4–22.6 ms |
+| `zygo run`, no network | 22.4–23.4 ms | **20.6–21.4 ms** |
+| `zygo run`, with a network | 31.0–31.9 ms | **27.7–27.9 ms** |
+| the stand-in, no network | 25.6–30.3 ms | 24.3–28.4 ms |
+| the stand-in, with a network | 34.7–35.7 ms | 31.5–32.3 ms |
 
-Under load, the whole Windmill stack. nsjail was measured twice; its ranges
-cover both runs.
+Three loops at once in one worker, 30 runs each, two rounds — what three
+workers running jobs side by side ask of the sandbox
+([`parcost.sh`](../../bench/results/2026-10-06-zygo-in-windmill/harness/zygo-worker/parcost.sh)):
 
-| | nsjail | Zygo as `nsjail` | Zygo against nsjail | Zygo through a script |
-|---|---|---|---|---|
-| burst of 200, trivial: jobs/s | 51.4 | 50.0 | −3% | 43.6 |
-| burst of 200, CPU-bound: jobs/s | 38.0–38.3 | 37.0 | −3% | 33.4 |
-| CPU per job, trivial burst | 32.8 ms | 33.2 ms | +1% | 38.1 ms |
-| CPU per job, CPU-bound burst | 44.7–45.4 ms | 46.2 ms | +2–3% | 50.7 ms |
-| 20/s steady: usually / 1 in 100 | 55–57 / 97–102 ms | 56 / 94 ms | level | 62 / 103 ms |
-| 40/s steady: usually / 1 in 100 | 57–60 / 91–99 ms | 65 / 112 ms | +8–14% / +13–23% | 87 / 156 ms |
-| highest rate sustained | 48.5–49.6/s | about 47/s | −4–6% | about 41/s |
-| idle memory of the stack | 384–634 MB | 534–590 MB | level | 531–565 MB |
-| failed jobs | 0 | 0 of 2 600 | | 0 |
-| per-job cgroup limits | no | memory, processes | | memory, processes |
-| seccomp, Landlock | no | yes, yes | | yes, yes |
+| | runs/s | CPU per run |
+|---|---|---|
+| nsjail | 80.7–85.8 | 20.7–21.2 ms |
+| `zygo run`, no network | 78.5–78.8 | 20.8 ms |
+| `zygo run`, with a network | 51.8–52.1 | 28.1–28.2 ms |
+| the stand-in, no network | 67.7–70.1 | 24.1–24.3 ms |
+| the stand-in, with a network | 48.5–51.0 | 31.2–31.4 ms |
 
-**Level per job, and 1–6% behind at saturation, while doing more.** Zygo gave
-every job a cgroup with memory and process limits, a seccomp allowlist and a
-Landlock ruleset, and Windmill's nsjail config sets none of those. The likely
-cost at saturation is the cgroup Zygo creates and removes per job:
-`lru_gen_online_memcg`, `cgroup_addrm_files` and `tg_set_cfs_bandwidth` show in
-`perf`. That was not measured on its own. Below saturation the two cannot be
-told apart. Through a shell script, the same swap costs about 15% of
-throughput, because the script's `sh`, `awk`, `grep` and `env` add about 4 ms
-to every job. Idle memory does not move, because neither sandbox stays resident
-between jobs. On the warm path it does: the embedder measured in chapter 25
-kept two runtime pools warm for about 30 MB, against the 400–600 MB Windmill's
-servers and workers hold while idle.
+**Under load, the whole Windmill stack**, through the stand-in, as Windmill
+would run it today. nsjail was measured before and after the Zygo modes;
+ranges cover the runs of each mode.
 
-Running it found three defects in Zygo, all fixed:
+| | nsjail | Zygo, no network | Zygo, with a network |
+|---|---|---|---|
+| burst of 200, trivial: jobs/s | 45.5–49.3 | 40.1–40.5 | 30.8–31.6 |
+| burst of 200, CPU-bound: jobs/s | 32.7–37.8 | 31.4–31.9 | 24.6–24.7 |
+| CPU per job, trivial burst | 33.6–36.0 ms | 39.3–40.3 ms | 47.9–49.2 ms |
+| CPU per job, CPU-bound burst | 45.3–50.7 ms | 52.2–52.9 ms | 63.8–64.0 ms |
+| 20/s steady: usually / 1 in 100 | 58–59 / 100–106 ms | 66 / 120 ms | 96 / 714 ms |
+| 40/s steady: done/s | 37.3–39.0 | 39.0 | 29.4 |
+| 50/s steady: done/s | 43.8–45.2 | 38.4 | 27.1 |
+| failed jobs | 0 | 0 | 0 |
 
-- **Two runs could share a staging directory.** The three workers shared one
-  Zygo store, but each had its own PID namespace, and a staging root was named
-  after the PID. 2 jobs in 200 failed. Every per-process name now carries the
-  PID and 64 random bits.
-- **A writable mount of a single file never started.** Landlock was given
-  directory rights on a regular file, and the kernel answers that with
-  `EINVAL`. nsjail configs hand a job its `result.json` exactly this way. A rule
-  on a file is now narrowed to the file rights.
-- **The stand-in script itself cost 4 ms a job**, as described above.
+**What a job sees and reaches**, by
+[a probe](../../bench/results/2026-10-06-zygo-in-windmill/harness/isolation_probe.py)
+run as a Windmill job under each mode, and the limits each sets:
+
+| | nsjail | Zygo, no network | Zygo, with a network |
+|---|---|---|---|
+| seccomp filter | none | on | on |
+| Landlock | no | yes | yes |
+| its own root filesystem | no — binds of the worker's | yes | yes |
+| network namespace | **the worker's** | its own, empty | its own, through `pasta` |
+| Windmill's Postgres, `db:5432` | **open** | unreachable | blocked (private range) |
+| Windmill's server, `:8000` | open | unreachable | blocked (private range) |
+| the internet | open | unreachable | open |
+| memory limit | `rlimit_as` 4 GB per process | cgroup, 2 GB per job | the same |
+| process limit | none | cgroup, 1024 per job | the same |
+
+Four things to read from it:
+
+- **Without a network, Zygo's sandbox costs what nsjail's does.** 20.6–21.4 ms
+  of CPU per job against 20.4–22.6, and 3–9% behind nsjail's throughput with
+  three jobs at once — while giving every job a cgroup with memory and process
+  limits, a seccomp filter, Landlock and a root of its own, none of which
+  Windmill's nsjail config sets.
+- **A network per job is the expensive part: about 7 ms of CPU**, and about a
+  third of the throughput with three jobs at once. Zygo gives each sandbox a
+  network namespace and a `pasta`; Windmill's nsjail leaves the job on the
+  worker's network, which is why a job there can open Windmill's own database.
+  That is the cost, and it is also the difference in what the job can reach.
+- **The shell stand-in adds 3–7 ms per job** of `sh`, `awk`, `grep` and `env`.
+  Under the full stack that is the gap between 40 and 45–49 jobs/s. A
+  translation of nsjail's command line inside the `zygo` binary would remove
+  it; Zygo does not have one today.
+- **Under Zygo with a network, a job cannot reach `windmill_server` either**,
+  a private address, so the `wmill` client inside a job — variables,
+  resources, sub-jobs — would need that address allowed
+  (`--allow-private-net` and an `allow` rule). Not tested.
+
+A first round of this measurement, on 24 September 2026, ran Zygo with the
+network off and this chapter did not say so; it also ran a translation of
+nsjail's command line that was built for the benchmark and never committed.
+That round is not kept. It found two defects in Zygo, both fixed: two runs
+could share a staging directory, because the three workers shared one store
+but each had its own PID namespace and a staging root was named after the
+PID (2 jobs in 200 failed; every per-process name now carries the PID and
+64 random bits); and a writable mount of a single file never started,
+because Landlock was given directory rights on a regular file, which nsjail
+configs do with a job's `result.json` (a rule on a file is now narrowed to
+the file rights).
 
 ### Inside n8n, as its Code-node runner
 
@@ -927,12 +976,15 @@ A run now starts 4 processes, down from 13 at the worst.
   sandbox made Python about twice as slow as a plain container did. That cost
   belongs to the old kernel, and it would have been measured against every
   namespace-based runner alike.
-- **The raw results and the load generator are kept, outside `zygo bench`.**
+- **The raw results and the harness are kept, outside `zygo bench`.**
+  [`bench/results/2026-10-06-zygo-in-windmill/`](../../bench/results/2026-10-06-zygo-in-windmill)
+  has the Windmill comparison: the `nsjail` stand-in, the per-job scripts, the
+  probe, the compose overrides, the worker image and every result line.
   [`bench/results/2026-10-05-embedder-windmill/`](../../bench/results/2026-10-05-embedder-windmill)
-  has the load generator, the `nsjail` stand-in, the kern harness and every
-  result line behind these tables, with a README naming each. They need the
-  embedder's own checkout to run again, so they are a record rather than a
-  `make` target; the numbers in [chapter 25](25-performance.md) are the latter:
+  has the kern harness and the load generator both used. Each has a README
+  naming its files. They need Windmill's compose file at v1.817.0 and Elixir
+  for the generator, so they are a record rather than a `make` target; the
+  numbers in [chapter 25](25-performance.md) are the latter:
   `make bench-record` writes them as JSON into the same [`bench/`](../../bench).
 
 ## Everything in one table

@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: Apache-2.0
+# Each start-up piece on its own, 50 runs each; then `perf` by program over 60 runs of Zygo and of kern.
 Z=/opt/zygo-bench/zygo; K=/opt/zygo-bench/kern
 t() { label=$1; shift; /usr/bin/time -f "$label: %U user %S sys %e wall (50 runs)" sh -c "for i in \$(seq 50); do $* >/dev/null 2>&1; done"; }
 t "zygo default user     " $Z run --quiet --mem 256M --pids 128 --net none python:3.12-slim /bin/true

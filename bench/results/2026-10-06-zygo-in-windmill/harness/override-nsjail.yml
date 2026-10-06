@@ -1,0 +1,6 @@
+# Windmill's own sandbox: nsjail on for the general workers, job dirs kept for inspection.
+services:
+  windmill_worker:
+    environment:
+      - DISABLE_NSJAIL=false
+      - KEEP_JOB_DIR=${KEEP_JOB_DIR:-false}

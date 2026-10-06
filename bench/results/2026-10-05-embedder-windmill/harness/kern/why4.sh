@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: Apache-2.0
+# One Zygo run under strace: cgroupfs work by file, mounts, Landlock and seccomp calls, and the biggest gaps between syscalls.
 Z=/opt/zygo-bench/zygo
 strace -f -b execve -tt -T -o /tmp/z.tl $Z run --quiet --mem 256M --pids 128 --net none python:3.12-slim /bin/true; echo "zygo exit $?"
 f=/tmp/z.tl

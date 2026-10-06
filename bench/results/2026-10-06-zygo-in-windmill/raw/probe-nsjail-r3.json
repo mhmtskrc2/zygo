@@ -1,0 +1,18 @@
+{
+ "uid": 0,
+ "pids.max": "unreadable",
+ "memory.max": "unreadable",
+ "own cgroup": "0::/",
+ "no_new_privs": "1",
+ "internet 1.1.1.1:53": "OPEN",
+ "effective capabilities": "0000000000000000",
+ "can read /proc/1/environ": true,
+ "database-looking env vars": [
+  "WM_TOKEN"
+ ],
+ "seccomp (0 off, 2 filter)": "0",
+ "the VM host 192.168.5.2:22": "ConnectionRefusedError",
+ "Windmill's Postgres (db:5432)": "OPEN",
+ "cloud metadata 169.254.169.254:80": "ConnectionRefusedError",
+ "Windmill's server (windmill_server:8000)": "OPEN"
+}

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # nsjail, as Windmill's worker calls it, run with Zygo instead:
 #
 #   nsjail --config run.config.proto -- <program> <args...>     (cwd: the job's directory)

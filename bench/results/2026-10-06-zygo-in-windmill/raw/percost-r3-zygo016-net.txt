@@ -1,0 +1,20 @@
+round 1
+nsjail                 wall  21.9 ms/run   CPU  21.2 ms/run   failed 0/50
+stand-in, then zygo    wall  34.9 ms/run   CPU  31.5 ms/run   failed 0/50
+zygo run, no script    wall  31.0 ms/run   CPU  27.8 ms/run   failed 0/50
+round 2
+nsjail                 wall  21.0 ms/run   CPU  20.4 ms/run   failed 0/50
+stand-in, then zygo    wall  35.7 ms/run   CPU  32.3 ms/run   failed 0/50
+zygo run, no script    wall  31.1 ms/run   CPU  27.7 ms/run   failed 0/50
+round 3
+nsjail                 wall  21.1 ms/run   CPU  20.6 ms/run   failed 0/50
+stand-in, then zygo    wall  34.7 ms/run   CPU  31.9 ms/run   failed 0/50
+zygo run, no script    wall  31.9 ms/run   CPU  27.9 ms/run   failed 0/50
+round 1, 3 at once
+nsjail                  85.8 runs/s   CPU  20.7 ms/run   failed 0/90
+stand-in, then zygo     51.0 runs/s   CPU  31.4 ms/run   failed 0/90
+zygo run, no script     51.8 runs/s   CPU  28.2 ms/run   failed 0/90
+round 2, 3 at once
+nsjail                  80.7 runs/s   CPU  20.7 ms/run   failed 0/90
+stand-in, then zygo     48.5 runs/s   CPU  31.2 ms/run   failed 0/90
+zygo run, no script     52.1 runs/s   CPU  28.1 ms/run   failed 0/90
