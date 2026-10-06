@@ -475,6 +475,21 @@ def main() -> int:
         else:
             bad("the script did not arrive as a path", out.result)
 
+        # What the request cost, which an embedder bills from. There is no
+        # agent on this path to report it, so the supervisor reads the
+        # request's cgroup — and for a while read nothing: every warm-exec
+        # request came back with `cpu_ms: 0` and `peak_rss_kb: 0`.
+        cost = client.run_script(
+            "sh-pool",
+            'read -r _\nhead -c 4000000 /dev/zero | tr "\\0" a | wc -c > /dev/null\n'
+            'printf \'{"done":1}\\n\'\n',
+        )
+        m = cost.metrics
+        if m.cpu_ms > 0 and m.peak_rss_kb > 0:
+            ok(f"a warm-exec request reports what it cost ({m.cpu_ms:.1f} ms CPU, {m.peak_rss_kb} kB peak)")
+        else:
+            bad("a warm-exec request's metrics are zero", f"cpu_ms={m.cpu_ms} peak_rss_kb={m.peak_rss_kb}")
+
         # Two requests, two processes — the same claim an agent pool makes,
         # and here it is structural: every request is an `execve`.
         first = client.run_script(

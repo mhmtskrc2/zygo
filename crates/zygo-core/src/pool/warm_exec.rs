@@ -13,7 +13,8 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use super::request::{
-    KILL_GRACE, RequestLease, Requests, kill_request, next_request_id, request_cgroup, resident_kb,
+    KILL_GRACE, RequestLease, Requests, kill_request, measure_cgroup, next_request_id,
+    request_cgroup, request_metrics, resident_kb,
 };
 use super::scripts::{SCRIPT_DIR_IN_SANDBOX, ScriptLease, Scripts, place_script};
 use super::secrets::{Secrets, SecretsAt, place_secrets};
@@ -381,7 +382,14 @@ impl WarmExec {
         });
 
         let exit_status = read_status(&entered, STATUS_GRACE);
-        let _ = entered.reap_helper();
+        // What the request cost: its cgroup's counters, read now that it has
+        // exited and before the cgroup goes; and the helper's `wait4` usage,
+        // for a request that had no cgroup of its own.
+        let measured = request_cgroup
+            .as_deref()
+            .map(measure_cgroup)
+            .unwrap_or_default();
+        let usage = entered.reap_helper().ok().map(|u| (u.cpu, u.max_rss_kb));
         let done = Instant::now();
 
         drop(_secrets);
@@ -390,8 +398,9 @@ impl WarmExec {
         }
         let cleaned = Instant::now();
 
+        let metrics = request_metrics(done - admitted, measured, usage);
         let outcome = collected
-            .and_then(|c| into_outcome(c, exit_status, done - admitted))
+            .and_then(|c| into_outcome(c, exit_status, metrics))
             .map(|o| Outcome {
                 id: id.clone(),
                 cancelled: request.cancelled(),
@@ -585,11 +594,7 @@ fn read_status(
 const STATUS_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Turn what the request left behind into an [`Outcome`].
-fn into_outcome(
-    c: Collected,
-    wait_status: Option<i32>,
-    elapsed: std::time::Duration,
-) -> Result<Outcome> {
+fn into_outcome(c: Collected, wait_status: Option<i32>, metrics: Metrics) -> Result<Outcome> {
     if let Some((step, errno)) = c.launch_failure {
         return Err(Error::Primitive {
             operation: step.describe(),
@@ -656,15 +661,11 @@ fn into_outcome(
         },
         stderr,
         error,
-        metrics: Metrics {
-            // Measured here, because on this path there is nobody else to
-            // measure it: a warm-exec request is a bare process, not an agent
-            // that reports on itself. It was `Metrics::default()` — every
-            // warm-exec request in the log timed at zero, so `zygo stats`
-            // reported a p50 of `0.0 ms` for a function that was working.
-            wall_ms: elapsed.as_secs_f64() * 1000.0,
-            ..Metrics::default()
-        },
+        // Measured by the caller, because on this path there is nobody else
+        // to measure it: a warm-exec request is a bare process, not an agent
+        // that reports on itself. `request_metrics` says where each number
+        // comes from, and remembers the time they were all zero.
+        metrics,
         timed_out: c.timed_out,
     })
 }

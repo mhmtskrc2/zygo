@@ -84,18 +84,52 @@ pub struct Entered {
 
 impl Entered {
     /// Collect the helper. It exits on its own once the request has.
-    pub fn reap_helper(&self) -> Result<()> {
+    /// Reap the helper, and learn what it and the request cost.
+    ///
+    /// `wait4` reports a child's resource usage *together with* that of the
+    /// children the child waited for, and the helper waits for the request
+    /// before it reports the exit status and exits. So the numbers are the
+    /// request's, plus a helper that does almost nothing. They are the
+    /// request's metrics when it had no cgroup to read them from.
+    pub fn reap_helper(&self) -> Result<HelperUsage> {
         let mut status: c_int = 0;
-        // SAFETY: `helper` is a child of this process that has not been reaped.
-        let rc = unsafe { libc::waitpid(self.helper as libc::pid_t, &mut status, 0) };
+        // SAFETY: all-zero is a valid `rusage`; `wait4` fills it in.
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        // SAFETY: `helper` is a child of this process that has not been reaped,
+        // and both out-pointers are to live locals.
+        let rc = unsafe { libc::wait4(self.helper as libc::pid_t, &mut status, 0, &mut usage) };
         if rc < 0 {
             return Err(Error::primitive(
-                "waitpid",
+                "wait4",
                 "the warm-exec helper could not be reaped",
                 std::io::Error::last_os_error(),
             ));
         }
-        Ok(())
+        Ok(HelperUsage::from(&usage))
+    }
+}
+
+/// What the helper and the request it waited for used, from `wait4`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HelperUsage {
+    /// User plus system CPU time, of the request and the helper together.
+    pub cpu: std::time::Duration,
+    /// `ru_maxrss`, which Linux reports in kilobytes: the largest resident set
+    /// any one of them reached, which is the request's — the helper's is a
+    /// fraction of a megabyte.
+    pub max_rss_kb: u64,
+}
+
+impl From<&libc::rusage> for HelperUsage {
+    fn from(usage: &libc::rusage) -> Self {
+        let seconds = |tv: libc::timeval| {
+            std::time::Duration::from_secs(tv.tv_sec.max(0) as u64)
+                + std::time::Duration::from_micros(tv.tv_usec.max(0) as u64)
+        };
+        HelperUsage {
+            cpu: seconds(usage.ru_utime) + seconds(usage.ru_stime),
+            max_rss_kb: usage.ru_maxrss.max(0) as u64,
+        }
     }
 }
 

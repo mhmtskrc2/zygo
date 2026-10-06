@@ -312,6 +312,66 @@ pub(super) fn resident_kb(pid: u32) -> Option<u64> {
         .ok()
 }
 
+/// What a request cost, read from its cgroup before the cgroup is removed:
+/// `cpu.stat`'s `usage_usec` and `memory.peak`, which cover the request's whole
+/// process tree. Either is `None` where the file is not there — `memory.peak`
+/// needs Linux 5.19 and the memory controller — and the caller falls back.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+// Used by the warm-exec path, which only a Linux kernel can run; the arithmetic
+// is the same everywhere and tested everywhere.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) struct Measured {
+    pub cpu_ms: Option<f64>,
+    pub peak_rss_kb: Option<u64>,
+}
+
+// Used by the warm-exec path, which only a Linux kernel can run; the arithmetic
+// is the same everywhere and tested everywhere.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) fn measure_cgroup(dir: &std::path::Path) -> Measured {
+    let cpu_ms = std::fs::read_to_string(dir.join("cpu.stat"))
+        .ok()
+        .and_then(|stat| {
+            stat.lines()
+                .find_map(|l| l.strip_prefix("usage_usec")?.trim().parse::<u64>().ok())
+        })
+        .map(|us| us as f64 / 1000.0);
+    let peak_rss_kb = crate::cgroup::peak_memory(dir).map(|bytes| bytes.get() / 1024);
+    Measured {
+        cpu_ms,
+        peak_rss_kb,
+    }
+}
+
+/// A warm-exec request's metrics: the wall clock the supervisor kept, and CPU
+/// and peak memory from the request's cgroup first, else from the helper's
+/// `wait4` usage (`cpu`, `max_rss_kb`) — which needs no cgroup and covers the
+/// request plus a helper that does almost nothing.
+///
+/// Both were `Metrics::default()` once: every warm-exec request reported
+/// `cpu_ms: 0` and `peak_rss_kb: 0`, so the usage events an embedder bills
+/// from said that exec pools cost nothing, and `zygo stats` agreed.
+// Used by the warm-exec path, which only a Linux kernel can run; the arithmetic
+// is the same everywhere and tested everywhere.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) fn request_metrics(
+    wall: std::time::Duration,
+    measured: Measured,
+    usage: Option<(std::time::Duration, u64)>,
+) -> crate::protocol::Metrics {
+    crate::protocol::Metrics {
+        wall_ms: wall.as_secs_f64() * 1000.0,
+        cpu_ms: measured
+            .cpu_ms
+            .or(usage.map(|(cpu, _)| cpu.as_secs_f64() * 1000.0))
+            .unwrap_or(0.0),
+        peak_rss_kb: measured
+            .peak_rss_kb
+            .or(usage.map(|(_, max_rss_kb)| max_rss_kb))
+            .unwrap_or(0),
+    }
+}
+
 /// Put a request's process in its own cgroup. Returns the directory to remove
 /// afterwards, if one was created.
 ///
@@ -529,4 +589,71 @@ mod tests {
     // Parsed from files rather than mocked, because the format is the thing
     // being got right: `cpu.stat` gained fields between kernel releases and
     // `cpu.max` has two shapes.
+
+    #[test]
+    fn a_request_is_measured_from_its_cgroup_first() {
+        use std::time::Duration;
+        let measured = Measured {
+            cpu_ms: Some(2.5),
+            peak_rss_kb: Some(18_000),
+        };
+        let m = request_metrics(
+            Duration::from_millis(4),
+            measured,
+            Some((Duration::from_millis(9), 900)),
+        );
+        assert_eq!((m.cpu_ms, m.peak_rss_kb), (2.5, 18_000));
+        assert!((m.wall_ms - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn without_a_cgroup_the_helpers_usage_stands_in() {
+        use std::time::Duration;
+        let m = request_metrics(
+            Duration::from_millis(4),
+            Measured::default(),
+            Some((Duration::from_micros(1_750), 1_024)),
+        );
+        assert!((m.cpu_ms - 1.75).abs() < 1e-9);
+        assert_eq!(m.peak_rss_kb, 1_024);
+    }
+
+    #[test]
+    fn each_number_falls_back_on_its_own() {
+        use std::time::Duration;
+        // A kernel before 5.19 has cpu.stat but no memory.peak.
+        let measured = Measured {
+            cpu_ms: Some(3.0),
+            peak_rss_kb: None,
+        };
+        let m = request_metrics(Duration::ZERO, measured, Some((Duration::ZERO, 2_048)));
+        assert_eq!((m.cpu_ms, m.peak_rss_kb), (3.0, 2_048));
+        // Nothing to read at all: zero, said plainly, rather than a guess.
+        let m = request_metrics(Duration::ZERO, Measured::default(), None);
+        assert_eq!((m.cpu_ms, m.peak_rss_kb), (0.0, 0));
+    }
+
+    #[test]
+    fn the_cgroup_reader_takes_what_is_there() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("cpu.stat"),
+            "usage_usec 1500\nuser_usec 1000\nsystem_usec 500\n",
+        )
+        .unwrap();
+        let m = measure_cgroup(tmp.path());
+        assert_eq!(
+            m,
+            Measured {
+                cpu_ms: Some(1.5),
+                peak_rss_kb: None
+            }
+        );
+        std::fs::write(tmp.path().join("memory.peak"), "20480\n").unwrap();
+        assert_eq!(measure_cgroup(tmp.path()).peak_rss_kb, Some(20));
+        assert_eq!(
+            measure_cgroup(tmp.path().join("missing").as_path()),
+            Measured::default()
+        );
+    }
 }

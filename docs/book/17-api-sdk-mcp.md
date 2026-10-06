@@ -240,6 +240,13 @@ event, `{"stream": "stdout" | "stderr" | "progress", "data": …}`, then a last
 line with the body above and a `status`. [Watching a request](#watching-a-request)
 explains it.
 
+Where the three numbers come from differs by runtime. In an agent pool the
+agent measures the child it forked. In a warm-exec pool there is no agent, so
+the supervisor measures: `wall_ms` on its own clock, and `cpu_ms` and
+`peak_rss_kb` from the request's cgroup, which cover its whole process tree —
+or, for a request that had no cgroup of its own, from the helper's `wait4`
+usage, which includes the request it waited for.
+
 ## The answer of a one-shot run
 
 `POST /run` answers with more than an exit code, because the exit code alone
