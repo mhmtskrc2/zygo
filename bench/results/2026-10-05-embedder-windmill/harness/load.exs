@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # One load generator for both systems, run on the Mac so its own CPU is nobody's:
 #
 #   cd <the embedder's checkout> && mix run --no-start ~/windmill-bench/load.exs SYSTEM SCRIPT MODE ...

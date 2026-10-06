@@ -373,7 +373,7 @@ file, and the shortest way to get it is out of Zygo's own image, which is the
 binary that was checked and signed at the release:
 
 ```dockerfile
-FROM ghcr.io/mhmtskrc2/zygo:0.1.5 AS zygo
+FROM ghcr.io/mhmtskrc2/zygo:0.1.6 AS zygo
 
 FROM alpine:3.22
 # What a networked sandbox needs. Leave the four out for `network = "none"` only.
@@ -524,7 +524,7 @@ thing in front of the API is your own control plane. The worker image does.
 ## Verifying a published image
 
 ```bash
-cosign verify ghcr.io/mhmtskrc2/zygo:0.1.5 \
+cosign verify ghcr.io/mhmtskrc2/zygo:0.1.6 \
   --certificate-identity-regexp '^https://github\.com/.*/\.github/workflows/release\.yml@refs/tags/' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```

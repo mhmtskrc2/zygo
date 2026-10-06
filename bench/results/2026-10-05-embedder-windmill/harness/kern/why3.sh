@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 Z=/opt/zygo-bench/zygo; K=/opt/zygo-bench/kern
 strace -f -tt -T -o /tmp/z.tl $Z run --quiet --user 0 --mem 256M --pids 128 --net none python:3.12-slim /bin/true; echo "zygo exit $?"
 strace -f -tt -T -o /tmp/k.tl $K box t1 --image python:3.12-slim --pull never --rm -q --security-profile untrusted -m 256m --pids-limit 128 --net none -- /bin/true; echo "kern exit $?"

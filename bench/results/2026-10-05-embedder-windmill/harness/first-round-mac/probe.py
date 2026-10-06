@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 import json, os, socket
 def reach(host, port):
     try:

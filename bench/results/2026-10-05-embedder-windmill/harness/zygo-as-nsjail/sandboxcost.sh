@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # Inside a worker, in a kept job directory: wall and children's CPU per run for nsjail,
 # the stand-in with Zygo, and Zygo called directly with the stand-in's arguments.
 PY=/tmp/windmill/cache/py_runtime/cpython-3.12.13-linux-aarch64-gnu/bin/python3.12

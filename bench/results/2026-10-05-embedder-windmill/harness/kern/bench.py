@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Zygo against kern under concurrent load, running what the embedder runs.
 
 Run inside a delegated scope, the way a service runs:

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # In the Lima VM: peak anonymous memory per slice, every 20 ms. touch /tmp/cgm/reset_<g> to start a window.
 mkdir -p /tmp/cgm
 while true; do

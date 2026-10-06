@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # Before/after: cgroup work in one run, then 3 x 100 runs of each build, interleaved.
 for Z in /opt/zygo-bench/zygo-before /opt/zygo-bench/zygo; do
   strace -f -o /tmp/ab.tl $Z run --quiet --mem 256M --pids 128 --net none python:3.12-slim /bin/true 2>/dev/null

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # Where one `/bin/true` sandbox start goes, Zygo against kern.
 Z=/opt/zygo-bench/zygo; K=/opt/zygo-bench/kern
 zrun() { $Z run --quiet --mem 256M --pids 128 --net none python:3.12-slim /bin/true; }

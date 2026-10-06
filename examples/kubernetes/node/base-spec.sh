@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # Prints the base OCI spec for the `zygo` runtime handler: containerd's own
 # default, plus the node's /dev/net/tun as a device the container may open.
 #

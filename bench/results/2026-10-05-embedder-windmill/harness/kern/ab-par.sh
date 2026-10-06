@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 busy() { awk '/^cpu /{print $2+$3+$4+$7+$8}' /proc/stat; }
 for r in 1 2 3; do for Z in /opt/zygo-bench/zygo-before /opt/zygo-bench/zygo; do
   b0=$(busy); s=$(date +%s%N)

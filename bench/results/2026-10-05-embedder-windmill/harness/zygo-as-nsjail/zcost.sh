@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # zcost.sh JOBDIR ZYGO  -> per-run wall and children CPU for 20 runs of zygo run directly
 PY=/tmp/windmill/cache/py_runtime/cpython-3.12.13-linux-aarch64-gnu/bin/python3.12
 cd "$1"

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # Peak anonymous memory per stack (memory.stat "anon": what processes hold, not page
 # cache), sampled every 20 ms. `touch /tmp/reset_<g>` starts a window.
 while true; do

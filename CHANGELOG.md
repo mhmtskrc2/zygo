@@ -7,6 +7,14 @@ break things and will say so here.
 
 ## [Unreleased]
 
+## [0.1.6] — 2026-10-06
+
+The first release in which `zygo mcp`'s `run_code` runs: every earlier tag
+refused it, because the server mounted its workspace where the sandbox keeps
+its own files. With it, Zygo on Kubernetes without `privileged: true`,
+warm-exec requests that report what they cost, and a `zygo_sdk` on Hex that
+will not resolve a mint with the 2026 advisories.
+
 ### Added
 
 - Zygo on Kubernetes without `privileged: true`:

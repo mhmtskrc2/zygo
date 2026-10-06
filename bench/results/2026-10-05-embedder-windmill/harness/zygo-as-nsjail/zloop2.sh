@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # zloop2.sh JOBDIR N MODE   (MODE zygo | nsjail): N runs, as Windmill starts them
 PY=/tmp/windmill/cache/py_runtime/cpython-3.12.13-linux-aarch64-gnu/bin/python3.12
 cd "$1"

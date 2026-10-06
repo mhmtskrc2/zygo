@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # Cost of each start-up step on its own: CPU of the whole VM per iteration.
 N=200
 busy() { awk '/^cpu /{print $2+$3+$4+$7+$8}' /proc/stat; }

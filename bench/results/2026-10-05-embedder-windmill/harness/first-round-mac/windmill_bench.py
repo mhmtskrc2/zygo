@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Windmill, measured the way the embedder's own pipeline test measures it.
 
     python3 windmill_bench.py [hello|cpu|deps] [SEQ] [BURST]
