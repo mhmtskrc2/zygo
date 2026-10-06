@@ -18,8 +18,23 @@ break things and will say so here.
   limits, an egress allowlist, and a pod that cannot raise its own
   `memory.max` — which a new CI job, `kubernetes-unprivileged`, runs.
 
+### Changed
+
+- The Elixir client, `zygo_sdk`, requires mint 1.10.2 or newer. Every 1.x
+  release before it carries three 2026 advisories (EEF-CVE-2026-91043,
+  -92103, -94194), and the HTTP/1 chunked-framing one is on the path this
+  client uses. A floor, not a pin: an application's own resolution still picks
+  the newest it can.
+
 ### Fixed
 
+- A warm-exec request reports what it cost. `cpu_ms` and `peak_rss_kb` were
+  `0` for every request of an exec pool, in the call's answer, in the usage
+  events an embedder bills from and in `zygo stats`; only `wall_ms` was
+  measured. They now come from the request's own cgroup — `cpu.stat` and
+  `memory.peak`, read after it exits and before the cgroup goes — and, for a
+  request that had no cgroup, from the helper's `wait4` usage, which counts
+  the request it waited for.
 - `zygo doctor` gives a pod a pod's advice. A Kubernetes pod whose cgroup was
   read-only was told to `docker run --cgroup-parent`; it is now told about the
   RuntimeClass and `hostUsers: false`, or about the systemd cgroup driver when

@@ -34,9 +34,15 @@ defmodule Zygo.MixProject do
   # Mint is an HTTP client that is a data structure rather than a process, and
   # it opens a unix socket; NimblePool is what lends one of those data
   # structures to one caller at a time. JSON is the standard library's.
+  #
+  # Mint's floor is 1.10.2: the 1.x releases before it carry three 2026
+  # advisories (EEF-CVE-2026-91043, -92103, -94194), and the first — HTTP/1
+  # chunked framing applied when chunked is not the final transfer coding —
+  # is on the one path this client uses. A floor rather than a pin, so an
+  # application's own resolution still picks the newest it can.
   defp deps do
     [
-      {:mint, "~> 1.6"},
+      {:mint, ">= 1.10.2 and < 2.0.0"},
       {:nimble_pool, "~> 1.1"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false}
     ]
