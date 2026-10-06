@@ -258,10 +258,13 @@ belong on the `vm` backend and on separate hosts.
 `network = "egress"` or `"full"`, a sandbox **cannot reach** the cloud
 metadata endpoint (`169.254.169.254`), any RFC1918 address (the host, its
 neighbours, the LAN's router), any CGNAT, link-local, multicast or reserved
-address, or the host's loopback — whatever name they resolve from — unless the operator passes
-`--allow-private-net`. This is enforced inside the sandbox's own network
-namespace by nftables rules that sit *above* every allow rule, and by a
-resolver that admits only what the allowlist names. The host's loopback is
+address, or the host's loopback — whatever name they resolve from. The one
+exception is under `egress` with `--allow-private-net`: an `allow` rule written
+as an address or CIDR wholly inside those ranges reaches that address and port,
+and nothing else in them. This is enforced inside the sandbox's own network
+namespace by nftables rules that sit *above* every allow rule that came from a
+name, and by a resolver that admits only what the allowlist names and never a
+private address. The host's loopback is
 closed a second way, because the firewall has to pass the sandbox's own
 loopback: `pasta` is told not to carry the sandbox's loopback ports to the
 host's and not to answer for the gateway address ([chapter
@@ -274,9 +277,15 @@ guarantee is anything about the public internet under `full`: that mode means
         │
         ▼
   ┌───────────────────────────────────────────┐
-  │ nftables rule 1 (checked first):          │
+  │ egress + --allow-private-net only:        │
+  │ a rule written as a private address       │── match ──▶ connected
+  │ (192.168.1.70:8765, 10.0.0.0/8:5432)      │
+  └─────────────────────┬─────────────────────┘
+                        │ no match
+                        ▼
+  ┌───────────────────────────────────────────┐
   │ 169.254.x, 10.x, 172.16-31.x, 192.168.x,  │── match ──▶ refused, "no route"
-  │ CGNAT, link-local, loopback               │   (unless --allow-private-net)
+  │ CGNAT, link-local, loopback               │   (always)
   └─────────────────────┬─────────────────────┘
                         │ no match
                         ▼

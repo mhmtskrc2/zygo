@@ -62,6 +62,22 @@ why.
   private address without the flag, is refused where it used to be
   accepted. Neither ever worked.
 
+## Correction, 2026-10-07
+
+The decision said "a rule still names one address and one port, and the rest
+of every private range stays shut". Until 0.1.7 the code did not do that: with
+the flag, the ruleset left out its private rejects altogether and the
+resolver stopped leaving private addresses out of its answers. So an allowed
+*name* that resolved into a private range was reached, which is DNS
+rebinding to `169.254.169.254` for anybody who could point a name there, and
+under `network = "full"` the whole of every private range was open.
+
+Now the rejects are in every ruleset, and the flag lets through only a rule
+written as an address or CIDR wholly inside a private block, as an `accept`
+above them. A name never reaches a private address, flag or not, and `full`
+never reaches any. `0.0.0.0/0` starts in `0.0.0.0/8` but is not a private
+address; it is not lifted. What the decision describes is what the code does.
+
 ## What would reopen this
 
 * A channel for a request to ask its caller something mid-run, through the

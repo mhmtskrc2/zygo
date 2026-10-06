@@ -23,6 +23,19 @@ break things and will say so here.
   and the VM's logs; nothing in Zygo changed when it stopped, and the record
   says what was checked. The harness gained a per-container CPU sampler.
 
+### Security
+
+- `--allow-private-net` lets through what it always said it would and nothing
+  more: an `allow` rule written as a private address or CIDR, as an `accept`
+  above the private rejects, which are now in every ruleset. It used to drop
+  those rejects altogether, so with the flag an allowed name that resolved
+  into a private range was reached — DNS rebinding to `169.254.169.254` — and
+  under `network = "full"` every private range was open. The sandbox's
+  resolver now leaves a private address out of every answer whatever the
+  flag, the host-side resolution of an allowlist does the same, and a rule
+  that only starts in a private range, such as `0.0.0.0/0`, is not lifted.
+  ADR 0009 has the correction.
+
 ## [0.1.6] — 2026-10-06
 
 The first release in which `zygo mcp`'s `run_code` runs: every earlier tag

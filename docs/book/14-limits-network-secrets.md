@@ -295,9 +295,19 @@ with a namespace — `none`, `egress` and `full` — these ranges stay closed:
 Multicast is on the list because a multicast group is a way to talk to the
 neighbours without naming any of them.
 
-Only `--allow-private-net` opens them. An `allow` rule inside one of these
-ranges — a CIDR, or a single address such as `192.168.1.70:8765` — is refused
-unless you pass that flag. Before 0.1.4 a single address was read as a host
+Nothing opens them as a whole. `--allow-private-net` lets an `allow` rule that
+is *written as* an address inside one of these ranges — a CIDR, or a single
+address such as `192.168.1.70:8765` — be accepted: that address or range, that
+port, above the rule that refuses the rest. Without the flag such a rule is
+refused when the sandbox is declared. A *name* never reaches these ranges,
+with the flag or without: the sandbox's resolver leaves a private address out
+of every answer, because a name's answer can change after it was checked, and
+that is how a public name is pointed at `169.254.169.254`. A rule that only
+starts in a private range, such as `0.0.0.0/0`, is not lifted either; it
+reaches the public part of what it names. And under `network = "full"` the
+ranges stay closed whatever the flag, because `full` has no rules to name an
+address with. Before 0.1.7 the flag removed the refusal altogether, for every
+rule, every answer and `full` as well. Before 0.1.4 a single address was read as a host
 name: `serve` accepted it, and the firewall then refused every connection to
 it as the private address it is, with nothing to say why.
 

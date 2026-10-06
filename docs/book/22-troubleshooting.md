@@ -319,8 +319,10 @@ allow = ["api.example.com:443", "*.cdn.example.com:443"]
 ### A private address is refused even with `network = "full"`
 
 On purpose. Private and link-local address ranges — your host, its neighbours
-on the network, and `169.254.169.254` — stay refused in every namespaced mode
-unless you pass `--allow-private-net`. `169.254.169.254` is the cloud metadata
+on the network, and `169.254.169.254` — stay refused in every namespaced mode,
+and under `full` whatever flag you pass. Under `egress`, `--allow-private-net`
+lets a rule written as one address or range inside them through, and nothing
+else. `169.254.169.254` is the cloud metadata
 address, and it is the first thing a compromised handler tries.
 
 ## When a request fails

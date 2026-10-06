@@ -238,7 +238,6 @@ pub type Resolve<'a> = dyn Fn(&str) -> Vec<IpAddr> + Send + Sync + 'a;
 pub fn answer(
     query: &Query,
     rules: &[AllowRule],
-    allow_private: bool,
     resolve: &Resolve<'_>,
     admit: &mut Admit<'_>,
 ) -> Vec<u8> {
@@ -250,13 +249,14 @@ pub fn answer(
         return response(query, Rcode::NoError, &[]);
     }
 
+    // Never a private address, `--allow-private-net` or not. The filter rejects
+    // these ranges above every rule that came from a name, so an answer naming
+    // one would be a connect that fails; and a name is not how a private
+    // destination is allowed — its answer can change after it was checked, which
+    // is how a public name is turned into the cloud metadata address. The flag
+    // lets a rule *written as an address* through, and that never asks here.
     let mut addrs = resolve(&query.name);
-    if !allow_private {
-        // The filter rejects these ranges above every allow rule, so an answer
-        // naming one would be a connect that fails. Leaving it out is the
-        // same policy, one round trip earlier.
-        addrs.retain(|a| !is_private(*a));
-    }
+    addrs.retain(|a| !is_private(*a));
     addrs.sort();
     addrs.dedup();
 
@@ -285,7 +285,6 @@ pub fn is_private(addr: IpAddr) -> bool {
 pub fn serve(
     socket: UdpSocket,
     rules: Vec<AllowRule>,
-    allow_private: bool,
     stop: Arc<AtomicBool>,
     resolve: &Resolve<'_>,
     admit: &mut Admit<'_>,
@@ -313,7 +312,7 @@ pub fn serve(
         let Some(query) = parse_query(&buf[..n]) else {
             continue;
         };
-        let reply = answer(&query, &rules, allow_private, resolve, admit);
+        let reply = answer(&query, &rules, resolve, admit);
         let _ = socket.send_to(&reply, from);
     }
 }
@@ -428,13 +427,7 @@ mod tests {
             admitted.push((a, p.to_vec()));
             Ok(())
         };
-        let r = answer(
-            &q,
-            &rules(&["api.example.com:443"]),
-            false,
-            &resolve,
-            &mut admit,
-        );
+        let r = answer(&q, &rules(&["api.example.com:443"]), &resolve, &mut admit);
         assert_eq!(r[3] & 0x0F, Rcode::NxDomain as u8);
         assert_eq!(u16::from_be_bytes([r[6], r[7]]), 0, "no answers");
         assert!(admitted.is_empty(), "nothing was let through the filter");
@@ -451,13 +444,7 @@ mod tests {
             log.push(format!("admit {a} {p:?}"));
             Ok(())
         };
-        let r = answer(
-            &q,
-            &rules(&["api.example.com:443"]),
-            false,
-            &resolve,
-            &mut admit,
-        );
+        let r = answer(&q, &rules(&["api.example.com:443"]), &resolve, &mut admit);
         assert_eq!(log, ["admit 93.184.216.34 [Some(443)]"]);
         assert_eq!(u16::from_be_bytes([r[6], r[7]]), 1);
     }
@@ -502,45 +489,33 @@ mod tests {
                 Ok(())
             }
         };
-        let r = answer(
-            &q,
-            &rules(&["api.example.com:443"]),
-            false,
-            &resolve,
-            &mut admit,
-        );
+        let r = answer(&q, &rules(&["api.example.com:443"]), &resolve, &mut admit);
         assert_eq!(u16::from_be_bytes([r[6], r[7]]), 1, "only the admitted one");
     }
 
     #[test]
-    fn private_addresses_are_dropped_from_answers_unless_allowed() {
+    fn private_addresses_are_dropped_from_answers_whatever_the_flag() {
         // DNS rebinding: an allowed name that resolves into the host's own
         // network. The filter would reject the connection anyway; the answer
-        // simply does not offer it.
+        // simply does not offer it. `--allow-private-net` used to put such an
+        // answer through, and with it the cloud metadata address under any
+        // name its owner could point there.
         let q = parse_query(&query_packet(1, "api.example.com", TYPE_A)).unwrap();
         let resolve = |_: &str| {
             vec![
                 "10.0.0.5".parse().unwrap(),
+                "169.254.169.254".parse().unwrap(),
                 "93.184.216.34".parse().unwrap(),
             ]
         };
-        let mut admit = |_: IpAddr, _: &[Option<u16>]| Ok(());
-        let closed = answer(
-            &q,
-            &rules(&["api.example.com:443"]),
-            false,
-            &resolve,
-            &mut admit,
-        );
-        assert_eq!(u16::from_be_bytes([closed[6], closed[7]]), 1);
-        let open = answer(
-            &q,
-            &rules(&["api.example.com:443"]),
-            true,
-            &resolve,
-            &mut admit,
-        );
-        assert_eq!(u16::from_be_bytes([open[6], open[7]]), 2);
+        let mut admitted = Vec::new();
+        let mut admit = |a: IpAddr, _: &[Option<u16>]| {
+            admitted.push(a);
+            Ok(())
+        };
+        let r = answer(&q, &rules(&["api.example.com:443"]), &resolve, &mut admit);
+        assert_eq!(u16::from_be_bytes([r[6], r[7]]), 1);
+        assert_eq!(admitted, ["93.184.216.34".parse::<IpAddr>().unwrap()]);
     }
 
     #[test]
@@ -550,13 +525,7 @@ mod tests {
         let q = parse_query(&query_packet(1, "api.example.com", 65)).unwrap();
         let resolve = |_: &str| vec!["93.184.216.34".parse().unwrap()];
         let mut admit = |_: IpAddr, _: &[Option<u16>]| Ok(());
-        let r = answer(
-            &q,
-            &rules(&["api.example.com:443"]),
-            false,
-            &resolve,
-            &mut admit,
-        );
+        let r = answer(&q, &rules(&["api.example.com:443"]), &resolve, &mut admit);
         assert_eq!(r[3] & 0x0F, 0);
         assert_eq!(u16::from_be_bytes([r[6], r[7]]), 0);
     }
@@ -599,7 +568,6 @@ mod tests {
                 serve(
                     socket,
                     rules(&["*.example.com:443"]),
-                    false,
                     stop,
                     &resolve,
                     &mut admit,

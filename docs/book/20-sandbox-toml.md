@@ -163,9 +163,10 @@ The forms an `allow` rule takes:
 Private and link-local ranges — `10/8`, `172.16/12`, `192.168/16`,
 `127/8`, `169.254/16` (the cloud metadata address), `100.64/10`, `0/8`,
 multicast and reserved (`224/4`, `240/4`), `::1`, `fe80::/10`, `fc00::/7`,
-`ff00::/8` — are never reachable in a namespaced mode unless you pass
-`--allow-private-net`, and a rule inside one of them — a CIDR or a single
-address — is refused without it. `network = "egress"` or `"full"` together
+`ff00::/8` — are never reachable in a namespaced mode through a name or under
+`full`. A rule written as an address inside one of them — a CIDR or a single
+address — is refused without `--allow-private-net`, and with it reaches that
+address and nothing else in the range. `network = "egress"` or `"full"` together
 with `seccomp = "strict"` is refused too: `strict` takes `socket` away, so
 nothing could be reached.
 

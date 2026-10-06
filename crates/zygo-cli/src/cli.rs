@@ -947,7 +947,11 @@ pub struct SandboxArgs {
     #[arg(long)]
     pub allow_host_net: bool,
 
-    /// Permit egress rules targeting private and link-local ranges.
+    /// Permit `allow` rules written as a private or link-local address or CIDR.
+    ///
+    /// Only those, as written: the rest of every private range stays refused,
+    /// a name never resolves into one, and under `--net full` they all stay
+    /// closed.
     #[arg(long)]
     pub allow_private_net: bool,
 

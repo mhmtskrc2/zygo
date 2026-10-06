@@ -52,7 +52,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, IoContext, Result};
 use crate::paths::which;
-use crate::spec::{AllowRule, HostPattern, Network};
+use crate::spec::{AllowRule, Cidr, HostPattern, Network};
 
 /// Where a `full` sandbox sends DNS. `pasta` intercepts this address and
 /// forwards to the host's own resolver.
@@ -129,8 +129,10 @@ pub fn needs_configuration(network: Network) -> bool {
     matches!(network, Network::Egress | Network::Full)
 }
 
-/// Blocks that reach the host and its neighbours. Rejected before any allow
-/// rule unless `--allow-private-net` was given.
+/// Blocks that reach the host and its neighbours. Rejected in every mode,
+/// above every allow rule that came from a name. `--allow-private-net` does not
+/// lift them: it lets a rule *written as an address* inside one of them be
+/// accepted just above (see [`named_private`]).
 ///
 /// Multicast, `0.0.0.0/8` and the reserved `240.0.0.0/4` (broadcast included)
 /// as well: none of them is "the internet", and under `full` an open
@@ -166,9 +168,18 @@ pub struct Allowed {
 }
 
 /// Resolve every exact-name and CIDR rule into addresses.
+///
+/// A private address a *name* resolves to is left out, as the sandbox's
+/// resolver leaves it out of an answer: it would sit below the private rejects
+/// and never match, and a name is not how a private destination is allowed
+/// (see [`named_private`]). A rule written as a private address is not here
+/// either; the ruleset states it as a rule of its own.
 pub fn resolve_allow(rules: &[AllowRule]) -> Allowed {
     let mut allowed = Allowed::default();
     for rule in rules {
+        if named_private(rule).is_some() {
+            continue;
+        }
         match &rule.host {
             HostPattern::Cidr(c) => allowed.entries.push((c.addr, rule.port)),
             HostPattern::Exact(name) => {
@@ -176,7 +187,7 @@ pub fn resolve_allow(rules: &[AllowRule]) -> Allowed {
                 if addrs.is_empty() {
                     allowed.unresolved.push(name.clone());
                 }
-                for ip in addrs {
+                for ip in addrs.into_iter().filter(|ip| !dns::is_private(*ip)) {
                     allowed.entries.push((ip, rule.port));
                 }
             }
@@ -186,6 +197,46 @@ pub fn resolve_allow(rules: &[AllowRule]) -> Allowed {
     allowed.entries.sort();
     allowed.entries.dedup();
     allowed
+}
+
+/// A rule written as an address — a CIDR, or a single address — that lies
+/// wholly inside one of the private blocks. The only kind of rule
+/// `--allow-private-net` lets through, and only as written.
+///
+/// *Wholly inside*, not merely starting there: `0.0.0.0/0` begins in
+/// `0.0.0.0/8` and names every private block at once, which is not naming a
+/// private address; it reaches the public internet and nothing more. And never
+/// a name, whatever it resolves to — a name's answer can change after it is
+/// checked, so a private destination has to be written down as one.
+pub fn named_private(rule: &AllowRule) -> Option<Cidr> {
+    let cidr = match &rule.host {
+        HostPattern::Cidr(c) => *c,
+        HostPattern::Exact(host) => {
+            let addr: IpAddr = host.parse().ok()?;
+            let prefix = if addr.is_ipv4() { 32 } else { 128 };
+            Cidr { addr, prefix }
+        }
+        HostPattern::Wildcard(_) => return None,
+    };
+    private_blocks()
+        .any(|block| block.prefix <= cidr.prefix && block.contains(cidr.addr))
+        .then_some(cidr)
+}
+
+fn private_blocks() -> impl Iterator<Item = Cidr> {
+    PRIVATE_V4
+        .iter()
+        .chain(PRIVATE_V6)
+        .map(|block| block.parse().expect("a constant CIDR"))
+}
+
+/// One `accept` line for an address rule: its CIDR, and its port if it has one.
+fn accept_line(cidr: &str, port: Option<u16>) -> String {
+    let family = if cidr.contains(':') { "ip6" } else { "ip" };
+    match port {
+        Some(port) => format!("    {family} daddr {cidr} tcp dport {port} accept\n"),
+        None => format!("    {family} daddr {cidr} accept\n"),
+    }
 }
 
 /// A CIDR rule keeps its prefix; a resolved name is a single address.
@@ -228,10 +279,15 @@ fn element(ip: IpAddr, port: Option<u16>) -> String {
 ///    the policy. Under `egress` no such line exists: the only resolver is on
 ///    loopback, already permitted, and `pasta`'s forwarder is deliberately
 ///    *not* reachable;
-/// 5. the private and link-local rejects, unless `allow_private`;
-/// 6. what the spec allowed — CIDRs as written, names through the sets the
+/// 5. under `egress` with `allow_private`, the rules written as an address
+///    inside a private block ([`named_private`]) — those, as written, and no
+///    other private address;
+/// 6. the private and link-local rejects, in every mode and whatever the flag
+///    says: under `full` they are what keeps "the internet" from meaning the
+///    host's neighbours, and a name never gets past them;
+/// 7. what the spec allowed — CIDRs as written, names through the sets the
 ///    resolver fills;
-/// 7. reject, with ICMP rather than a silent drop so a blocked program fails
+/// 8. reject, with ICMP rather than a silent drop so a blocked program fails
 ///    immediately instead of waiting out a connect timeout. `icmpx`, the
 ///    `inet` table's family-neutral form: `icmp` alone quietly adds "IPv4
 ///    only", and every IPv6 packet fell through to the drop policy.
@@ -293,16 +349,22 @@ pub fn ruleset(
         out.push_str(&format!("    ip daddr {DNS_ADDR} tcp dport 53 accept\n"));
     }
 
-    if !allow_private {
-        out.push_str(&format!(
-            "    ip daddr {{ {} }} reject with icmp type admin-prohibited\n",
-            PRIVATE_V4.join(", ")
-        ));
-        out.push_str(&format!(
-            "    ip6 daddr {{ {} }} reject with icmpv6 type admin-prohibited\n",
-            PRIVATE_V6.join(", ")
-        ));
+    if allow_private && network == Network::Egress {
+        for rule in rules {
+            if let Some(cidr) = named_private(rule) {
+                out.push_str(&accept_line(&cidr.to_string(), rule.port));
+            }
+        }
     }
+
+    out.push_str(&format!(
+        "    ip daddr {{ {} }} reject with icmp type admin-prohibited\n",
+        PRIVATE_V4.join(", ")
+    ));
+    out.push_str(&format!(
+        "    ip6 daddr {{ {} }} reject with icmpv6 type admin-prohibited\n",
+        PRIVATE_V6.join(", ")
+    ));
 
     match network {
         // Unrestricted egress: everything above still applies, so `full` is
@@ -310,15 +372,13 @@ pub fn ruleset(
         Network::Full => out.push_str("    accept\n"),
         _ => {
             // CIDR rules go in as written, so a `/8` stays a `/8` rather than
-            // being flattened into the one address it was parsed from.
+            // being flattened into the one address it was parsed from. A
+            // private one is above the rejects already, or not allowed.
             for rule in rules {
-                if let Some(cidr) = cidr_of(rule) {
-                    let family = if cidr.contains(':') { "ip6" } else { "ip" };
-                    out.push_str(&format!("    {family} daddr {cidr}"));
-                    if let Some(port) = rule.port {
-                        out.push_str(&format!(" tcp dport {port}"));
-                    }
-                    out.push_str(" accept\n");
+                if let Some(cidr) = cidr_of(rule)
+                    && named_private(rule).is_none()
+                {
+                    out.push_str(&accept_line(&cidr, rule.port));
                 }
             }
             out.push_str("    ip daddr . tcp dport @allow4 accept\n");
@@ -636,12 +696,7 @@ pub(crate) mod linux {
         }
 
         if network == Network::Egress {
-            return Ok(Some(start_resolver(
-                ns,
-                programs.nft,
-                rules.to_vec(),
-                allow_private,
-            )?));
+            return Ok(Some(start_resolver(ns, programs.nft, rules.to_vec())?));
         }
         Ok(None)
     }
@@ -1189,12 +1244,7 @@ pub(crate) mod linux {
     }
 
     /// Start the egress resolver for one sandbox.
-    fn start_resolver(
-        ns: NetNs,
-        nft: PathBuf,
-        rules: Vec<AllowRule>,
-        allow_private: bool,
-    ) -> Result<DnsProxy> {
+    fn start_resolver(ns: NetNs, nft: PathBuf, rules: Vec<AllowRule>) -> Result<DnsProxy> {
         let addr: std::net::SocketAddrV4 = format!("{PROXY_ADDR}:53")
             .parse()
             .expect("a constant address");
@@ -1224,7 +1274,6 @@ pub(crate) mod linux {
                 dns::serve(
                     socket,
                     rules,
-                    allow_private,
                     thread_stop,
                     &dns::resolve_on_host,
                     &mut admit,
@@ -1452,16 +1501,95 @@ mod tests {
     }
 
     #[test]
-    fn private_ranges_are_rejected_unless_they_were_asked_for() {
-        let closed = egress(&[], &Allowed::default(), false);
-        for block in PRIVATE_V4.iter().chain(PRIVATE_V6) {
-            assert!(closed.contains(block), "{block} missing from {closed}");
+    fn private_ranges_are_rejected_whatever_the_flag() {
+        for private in [false, true] {
+            let text = egress(&[], &Allowed::default(), private);
+            for block in PRIVATE_V4.iter().chain(PRIVATE_V6) {
+                assert!(text.contains(block), "{block} missing from {text}");
+            }
         }
-        // With `--allow-private-net` the rejects have to go: a rule naming
-        // 10.0.0.0/8 would otherwise be dead code below them.
-        let open = egress(&[], &Allowed::default(), true);
-        assert!(!open.contains("10.0.0.0/8"), "{open}");
-        assert!(!open.contains("fe80::/10"), "{open}");
+    }
+
+    /// Where `line` is in the ruleset, to say what is checked before what.
+    fn at(text: &str, line: &str) -> usize {
+        text.find(line)
+            .unwrap_or_else(|| panic!("{line:?} missing from {text}"))
+    }
+
+    #[test]
+    fn with_the_flag_a_rule_written_as_a_private_address_goes_above_the_rejects() {
+        // The embedder's case: one service on one private address, as an
+        // address with a port, and a CIDR beside it.
+        let list = ["172.28.0.2:7712", "10.0.0.0/8:5432", "api.example.com:443"];
+        let text = egress(&list, &Allowed::default(), true);
+        let reject = at(&text, "ip daddr { 10.0.0.0/8");
+        assert!(at(&text, "ip daddr 172.28.0.2/32 tcp dport 7712 accept") < reject);
+        assert!(at(&text, "ip daddr 10.0.0.0/8 tcp dport 5432 accept") < reject);
+        // Nothing else private is opened by it.
+        // Loopback and established, the two rules written above, the four sets.
+        assert_eq!(text.matches(" accept\n").count(), 2 + 2 + 4, "{text}");
+    }
+
+    #[test]
+    fn without_the_flag_no_private_address_is_accepted_anywhere() {
+        let text = egress(&["172.28.0.2:7712"], &Allowed::default(), false);
+        assert!(!text.contains("172.28.0.2"), "{text}");
+    }
+
+    #[test]
+    fn a_rule_that_only_starts_in_private_space_is_not_lifted() {
+        // `0.0.0.0/0` begins in `0.0.0.0/8`: lifting it would open every
+        // private block behind a rule nobody wrote for one.
+        let text = egress(&["0.0.0.0/0:443"], &Allowed::default(), true);
+        let reject = at(&text, "ip daddr { 10.0.0.0/8");
+        assert!(
+            at(&text, "ip daddr 0.0.0.0/0 tcp dport 443 accept") > reject,
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn full_keeps_the_rejects_with_the_flag() {
+        let text = ruleset(Network::Full, &[], &Allowed::default(), true, 256);
+        assert!(
+            text.contains("10.0.0.0/8") && text.contains("169.254.0.0/16"),
+            "{text}"
+        );
+        assert!(
+            at(&text, "169.254.0.0/16") < at(&text, "\n    accept\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn only_an_address_wholly_inside_a_private_block_is_named_private() {
+        let named = |rule: &str| named_private(&rule.parse().expect("rule")).map(|c| c.to_string());
+        assert_eq!(named("10.0.0.5:80").as_deref(), Some("10.0.0.5/32"));
+        assert_eq!(named("[fd00::1]:80").as_deref(), Some("fd00::1/128"));
+        assert_eq!(named("192.168.0.0/24").as_deref(), Some("192.168.0.0/24"));
+        assert_eq!(
+            named("169.254.169.254").as_deref(),
+            Some("169.254.169.254/32")
+        );
+        assert_eq!(named("0.0.0.0/0"), None);
+        assert_eq!(
+            named("10.0.0.0/7"),
+            None,
+            "wider than the block it starts in"
+        );
+        assert_eq!(named("203.0.113.0/24"), None);
+        assert_eq!(named("localhost:80"), None, "a name is never one");
+        assert_eq!(named("*.internal.example:443"), None);
+    }
+
+    #[test]
+    fn a_name_that_resolves_into_private_space_adds_nothing_to_the_sets() {
+        let allowed = resolve_allow(&rules(&["localhost:80", "10.0.0.5:80", "203.0.113.7:443"]));
+        assert_eq!(
+            allowed.entries,
+            [("203.0.113.7".parse().unwrap(), Some(443))],
+            "localhost's loopback and the written private address are not set entries"
+        );
     }
 
     #[test]

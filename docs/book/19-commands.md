@@ -72,7 +72,7 @@ wherever they appear. Each maps to a `sandbox.toml` field and wins over it.
 | `--user UID` | `1000` | uid inside the sandbox. |
 | `--workdir PATH` | `/app` | Working folder inside the sandbox. |
 | `--allow-host-net` | off | Permit `--net host`, which removes the network boundary. |
-| `--allow-private-net` | off | Permit private and link-local ranges. |
+| `--allow-private-net` | off | Permit `allow` rules written as a private or link-local address or CIDR; only those, and never through a name. |
 | `--allow-unlimited` | off | Permit `--timeout 0`. |
 
 `-f`, `--file PATH` names the spec file on every command that reads one;
