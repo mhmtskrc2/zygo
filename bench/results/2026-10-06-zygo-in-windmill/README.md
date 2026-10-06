@@ -69,9 +69,25 @@ runs of each mode; nsjail was measured before and after the Zygo modes.
 | failed jobs | 0 | 0 | 0 |
 
 The first Zygo set after the store was created (`raw/load-r3-zygo-none-B1.txt`)
-ran at 23–32 jobs/s and is left out of the table: the same set repeated after
-the workers were recreated ran at 40/s, and one-worker measurements showed no
-contention. The cause of the slow first runs was not isolated.
+is left out of the table: its bursts ran at 23–32 jobs/s. It was looked into
+afterwards, from Windmill's own job records and the VM's logs. For one minute,
+14:55:10 to 14:56:10 UTC, every job on all three workers alike took about
+40 ms longer and 20 ms more CPU — Windmill's per-job durations put the median
+at 106 ms against 60–72 ms in the minutes before and after — and the
+steady-rate lines that followed were normal. Nothing in Zygo changed when it
+stopped: the store built nothing during that minute (its skeleton and layer
+entries date from the probe before it and from the networked rounds after),
+the job logs are byte for byte those of the normal sets, and recreating the
+conditions — a fresh store volume, fresh workers, the same bursts — ran at
+42–47 jobs/s from the first burst. Nothing in the VM accounts for it either:
+no systemd timer fired, the last autovacuums had finished at 14:54:28, the
+journal is empty for that minute. The 10-minute `sar` sample around it shows
+memory tight (207 MB free, reclaim running), and Docker Desktop's own VM was
+running on the same laptop. A stall on the host is the likeliest reading: the
+VM's hypervisor reports no steal time, so a vCPU the host paused is counted
+as guest CPU, in every container alike. `harness/cgsample.sh` now records
+every container's CPU every two seconds beside a run, which would have
+settled it.
 
 ## What a job sees and reaches
 
@@ -124,6 +140,7 @@ stand-in's arguments:
 | `harness/zygo-worker/percost2.sh`, `parcost.sh` | the per-job measurements |
 | `harness/isolation_probe.py`, `wm_probe.py` | the probe and the driver that runs it as a Windmill job |
 | `harness/cgmon-lima.sh` | the 20 ms memory sampler |
+| `harness/cgsample.sh` | every container's CPU every two seconds, for reading a slow set container by container; added after the set above |
 | `raw/` | every result line: `load-r3-*` (A1, A2 nsjail; B1, B2 no network; B3 with a network), `percost-*`, `parcost-*`, `probe-*` |
 
 A line in `raw/load-*.txt` reads: *system script, scenario: done/planned ok

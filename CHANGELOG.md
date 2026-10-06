@@ -18,6 +18,10 @@ break things and will say so here.
   the network off and the chapter did not say so; its stand-in copy and
   results are no longer kept. The stand-in, the probe, the per-job scripts
   and every result line are in `bench/results/2026-10-06-zygo-in-windmill/`.
+  The one set its tables leave out — a minute in which every job on every
+  worker ran slower — was examined afterwards from Windmill's own job records
+  and the VM's logs; nothing in Zygo changed when it stopped, and the record
+  says what was checked. The harness gained a per-container CPU sampler.
 
 ## [0.1.6] — 2026-10-06
 

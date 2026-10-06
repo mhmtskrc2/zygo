@@ -821,7 +821,11 @@ workers running jobs side by side ask of the sandbox
 
 **Under load, the whole Windmill stack**, through the stand-in, as Windmill
 would run it today. nsjail was measured before and after the Zygo modes;
-ranges cover the runs of each mode.
+ranges cover the runs of each mode. One Zygo set, the first after the store
+was created, is left out: for one minute its bursts ran a third slower on all
+three workers alike, with the extra time inside each job by Windmill's own
+records, and nothing in Zygo's store, logs or cgroups changed when it
+stopped; the record says what was checked.
 
 | | nsjail | Zygo, no network | Zygo, with a network |
 |---|---|---|---|
