@@ -364,6 +364,71 @@ That is worse than the privilege you were trying to avoid. Give Zygo a
 subtree of its own instead, as the command above does with `/zygo`. Sealed
 sandboxes — `network = "none"`, the default — do not need `/dev/net/tun`.
 
+## Into an image of your own
+
+An embedder's own container can carry Zygo rather than run it beside: the
+API starts next to the application and the sandboxes come up inside the same
+container. There is no package to `apt install`; the binary is one static
+file, and the shortest way to get it is out of Zygo's own image, which is the
+binary that was checked and signed at the release:
+
+```dockerfile
+FROM ghcr.io/mhmtskrc2/zygo:0.1.5 AS zygo
+
+FROM alpine:3.22
+# What a networked sandbox needs. Leave the four out for `network = "none"` only.
+RUN apk add --no-cache passt nftables iproute2 shadow-uidmap ca-certificates \
+    && cp -L /usr/bin/pasta /usr/local/bin/pasta && rm /usr/bin/pasta
+COPY --from=zygo /usr/local/bin/zygo /usr/local/bin/zygo
+ENV ZYGO_DATA_HOME=/var/lib/zygo
+VOLUME ["/var/lib/zygo"]
+```
+
+On Debian or Ubuntu the same four packages are `passt nftables iproute2
+uidmap`, and `pasta` is moved the same way: Ubuntu hosts load an AppArmor
+profile that attaches to `/usr/bin/pasta` by path, inside containers too.
+Without a registry in reach, the release tarball does the same as the
+`COPY --from`:
+
+```dockerfile
+ARG ZYGO_VERSION=0.1.5
+RUN url=https://github.com/mhmtskrc2/zygo/releases/download/v${ZYGO_VERSION} \
+    && curl -fsSLO "$url/zygo-$(uname -m)-unknown-linux-musl.tar.gz" \
+    && curl -fsSL "$url/SHA256SUMS" | sha256sum -c --ignore-missing \
+    && tar xzf zygo-*-unknown-linux-musl.tar.gz \
+    && install -m 0755 zygo-*/zygo /usr/local/bin/zygo
+```
+
+Then, in the entrypoint, `zygo pull` the images the functions use — into
+the volume, once — and start `zygo api` before the application:
+
+```sh
+zygo pull python:3.12-slim
+zygo api --allow-deploy --allow-private-net --listen 127.0.0.1:7700 &
+exec your-application
+```
+
+The container is run with the flags of the `docker run` above, nothing
+fewer and nothing more: they are what a sandbox needs, and they are the
+same whether the image is Zygo's or yours. Two things to know, both from
+[chapter 14](14-limits-network-secrets.md#the-hosts-own-loopback):
+
+* **A service of the application that sandboxes call** — the way scripts
+  read their tables, say — must listen on a second address of the container.
+  `pasta` gives each sandbox a copy of the address the container's default
+  route uses, so a connection to that one reaches the sandbox itself. In
+  compose, a second network gives the container a second interface; the
+  application listens there, and `--allow-private-net` with an `allow` rule
+  for that address lets the sandboxes reach it. This was found by the first
+  such container, where every such call was refused until it had two
+  addresses.
+* `zygo api` on `127.0.0.1` is out of a sandbox's reach, which is as it
+  should be: a function cannot deploy its neighbours.
+
+The embedder measured in [chapter 25](25-performance.md#the-warm-path-inside-an-embedder-under-load)
+runs this way, one image with both inside; what it checked, and how, is
+written in its own repository's README.
+
 ## In Kubernetes, without `privileged`
 
 A pod cannot be given a cgroup subtree the way `docker run` can: there is no
