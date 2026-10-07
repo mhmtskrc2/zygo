@@ -58,6 +58,10 @@ break things and will say so here.
 
 ### Fixed
 
+- The n8n harness (`examples/n8n-runner/bench/stack.sh`) waits for n8n's
+  `/healthz/readiness` before importing workflows. `/healthz` answers before
+  the database is migrated, and an import beside the migration met
+  `SQLITE_BUSY` on a loaded host and took n8n down.
 - A supervisor started in the background died at its first warning. Its
   stderr was a pipe the starting command read one line of and then dropped,
   and with `SIGPIPE` at its default — so that `zygo ps | head` ends quietly —

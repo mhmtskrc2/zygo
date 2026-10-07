@@ -59,14 +59,17 @@ $DOCKER compose --profile stock down -v >/dev/null 2>&1 || true
 rm -rf work/workflows
 python3 workflows.py work/workflows "$HOST_IP" "$GATEWAY" >/dev/null
 $DOCKER compose up -d n8n >/dev/null 2>&1
-until curl -sf localhost:5678/healthz >/dev/null; do sleep 1; done
+# /healthz answers before n8n has migrated its database; an import run beside
+# the migration meets SQLITE_BUSY and takes n8n down. /healthz/readiness
+# waits for the end of start-up.
+until curl -sf localhost:5678/healthz/readiness >/dev/null; do sleep 1; done
 $DOCKER cp work/workflows n8n:/tmp/wf
 $DOCKER exec n8n n8n import:workflow --separate --input=/tmp/wf >/dev/null 2>&1
 for id in $($DOCKER exec -e N8N_LOG_LEVEL=info n8n n8n list:workflow 2>/dev/null | cut -d'|' -f1); do
     $DOCKER exec n8n n8n publish:workflow --id="$id" >/dev/null 2>&1
 done
 $DOCKER restart n8n >/dev/null
-until curl -sf localhost:5678/healthz >/dev/null; do sleep 1; done
+until curl -sf localhost:5678/healthz/readiness >/dev/null; do sleep 1; done
 
 case $STACK in
 stock)
