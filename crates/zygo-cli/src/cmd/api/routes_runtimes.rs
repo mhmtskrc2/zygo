@@ -103,7 +103,7 @@ pub(super) async fn runtimes(
 ) -> Result<Response<ApiBody>, HttpError> {
     let reply = control(api, |c| Ok(c.send(&Control::Runtimes)?)).await?;
     match (reply, tenant) {
-        (Reply::Runtimes { runtimes }, Some(id)) => {
+        (Reply::Runtimes { runtimes, .. }, Some(id)) => {
             let runtimes: Vec<_> = runtimes.into_iter().filter(|r| r.tenant == id).collect();
             Ok(json(
                 StatusCode::OK,

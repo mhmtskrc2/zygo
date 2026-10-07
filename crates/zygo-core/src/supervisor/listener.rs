@@ -108,6 +108,10 @@ impl Listener {
                 .spawn(move || {
                     while !supervisor.is_stopping() {
                         std::thread::sleep(TIER_INTERVAL);
+                        // Before anything that might need the launcher: a
+                        // stuck one is named in the log once, from here,
+                        // whether or not anybody asks it for anything.
+                        supervisor.check_launcher();
                         let tiered = supervisor.tier_idle();
                         for name in &tiered.paused {
                             tracing::info!(function = %name, "idle: paused");

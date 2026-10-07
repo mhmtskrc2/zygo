@@ -38,6 +38,43 @@ pub struct Oneshot {
     pub newroot: PathBuf,
 }
 
+/// A one-shot with everything made that can be made before the sandbox
+/// exists, and the client's streams held until it does. See
+/// [`Pool::prepare_oneshot`]. Dropped unstarted, it removes the empty root
+/// it made.
+pub struct PreparedOneshot {
+    #[cfg(target_os = "linux")]
+    inner: Option<PreparedOneshotInner>,
+}
+
+#[cfg(target_os = "linux")]
+struct PreparedOneshotInner {
+    isolation: crate::spec::Isolation,
+    config: crate::sandbox::SandboxConfig,
+    client: ClientStreams,
+    newroot: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PreparedOneshot {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            let _ = std::fs::remove_dir(&inner.newroot);
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn not_on_this_platform() -> Error {
+    Error::BackendUnavailable {
+        backend: "pool",
+        reason: "a one-shot sandbox enters Linux namespaces".into(),
+        remedy: "run Zygo inside a Linux VM or container; on macOS the `zygo` \
+                 binary normally forwards into one it manages"
+            .into(),
+    }
+}
+
 impl Pool {
     /// Start a one-shot sandbox with somebody else's standard streams.
     ///
@@ -59,6 +96,20 @@ impl Pool {
     /// launcher's child relies on when it `dup2`s them into place.
     #[cfg(target_os = "linux")]
     pub fn start_oneshot(&self, f: &ResolvedFn, client: ClientStreams) -> Result<Oneshot> {
+        let prepared = self.prepare_oneshot(f, client)?;
+        self.start_oneshot_prepared(prepared)
+    }
+
+    /// Everything a one-shot needs before it is started: what
+    /// [`Pool::prepare`] is to a warm-up. The layers, the venv, the
+    /// allowlist, the root and the configuration are made here, on the
+    /// caller's thread; the launcher gets the start alone.
+    #[cfg(target_os = "linux")]
+    pub fn prepare_oneshot(
+        &self,
+        f: &ResolvedFn,
+        client: ClientStreams,
+    ) -> Result<PreparedOneshot> {
         use std::os::fd::AsRawFd;
 
         use crate::image::{Reference, Store};
@@ -178,7 +229,30 @@ impl Pool {
         // The client's dispositions, not this process's: see the field.
         config.ignored_signals = Some(client.ignored_signals);
 
-        let backend = crate::backend::for_isolation(f.isolation, &self.config.paths)?;
+        Ok(PreparedOneshot {
+            inner: Some(PreparedOneshotInner {
+                isolation: f.isolation,
+                config,
+                client,
+                newroot,
+            }),
+        })
+    }
+
+    /// Start a prepared one-shot. On the launcher thread, and nothing else
+    /// of the run is: the caller waits for the sandbox on its own thread.
+    #[cfg(target_os = "linux")]
+    pub fn start_oneshot_prepared(&self, mut prepared: PreparedOneshot) -> Result<Oneshot> {
+        let PreparedOneshotInner {
+            isolation,
+            config,
+            client,
+            newroot,
+        } = prepared
+            .inner
+            .take()
+            .expect("a prepared one-shot is started once");
+        let backend = crate::backend::for_isolation(isolation, &self.config.paths)?;
         let sandbox = backend.start(&config);
         // Held open across the start and no longer: the child has its own
         // copies now, and these must not outlive the request in a process
@@ -199,12 +273,20 @@ impl Pool {
     /// and still says why.
     #[cfg(not(target_os = "linux"))]
     pub fn start_oneshot(&self, _f: &ResolvedFn, _client: ClientStreams) -> Result<Oneshot> {
-        Err(Error::BackendUnavailable {
-            backend: "pool",
-            reason: "a one-shot sandbox enters Linux namespaces".into(),
-            remedy: "run Zygo inside a Linux VM or container; on macOS the `zygo` \
-                 binary normally forwards into one it manages"
-                .into(),
-        })
+        Err(not_on_this_platform())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn prepare_oneshot(
+        &self,
+        _f: &ResolvedFn,
+        _client: ClientStreams,
+    ) -> Result<PreparedOneshot> {
+        Err(not_on_this_platform())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn start_oneshot_prepared(&self, _prepared: PreparedOneshot) -> Result<Oneshot> {
+        Err(not_on_this_platform())
     }
 }

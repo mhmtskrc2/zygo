@@ -25,9 +25,11 @@ use super::{Api, control};
 ///
 /// * **`200 ok`** — every pool is at its floor.
 /// * **`200 degraded`** — a pool is below `min_warm`, so requests will work
-///   but the first of them pay a cold start. Still `200`: a host that can
-///   serve should be served to, and a probe that took it out of rotation for
-///   being slow would take every host out at once after a restart.
+///   but the first of them pay a cold start; or the supervisor's launcher is
+///   stuck on one start, so what is warm serves and nothing new warms. Still
+///   `200`: a host that can serve should be served to, and a probe that took
+///   it out of rotation for being slow would take every host out at once
+///   after a restart. The body says which, and for the launcher, on what.
 /// * **`503 stopping`** — the supervisor is draining. A balancer that keeps
 ///   sending here is the reason draining does not work, so this is the one
 ///   answer that is not `200`.
@@ -53,32 +55,30 @@ pub(super) async fn healthz(api: &Arc<Api>) -> Result<Response<ApiBody>, HttpErr
 
     let reply = control(api, |c| Ok(c.send(&Control::Runtimes)?)).await;
     let (status, body) = match reply {
-        Ok(Reply::Runtimes { runtimes }) => {
+        Ok(Reply::Runtimes { runtimes, launcher }) => {
             let below: Vec<&str> = runtimes
                 .iter()
                 .filter(|r| r.warm + r.paused < r.min_warm)
                 .map(|r| r.name.as_str())
                 .collect();
-            if below.is_empty() {
-                (
-                    StatusCode::OK,
-                    serde_json::json!({
-                        "ok": true,
-                        "status": "ok",
-                        "uptime_s": api.started.elapsed().as_secs(),
-                    }),
-                )
-            } else {
-                (
-                    StatusCode::OK,
-                    serde_json::json!({
-                        "ok": true,
-                        "status": "degraded",
-                        "below_min_warm": below,
-                        "uptime_s": api.started.elapsed().as_secs(),
-                    }),
-                )
+            let mut body = serde_json::json!({
+                "ok": true,
+                "status": if below.is_empty() && !launcher.stuck { "ok" } else { "degraded" },
+                "uptime_s": api.started.elapsed().as_secs(),
+            });
+            if !below.is_empty() {
+                body["below_min_warm"] = serde_json::json!(below);
             }
+            if launcher.stuck {
+                // Named, because the remedy is a person's: the start will
+                // not finish and the supervisor has to be restarted.
+                body["launcher_stuck"] = serde_json::json!({
+                    "running": launcher.running,
+                    "running_s": launcher.running_s,
+                    "queued": launcher.queued,
+                });
+            }
+            (StatusCode::OK, body)
         }
         // The supervisor is gone or going. Either way this host cannot take
         // work, which is the one thing this route exists to say.

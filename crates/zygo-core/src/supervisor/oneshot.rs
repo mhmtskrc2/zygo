@@ -57,11 +57,23 @@ impl Supervisor {
             .resolve(None, layer, options)
             .map_err(|e| Response::error(ControlError::BadSpec, e))?;
 
-        // On the launcher thread, never here: see [`Launcher`].
+        // Made here, on this connection's thread: the layers, the venv, the
+        // allowlist, the root. Only the start goes to the launcher, and it
+        // waits its turn for a bounded time — under the thirty seconds the
+        // client gives `STARTED` — so a busy launcher is an answer the client
+        // prints rather than a timeout it guesses at. See [`Launcher`].
+        let prepared = self
+            .pool
+            .prepare_oneshot(&resolved, client)
+            .map_err(|e| Response::error(ControlError::WarmFailed, e))?;
         let pool = Arc::clone(&self.pool);
         let oneshot = self
             .launcher
-            .run(move || pool.start_oneshot(&resolved, client))
+            .run_within(
+                format!("run `{}`", resolved.image),
+                super::RUN_QUEUE_WAIT,
+                move || pool.start_oneshot_prepared(prepared),
+            )
             .map_err(|e| Response::error(ControlError::WarmFailed, e))?
             .map_err(|e| Response::error(ControlError::WarmFailed, e))?;
         let crate::pool::Oneshot {

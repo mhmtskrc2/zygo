@@ -112,6 +112,30 @@ pub fn cache_key(image_manifest: &str, requirements: &[u8]) -> String {
 /// same requirements and start together build once. The lock is taken only
 /// when the marker is missing; the common case is a single `stat`.
 pub fn ensure(store: &Store, image: &ImageEntry, requirements: &Path) -> Result<Venv> {
+    ensure_with(store, image, requirements, None)
+}
+
+/// [`ensure`], holding `builds` for the length of a build and not otherwise.
+///
+/// The supervisor passes its one build lock: two `pip install`s at two CPUs
+/// each, on a host that is also serving requests, is a host that stops
+/// serving them. The fast path — the venv is there — never touches the lock,
+/// so a warm-up that needs no build is not queued behind one that does.
+pub fn ensure_gated(
+    store: &Store,
+    image: &ImageEntry,
+    requirements: &Path,
+    builds: &std::sync::Mutex<()>,
+) -> Result<Venv> {
+    ensure_with(store, image, requirements, Some(builds))
+}
+
+fn ensure_with(
+    store: &Store,
+    image: &ImageEntry,
+    requirements: &Path,
+    builds: Option<&std::sync::Mutex<()>>,
+) -> Result<Venv> {
     let bytes = std::fs::read(requirements).at(requirements)?;
     let key = cache_key(&image.manifest, &bytes);
     let dir = store.paths().venv_cache().join(&key);
@@ -122,6 +146,10 @@ pub fn ensure(store: &Store, image: &ImageEntry, requirements: &Path) -> Result<
         return Ok(Venv { dir, built: false });
     }
 
+    // The host's one-build-at-a-time lock first, then the key's: the order
+    // every builder uses, so two of them cannot each hold one and wait for
+    // the other.
+    let _one_at_a_time = builds.map(|b| b.lock().unwrap_or_else(|e| e.into_inner()));
     let _lock = store.lock(&format!("venv-{key}"))?;
     if dir.join(DONE_MARKER).is_file() {
         return Ok(Venv { dir, built: false });

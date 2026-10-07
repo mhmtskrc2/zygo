@@ -93,4 +93,4 @@ address; it is not lifted. What the decision describes is what the code does.
 
 ---
 
-← [ADR 0008 — A function may listen; a pool may not](0008-listening-inside-a-sandbox.md) · [Contents](../README.md) · **Next: [Glossary](../glossary.md) →**
+← [ADR 0008 — A function may listen; a pool may not](0008-listening-inside-a-sandbox.md) · [Contents](../README.md) · **Next: [ADR 0010 — The launcher is given only the start](0010-launcher-gets-the-start-alone.md) →**

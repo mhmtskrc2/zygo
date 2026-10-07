@@ -51,7 +51,7 @@ pub fn run(cli: &Cli, interval: f64, once: bool) -> anyhow::Result<u8> {
         // handler, so its row is warm/paused/cold counts rather than the
         // function columns with three of them left blank.
         let pools = match client.send(&Request::Runtimes)? {
-            Response::Runtimes { runtimes } => runtimes,
+            Response::Runtimes { runtimes, .. } => runtimes,
             other => return super::supervisor::report_failure(cli, &other),
         };
         let now = Instant::now();

@@ -60,4 +60,5 @@ is the project README.
   - [ADR 0007 — A third SDK, in Elixir](book/adr/0007-elixir-sdk.md)
   - [ADR 0008 — A function may listen; a pool may not](book/adr/0008-listening-inside-a-sandbox.md)
   - [ADR 0009 — The API may allow private addresses](book/adr/0009-api-private-net.md)
+  - [ADR 0010 — The launcher is given only the start](book/adr/0010-launcher-gets-the-start-alone.md)
 - [Glossary](book/glossary.md)

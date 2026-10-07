@@ -62,7 +62,10 @@ use crate::paths::Paths;
 use crate::pool::{Pool, PoolConfig};
 
 pub use gate::{Gate, Rejected};
-pub use lifecycle::{REWARM_BACKOFF_BASE, REWARM_BACKOFF_MAX, TIER_INTERVAL, Tiered};
+pub use lifecycle::{
+    LAUNCH_QUEUE_LIMIT, LAUNCH_STUCK_AFTER, LauncherLoad, REWARM_BACKOFF_BASE, REWARM_BACKOFF_MAX,
+    RUN_QUEUE_WAIT, TIER_INTERVAL, Tiered, WARM_QUEUE_WAIT,
+};
 #[cfg(unix)]
 pub use lifecycle::{TermGuard, on_terminate};
 pub use listener::Listener;

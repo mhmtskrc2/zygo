@@ -64,7 +64,10 @@ use crate::spec::{Layer, Spec};
 /// - v14: a `runtimes` on `STOP` — `zygo stop` reaches the pools as well as
 ///   the functions, so a name that is a pool no longer answers "no function
 ///   named …". `DELETE /fn/<name>` leaves it off and keeps its meaning.
-pub const CONTROL_VERSION: u32 = 14;
+/// - v15: a `launcher` on `RUNTIMES` — what the one thread that starts
+///   sandboxes is doing, so `GET /healthz` can say `degraded` for a start
+///   stuck inside the kernel instead of `ok` for an hour.
+pub const CONTROL_VERSION: u32 = 15;
 
 /// The files one request brings with it and takes away (v9).
 ///
@@ -662,6 +665,10 @@ pub enum Response {
     /// Answer to `Runtimes`.
     Runtimes {
         runtimes: Vec<super::runtime::RuntimeStatus>,
+        /// What the launcher is doing (v15). Defaulted for an answer from a
+        /// supervisor that predates it.
+        #[serde(default)]
+        launcher: super::LauncherLoad,
     },
 
     /// Answer to `CreateTenant`, `Tenants` and `DeleteTenant`.
@@ -1111,6 +1118,12 @@ mod tests {
                 change: Change::Started,
             },
             Response::Runtimes {
+                launcher: crate::supervisor::LauncherLoad {
+                    queued: 2,
+                    running: Some("warm `resize`".into()),
+                    running_s: 3,
+                    stuck: false,
+                },
                 runtimes: vec![crate::supervisor::runtime::RuntimeStatus {
                     name: "py312".into(),
                     tenant: "acme".into(),

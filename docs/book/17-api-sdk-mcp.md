@@ -157,7 +157,7 @@ rights. Bodies are JSON unless marked raw; the limit is 16 MiB.
 
 | Route | Who | What it does |
 |---|---|---|
-| `GET /healthz` | nobody needs a token | `ok`, `degraded` (a pool below `min_warm`) or `stopping` (503). |
+| `GET /healthz` | nobody needs a token | `ok`, `degraded` (a pool below `min_warm`, or the launcher stuck on a start) or `stopping` (503). |
 | `GET /version` | any | Zygo version, API version, and whether you have deploy rights. |
 | `GET /metrics` | any | Prometheus text (below); scoped to the token. |
 | `POST /drain?grace_ms=` | deploy | Stop taking requests, finish the running ones, exit. |
@@ -218,7 +218,7 @@ function call takes only a blob digest, never an inline tar (see
 | 429 | Busy: every slot and the queue are full. Retry after the header. |
 | 499 | The request was cancelled. |
 | 500 | The handler raised: the body has `error`, `stdout`, `stderr`, `exit_code`. |
-| 503 | Warming failed, dependencies still building, or the API is stopping. |
+| 503 | Warming failed, dependencies still building, the supervisor's start queue is full or slow (the body says so; send the same request again shortly), or the API is stopping. |
 | 504 | The request stopped answering heartbeats: stuck. |
 
 Errors always have the shape `{"error": "…", "code": "…"}`.
@@ -684,7 +684,7 @@ of three things:
 | Status | Code | Means |
 |---|---|---|
 | `ok` | 200 | every pool is at its floor |
-| `degraded` | 200 | a pool is below `min_warm`; requests work, the first pay a cold start |
+| `degraded` | 200 | a pool is below `min_warm`, so requests work but the first pay a cold start; or the supervisor's launcher is stuck on one start, so what is warm serves and nothing new warms. The body says which: `below_min_warm`, or `launcher_stuck` with the start's name and age |
 | `stopping` | **503** | the supervisor is draining |
 
 `degraded` is a `200` on purpose. A host that can serve should be served to.
@@ -692,6 +692,12 @@ A probe that took hosts out of rotation for being slow would take every host
 out at once after a restart. `stopping` is the one answer that is not a 200,
 because a balancer that keeps sending to a draining host is the reason
 draining fails.
+
+A stuck launcher is a person's problem, not the balancer's: the start it is
+on will not finish, and `zygo supervisor stop` is the remedy
+([chapter 22](22-troubleshooting.md#waited-60-s-for-the-launcher-and-did-not-get-a-turn-or-the-launchers-queue-is-full)).
+Until then the host keeps serving what it has, which is why this is
+`degraded` and not `503`.
 
 ### Draining
 

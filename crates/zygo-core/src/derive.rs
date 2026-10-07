@@ -156,6 +156,26 @@ pub fn derived_reference(base: &str, key: &str) -> String {
 /// same packages and start together build once. The common case is a scan of
 /// the image index.
 pub fn ensure(store: &Store, base: &ImageEntry, packages: &[String]) -> Result<Derived> {
+    ensure_with(store, base, packages, None)
+}
+
+/// [`ensure`], holding `builds` for the length of a build and not otherwise.
+/// See [`crate::venv::ensure_gated`] for what the lock is.
+pub fn ensure_gated(
+    store: &Store,
+    base: &ImageEntry,
+    packages: &[String],
+    builds: &std::sync::Mutex<()>,
+) -> Result<Derived> {
+    ensure_with(store, base, packages, Some(builds))
+}
+
+fn ensure_with(
+    store: &Store,
+    base: &ImageEntry,
+    packages: &[String],
+    builds: Option<&std::sync::Mutex<()>>,
+) -> Result<Derived> {
     for p in packages {
         validate_package(p).map_err(|m| Error::Spec(SpecError::invalid("system", m)))?;
     }
@@ -178,6 +198,8 @@ pub fn ensure(store: &Store, base: &ImageEntry, packages: &[String]) -> Result<D
         });
     }
 
+    // The host's build lock before the key's, as every builder orders them.
+    let _one_at_a_time = builds.map(|b| b.lock().unwrap_or_else(|e| e.into_inner()));
     let _lock = store.lock(&format!("system-{key}"))?;
     if let Some(image) = find(store, &reference) {
         return Ok(Derived {

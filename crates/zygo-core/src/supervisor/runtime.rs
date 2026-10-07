@@ -317,9 +317,21 @@ impl Supervisor {
         }
 
         let started = Instant::now();
-        let mut zygotes = Vec::new();
+        // Launched one after another, then awaited together: the launcher
+        // creates each sandbox in milliseconds, and the interpreters start
+        // and import side by side. A pool of eight used to warm in eight
+        // times the time of one.
+        let mut launched = Vec::new();
         for _ in 0..resolved.min_warm {
-            zygotes.push(Arc::new(Zygote::new(self.warm_zygote(&resolved)?)));
+            launched.push(self.launch_zygote(&resolved)?);
+        }
+        let mut zygotes = Vec::new();
+        for (warming, started_zygote) in launched {
+            zygotes.push(Arc::new(Zygote::new(self.await_zygote(
+                &resolved,
+                started_zygote,
+                warming,
+            )?)));
         }
         let status = zygotes
             .first()
@@ -377,15 +389,65 @@ impl Supervisor {
         })
     }
 
-    /// Start one zygote for a pool, on the launcher thread.
+    /// Start one zygote for a pool and wait for it: the two halves below,
+    /// on one thread. What growth under load uses.
     fn warm_zygote(&self, resolved: &ResolvedFn) -> std::result::Result<Function, Response> {
+        let (warming, started) = self.launch_zygote(resolved)?;
+        self.await_zygote(resolved, started, warming)
+    }
+
+    /// Prepare a zygote here and create its sandbox on the launcher thread.
+    ///
+    /// The same two halves as a function's warm-up; see
+    /// `Supervisor::warm_and_register`. Returns the clock the warm-up started
+    /// on, for the line [`Self::await_zygote`] writes.
+    fn launch_zygote(
+        &self,
+        resolved: &ResolvedFn,
+    ) -> std::result::Result<(Instant, crate::pool::Started), Response> {
+        let name = resolved.name.as_str();
+        tracing::info!(runtime = name, image = %resolved.image, "warming a zygote");
+        let warming = Instant::now();
+        let failed = |e: crate::error::Error| {
+            tracing::warn!(runtime = name, error = %e, "a zygote's warm-up failed");
+            Response::error(ControlError::WarmFailed, e)
+        };
+        let prepared = self
+            .pool
+            .prepare(resolved, Some(&self.deps_build))
+            .map_err(failed)?;
         let pool = Arc::clone(&self.pool);
-        let spec = resolved.clone();
-        let logs = self.logs_for(&resolved.name);
-        self.launcher
-            .run(move || pool.serve_with_logs(&spec, logs))
-            .map_err(|e| Response::error(ControlError::WarmFailed, e))?
-            .map_err(|e| Response::error(ControlError::WarmFailed, e))
+        let logs = self.logs_for(name);
+        let started = self
+            .launcher
+            .run_within(
+                format!("warm a zygote for `{name}`"),
+                super::WARM_QUEUE_WAIT,
+                move || pool.launch(prepared, logs),
+            )
+            .map_err(failed)?
+            .map_err(failed)?;
+        Ok((warming, started))
+    }
+
+    /// Wait for a launched zygote's agent, on this thread.
+    fn await_zygote(
+        &self,
+        resolved: &ResolvedFn,
+        started: crate::pool::Started,
+        warming: Instant,
+    ) -> std::result::Result<Function, Response> {
+        let name = resolved.name.as_str();
+        let function = self.pool.await_ready(started).map_err(|e| {
+            tracing::warn!(runtime = name, error = %e, "a zygote's warm-up failed");
+            Response::error(ControlError::WarmFailed, e)
+        })?;
+        tracing::info!(
+            runtime = name,
+            warm_ms = warming.elapsed().as_millis() as u64,
+            "zygote warm"
+        );
+        Ok(function)
     }
 
     fn runtime_named(&self, name: &str) -> std::result::Result<Arc<RuntimePool>, Response> {

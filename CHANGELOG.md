@@ -7,7 +7,40 @@ break things and will say so here.
 
 ## [Unreleased]
 
+### Added
+
+- `supervisor.log` in the data folder: the stderr of a supervisor started in
+  the background by `serve`, `up` or `api`. Every warm-up, refusal and idle
+  tier is a line there, with a time, at `info`; past 8 MiB it is moved to
+  `supervisor.log.1` at the next start. A supervisor that dies on startup is
+  quoted from it. Chapters 21 and 22 say where it is and what is in it.
+
 ### Changed
+
+- The supervisor's one launcher thread is given only the start of a sandbox
+  — the `clone3`, the mounts and the handshake to `execve`, with its 60 s
+  deadline — so a turn on it is milliseconds. The venv, the `system` and
+  bytecode layers, the allowlist's names and the root are made first, on
+  the thread of the command that asked, under one build lock; and the wait
+  for the agent's `READY`, where a warm-up's time goes, is that thread's
+  too. A `pip install` no longer holds every `zygo run` on the host behind
+  it, and a pool's `min_warm` zygotes are launched one after another and
+  import side by side, so a pool of eight warms in about the time of one.
+  The line in front of the launcher is bounded: 60 s for a warm-up, 20 s
+  for a `zygo run`, 32 waiting at most. Past that the caller is told the
+  launcher is busy, what it is doing and for how long (a `503` over the
+  API, exit 125 at the CLI), and the start never happens. A start the
+  launcher has held for three minutes is called stuck: once in the
+  supervisor's log, and by `GET /healthz`, which answers `degraded` with
+  `launcher_stuck` naming it where it used to say `ok`. One such start used
+  to hold every later one for ever while the supervisor answered `ping`.
+  ADR 0010 and chapter 6 explain; chapters 17 and 22 say what the probe and
+  the message mean and what to do.
+- Control protocol v15: a `launcher` on `RUNTIMES`. A CLI of this release
+  asks a running supervisor of the previous one to stop; `zygo supervisor
+  stop` does it.
+- The supervisor logs at `info` by default. `ZYGO_LOG` in the environment of
+  the command that starts it still decides.
 
 - Chapter 10's Windmill comparison is the 6 October 2026 round: Zygo 0.1.6
   as released in Windmill's workers in nsjail's place, without and with a
@@ -22,6 +55,15 @@ break things and will say so here.
   worker ran slower — was examined afterwards from Windmill's own job records
   and the VM's logs; nothing in Zygo changed when it stopped, and the record
   says what was checked. The harness gained a per-container CPU sampler.
+
+### Fixed
+
+- A supervisor started in the background died at its first warning. Its
+  stderr was a pipe the starting command read one line of and then dropped,
+  and with `SIGPIPE` at its default — so that `zygo ps | head` ends quietly —
+  the next write to it killed the supervisor, with nothing anywhere to say
+  so. Every line it logged before that was lost the same way. Its stderr is
+  now `supervisor.log`.
 
 ### Security
 

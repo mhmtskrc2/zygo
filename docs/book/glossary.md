@@ -36,6 +36,7 @@ One line each. The chapter in brackets explains the term in full; the numbers fo
 | **jail** | FreeBSD's kernel object that confines a group of processes. [9] |
 | **KVM** | The Linux feature that lets it run virtual machines using the CPU's hardware support. [10] |
 | **Landlock** | A Linux feature that lets a process limit its own file and network access. [4] |
+| **launcher** | The supervisor's one thread that creates every sandbox, so the kernel's "kill the child when its parent dies" keeps working; it is given only the start, and the line in front of it is bounded. [6] |
 | **layer** | One tar file of changes in an image, named by the hash of its content. [5] |
 | **layer (of a spec)** | One `sandbox.toml` table — `[defaults]`, `[fn.NAME]` or `[runtime.NAME]` — with every field optional, merged over the one below; what the API's `PUT /fn/{name}` and `POST /run` bodies carry. [17, 20] |
 | **Lima** | The tool Zygo uses to run a Linux virtual machine on a Mac. [11] |
@@ -87,4 +88,4 @@ One line each. The chapter in brackets explains the term in full; the numbers fo
 
 ---
 
-← [ADR 0009 — The API may allow private addresses](adr/0009-api-private-net.md) · [Contents](README.md)
+← [ADR 0010 — The launcher is given only the start](adr/0010-launcher-gets-the-start-alone.md) · [Contents](README.md)

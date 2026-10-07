@@ -502,7 +502,22 @@ fn unexpected(response: &Response) -> Error {
 /// Neither development environment could show it. Both set `ZYGO_DATA_HOME`
 /// *and* have no `XDG_RUNTIME_DIR`, so both halves came from the same place
 /// and the two layouts happened to coincide.
+///
+/// Its stderr is `supervisor.log` in the data folder, opened here and
+/// handed over as a descriptor. It used to be a pipe this function read one
+/// line of and then dropped — after which the supervisor's stderr had no
+/// reader, and because `zygo` restores `SIGPIPE` so that `zygo ps | head`
+/// ends quietly, the first warning the supervisor printed killed it. A
+/// supervisor that had run for an hour died at its first `could not grow
+/// the pool`, with nothing anywhere to say so. A file has no reader to lose,
+/// and is where the log should have been all along.
 fn start_supervisor(paths: &Paths, exe: &Path) -> Result<()> {
+    let log_path = paths.supervisor_log();
+    let log = open_supervisor_log(&log_path)?;
+    // Where this lifetime's lines begin, so an early death can be quoted
+    // from a file that already holds every lifetime before it.
+    let mark = log.metadata().map(|m| m.len()).unwrap_or(0);
+
     let mut command = Command::new(exe);
     for (key, value) in paths.as_vars() {
         command.env(key, value);
@@ -512,9 +527,7 @@ fn start_supervisor(paths: &Paths, exe: &Path) -> Result<()> {
         .arg("run")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        // Kept, so a supervisor that dies on startup can say why instead of
-        // leaving the client with a bare timeout.
-        .stderr(Stdio::piped())
+        .stderr(Stdio::from(log))
         .spawn()
         .map_err(|e| Error::primitive("spawn", "supervisor", e))?;
 
@@ -532,11 +545,13 @@ fn start_supervisor(paths: &Paths, exe: &Path) -> Result<()> {
                 backend: "supervisor",
                 reason: format!(
                     "the supervisor exited immediately ({status}): {}",
-                    first_line_of_stderr(&mut child)
+                    first_line_after(&log_path, mark)
                 ),
-                remedy: "run `zygo doctor`, or start it in the foreground with \
-                         `zygo supervisor run` to see the whole error"
-                    .into(),
+                remedy: format!(
+                    "run `zygo doctor`, read {}, or start it in the foreground with \
+                     `zygo supervisor run` to see the whole error",
+                    log_path.display()
+                ),
             });
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -558,12 +573,49 @@ fn start_supervisor(paths: &Paths, exe: &Path) -> Result<()> {
     })
 }
 
-/// The child's first line of stderr, which is where its error message is.
-fn first_line_of_stderr(child: &mut std::process::Child) -> String {
-    let Some(stderr) = child.stderr.take() else {
+/// Past this size the log is moved aside at the next start, and the one
+/// before it is dropped. Two lifetimes' worth at most: the one running and
+/// the one before it, which is the one an investigation needs.
+const SUPERVISOR_LOG_ROTATE_BYTES: u64 = 8 << 20;
+
+/// Open the supervisor's log for appending, moving a large one aside first.
+fn open_supervisor_log(path: &Path) -> Result<std::fs::File> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| {
+            Error::primitive("mkdir", format!("the data folder {}", dir.display()), e)
+        })?;
+    }
+    if std::fs::metadata(path).is_ok_and(|m| m.len() > SUPERVISOR_LOG_ROTATE_BYTES) {
+        let _ = std::fs::rename(path, path.with_extension("log.1"));
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| {
+            Error::primitive(
+                "open",
+                format!(
+                    "the supervisor's log {} could not be opened",
+                    path.display()
+                ),
+                e,
+            )
+        })
+}
+
+/// The first non-empty line written to the log after `mark`, which is where
+/// a supervisor that died on startup said why.
+fn first_line_after(path: &Path, mark: u64) -> String {
+    use std::io::Seek;
+
+    let Ok(mut file) = std::fs::File::open(path) else {
         return "no output".into();
     };
-    BufReader::new(stderr)
+    if file.seek(std::io::SeekFrom::Start(mark)).is_err() {
+        return "no output".into();
+    }
+    BufReader::new(file)
         .lines()
         .map_while(std::result::Result::ok)
         .find(|l| !l.trim().is_empty())

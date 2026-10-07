@@ -423,7 +423,10 @@ layer. On a fast disk that is a few seconds; on a slow one it is not.
 A Raspberry Pi 5 on an SD card took over a minute to compile
 `python:3.12-slim`, and the run was refused with this message while the
 build went on. A second run in that minute waits on the same build and is
-refused the same way.
+refused the same way. A run of another image is not held up by it: a build
+runs on the thread of the command that needs it, and only the start itself
+takes a turn on the supervisor's one launcher thread
+([chapter 6](06-how-zygo-works.md#starting-a-sandbox-the-launcher)).
 
 The build finishes on its own, so the next run may simply work. To take it
 off the request path, `zygo pull IMAGE` builds the same layers ahead of time,
@@ -433,9 +436,9 @@ which layers. A host with no supervisor running is not affected: there
 `zygo run` builds everything itself and waits as long as it takes.
 
 If the message repeats for an image whose layers are all built, the
-supervisor is running but not replying. `zygo logs` says what it is doing;
-`zygo supervisor stop` ends it, and the next `serve` or `up` starts a fresh
-one.
+supervisor is running but not replying. `supervisor.log` in the data folder
+says what it is doing ([below](#the-supervisors-log)); `zygo supervisor
+stop` ends it, and the next `serve` or `up` starts a fresh one.
 
 ### "`<name>` is at its concurrency limit — retry" (HTTP 429, exit 75)
 
@@ -448,6 +451,29 @@ shell understands.
 The SDKs raise this as its own type, `Busy` (in Elixir, a `Zygo.Error` with
 `kind: :busy`), so a caller can tell it apart from a handler that failed. A
 handler that raised will raise again; a `Busy` will not.
+
+### "waited 60 s for the launcher and did not get a turn", or "the launcher's queue is full"
+
+Every sandbox the supervisor starts takes a turn on one thread, the
+launcher ([chapter 6](06-how-zygo-works.md#starting-a-sandbox-the-launcher)).
+A start still waiting for its turn after 60 seconds (20 for `zygo run`), or
+one that arrives when 32 are already waiting, is refused with this message.
+**The start did not happen**, and nothing was left behind. Over the API it
+is a 503 with `code: warm_failed`; `zygo run` and `zygo serve` exit 125.
+
+The message says what the launcher was doing and for how long. A turn is
+normally milliseconds and never more than about 70 seconds: a sandbox has
+60 seconds to reach its program, and one that did not has 10 more to be
+killed and reaped. The wait for an agent's `READY` is not on the launcher.
+So a start the launcher "has been running for 400 s" is stuck inside the
+kernel — a bind mount on a network filesystem that stopped answering is the
+case that was seen — and the launcher is not coming back on its own. At
+three minutes the supervisor's log says so once (`launcher stuck`, with
+the start's name), and `GET /healthz` answers `degraded` with
+`launcher_stuck` naming it. `zygo supervisor stop` ends the supervisor, and
+the next `serve` or `up` starts a fresh one. If the running start is young
+and the line is simply long — a host warming many pools at once — wait a
+moment and send the same request again.
 
 ### Exit 4: no such function
 
@@ -491,6 +517,20 @@ These problems are about it staying up.
    ▲                                                    │
    └────────── next request pays a warm-up ─────────────┘
 ```
+
+### The supervisor's log
+
+A supervisor started in the background — by `zygo serve`, `zygo up` or
+`zygo api` — writes its log to `supervisor.log` in the data folder, which is
+`~/.local/share/zygo/supervisor.log` unless `ZYGO_DATA_HOME` says otherwise
+([chapter 21](21-environment-files-exit-codes.md#files-zygo-writes)). Every
+warm-up, every refusal and every idle tier is a line there, with a time, at
+`info`. Each lifetime begins with `supervisor listening`; past 8 MiB the
+file is moved to `supervisor.log.1` at the next start, and the one before
+that is dropped. `tail -f` it while a `serve` is slow. For more detail, set
+`ZYGO_LOG=debug` in the environment of the command that starts the
+supervisor; it is passed on. A supervisor run in the foreground with
+`zygo supervisor run` logs to the terminal instead.
 
 ### It keeps restarting
 

@@ -174,7 +174,7 @@ pub(super) fn reply_to_json(reply: Reply) -> (StatusCode, serde_json::Value) {
                 "warnings": warnings, "change": change,
             }),
         ),
-        Reply::Runtimes { runtimes } => {
+        Reply::Runtimes { runtimes, .. } => {
             (StatusCode::OK, serde_json::json!({ "runtimes": runtimes }))
         }
         Reply::Logs {

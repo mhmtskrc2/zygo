@@ -232,6 +232,15 @@ impl Paths {
     pub fn supervisor_pid(&self) -> PathBuf {
         self.runtime.join("supervisor.pid")
     }
+    /// The supervisor's stderr, when it was started in the background.
+    ///
+    /// In the data folder rather than the runtime folder: the runtime folder
+    /// is a tmpfs on most hosts, and this file exists to be read after the
+    /// fact — after a restart, after a reboot. Appended to across lifetimes,
+    /// each of which begins with its own `supervisor listening` line.
+    pub fn supervisor_log(&self) -> PathBuf {
+        self.data.join("supervisor.log")
+    }
     pub fn agent_sock(&self, name: &str) -> PathBuf {
         self.runtime.join("tenants").join(name).join("agent.sock")
     }

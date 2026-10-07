@@ -85,7 +85,7 @@ pub use agent::{
 };
 pub use function::Function;
 pub use logs::{LOG_ENTRIES, LOG_TEXT_BYTES, LogEntry, LogKind, LogRing, Logs};
-pub use oneshot::{ClientStreams, Oneshot};
+pub use oneshot::{ClientStreams, Oneshot, PreparedOneshot};
 pub use outcome::{Outcome, Usage};
 pub use request::{Call, ChunkSink, InFlight, KILL_GRACE, Workspace};
 pub use scripts::{SCRIPT_DIR_IN_SANDBOX, SCRIPT_DIR_MODE};
@@ -181,6 +181,96 @@ enum Mode {
     Exec,
 }
 
+/// A warm-up with everything made that can be made before the sandbox
+/// exists: the layers it runs on, its mounts, its allowlist, its root and its
+/// configuration. Made by [`Pool::prepare`] on the caller's thread and
+/// started by [`Pool::start_prepared`] on the launcher's.
+///
+/// Dropped unstarted — the launcher refused it, or the caller went away —
+/// it removes the two empty directories it made, so nothing is left in
+/// `tmp/` for a sandbox that never ran.
+pub struct Prepared(Option<PreparedInner>);
+
+struct PreparedInner {
+    f: ResolvedFn,
+    mode: Mode,
+    config: crate::sandbox::SandboxConfig,
+    script_dir: PathBuf,
+    newroot: PathBuf,
+    tenant_cgroup: Option<PathBuf>,
+}
+
+impl Drop for Prepared {
+    fn drop(&mut self) {
+        if let Some(inner) = self.0.take() {
+            // Both empty: the sandbox that would have filled them never ran.
+            let _ = std::fs::remove_dir(&inner.newroot);
+            let _ = std::fs::remove_dir(&inner.script_dir);
+        }
+    }
+}
+
+/// The three layer builders, each taking the host's build lock only for a
+/// build. Small wrappers so `prepare` reads as the list of steps it is.
+fn ensure_system(
+    store: &crate::image::Store,
+    entry: &crate::image::ImageEntry,
+    packages: &[String],
+    builds: Option<&Mutex<()>>,
+) -> Result<crate::image::ImageEntry> {
+    Ok(match builds {
+        Some(lock) => crate::derive::ensure_gated(store, entry, packages, lock)?,
+        None => crate::derive::ensure(store, entry, packages)?,
+    }
+    .image)
+}
+
+fn ensure_venv(
+    store: &crate::image::Store,
+    entry: &crate::image::ImageEntry,
+    requirements: &std::path::Path,
+    builds: Option<&Mutex<()>>,
+) -> Result<crate::venv::Venv> {
+    match builds {
+        Some(lock) => crate::venv::ensure_gated(store, entry, requirements, lock),
+        None => crate::venv::ensure(store, entry, requirements),
+    }
+}
+
+fn ensure_bytecode(
+    store: &crate::image::Store,
+    entry: &crate::image::ImageEntry,
+    builds: Option<&Mutex<()>>,
+) -> Result<crate::image::ImageEntry> {
+    Ok(match builds {
+        Some(lock) => crate::bytecode::ensure_gated(store, entry, lock)?,
+        None => crate::bytecode::ensure(store, entry)?,
+    }
+    .image)
+}
+
+/// A sandbox that exists and whose agent has not announced itself yet.
+///
+/// What [`Pool::launch`] returns and [`Pool::await_ready`] consumes. Dropped
+/// unawaited, the sandbox in it is killed, as any sandbox handle is.
+pub struct Started(Option<StartedInner>);
+
+enum StartedInner {
+    /// An agent is starting in it; wait for `READY`.
+    Agent(Box<StartedAgent>),
+    /// Nothing to wait for: a warm-exec function is up once its init is.
+    Ready(Function),
+}
+
+struct StartedAgent {
+    f: ResolvedFn,
+    sandbox: Box<dyn crate::backend::Sandbox>,
+    socket: std::os::unix::net::UnixStream,
+    generation: Option<PathBuf>,
+    tenant_cgroup: Option<PathBuf>,
+    script_dir: PathBuf,
+}
+
 /// Owns the warm sandboxes.
 pub struct Pool {
     config: PoolConfig,
@@ -233,6 +323,28 @@ impl Pool {
     /// a replacement's import-time lines land in the same log a `zygo logs -f`
     /// is already following.
     pub fn serve_with_logs(&self, f: &ResolvedFn, logs: Logs) -> Result<Function> {
+        let prepared = self.prepare(f, None)?;
+        self.start_prepared(prepared, logs)
+    }
+
+    /// Everything a warm-up needs that can be made before the sandbox exists.
+    ///
+    /// Run on the caller's own thread, before the start is handed to the
+    /// launcher — which is one thread for the whole host, and on which a
+    /// `pip install` or a slow DNS answer used to hold every other start on
+    /// the machine. What is made here: the image's layers, the `system`
+    /// layer, the venv, the bytecode layer, the allowlist, the rootfs view,
+    /// the empty root and the sandbox's configuration. None of it needs the
+    /// thread that creates the sandbox; all of it is where the time goes.
+    ///
+    /// `builds` is the host's one-build-at-a-time lock, held for a `pip
+    /// install`, an `apt-get` or a bytecode build and not otherwise; `None`
+    /// builds unserialised, which is right for a process with one caller.
+    ///
+    /// The image has to be in the store already: pulling is a network
+    /// operation, and an embedder running untrusted tenants should decide
+    /// when that happens rather than have a warm-up reach out.
+    pub fn prepare(&self, f: &ResolvedFn, builds: Option<&Mutex<()>>) -> Result<Prepared> {
         use crate::image::{Reference, Store};
         use crate::sandbox::{SandboxConfig, mount};
 
@@ -274,7 +386,7 @@ impl Pool {
         let entry = if f.system.is_empty() {
             entry
         } else {
-            crate::derive::ensure(&store, &entry, &f.system)?.image
+            ensure_system(&store, &entry, &f.system, builds)?
         };
 
         // Dependencies first, because they are the slow part and the part
@@ -291,7 +403,7 @@ impl Pool {
                             .into(),
                     }));
                 }
-                Some(crate::venv::ensure(&store, &entry, requirements)?)
+                Some(ensure_venv(&store, &entry, requirements, builds)?)
             }
             None => None,
         };
@@ -301,7 +413,7 @@ impl Pool {
         };
         // After the venv, which is keyed on the image it was built for. See
         // `crate::bytecode`: the slim images ship no `.pyc`.
-        let entry = crate::bytecode::ensure(&store, &entry)?.image;
+        let entry = ensure_bytecode(&store, &entry, builds)?;
 
         // Which of the two warm modes this is. A runtime
         // means an agent in the box that forks per request; none means
@@ -446,10 +558,57 @@ impl Pool {
         let tenant_cgroup = crate::cgroup::Hierarchy::discover()
             .ok()
             .map(|h| h.function(&f.tenant, &f.name));
+
+        Ok(Prepared(Some(PreparedInner {
+            f: f.clone(),
+            mode,
+            config,
+            script_dir,
+            newroot,
+            tenant_cgroup,
+        })))
+    }
+
+    /// Start a prepared warm-up and wait for its agent to announce itself:
+    /// [`Pool::launch`] then [`Pool::await_ready`], on one thread.
+    pub fn start_prepared(&self, prepared: Prepared, logs: Logs) -> Result<Function> {
+        self.await_ready(self.launch(prepared, logs)?)
+    }
+
+    /// Create the sandbox of a prepared warm-up.
+    ///
+    /// This is the part that has to run on the launcher thread, and only
+    /// this: the `clone3` and the handshake until the child has `execve`d,
+    /// which the backend bounds with its start deadline. The wait for the
+    /// agent's `READY` — the interpreter starting and the handler's imports,
+    /// which is where a warm-up's time goes — is not here; it is
+    /// [`Pool::await_ready`], on whichever thread asked. The kernel's
+    /// parent-death rule is about the thread that *created* the sandbox,
+    /// and that thread stays; who reads the socket afterwards is nobody's
+    /// business but the reader's.
+    pub fn launch(&self, mut prepared: Prepared, logs: Logs) -> Result<Started> {
+        let PreparedInner {
+            f,
+            mode,
+            mut config,
+            script_dir,
+            newroot: _,
+            tenant_cgroup,
+        } = prepared
+            .0
+            .take()
+            .expect("a prepared warm-up is started once");
         let backend = crate::backend::for_isolation(f.isolation, &self.config.paths)?;
 
         match mode {
-            Mode::Exec => self.serve_exec(f, config, backend.as_ref(), tenant_cgroup, &script_dir),
+            // Up once its init is: nothing to wait for afterwards.
+            Mode::Exec => Ok(Started(Some(StartedInner::Ready(self.serve_exec(
+                &f,
+                config,
+                backend.as_ref(),
+                tenant_cgroup,
+                &script_dir,
+            )?)))),
             Mode::Agent(_) => {
                 // A socket pair rather than a listening socket: no path,
                 // nothing on the filesystem, and the sandbox cannot reach a
@@ -475,82 +634,108 @@ impl Pool {
                 drop(log_write);
                 spawn_zygote_log_reader(&f.name, log_read, std::sync::Arc::clone(&logs));
 
-                let reader = crate::protocol::FrameReader::new(
-                    ours.try_clone()
-                        .map_err(|e| Error::primitive("dup socket", "internal pool error", e))?,
-                );
-                let mut reader = reader;
-                // Bounded, because the launcher runs one warm-up at a time
-                // and a wait with no end here stops every later `serve` for
-                // ever. An agent that has not announced itself by now is a
-                // failed warm-up, not a slow one: its imports happen *after*
-                // the venv and the derived layer are already built.
-                let _ = ours.set_read_timeout(Some(AGENT_READY_TIMEOUT));
-                let ready = read_ready(&mut reader);
-                let _ = ours.set_read_timeout(None);
-                let (runtime, rss_kb, imports_ms) = ready.map_err(|e| {
-                    if is_timeout(&e) {
-                        Error::BackendUnavailable {
-                            backend: "pool",
-                            reason: format!(
-                                "the agent did not send READY within {}s",
-                                AGENT_READY_TIMEOUT.as_secs()
-                            ),
-                            remedy: "check `zygo logs <name>` for what the runtime printed; \
-                                     an agent must announce itself before it does any work"
-                                .into(),
-                        }
-                    } else {
-                        e
-                    }
-                })?;
-
-                // One thread per function, routing replies to their callers.
-                // It ends when the socket does, which is when the sandbox goes
-                // away.
-                let conn = std::sync::Arc::new(Conn {
-                    writer: Mutex::new(crate::protocol::FrameWriter::new(
-                        ours.try_clone().map_err(|e| {
-                            Error::primitive("dup socket", "internal pool error", e)
-                        })?,
-                    )),
-                    waiting: Mutex::new(BTreeMap::new()),
-                    broken: Mutex::new(None),
-                });
-                let replies = {
-                    let conn = std::sync::Arc::clone(&conn);
-                    std::thread::Builder::new()
-                        .name(format!("zygo-agent-{}", f.name))
-                        .spawn(move || Conn::read_replies(&conn, reader))
-                        .map_err(|e| Error::primitive("spawn", "agent reader thread", e))?
-                };
-
-                Ok(Function::Agent(Box::new(WarmFn {
-                    name: f.name.clone(),
-                    tenant: f.tenant.clone(),
-                    image: f.image.clone(),
-                    conn,
-                    replies: Mutex::new(Some(replies)),
+                Ok(Started(Some(StartedInner::Agent(Box::new(StartedAgent {
+                    f,
+                    sandbox,
                     socket: ours,
-                    runtime,
-                    rss_kb,
-                    imports_ms,
-                    counters: Mutex::new(Counters::default()),
-                    in_flight: Requests::default(),
-                    state: Mutex::new(SandboxState::Warm),
+                    generation,
                     tenant_cgroup,
-                    generation_cgroup: generation,
-                    per_request_cgroup: self.config.per_request_cgroup,
-                    timeout: f.limits.timeout.get(),
-                    limits: f.limits.clone(),
-                    agent_host_pid: sandbox.pid(),
-                    secrets: Mutex::new(Secrets::default()),
-                    scripts: Mutex::new(Scripts::default()),
                     script_dir,
-                    _sandbox: sandbox,
-                })))
+                })))))
             }
         }
+    }
+
+    /// Wait for a started sandbox's agent to announce itself, and make the
+    /// function.
+    ///
+    /// On the caller's thread, so that ten zygotes of one pool, launched
+    /// one after another, run their imports at the same time rather than in
+    /// turn. Bounded by [`AGENT_READY_TIMEOUT`]: an agent that has not
+    /// announced itself by then is a failed warm-up, not a slow one — its
+    /// imports happen *after* the venv and the derived layer are already
+    /// built. Dropping the sandbox on failure kills it.
+    pub fn await_ready(&self, mut started: Started) -> Result<Function> {
+        let agent = match started.0.take().expect("a started sandbox is awaited once") {
+            StartedInner::Ready(function) => return Ok(function),
+            StartedInner::Agent(agent) => agent,
+        };
+        let StartedAgent {
+            f,
+            sandbox,
+            socket: ours,
+            generation,
+            tenant_cgroup,
+            script_dir,
+        } = *agent;
+
+        let mut reader = crate::protocol::FrameReader::new(
+            ours.try_clone()
+                .map_err(|e| Error::primitive("dup socket", "internal pool error", e))?,
+        );
+        let _ = ours.set_read_timeout(Some(AGENT_READY_TIMEOUT));
+        let ready = read_ready(&mut reader);
+        let _ = ours.set_read_timeout(None);
+        let (runtime, rss_kb, imports_ms) = ready.map_err(|e| {
+            if is_timeout(&e) {
+                Error::BackendUnavailable {
+                    backend: "pool",
+                    reason: format!(
+                        "the agent did not send READY within {}s",
+                        AGENT_READY_TIMEOUT.as_secs()
+                    ),
+                    remedy: "check `zygo logs <name>` for what the runtime printed; \
+                             an agent must announce itself before it does any work"
+                        .into(),
+                }
+            } else {
+                e
+            }
+        })?;
+
+        // One thread per function, routing replies to their callers.
+        // It ends when the socket does, which is when the sandbox goes
+        // away.
+        let conn = std::sync::Arc::new(Conn {
+            writer: Mutex::new(crate::protocol::FrameWriter::new(
+                ours.try_clone()
+                    .map_err(|e| Error::primitive("dup socket", "internal pool error", e))?,
+            )),
+            waiting: Mutex::new(BTreeMap::new()),
+            broken: Mutex::new(None),
+        });
+        let replies = {
+            let conn = std::sync::Arc::clone(&conn);
+            std::thread::Builder::new()
+                .name(format!("zygo-agent-{}", f.name))
+                .spawn(move || Conn::read_replies(&conn, reader))
+                .map_err(|e| Error::primitive("spawn", "agent reader thread", e))?
+        };
+
+        Ok(Function::Agent(Box::new(WarmFn {
+            name: f.name.clone(),
+            tenant: f.tenant.clone(),
+            image: f.image.clone(),
+            conn,
+            replies: Mutex::new(Some(replies)),
+            socket: ours,
+            runtime,
+            rss_kb,
+            imports_ms,
+            counters: Mutex::new(Counters::default()),
+            in_flight: Requests::default(),
+            state: Mutex::new(SandboxState::Warm),
+            tenant_cgroup,
+            generation_cgroup: generation,
+            per_request_cgroup: self.config.per_request_cgroup,
+            timeout: f.limits.timeout.get(),
+            limits: f.limits.clone(),
+            agent_host_pid: sandbox.pid(),
+            secrets: Mutex::new(Secrets::default()),
+            scripts: Mutex::new(Scripts::default()),
+            script_dir,
+            _sandbox: sandbox,
+        })))
     }
 
     /// Bring up a warm-exec function: a held sandbox and the plan every

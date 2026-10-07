@@ -86,20 +86,35 @@ const RETRY_FAILED_AFTER: std::time::Duration = std::time::Duration::from_secs(3
 /// whose disk had filled — was slower than having no bytecode at all.
 /// `zygo pull` tries again regardless ([`ensure_now`]).
 pub fn ensure(store: &Store, base: &ImageEntry) -> Result<Bytecode> {
-    ensure_with(store, base, false)
+    ensure_with(store, base, false, None)
+}
+
+/// [`ensure`], holding `builds` for the length of a build and not otherwise.
+/// See [`crate::venv::ensure_gated`] for what the lock is.
+pub fn ensure_gated(
+    store: &Store,
+    base: &ImageEntry,
+    builds: &std::sync::Mutex<()>,
+) -> Result<Bytecode> {
+    ensure_with(store, base, false, Some(builds))
 }
 
 /// [`ensure`], trying a build that failed recently too — what `zygo pull`
 /// does, because pulling is when an operator expects the work to be done.
 pub fn ensure_now(store: &Store, base: &ImageEntry) -> Result<Bytecode> {
-    ensure_with(store, base, true)
+    ensure_with(store, base, true, None)
 }
 
 fn failed_marker(store: &Store, key: &str) -> std::path::PathBuf {
     store.paths().data().join("cache/bytecode-failed").join(key)
 }
 
-fn ensure_with(store: &Store, base: &ImageEntry, retry_failed: bool) -> Result<Bytecode> {
+fn ensure_with(
+    store: &Store,
+    base: &ImageEntry,
+    retry_failed: bool,
+    builds: Option<&std::sync::Mutex<()>>,
+) -> Result<Bytecode> {
     let unchanged = || {
         Ok(Bytecode {
             image: base.clone(),
@@ -130,6 +145,8 @@ fn ensure_with(store: &Store, base: &ImageEntry, retry_failed: bool) -> Result<B
     {
         return unchanged();
     }
+    // The host's build lock before the key's, as every builder orders them.
+    let _one_at_a_time = builds.map(|b| b.lock().unwrap_or_else(|e| e.into_inner()));
     let _lock = store.lock(&format!("bytecode-{key}"))?;
     if let Some(image) = find(store, &reference) {
         return Ok(Bytecode {

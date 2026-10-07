@@ -480,8 +480,9 @@ zygo exec --runtime py312 --script sha256:9f2c… --entry-point monthly '{}'
 
 A pool keeps `min_warm` zygotes ready whatever the load (default 1; 0 counts
 as 1) and may grow to `max_warm` under load (default the larger of `min_warm`
-and 4). `--agent` is `python`, `node`, or the path of your own agent inside
-the sandbox. The +0.5 ms was measured with a different script on every
+and 4). The `min_warm` zygotes are warmed side by side, so a pool of eight
+is up in about the time of one. `--agent` is `python`, `node`, or the path
+of your own agent inside the sandbox. The +0.5 ms was measured with a different script on every
 request, a thousand of them: +0.47 ms on the Lima VM and +0.46 ms on Docker
 Desktop's ([chapter 25](25-performance.md#the-embedders-benchmark)). A pool
 with a `cmd` instead of an `agent` is a *warm-exec pool*: the script's path

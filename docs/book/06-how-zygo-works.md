@@ -176,6 +176,52 @@ started go with it; nothing is left running on its own.
       └───────┘ └───────┘ └───────┘
 ```
 
+## Starting a sandbox: the launcher
+
+Every sandbox the supervisor makes — a zygote, a one-shot run, a new member
+of a pool — is created on one thread of its own, the *launcher*. The reason
+is a kernel rule. Each sandbox asks the kernel to kill it when its parent
+dies, so a crashed supervisor leaves nothing running; and the kernel counts
+the *thread* that created it as the parent. A sandbox created on the thread
+serving one CLI command would die the moment that command returned. So the
+supervisor keeps one thread that never returns, and only it creates
+sandboxes.
+
+One thread means starts take turns. To keep the turns short, the launcher
+is given only the start: the `clone3`, the mounts and the handshake until
+the new process has reached its program, which has a deadline of 60
+seconds. Everything a start needs that can be made beforehand — the image
+layers, a venv, the `system` layer, the bytecode layer, the resolved
+allowlist, the sandbox's root — is made first, on the thread of whoever
+asked. A `pip install` runs there too, under one host-wide lock, so two
+builds never run at once. And the wait for the agent's `READY` — the
+interpreter starting, the handler's imports, which is where a warm-up's
+time goes — is that thread's as well. So a pool's zygotes are launched one
+after another and import side by side, and a turn on the launcher is
+milliseconds.
+
+The line in front of the launcher is bounded. A warm-up waits at most 60
+seconds for its turn and a `zygo run` 20; no more than 32 starts may wait
+at once. Past either, the caller is told the launcher is busy, what it is
+doing and for how long, and that start never happens
+([chapter 22](22-troubleshooting.md#waited-60-s-for-the-launcher-and-did-not-get-a-turn-or-the-launchers-queue-is-full)).
+A start the launcher has held for three minutes is past every deadline a
+start has, so it is parked inside the kernel: the supervisor's log says so
+once, and `GET /healthz` answers `degraded` naming it. Before the bound, one
+such start held every later one for ever, while the supervisor still
+answered `ping` and the probe said `ok`.
+
+```text
+  the thread that asked                     the launcher (one, for ever)
+  ─────────────────────                     ────────────────────────────
+  resolve the spec
+  build what is missing: venv, layers
+  resolve the allowlist, make the root
+  hand over the start ────────────────────▶ clone3 ─▶ mounts ─▶ execve
+  wait, at most 60 s in line ◀───────────── the sandbox, or why not
+  wait for the agent's READY: the imports
+```
+
 ## Images without a Dockerfile
 
 Zygo pulls normal OCI images from any registry, into a store under your home

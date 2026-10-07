@@ -343,6 +343,7 @@ pub(super) fn dispatch(supervisor: &Supervisor, request: Request, greeted: &mut 
         })),
         Request::Runtimes => Response::Runtimes {
             runtimes: supervisor.runtimes(),
+            launcher: supervisor.launcher_load(),
         },
         Request::StopRuntime { name } => merge(supervisor.stop_runtime(&name)),
         Request::PutScript { source, tenant } => {

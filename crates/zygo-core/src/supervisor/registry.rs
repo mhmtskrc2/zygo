@@ -281,15 +281,40 @@ impl Supervisor {
         // sandbox may or may not have read it, and "replace" is the safe answer.
         let sources = Sources::of(&resolved);
 
-        // On the launcher thread, never here: see [`Launcher`].
+        // Two halves. Everything the start needs that can be made ahead —
+        // the layers, the venv, the allowlist, the root — is made here, on
+        // this connection's thread, under the host's build lock when it has
+        // to build. The start itself goes to the launcher, which is one
+        // thread for the whole host and must be given nothing else: see
+        // [`Launcher`].
+        tracing::info!(function = name, image = %resolved.image, "warming");
+        let warming = Instant::now();
+        let failed = |e: crate::error::Error| {
+            tracing::warn!(function = name, error = %e, "warm-up failed");
+            Response::error(ControlError::WarmFailed, e)
+        };
+        let prepared = self
+            .pool
+            .prepare(&resolved, Some(&self.deps_build))
+            .map_err(failed)?;
         let pool = Arc::clone(&self.pool);
-        let spec_for_warm = resolved.clone();
         let logs = self.logs_for(name);
-        let function = self
+        let started = self
             .launcher
-            .run(move || pool.serve_with_logs(&spec_for_warm, logs))
-            .map_err(|e| Response::error(ControlError::WarmFailed, e))?
-            .map_err(|e| Response::error(ControlError::WarmFailed, e))?;
+            .run_within(
+                format!("warm `{name}`"),
+                super::WARM_QUEUE_WAIT,
+                move || pool.launch(prepared, logs),
+            )
+            .map_err(failed)?
+            .map_err(failed)?;
+        // The imports run now, and the wait for them is this thread's.
+        let function = self.pool.await_ready(started).map_err(failed)?;
+        tracing::info!(
+            function = name,
+            warm_ms = warming.elapsed().as_millis() as u64,
+            "warm"
+        );
         function.set_secrets(secrets.clone());
 
         let status = function.status();

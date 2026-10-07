@@ -10,7 +10,7 @@ is the chapter to keep open.
 |---|---|---|---|
 | `ZYGO_DATA_HOME` | CLI, supervisor | The data folder (same as `--data-root`). | `$XDG_DATA_HOME/zygo`, else `~/.local/share/zygo` |
 | `ZYGO_RUNTIME_DIR` | CLI, supervisor | The runtime folder: sockets and pid files. | `$XDG_RUNTIME_DIR/zygo`, else `/tmp/zygo-<uid>` |
-| `ZYGO_LOG` | CLI | Log filter, e.g. `debug` or `zygo=trace`. Overrides `-v`. Logs go to stderr. | `warn` |
+| `ZYGO_LOG` | CLI, supervisor | Log filter, e.g. `debug` or `zygo=trace`. Overrides `-v`. Logs go to stderr; a supervisor started in the background has `supervisor.log` as its stderr, and takes the variable from the command that started it. | `warn`; `info` for the supervisor |
 | `NO_COLOR` | CLI | Any value turns colour off. Colour is also off when output is not a terminal. | |
 | `ZYGO_API_TOKEN` | `zygo api`, SDKs | The bootstrap bearer token. Never a flag, because flags show in `ps`. It is removed from the environment of sandboxes the API starts. | |
 | `ZYGO_API_URL` | SDKs | Where the API is: `unix:///path`, `http://host:port` or `host:port`. | `http://127.0.0.1:7700` |
@@ -74,6 +74,7 @@ Secrets are **not** environment variables: they are files in
 ├── auth.json                           `zygo login` credentials           (mode 0600)
 ├── agents/                             the Python and Node agents, kept up to date
 ├── backends/                           gvisor/runsc · krun/Image (the vm guest kernel)
+├── supervisor.log                      the supervisor's own log, when started in the background
 └── tmp/                                locks, and sandbox roots while they exist
 
 $XDG_RUNTIME_DIR/zygo/                  the runtime folder (ZYGO_RUNTIME_DIR), mode 0700

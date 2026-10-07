@@ -153,10 +153,14 @@ fn run(cli: &Cli) -> anyhow::Result<u8> {
     }
 }
 
-fn init_tracing(verbose: u8, json: bool, keep_time: bool) {
+fn init_tracing(verbose: u8, json: bool, supervisor: bool) {
     use tracing_subscriber::{EnvFilter, fmt};
 
     let default = match verbose {
+        // The supervisor's log is read after the fact, to learn what it was
+        // doing when something took too long. At `warn` it would be empty
+        // then: every warm-up, every refusal and every idle tier is `info`.
+        0 if supervisor => "info",
         0 => "warn",
         1 => "info",
         2 => "debug",
@@ -167,7 +171,7 @@ fn init_tracing(verbose: u8, json: bool, keep_time: bool) {
 
     if json {
         builder.json().init();
-    } else if keep_time {
+    } else if supervisor {
         // The supervisor's log is read after the fact, against a client's
         // timings: a line without a time cannot say whether a gate was closed
         // before a request arrived or after it gave up, which is exactly the

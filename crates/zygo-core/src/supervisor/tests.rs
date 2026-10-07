@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::dispatch::dispatch;
-use super::lifecycle::{Backoff, Launcher};
+use super::lifecycle::{Backoff, LAUNCH_STUCK_AFTER, Launcher, LauncherLoad};
 use super::listener::{current_uid, peer_uid, peer_verdict, reject_foreign_peer};
 use super::registry::{Cold, Sources};
 use super::*;
@@ -298,6 +298,29 @@ fn a_deliberate_serve_clears_the_crash_history() {
 
 // --- the launcher thread ---------------------------------------------
 
+/// A queue budget no test here means to exhaust.
+const PATIENT: Duration = Duration::from_secs(10);
+
+/// Hold the launcher until told otherwise, and say when it is held.
+///
+/// Returns the sender that releases it. The thread that calls `run_within`
+/// is the test's own, so the hold is a job of its own on a helper thread.
+fn hold_launcher(launcher: &Arc<Launcher>) -> std::sync::mpsc::Sender<()> {
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let (held, holding) = std::sync::mpsc::channel::<()>();
+    let launcher = Arc::clone(launcher);
+    std::thread::spawn(move || {
+        launcher
+            .run_within("hold", PATIENT, move || {
+                let _ = held.send(());
+                let _ = released.recv();
+            })
+            .expect("the hold runs");
+    });
+    holding.recv().expect("the hold started");
+    release
+}
+
 #[test]
 fn every_job_runs_on_one_thread_that_is_not_the_callers() {
     // The property the whole design rests on: `PDEATHSIG` is delivered when
@@ -313,7 +336,7 @@ fn every_job_runs_on_one_thread_that_is_not_the_callers() {
                 .spawn(|| {
                     callers.insert(std::thread::current().id());
                     launcher
-                        .run(|| std::thread::current().id())
+                        .run_within("job", PATIENT, || std::thread::current().id())
                         .expect("job ran")
                 })
                 .join()
@@ -337,11 +360,17 @@ fn the_launcher_thread_outlives_the_caller() {
     // Deliberately a thread that ends straight after asking.
     let first = std::thread::scope(|scope| {
         scope
-            .spawn(|| launcher.run(|| std::thread::current().id()).expect("job"))
+            .spawn(|| {
+                launcher
+                    .run_within("job", PATIENT, || std::thread::current().id())
+                    .expect("job")
+            })
             .join()
             .expect("join")
     });
-    let second = launcher.run(|| std::thread::current().id()).expect("job");
+    let second = launcher
+        .run_within("job", PATIENT, || std::thread::current().id())
+        .expect("job");
     assert_eq!(
         first, second,
         "the thread that ran the first job must still be there for the second"
@@ -351,19 +380,139 @@ fn the_launcher_thread_outlives_the_caller() {
 #[test]
 fn a_job_returns_its_value_to_the_caller() {
     let launcher = Launcher::new().expect("launcher");
-    assert_eq!(launcher.run(|| 6 * 7).expect("job"), 42);
+    assert_eq!(
+        launcher.run_within("job", PATIENT, || 6 * 7).expect("job"),
+        42
+    );
     assert_eq!(
         launcher
-            .run(|| "from the launcher".to_string())
+            .run_within("job", PATIENT, || "from the launcher".to_string())
             .expect("job"),
         "from the launcher"
     );
     // Results carry errors through unchanged, which is how a failed warm-up
     // reaches the client.
     let failed: std::result::Result<(), String> = launcher
-        .run(|| Err("no such image".to_string()))
+        .run_within("job", PATIENT, || Err("no such image".to_string()))
         .expect("job");
     assert_eq!(failed, Err("no such image".into()));
+}
+
+#[test]
+fn a_job_still_queued_when_its_budget_ends_is_refused_and_never_runs() {
+    let launcher = Arc::new(Launcher::new().expect("launcher"));
+    let release = hold_launcher(&launcher);
+
+    let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&ran);
+    let refused = launcher.run_within("warm `late`", Duration::from_millis(50), move || {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    let message = refused
+        .expect_err("a job that waited past its budget")
+        .to_string();
+    assert!(
+        message.contains("`warm `late`` waited 0 s") && message.contains("`hold` has been running"),
+        "the refusal names the job and what the launcher was doing: {message}"
+    );
+
+    // Let the launcher go, and give it time to reach the abandoned job.
+    release.send(()).expect("release");
+    launcher
+        .run_within("after", PATIENT, || ())
+        .expect("the launcher is free again");
+    assert!(
+        !ran.load(std::sync::atomic::Ordering::SeqCst),
+        "an abandoned job must not run later for a caller that has gone"
+    );
+}
+
+#[test]
+fn a_job_already_running_is_waited_for_past_its_budget() {
+    // The budget bounds the wait in line, not the work: a caller whose job
+    // has started stays for the result, because a sandbox is being made for
+    // it and abandoning that would leak the sandbox.
+    let launcher = Launcher::new().expect("launcher");
+    let value = launcher
+        .run_within("slow", Duration::from_millis(20), || {
+            std::thread::sleep(Duration::from_millis(150));
+            42
+        })
+        .expect("a running job is not abandoned");
+    assert_eq!(value, 42);
+}
+
+#[test]
+fn a_full_queue_refuses_the_next_job_without_waiting() {
+    let launcher = Arc::new(Launcher::new().expect("launcher"));
+    let release = hold_launcher(&launcher);
+
+    // Fill the queue from threads of their own, each waiting patiently.
+    let waiters: Vec<_> = (0..LAUNCH_QUEUE_LIMIT)
+        .map(|_| {
+            let launcher = Arc::clone(&launcher);
+            std::thread::spawn(move || launcher.run_within("queued", PATIENT, || ()))
+        })
+        .collect();
+    let deadline = Instant::now() + PATIENT;
+    while launcher.queued() < LAUNCH_QUEUE_LIMIT {
+        assert!(Instant::now() < deadline, "the queue never filled");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let asked = Instant::now();
+    let refused = launcher.run_within("one too many", PATIENT, || ());
+    let message = refused.expect_err("the queue is full").to_string();
+    assert!(
+        asked.elapsed() < Duration::from_secs(1),
+        "a full queue is refused at the door, not after the budget"
+    );
+    assert!(
+        message.contains("queue is full") && message.contains("`one too many` was not queued"),
+        "{message}"
+    );
+
+    release.send(()).expect("release");
+    for waiter in waiters {
+        waiter
+            .join()
+            .expect("join")
+            .expect("a queued job within its budget runs");
+    }
+}
+
+#[test]
+fn the_load_names_the_running_start_and_calls_it_stuck_past_the_threshold() {
+    let launcher = Arc::new(Launcher::new().expect("launcher"));
+    assert_eq!(
+        launcher.load(),
+        LauncherLoad::default(),
+        "idle: nothing running, nothing queued"
+    );
+
+    let release = hold_launcher(&launcher);
+    let now = Instant::now();
+    let young = launcher.load_at(now, LAUNCH_STUCK_AFTER);
+    assert_eq!(young.running.as_deref(), Some("hold"));
+    assert!(
+        !young.stuck,
+        "a start under the threshold is merely running"
+    );
+
+    // The same start, seen from three minutes later: stuck, and said so.
+    let old = launcher.load_at(now + LAUNCH_STUCK_AFTER, LAUNCH_STUCK_AFTER);
+    assert!(old.stuck);
+    assert_eq!(old.running_s, LAUNCH_STUCK_AFTER.as_secs());
+
+    release.send(()).expect("release");
+    launcher
+        .run_within("after", PATIENT, || ())
+        .expect("released");
+    assert_eq!(
+        launcher.load().running,
+        None,
+        "a finished start is no longer reported"
+    );
 }
 
 /// The mechanism itself, with no Zygo in the way: does a child outlive the
@@ -414,7 +563,11 @@ fn a_child_created_through_the_launcher_survives_the_caller() {
     let launcher = Launcher::new().expect("launcher");
     let through_launcher = std::thread::scope(|scope| {
         scope
-            .spawn(|| launcher.run(spawn_child).expect("job"))
+            .spawn(|| {
+                launcher
+                    .run_within("job", PATIENT, spawn_child)
+                    .expect("job")
+            })
             .join()
             .expect("join")
     });

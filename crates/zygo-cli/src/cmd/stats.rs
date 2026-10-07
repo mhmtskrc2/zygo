@@ -77,7 +77,7 @@ pub fn run(cli: &Cli, name: Option<&str>) -> anyhow::Result<u8> {
     // latencies are the number an embedder is here for. What a pool has
     // instead of one state is several zygotes, so the row says how many.
     let pools = match client.send(&Request::Runtimes)? {
-        Response::Runtimes { runtimes } => runtimes,
+        Response::Runtimes { runtimes, .. } => runtimes,
         other => return super::supervisor::report_failure(cli, &other),
     };
     functions.extend(pools.iter().map(|p| Status {
