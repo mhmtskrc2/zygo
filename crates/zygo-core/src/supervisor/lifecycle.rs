@@ -194,11 +194,17 @@ impl Launcher {
                 {
                     return;
                 }
-                let _running = Running::start(&load, what);
+                let running = Running::start(&load, what);
+                let value = f();
+                // Unmarked before the answer goes, not after: a caller that
+                // asks `load()` the moment its start returns must not find
+                // that start still running. A panic in `f` unmarks it too, as
+                // the guard drops on the way out.
+                drop(running);
                 // A receiver that has gone away means the caller was killed;
                 // the work still ran, and dropping the result is the right
                 // thing.
-                let _ = done.send(f());
+                let _ = done.send(value);
             })
         };
         self.load.queued.fetch_add(1, Ordering::SeqCst);
