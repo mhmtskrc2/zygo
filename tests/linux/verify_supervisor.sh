@@ -1593,13 +1593,24 @@ fi
 # Killing the one pid we know about is not enough. Below kernel 5.14 there is
 # no `cgroup.kill`, and a handler that forked helpers leaves them holding the
 # result pipe open, so the agent never sees EOF and the function wedges.
+#
+# Only this function's processes count: a helper cannot leave its parent's cgroup, so a
+# survivor is under `zygo.slice/tenants/default/spawn/`, while a python3 the runner itself
+# happens to be running is not. Counting every python3 on the host failed this check once
+# on a hosted runner, with nothing in the log to say whose process it was. And the kill is
+# not instant, so it is given three seconds to land rather than one look after one.
 "$ZYGO" serve spawn.py --name spawn --timeout 2s --pids 32 >/dev/null 2>&1
 "$ZYGO" exec spawn '{}' >/dev/null 2>&1
-sleep 1
 spinning=0
-for d in /proc/[0-9]*; do
-    [ "$(cat "$d/comm" 2>/dev/null)" = python3 ] || continue
-    [ "$(awk '{print $3}' "$d/stat" 2>/dev/null)" = R ] && spinning=$((spinning+1))
+for _ in 1 2 3 4 5 6; do
+    sleep 0.5
+    spinning=0
+    for d in /proc/[0-9]*; do
+        grep -q 'zygo.slice/tenants/default/spawn/' "$d/cgroup" 2>/dev/null || continue
+        [ "$(cat "$d/comm" 2>/dev/null)" = python3 ] || continue
+        [ "$(awk '{print $3}' "$d/stat" 2>/dev/null)" = R ] && spinning=$((spinning+1))
+    done
+    [ "$spinning" -eq 0 ] && break
 done
 if [ "$spinning" -eq 0 ]; then
     ok "a timed-out handler's own forked helpers are killed with it"
