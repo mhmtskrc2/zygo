@@ -7,6 +7,16 @@ break things and will say so here.
 
 ## [Unreleased]
 
+## [0.1.7] — 2026-10-08
+
+`--allow-private-net` lets through only the private addresses a rule names: before, with
+the flag, an allowed name that resolved into a private range was reached, and under
+`network = "full"` every private range was open. And the supervisor's one launcher
+thread is given only the start of a sandbox, with a bounded line in front of it and a
+`degraded` health answer when a start is stuck, so one slow `pip install` no longer
+holds every sandbox on the host behind it. Upgrade if you run the API with
+`--allow-private-net`.
+
 ### Added
 
 - `supervisor.log` in the data folder: the stderr of a supervisor started in
@@ -606,7 +616,9 @@ The first public version.
 - A warm-exec request is created inside its cgroup (`CLONE_INTO_CGROUP`,
   Linux 5.7+) rather than moved there, so it never waits on that lock.
 
-[Unreleased]: https://github.com/mhmtskrc2/zygo/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/mhmtskrc2/zygo/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/mhmtskrc2/zygo/compare/v0.1.6...v0.1.7
+[0.1.6]: https://github.com/mhmtskrc2/zygo/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/mhmtskrc2/zygo/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/mhmtskrc2/zygo/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/mhmtskrc2/zygo/compare/v0.1.2...v0.1.3

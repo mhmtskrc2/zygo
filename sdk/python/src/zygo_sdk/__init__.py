@@ -66,7 +66,7 @@ from ._models import (
 )
 from ._sync import Client, FunctionHandle, connect
 
-__version__ = "0.1.6"
+__version__ = "0.1.7"
 
 __all__ = [
     "aio",

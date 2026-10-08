@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "zygo-sdk"
-version = "0.1.6"
+version = "0.1.7"
 description = "Run untrusted code safely from Python: a client for Zygo, which gives every request a fresh, kernel-isolated sandbox in about a millisecond"
 readme = "README.md"
 requires-python = ">=3.9"
