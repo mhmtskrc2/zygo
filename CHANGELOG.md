@@ -7,6 +7,20 @@ break things and will say so here.
 
 ## [Unreleased]
 
+### Fixed
+
+- The macOS archive and the Homebrew formula carry the Lima template the VM
+  is created from, as `share/zygo/lima.yaml` beside the binary. 0.1.7 shipped
+  without it, so on a Mac with no VM yet, or with one that had stopped, every
+  command exited 125 with "the VM template is missing". The release checks
+  that the unpacked archive finds it; before, the check ran the binary from
+  the build, which found the template in the checkout instead.
+- A VM that exists starts without the template, which Lima reads only when it
+  creates one. While a VM exists, `zygo doctor` calls a missing template
+  `degraded` rather than `FAIL`.
+- The Homebrew formula's test looks for the Linux build by the name the shim
+  uses: `zygo-linux-aarch64` on Apple silicon, not Homebrew's `arm64`.
+
 ## [0.1.7] — 2026-10-08
 
 `--allow-private-net` lets through only the private addresses a rule names: before, with

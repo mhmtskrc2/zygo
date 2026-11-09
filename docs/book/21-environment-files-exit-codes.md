@@ -29,7 +29,7 @@ is the chapter to keep open.
 | Variable | Meaning |
 |---|---|
 | `ZYGO_LINUX_BIN` | The Linux build of Zygo to copy into the VM, before the ones Zygo looks for itself. |
-| `ZYGO_LIMA_TEMPLATE` | The Lima template to create the VM from. |
+| `ZYGO_LIMA_TEMPLATE` | The Lima template to create the VM from, before the one installed beside the binary (`../share/zygo/lima.yaml`). Read only when the VM is created. |
 | `LIMA_HOME` | Where Lima keeps its VMs (`~/.lima`). |
 
 Every `ZYGO_*` variable in your shell is passed into the VM; so are the

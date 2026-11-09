@@ -3,12 +3,14 @@
 # in from what the release workflow just produced. A formula in the repository
 # with placeholder hashes in it is a formula nobody can install.
 #
-# What makes this different from an ordinary Rust formula is the second file.
-# On a Mac, `zygo` is a shim: every sandbox command is forwarded into a Linux
-# VM that Zygo starts and manages, because sandboxes are Linux. The shim looks
-# for the Linux build at `../share/zygo/zygo-linux-<arch>` relative to itself
-# (`shim::linux_binary`), so the bottle has to carry one — installing the Mac
-# binary alone installs something that cannot run a sandbox.
+# What makes this different from an ordinary Rust formula is the two other
+# files. On a Mac, `zygo` is a shim: every sandbox command is forwarded into a
+# Linux VM that Zygo starts and manages, because sandboxes are Linux. The shim
+# looks beside itself, in `../share/zygo/`, for the Linux build it runs there
+# (`zygo-linux-<arch>`, `shim::linux_binary`) and for the Lima template the VM
+# is created from (`lima.yaml`, `shim::template_path`), so the bottle has to
+# carry both — installing the Mac binary alone installs something that cannot
+# run a sandbox.
 class Zygo < Formula
   desc "Daemonless, rootless warm sandbox runtime with Docker's ergonomics"
   homepage "https://github.com/@@REPO@@"
@@ -48,9 +50,9 @@ class Zygo < Formula
     if OS.mac?
       bin.install "bin/zygo"
       # Beside the binary, where the shim looks. `pkgshare` is
-      # `share/zygo`, which is the path `shim::linux_binary` builds from
-      # `current_exe()/../share/zygo/zygo-linux-<arch>`.
-      pkgshare.install Dir["share/zygo/zygo-linux-*"]
+      # `share/zygo`, which is the path `shim::linux_binary` and
+      # `shim::template_path` build from `current_exe()/../share/zygo/`.
+      pkgshare.install Dir["share/zygo/zygo-linux-*"], "share/zygo/lima.yaml"
     else
       bin.install "zygo"
     end
@@ -84,8 +86,13 @@ class Zygo < Formula
     assert_match(/kernel|namespace|cgroup|Lima|VM/i, output)
 
     if OS.mac?
-      assert_predicate pkgshare/"zygo-linux-#{Hardware::CPU.arch}", :exist?,
+      # Named as Rust names the architecture, which is what the shim asks for:
+      # Homebrew calls Apple silicon `arm64`, the file says `aarch64`.
+      arch = Hardware::CPU.arm? ? "aarch64" : "x86_64"
+      assert_predicate pkgshare/"zygo-linux-#{arch}", :exist?,
                        "the Linux build the shim forwards into is missing"
+      assert_predicate pkgshare/"lima.yaml", :exist?,
+                       "the template the shim creates the Linux VM from is missing"
     end
   end
 end

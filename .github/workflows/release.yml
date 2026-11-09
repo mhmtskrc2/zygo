@@ -139,8 +139,9 @@ jobs:
 
   # The macOS binary is the shim: it forwards every sandbox command into a
   # Linux VM. It is useless without a Linux build for the same architecture,
-  # so the archive carries one — which is what `share/zygo/zygo-linux-<arch>`
-  # is, and where `shim::linux_binary` looks.
+  # or without the Lima template the VM is created from, so the archive
+  # carries both — `share/zygo/zygo-linux-<arch>` and `share/zygo/lima.yaml`,
+  # where `shim::linux_binary` and `shim::template_path` look.
   macos:
     needs: [what, linux]
     strategy:
@@ -182,6 +183,9 @@ jobs:
           cp "linux/zygo-linux-${{ matrix.linux_target }}" \
              "dist/$name/share/zygo/zygo-linux-${{ matrix.arch }}"
           chmod +x "dist/$name/share/zygo/zygo-linux-${{ matrix.arch }}"
+          # The template `shim::template_path` looks for in the same place.
+          # Without it the first command on a new Mac cannot create the VM.
+          cp shim/lima.yaml "dist/$name/share/zygo/lima.yaml"
           cp README.md SECURITY.md LICENSE NOTICE "dist/$name/"
           tar -C dist -czf "dist/$asset.tar.gz" "$name"
           (cd dist && shasum -a 256 "$asset.tar.gz" > "$asset.tar.gz.sha256")
@@ -193,6 +197,27 @@ jobs:
         run: |
           ./target/release/zygo --version
           ./target/release/zygo doctor || true
+
+      # What the shim looks for beside itself, found where an install puts
+      # it. Run from the unpacked archive rather than from `target/`: there
+      # the template is also found in this checkout, through the path built
+      # into the binary, which is how 0.1.7 shipped without one and the step
+      # above did not notice.
+      - name: The archive carries what the shim looks for
+        shell: bash
+        run: |
+          name="zygo-${{ needs.what.outputs.version }}-${{ matrix.arch }}-apple-darwin"
+          asset="zygo-${{ matrix.arch }}-apple-darwin"
+          mkdir -p "$RUNNER_TEMP/unpacked"
+          tar -C "$RUNNER_TEMP/unpacked" -xzf "dist/$asset.tar.gz"
+          report=$("$RUNNER_TEMP/unpacked/$name/bin/zygo" doctor 2>&1 || true)
+          echo "$report"
+          for file in lima.yaml "zygo-linux-${{ matrix.arch }}"; do
+            if ! grep -qF "$name/share/zygo/$file" <<<"$report"; then
+              echo "::error::the archive's zygo does not find share/zygo/$file beside itself"
+              exit 1
+            fi
+          done
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -608,7 +633,7 @@ jobs:
           curl -fsSL "\$url/SHA256SUMS" | sha256sum -c --ignore-missing
           tar xzf zygo-*-unknown-linux-musl.tar.gz && sudo install -m 0755 zygo-*/zygo /usr/local/bin/
 
-          # macOS: the shim, the Linux build the VM needs, and Lima
+          # macOS: the shim, the Linux build and template the VM needs, and Lima
           brew install $OWNER/zygo/zygo
 
           # from source

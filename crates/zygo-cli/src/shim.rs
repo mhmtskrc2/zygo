@@ -503,19 +503,24 @@ fn instance_generation() -> u64 {
         .unwrap_or(0)
 }
 
-/// `limactl start --tty=false zygo`, or the same with a template the first
-/// time, when there is no instance to start yet.
+/// `limactl start --tty=false zygo`, or, given the template, the same
+/// creating the instance from it.
+///
+/// The template is only for the first time, when there is no instance to
+/// start yet: Lima keeps its own copy and never reads the source again, so a
+/// VM that exists starts without one.
 ///
 /// `--tty=false` because the first run is otherwise interactive: `limactl`
 /// offers to edit the template, and a prompt nobody is watching is a hang.
-pub fn start_args(vm: Vm, template: &Path) -> Vec<OsString> {
+pub fn start_args(template: Option<&Path>) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec!["start".into(), "--tty=false".into()];
-    if vm == Vm::Absent {
-        args.push("--name".into());
-        args.push(INSTANCE.into());
-        args.push(template.into());
-    } else {
-        args.push(INSTANCE.into());
+    match template {
+        Some(template) => {
+            args.push("--name".into());
+            args.push(INSTANCE.into());
+            args.push(template.into());
+        }
+        None => args.push(INSTANCE.into()),
     }
     args
 }
@@ -723,11 +728,18 @@ pub fn host_checks(
             "brew install lima",
         ),
     });
-    checks.push(match template {
-        Some(path) => Check::ok("vm template", path.display().to_string()),
-        None => Check::failed(
+    // Only creating the VM reads the template, so one that exists already is
+    // not held up by its absence; a new one cannot be made without it.
+    checks.push(match (template, vm) {
+        (Some(path), _) => Check::ok("vm template", path.display().to_string()),
+        (None, Vm::Absent) => Check::failed(
             "vm template",
             "missing; Zygo cannot create the Linux VM without it",
+            "set ZYGO_LIMA_TEMPLATE to a Lima template, or reinstall Zygo",
+        ),
+        (None, _) => Check::degraded(
+            "vm template",
+            "missing; the VM that exists starts without it, but a new one cannot be created",
             "set ZYGO_LIMA_TEMPLATE to a Lima template, or reinstall Zygo",
         ),
     });
@@ -1496,7 +1508,16 @@ fn ensure_running(limactl: &Path, paths: &zygo_core::paths::Paths) -> anyhow::Re
         return Ok(());
     }
 
-    let template = template_path()?;
+    // Looked for only when the VM is to be created. A template missing from
+    // the install must not keep a VM that is already there from starting:
+    // 0.1.7 shipped without one, and a Mac whose VM had stopped could not
+    // start it again for want of a file it would not have read.
+    let first_time = vm == Vm::Absent;
+    let template = if first_time {
+        Some(template_path()?)
+    } else {
+        None
+    };
 
     // One line of ours, and `limactl`'s thirty kept back unless they are
     // needed. Booting a virtual machine has a lot to say — a hostagent
@@ -1508,7 +1529,6 @@ fn ensure_running(limactl: &Path, paths: &zygo_core::paths::Paths) -> anyhow::Re
     // Which does not mean silence: a machine that takes a minute to appear
     // should say it is doing something, and a failure has to arrive with
     // everything `limactl` said about it.
-    let first_time = vm == Vm::Absent;
     eprintln!(
         "starting the Linux VM Zygo runs its sandboxes in{}",
         if first_time {
@@ -1518,7 +1538,7 @@ fn ensure_running(limactl: &Path, paths: &zygo_core::paths::Paths) -> anyhow::Re
         }
     );
     let out = std::process::Command::new(limactl)
-        .args(start_args(vm, &template))
+        .args(start_args(template.as_deref()))
         .output()
         .map_err(|e| anyhow::anyhow!("could not start the VM: {e}"))?;
     if !out.status.success() {
@@ -1935,6 +1955,30 @@ mod tests {
             !names(&bare).contains(&"vm template generation"),
             "no instance, no generation to compare"
         );
+        let template_check = |checks: &[zygo_core::doctor::Check]| {
+            checks
+                .iter()
+                .find(|c| c.name == "vm template")
+                .unwrap()
+                .status
+        };
+        assert_eq!(
+            template_check(&bare),
+            Status::Failed,
+            "no instance and no template: there is nothing to start and nothing to make one from"
+        );
+
+        // A template missing from the install holds up only a VM that has
+        // yet to be created; one that exists starts without it.
+        let untemplated = host_checks(
+            Some(Path::new("/l")),
+            None,
+            Some(Path::new("/b")),
+            Vm::Stopped,
+            Some(TEMPLATE_GENERATION),
+            None,
+        );
+        assert_eq!(template_check(&untemplated), Status::Degraded);
 
         // A stopped VM is not a broken one, but nothing can vouch for the
         // sandboxes until it is up — so `ok` is false, with the remedy.
@@ -1984,11 +2028,13 @@ mod tests {
     #[test]
     fn the_first_start_names_the_instance_and_the_later_ones_do_not() {
         let template = Path::new("/opt/zygo/lima.yaml");
-        let first = start_args(Vm::Absent, template);
+        let first = start_args(Some(template));
         assert!(first.iter().any(|a| a == "--name"));
         assert!(first.iter().any(|a| a == template));
 
-        let later = start_args(Vm::Stopped, template);
+        // An instance that exists is started by name, with no template to
+        // find: Lima would not read one.
+        let later = start_args(None);
         assert!(!later.iter().any(|a| a == "--name"));
         assert!(!later.iter().any(|a| a == template));
         assert!(later.iter().any(|a| a == INSTANCE));
@@ -1996,12 +2042,10 @@ mod tests {
 
     #[test]
     fn a_start_never_waits_for_an_answer_nobody_is_there_to_give() {
-        for vm in [Vm::Absent, Vm::Stopped] {
+        for template in [Some(Path::new("t.yaml")), None] {
             assert!(
-                start_args(vm, Path::new("t.yaml"))
-                    .iter()
-                    .any(|a| a == "--tty=false"),
-                "{vm:?} would prompt"
+                start_args(template).iter().any(|a| a == "--tty=false"),
+                "{template:?} would prompt"
             );
         }
     }

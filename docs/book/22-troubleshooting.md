@@ -731,6 +731,26 @@ That is the binary that runs inside the VM. A release ships it beside the Mac
 one. From a checkout it is one `make`, and the next `zygo` command copies it
 in.
 
+### "the VM template is missing" (exit 125)
+
+The template is the file Lima creates Zygo's VM from. A release ships it
+beside the Mac binary, as `../share/zygo/lima.yaml`; the 0.1.7 archive and
+its Homebrew formula left it out. Lima reads it only when it creates the VM,
+so a VM that exists starts without it, and `zygo doctor` then calls the
+missing file `degraded`, not `FAIL`. With no VM yet, a template is needed;
+0.1.7 also asked for one to start a stopped VM. Upgrade, or point
+`ZYGO_LIMA_TEMPLATE` at the template from your version's tag:
+
+```bash
+curl -fsSL --create-dirs -o ~/.config/zygo/lima.yaml \
+  https://raw.githubusercontent.com/mhmtskrc2/zygo/v0.1.7/shim/lima.yaml
+export ZYGO_LIMA_TEMPLATE=~/.config/zygo/lima.yaml
+```
+
+Put the `export` in your shell's profile. A program that starts `zygo` itself,
+such as a service running `zygo api`, needs the variable in its own
+environment.
+
 ### "Session open refused by peer", or exit 111
 
 Every command forwarded into the VM is one *session* on one shared

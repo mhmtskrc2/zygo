@@ -34,8 +34,11 @@ Without the secret the `tap` job prints a warning and changes nothing; the
 rest of the release is unaffected, and `brew install` keeps offering the
 previous version.
 
-The macOS archive carries a Linux binary as well as the macOS one. That is not
-padding: on a Mac `zygo` is a shim that forwards every sandbox command into a
-Linux VM, and it looks for the Linux build at `../share/zygo/zygo-linux-<arch>`
-relative to itself. Installing the macOS binary alone installs something that
-cannot run a sandbox.
+The macOS archive carries a Linux binary and a Lima template as well as the
+macOS binary. That is not padding: on a Mac `zygo` is a shim that forwards
+every sandbox command into a Linux VM, and it looks beside itself, in
+`../share/zygo/`, for the Linux build it runs there (`zygo-linux-<arch>`) and
+the template it creates the VM from (`lima.yaml`). Installing the macOS binary
+alone installs something that cannot run a sandbox. The release unpacks the
+archive and checks that its `zygo doctor` finds both there, not in the
+checkout it was built from.
