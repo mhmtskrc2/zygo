@@ -73,7 +73,7 @@ jobs:
             label: linux/x86_64/old
           - os: ubuntu-24.04-arm
             label: linux/aarch64
-          - os: macos-14
+          - os: macos-15          # macos-14 is retired; a job on it is cancelled unrun
             label: macos/aarch64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30

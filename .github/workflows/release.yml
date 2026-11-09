@@ -148,7 +148,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-14
+          # Not macos-14: GitHub retired it, and a job asking for it is
+          # cancelled before its first step ("not supported").
+          - runner: macos-15
             arch: aarch64
             linux_target: aarch64-unknown-linux-musl
           - runner: macos-15-intel
