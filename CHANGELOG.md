@@ -7,6 +7,13 @@ break things and will say so here.
 
 ## [Unreleased]
 
+## [0.1.8] — 2026-11-09
+
+The Mac release carries the template Zygo's Linux VM is created from. 0.1.7 left it out,
+so on a Mac with no VM yet, or with one that had stopped, every command exited 125 with
+"the VM template is missing". Upgrade if you installed 0.1.7 on a Mac; on Linux nothing
+changes.
+
 ### Fixed
 
 - The macOS archive and the Homebrew formula carry the Lima template the VM
@@ -630,7 +637,8 @@ The first public version.
 - A warm-exec request is created inside its cgroup (`CLONE_INTO_CGROUP`,
   Linux 5.7+) rather than moved there, so it never waits on that lock.
 
-[Unreleased]: https://github.com/mhmtskrc2/zygo/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/mhmtskrc2/zygo/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/mhmtskrc2/zygo/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/mhmtskrc2/zygo/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/mhmtskrc2/zygo/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/mhmtskrc2/zygo/compare/v0.1.4...v0.1.5
