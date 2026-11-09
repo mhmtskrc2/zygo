@@ -42,6 +42,7 @@ One line each. The chapter in brackets explains the term in full; the numbers fo
 | **Lima** | The tool Zygo uses to run a Linux virtual machine on a Mac. [11] |
 | **MCP** | Model Context Protocol: how an AI agent host starts and talks to a tool server; `zygo mcp` is one. [17] |
 | **microVM** | A very small virtual machine that boots fast, such as Firecracker's. [10] |
+| **MTU** | The largest packet a network interface sends in one piece; 1500 bytes on most networks, 65520 on `pasta`'s. [14, 22] |
 | **namespace** | A separate copy of one kind of kernel table — mounts, pids, network — for a group of processes. [2] |
 | **`no_new_privs`** | A flag that stops a process and its children from ever gaining power, even through setuid. [4] |
 | **OCI** | The Open Container Initiative, and its standards for images, registries and runtimes. [5] |
@@ -76,6 +77,7 @@ One line each. The chapter in brackets explains the term in full; the numbers fo
 | **tenant** | One customer of whoever embeds Zygo; has its own scripts, secrets, limits and tokens. [14, 17] |
 | **tmpfs** | A file system in memory that disappears when no longer used. [4] |
 | **token** | A secret a caller sends to the API to prove who it is: operator or tenant. [17] |
+| **token bucket (`tbf`)** | A traffic limit that lets a packet out only when enough "tokens", refilled at the rate, have saved up; how `bandwidth` is enforced. [14, 22] |
 | **uid** | A user's number; `uid_map` translates uids between a user namespace and the host. [1, 2] |
 | **user space** | Everything outside the kernel: all normal programs. [1] |
 | **warm-exec** | Zygo's mode where the sandbox is kept ready and each request is a new process entered into it. [6] |

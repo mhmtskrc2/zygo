@@ -151,7 +151,9 @@ have open; past it, `open` fails with "Too many open files". `connections`
 (default 256) is how many TCP connections a networked function may hold at
 once; the firewall inside the sandbox answers the next one with a reset. It
 cannot be `0`. `bandwidth` is how many bytes a second the function may send,
-and on hosts with an `ifb` device also receive. `io_read` and `io_write` limit
+and on hosts with an `ifb` device also receive. While it is set, the sandbox's
+network interface uses 1500-byte packets instead of `pasta`'s 64 KiB ones, so
+the limit can let traffic through a little at a time. `io_read` and `io_write` limit
 disk reads and writes a second. These three have no default, so Zygo warns
 you when a served function leaves them unset.
 

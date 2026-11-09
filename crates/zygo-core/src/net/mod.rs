@@ -986,9 +986,9 @@ pub(crate) mod linux {
     /// Shape the sandbox's interface with `tc`. Returns whether what the
     /// sandbox *receives* was shaped too.
     ///
-    /// What the sandbox sends is a token bucket (`tbf`) on the interface's
-    /// root qdisc: measured on `pasta`, 500 KB at 100 KB/s takes the 4.9 s
-    /// the arithmetic says. What it receives is harder. The obvious tool, an
+    /// What the sandbox sends is a token bucket (`tbf`, sized by `tbf_args`)
+    /// on the interface's root qdisc, with the interface at `SHAPED_MTU`
+    /// first. What it receives is harder. The obvious tool, an
     /// ingress policer that drops packets over the rate, makes `pasta` reset
     /// the connection — it is a userspace TCP stack, and it treats that much
     /// loss on its tap side as a dead peer, whatever the burst. Queueing
@@ -998,20 +998,8 @@ pub(crate) mod linux {
     /// and an honest warning when it does not, rather than a limit that
     /// silently breaks every download.
     fn apply_bandwidth(ns: &NetNs, tc: &Path, ip: &Path, bytes_per_second: u64) -> Result<bool> {
-        let rate = format!("{}bit", bytes_per_second.saturating_mul(8));
-        // A tenth of a second's worth, and never below what a single full
-        // frame needs: a bucket smaller than a packet never passes one.
-        let burst = format!("{}b", (bytes_per_second / 10).max(32 * 1024));
         let dev = SANDBOX_IFNAME;
-        let shape = |device: &str| -> Vec<String> {
-            [
-                "qdisc", "add", "dev", device, "root", "tbf", "rate", &rate, "burst", &burst,
-                "latency", "400ms",
-            ]
-            .iter()
-            .map(|s| s.to_string())
-            .collect()
-        };
+        let shape = |device: &str| tbf_args(device, bytes_per_second);
         let tc_run = |args: Vec<String>| -> Result<()> {
             let refs: Vec<&str> = args.iter().map(String::as_str).collect();
             let output = run_in_namespace(ns, tc, &refs, None)?;
@@ -1031,6 +1019,28 @@ pub(crate) mod linux {
                 })
             }
         };
+
+        // Frames the bucket can always pass; see `SHAPED_MTU`. Received
+        // traffic comes through the same interface, so it is held to the same
+        // size before it is redirected to an `ifb` below.
+        let mtu = run_in_namespace(
+            ns,
+            ip,
+            &["link", "set", "dev", dev, "mtu", SHAPED_MTU],
+            None,
+        )?;
+        if !mtu.status.success() {
+            return Err(Error::BackendUnavailable {
+                backend: "network",
+                reason: format!(
+                    "the bandwidth limit could not be applied (`ip link set dev {dev} mtu \
+                     {SHAPED_MTU}`): {}",
+                    last_line(&mtu.stderr)
+                ),
+                remedy: "remove `bandwidth` until the sandbox's interface accepts a 1500-byte MTU"
+                    .into(),
+            });
+        }
 
         // Sent: always.
         tc_run(shape(dev))?;
@@ -1371,6 +1381,47 @@ fn pasta_remedy(said: &str) -> String {
     "`zygo doctor` reports what `network = \"egress\"` and `\"full\"` need; \
  `network = \"none\"` needs none of it"
         .to_string()
+}
+
+/// The MTU a sandbox's interface is given while `bandwidth` shapes it.
+///
+/// `pasta` gives the namespace a 65520-byte MTU, so one TCP segment can be
+/// 64 KiB, and `tbf` drops a packet bigger than its bucket that it cannot
+/// split. On Linux 7.0 nearly every segment of a bulk upload is one: a
+/// `bandwidth = "100K"` sandbox got 1425 bytes of a 500 KB upload out before
+/// the server gave up, on every try. Ethernet-sized frames always fit the
+/// bucket and meter the rate in small steps, and a limited sandbox has no use
+/// for the throughput the large MTU is for.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const SHAPED_MTU: &str = "1500";
+
+/// `tc qdisc add` arguments that hold what leaves `device` to
+/// `bytes_per_second`.
+///
+/// The bucket is a tenth of a second's worth, and never less than 32 KiB. The
+/// queue is what the bucket can send in 400 ms, but never less than 96 KiB on
+/// top of the bucket: a TCP sender's window grows past a smaller queue before
+/// it feels the delay, and the overflow is dropped. At `100K`, a 72 KiB queue
+/// dropped about one packet in forty on Linux 6.8 and stretched a five-second
+/// upload to fifteen; 128 KiB dropped none on 6.8 or 7.0. Measured with
+/// `pasta`, 500 KB at 100 KB/s takes the five seconds the arithmetic says.
+//
+// Compiled and tested on every host, like `pasta_remedy`: the numbers are a
+// decision, and a decision is worth checking wherever the tests run.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn tbf_args(device: &str, bytes_per_second: u64) -> Vec<String> {
+    let burst = (bytes_per_second / 10).max(32 * 1024);
+    let queue = (bytes_per_second.saturating_mul(2) / 5).max(96 * 1024);
+    let rate = format!("{}bit", bytes_per_second.saturating_mul(8));
+    let burst_arg = format!("{burst}b");
+    let limit_arg = format!("{}b", burst.saturating_add(queue));
+    [
+        "qdisc", "add", "dev", device, "root", "tbf", "rate", &rate, "burst", &burst_arg, "limit",
+        &limit_arg,
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 #[cfg(test)]
@@ -1910,5 +1961,43 @@ mod tests {
         let text = tun_remedy_for(&host);
         assert!(text.contains("modprobe tun"), "{text}");
         assert!(!text.contains("hostPath"), "{text}");
+    }
+
+    /// The value after `flag` in a `tc` argument list.
+    fn tc_value<'a>(args: &'a [String], flag: &str) -> &'a str {
+        let at = args.iter().position(|a| a == flag).expect(flag);
+        &args[at + 1]
+    }
+
+    #[test]
+    fn a_small_limit_gets_a_bucket_every_frame_fits_and_room_for_a_tcp_window() {
+        // The numbers measured at `100K` on Linux 6.8 and 7.0: no drops, five
+        // seconds for 500 KB.
+        let args = tbf_args("eth0", 100_000);
+        assert_eq!(
+            args[..6],
+            ["qdisc", "add", "dev", "eth0", "root", "tbf"].map(String::from)
+        );
+        assert_eq!(tc_value(&args, "rate"), "800000bit");
+        assert_eq!(tc_value(&args, "burst"), "32768b");
+        assert_eq!(tc_value(&args, "limit"), "131072b");
+        let frame: u64 = SHAPED_MTU.parse().unwrap();
+        assert!(
+            32 * 1024 > frame + 14,
+            "a frame and its header must fit the bucket"
+        );
+        assert!(
+            !args.iter().any(|a| a == "latency"),
+            "the queue is sized by `limit`; `latency` would replace it with 400 ms of the rate"
+        );
+    }
+
+    #[test]
+    fn a_large_limit_keeps_a_tenth_of_a_second_bucket_and_400_ms_of_queue() {
+        let args = tbf_args("ifb0", 10_000_000);
+        assert_eq!(tc_value(&args, "dev"), "ifb0");
+        assert_eq!(tc_value(&args, "rate"), "80000000bit");
+        assert_eq!(tc_value(&args, "burst"), "1000000b");
+        assert_eq!(tc_value(&args, "limit"), "5000000b");
     }
 }
