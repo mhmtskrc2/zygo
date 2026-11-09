@@ -7,6 +7,14 @@ break things and will say so here.
 
 ## [Unreleased]
 
+## [0.1.9] — 2026-11-09
+
+0.1.8, released in full and with its dependencies past nine security advisories. 0.1.8
+reached crates.io, PyPI, npm, Hex and ghcr.io, but not GitHub releases or Homebrew: the
+runner its Apple silicon build asked for had been retired, and the release stopped there.
+Everything 0.1.8 fixed is in 0.1.9, including the VM template a Mac install was missing.
+Upgrade from 0.1.7 or 0.1.8.
+
 ### Security
 
 - Nine advisories published after 0.1.7 are fixed by updating the crates they
@@ -648,7 +656,8 @@ The first public version.
 - A warm-exec request is created inside its cgroup (`CLONE_INTO_CGROUP`,
   Linux 5.7+) rather than moved there, so it never waits on that lock.
 
-[Unreleased]: https://github.com/mhmtskrc2/zygo/compare/v0.1.8...HEAD
+[Unreleased]: https://github.com/mhmtskrc2/zygo/compare/v0.1.9...HEAD
+[0.1.9]: https://github.com/mhmtskrc2/zygo/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/mhmtskrc2/zygo/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/mhmtskrc2/zygo/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/mhmtskrc2/zygo/compare/v0.1.5...v0.1.6
