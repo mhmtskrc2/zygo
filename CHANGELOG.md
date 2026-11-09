@@ -7,6 +7,19 @@ break things and will say so here.
 
 ## [Unreleased]
 
+### Fixed
+
+- A `bandwidth` limit no longer stalls uploads on Linux 7.0. Its token bucket
+  was 32 KiB, `pasta` gives the sandbox's interface a 65520-byte MTU, and
+  `tbf` drops a packet bigger than its bucket that it cannot split. Linux 7.0
+  sends most segments of a bulk upload that large, so a `100K` function got
+  1425 bytes of a 500 KB upload out before the server closed the connection,
+  every time; on Linux 6.8 the same upload finished, with about one packet in
+  four dropped. While a limit is set the interface now has a 1500-byte MTU, and the
+  queue holds 96 KiB beyond the bucket at the least rather than 400 ms of the
+  rate. 500 KB at 100 KB/s takes five seconds on 6.8 and 7.0, with nothing
+  dropped. Chapter 22 has the symptom and the "could not be applied" error.
+
 ## [0.1.9] — 2026-11-09
 
 0.1.8, released in full and with its dependencies past nine security advisories. 0.1.8

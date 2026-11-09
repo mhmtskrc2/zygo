@@ -141,7 +141,7 @@ These are enforced for every request. None can be switched off, except
 | `nofile` | integer | `1024` | `RLIMIT_NOFILE` | |
 | `io_read`, `io_write` | bytes per second | unlimited | `io.max` on the device behind the root | A warning when neither is set, except for `zygo run`. |
 | `connections` | integer | `256` | the sandbox's firewall | Not zero. TCP connections a networked function may hold at once. |
-| `bandwidth` | bytes per second | unlimited | traffic shaping in the sandbox | Not zero. What the function may send (and receive, where the host has an `ifb` device). A warning when unset with `egress` or `full`, except for `zygo run`. |
+| `bandwidth` | bytes per second | unlimited | traffic shaping in the sandbox | Not zero. What the function may send (and receive, where the host has an `ifb` device). The interface's MTU is 1500 while it is set. A warning when unset with `egress` or `full`, except for `zygo run`. |
 
 ## Network
 

@@ -316,6 +316,24 @@ allowlist doing its job. Add the name:
 allow = ["api.example.com:443", "*.cdn.example.com:443"]
 ```
 
+### An upload stalls under `bandwidth`, then "Remote end closed connection"
+
+This was a bug in 0.1.9 and older, seen on Linux 7.0. The limit is a token
+bucket (`tbf`), and it drops a packet bigger than the bucket. `pasta` lets one
+packet be up to 64 KiB, the bucket was 32 KiB, and Linux 7.0 sends most
+packets of a big upload at full size. So almost nothing got through, and
+the server gave up. A sandbox under a `bandwidth` limit now uses 1500-byte
+packets, which always fit. Upgrade Zygo.
+
+### "the bandwidth limit could not be applied"
+
+Zygo gives the sandbox's interface 1500-byte packets (`ip link ... mtu 1500`)
+and shapes it with `tc`. The message names the command that failed and what
+it said. A kernel without the `sch_tbf` module cannot shape traffic, and a
+sandbox cannot load the module itself. Load it on the host with `sudo modprobe
+sch_tbf`, or remove `bandwidth` until it is there. `zygo doctor` says when
+`tc` is missing.
+
 ### A private address is refused even with `network = "full"`
 
 On purpose. Private and link-local address ranges — your host, its neighbours
