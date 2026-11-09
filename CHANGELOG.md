@@ -7,6 +7,17 @@ break things and will say so here.
 
 ## [Unreleased]
 
+### Security
+
+- Nine advisories published after 0.1.7 are fixed by updating the crates they
+  name. The TLS that image pulls, OTLP export and usage delivery go through:
+  `rustls` 0.23.46 (RUSTSEC-2026-0346, -0347, -0348, -0349), `rustls-webpki`
+  0.103.16 (RUSTSEC-2026-0382) and `webpki-roots` 1.0.11 (RUSTSEC-2026-0381).
+  The decoder for zstd image layers, `ruzstd` 0.9.1, where a tiny crafted
+  layer could exhaust memory (RUSTSEC-2026-0344). And `ctutils` 0.4.8
+  (RUSTSEC-2026-0385) and `tokio` 1.54.1 (RUSTSEC-2026-0386). The 0.1.8
+  packages on crates.io and the 0.1.8 image were built before these.
+
 ## [0.1.8] — 2026-11-09
 
 The Mac release carries the template Zygo's Linux VM is created from. 0.1.7 left it out,
