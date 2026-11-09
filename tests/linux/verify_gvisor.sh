@@ -30,25 +30,40 @@ bad() { FAIL=$((FAIL+1)); say "  FAIL  $*"; }
 say "gvisor backend"
 say "  host kernel $(uname -r)"
 
-zygo pull "$IMAGE" >/dev/null 2>&1
+pull_image "$IMAGE"
 
 # The `ns` side of the comparison is captured *first*, before anything else
 # has run. Two reasons: it is the baseline, and a failing baseline makes the
 # comparison vacuous; and `ns` is what builds the cgroup hierarchy the
 # harness's wrapper then places every later invocation in.
+#
+# Each baseline keeps its stderr, and a failure prints it. A CI run on a
+# kernel 7.0 runner once failed the first of these with exit 125 while the
+# three after it passed, and all it could say was "exit 125": the reason was
+# the one line this script threw away.
 say ""
 say "the ns baseline, before anything else"
+ns_err=$(mktemp -d)
 probe_1='/bin/echo same-on-both'
 probe_2='/bin/sh -c "id -u"'
 probe_3='/bin/sh -c "echo x > /tmp/f && cat /tmp/f"'
-ns_1=$(eval zygo run --isolation ns "$IMAGE" $probe_1 2>/dev/null); ns_rc_1=$?
-ns_2=$(eval zygo run --isolation ns "$IMAGE" $probe_2 2>/dev/null); ns_rc_2=$?
-ns_3=$(eval zygo run --isolation ns "$IMAGE" $probe_3 2>/dev/null); ns_rc_3=$?
-ns_kernel=$(zygo run --isolation ns "$IMAGE" /bin/uname -r 2>/dev/null)
+ns_1=$(eval zygo run --isolation ns "$IMAGE" $probe_1 2>"$ns_err/1"); ns_rc_1=$?
+ns_2=$(eval zygo run --isolation ns "$IMAGE" $probe_2 2>"$ns_err/2"); ns_rc_2=$?
+ns_3=$(eval zygo run --isolation ns "$IMAGE" $probe_3 2>"$ns_err/3"); ns_rc_3=$?
+ns_kernel=$(zygo run --isolation ns "$IMAGE" /bin/uname -r 2>"$ns_err/kernel")
+
+# The last lines a baseline wrote to stderr, indented under its FAIL line.
+why() {
+    [ -s "$1" ] || return 0
+    tail -5 "$1" | sed 's/^/        /'
+}
+
 if [ "$ns_rc_1" -eq 0 ] && [ "$ns_1" = "same-on-both" ] && [ -n "$ns_kernel" ]; then
     ok "the ns backend runs here, so it is a baseline worth comparing against"
 else
     bad "the ns baseline does not work (exit $ns_rc_1, '$ns_1'); every comparison below would be vacuous"
+    why "$ns_err/1"
+    [ -n "$ns_kernel" ] || why "$ns_err/kernel"
 fi
 
 say ""
@@ -192,20 +207,23 @@ say "the same spec on two backends (requirement N8)"
 # The acceptance criterion for this phase: the same command, the same answer,
 # whichever backend drew the boundary. The `ns` side was captured at the top.
 compare() {
-    probe=$1; ns_out=$2; ns_rc=$3
-    gv_out=$(eval zygo run --isolation gvisor "$IMAGE" $probe 2>/dev/null)
+    probe=$1; ns_out=$2; ns_rc=$3; ns_why=$4
+    gv_out=$(eval zygo run --isolation gvisor "$IMAGE" $probe 2>"$ns_err/gvisor")
     gv_rc=$?
     if [ "$ns_rc" -ne 0 ]; then
         bad "the ns baseline for \`$probe\` failed (exit $ns_rc); this comparison is vacuous"
+        why "$ns_why"
     elif [ "$ns_out" = "$gv_out" ] && [ "$ns_rc" -eq "$gv_rc" ]; then
         ok "\`$probe\` gives the same answer on ns and gvisor ('$gv_out')"
     else
         bad "\`$probe\`: ns gave '$ns_out' (exit $ns_rc), gvisor gave '$gv_out' (exit $gv_rc)"
+        why "$ns_why"
+        why "$ns_err/gvisor"
     fi
 }
-compare "$probe_1" "$ns_1" "$ns_rc_1"
-compare "$probe_2" "$ns_2" "$ns_rc_2"
-compare "$probe_3" "$ns_3" "$ns_rc_3"
+compare "$probe_1" "$ns_1" "$ns_rc_1" "$ns_err/1"
+compare "$probe_2" "$ns_2" "$ns_rc_2" "$ns_err/2"
+compare "$probe_3" "$ns_3" "$ns_rc_3" "$ns_err/3"
 
 # And one thing that must differ, or the comparison above proves only that
 # both backends ran the same binary rather than that either isolated it.
