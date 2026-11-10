@@ -71,6 +71,9 @@ pub mod tokens;
 pub mod venv;
 pub mod workspace;
 
+#[cfg(test)]
+mod test_support;
+
 pub use error::{Error, Result};
 pub use paths::Paths;
 pub use spec::{ResolvedFn, Spec};

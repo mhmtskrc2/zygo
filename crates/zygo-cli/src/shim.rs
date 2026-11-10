@@ -1856,12 +1856,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_refused_session_is_recognised_only_with_exit_255() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let fake = |name: &str, script: &str| {
             let path = dir.path().join(name);
-            std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::test_support::write_executable(&path, &format!("#!/bin/sh\n{script}\n"));
             path
         };
         let refused = fake(
