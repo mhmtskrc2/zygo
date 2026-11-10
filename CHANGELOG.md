@@ -7,6 +7,11 @@ break things and will say so here.
 
 ## [Unreleased]
 
+## [0.1.10] — 2026-11-10
+
+Bandwidth limits work again on Linux 7.0, where a limited function could not
+finish an upload. Upgrade from any 0.1.x.
+
 ### Fixed
 
 - A `bandwidth` limit no longer stalls uploads on Linux 7.0. Its token bucket
@@ -669,7 +674,8 @@ The first public version.
 - A warm-exec request is created inside its cgroup (`CLONE_INTO_CGROUP`,
   Linux 5.7+) rather than moved there, so it never waits on that lock.
 
-[Unreleased]: https://github.com/mhmtskrc2/zygo/compare/v0.1.9...HEAD
+[Unreleased]: https://github.com/mhmtskrc2/zygo/compare/v0.1.10...HEAD
+[0.1.10]: https://github.com/mhmtskrc2/zygo/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/mhmtskrc2/zygo/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/mhmtskrc2/zygo/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/mhmtskrc2/zygo/compare/v0.1.6...v0.1.7
