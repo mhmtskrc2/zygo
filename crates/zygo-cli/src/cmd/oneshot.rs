@@ -343,12 +343,9 @@ mod tests {
     /// rather than a kernel. It is spawned exactly as the real one is, which
     /// is what makes the argument order and the spec file observable.
     fn fake_zygo(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("a temporary directory");
         let path = dir.path().join("zygo");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write the stand-in");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-            .expect("make it executable");
+        crate::test_support::write_executable(&path, &format!("#!/bin/sh\n{body}\n"));
         (dir, path)
     }
 

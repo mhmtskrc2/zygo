@@ -896,10 +896,11 @@ mod tests {
     /// An executable that fails the way a supervisor with a taken socket does:
     /// one line on stderr, then a non-zero exit.
     fn failing_executable(dir: &Path, message: &str) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let path = dir.join("fake-supervisor");
-        std::fs::write(&path, format!("#!/bin/sh\necho '{message}' >&2\nexit 3\n")).expect("write");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        crate::test_support::write_executable(
+            &path,
+            &format!("#!/bin/sh\necho '{message}' >&2\nexit 3\n"),
+        );
         path
     }
 

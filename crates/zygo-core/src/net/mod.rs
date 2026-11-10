@@ -1827,16 +1827,12 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_pasta_that_hangs_is_stopped_at_the_deadline_with_what_it_said() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let fake = dir.path().join("pasta");
-        std::fs::write(
+        crate::test_support::write_executable(
             &fake,
             "#!/bin/sh\necho 'Failed to set up tap device in namespace' >&2\nexec sleep 60\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let started = std::time::Instant::now();
         let err = linux::start_pasta_within(
@@ -1860,16 +1856,12 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_pasta_that_fails_is_reported_without_waiting_for_its_children() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let fake = dir.path().join("pasta");
-        std::fs::write(
+        crate::test_support::write_executable(
             &fake,
             "#!/bin/sh\nsleep 60 &\necho \"Couldn't open PID file /x.pid: Permission denied\" >&2\nexit 1\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let started = std::time::Instant::now();
         let err = linux::start_pasta_within(

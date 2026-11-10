@@ -14,6 +14,8 @@ mod scope;
 // the machine that can act on them. `scope` does the same in reverse.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod shim;
+#[cfg(test)]
+mod test_support;
 mod tty;
 
 use clap::Parser;
